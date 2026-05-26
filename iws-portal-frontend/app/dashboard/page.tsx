@@ -25,15 +25,21 @@ export default function DashboardPage() {
   const handleLogout = useCallback(async () => {
     setLoggingOut(true);
     try {
-      await fetch(`${API_URL}/api/v1/auth/logout`, {
+      const res = await fetch(`${API_URL}/api/v1/auth/logout`, {
         method: 'POST',
         credentials: 'include',
       });
+      if (!res.ok) {
+        setError('Sign out failed. Please try again.');
+        setLoggingOut(false);
+        return;
+      }
     } catch {
-      // best-effort logout; redirect regardless
-    } finally {
-      router.push('/');
+      setError('Network error during sign out. Please try again.');
+      setLoggingOut(false);
+      return;
     }
+    router.push('/');
   }, [router]);
 
   useEffect(() => {

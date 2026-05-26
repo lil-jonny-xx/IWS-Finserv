@@ -134,6 +134,7 @@ def write_audit_log(conn, user_id, action, table_name, record_id=None, details=N
         )
         cursor.close()
     except Exception as e:
+        conn.rollback()
         logger.error(f"Audit log write failed: {e}")
 
 def is_token_blacklisted(token: str) -> bool:
@@ -178,7 +179,7 @@ def get_token_from_request(request: Request, authorization: Optional[str] = None
 
 class LoginRequest(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=1, max_length=255)
+    password: str = Field(min_length=6, max_length=72)
 
 @app.get("/api/ping")
 def ping():
@@ -231,9 +232,6 @@ def _login_impl(request: Request, login_request: LoginRequest, response: Respons
     email = login_request.email.lower()
     password = login_request.password
 
-    if len(password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
-
     conn = get_db_connection()
 
     try:
@@ -256,22 +254,29 @@ def _login_impl(request: Request, login_request: LoginRequest, response: Respons
             )
 
         if not verify_password(password, user_row["password_hash"]):
-            new_attempts = (user_row.get("failed_attempts") or 0) + 1
-            lock_until = None
-
-            if new_attempts >= 10:
-                lock_until = datetime.utcnow() + timedelta(minutes=30)
-                logger.warning(f"Account locked: {email} after {new_attempts} attempts")
-
             cursor2 = conn.cursor()
             cursor2.execute(
-                "UPDATE users SET failed_attempts = %s, locked_until = %s WHERE id = %s",
-                (new_attempts, lock_until, user_row["id"])
+                """UPDATE users
+                   SET
+                     failed_attempts = failed_attempts + 1,
+                     locked_until = CASE
+                       WHEN failed_attempts + 1 >= 10
+                       THEN NOW() AT TIME ZONE 'UTC' + INTERVAL '30 minutes'
+                       ELSE NULL
+                     END
+                   WHERE id = %s
+                   RETURNING failed_attempts, locked_until""",
+                (user_row["id"],)
             )
+            updated = cursor2.fetchone()
             conn.commit()
             cursor2.close()
 
-            logger.info(f"Wrong password for: {email} (attempt {new_attempts})")
+            new_attempts = updated["failed_attempts"]
+            if updated["locked_until"]:
+                logger.warning(f"Account locked: {email} after {new_attempts} attempts")
+            else:
+                logger.info(f"Wrong password for: {email} (attempt {new_attempts})")
             raise HTTPException(status_code=401, detail="Invalid email or password")
 
         cursor2 = conn.cursor()
