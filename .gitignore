@@ -11,3 +11,4 @@ iws-portal-frontend/.env.local
 
 # Nginx default page
 html/
+.agents/
