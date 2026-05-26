@@ -74,9 +74,11 @@ def shutdown_handler():
 atexit.register(shutdown_handler)
 
 def real_ip(request: Request):
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+    # CF-Connecting-IP is set by Cloudflare and cannot be spoofed by clients
+    # (nginx allowlist ensures only Cloudflare IPs reach this server)
+    cf_ip = request.headers.get("CF-Connecting-IP")
+    if cf_ip:
+        return cf_ip
     return request.client.host
 
 limiter = Limiter(
@@ -135,22 +137,25 @@ def write_audit_log(conn, user_id, action, table_name, record_id=None, details=N
         logger.error(f"Audit log write failed: {e}")
 
 def is_token_blacklisted(token: str) -> bool:
+    if redis_client is None:
+        logger.error("Redis unavailable - denying token as precaution")
+        return True
     try:
-        if redis_client is None:
-            return False
         return redis_client.exists(f"blacklist:{token}") > 0
     except Exception as e:
         logger.error(f"Redis blacklist check failed: {e}")
-        return False
+        return True
 
-def blacklist_token(token: str, expiry_seconds: int = 2592000):
+def blacklist_token(token: str, expiry_seconds: int = 2592000) -> bool:
+    if redis_client is None:
+        logger.error("Redis unavailable - cannot revoke token")
+        return False
     try:
-        if redis_client is None:
-            logger.warning("Redis unavailable - token not blacklisted")
-            return
         redis_client.setex(f"blacklist:{token}", expiry_seconds, "revoked")
+        return True
     except Exception as e:
         logger.error(f"Redis blacklist set failed: {e}")
+        return False
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     try:
@@ -332,7 +337,8 @@ def logout(request: Request, response: Response, authorization: Optional[str] = 
     try:
         token = get_token_from_request(request, authorization)
         payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        blacklist_token(token)
+        if not blacklist_token(token):
+            raise HTTPException(status_code=503, detail="Logout failed - please try again")
         response.delete_cookie(key="access_token", httponly=True, secure=True, samesite="strict")
 
         conn = get_db_connection()
