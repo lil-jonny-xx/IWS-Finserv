@@ -13,12 +13,16 @@ export default function LoginPage() {
   const router = useRouter();
 
   useEffect(() => {
-    fetch(`${API_URL}/api/v1/me`, { credentials: 'include' })
+    const controller = new AbortController();
+    fetch(`${API_URL}/api/v1/me`, { credentials: 'include', signal: controller.signal })
       .then(res => {
         if (res.ok) router.replace('/dashboard');
         else setChecking(false);
       })
-      .catch(() => setChecking(false));
+      .catch(err => {
+        if (err.name !== 'AbortError') setChecking(false);
+      });
+    return () => controller.abort();
   }, [router]);
 
   const handleSubmit = async (e: { preventDefault(): void }) => {
@@ -46,18 +50,29 @@ export default function LoginPage() {
   };
 
   if (checking) return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-100">
-      <p className="text-gray-500 text-sm">Loading...</p>
-    </div>
+    <main id="main-content" className="min-h-screen flex items-center justify-center bg-page">
+      <span role="status" aria-live="polite" className="sr-only">Checking session</span>
+      <div
+        aria-hidden="true"
+        className="w-5 h-5 rounded-full border-2 border-rule border-t-prime animate-spin"
+      />
+    </main>
   );
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-100">
-      <div className="bg-white p-8 rounded-lg shadow-md w-full max-w-sm">
-        <h1 className="text-2xl font-bold text-gray-800 mb-6 text-center">IWS MIS Portal</h1>
-        <form onSubmit={handleSubmit} className="space-y-4">
+    <main id="main-content" className="min-h-screen flex flex-col items-center justify-center bg-page px-4 py-10">
+      <div className="bg-card p-6 sm:p-8 rounded-lg shadow-sm border border-rule w-full max-w-sm">
+        <p className="text-center text-xs font-semibold text-ghost tracking-widest uppercase mb-2">
+          IWS Finserv
+        </p>
+        <h1 className="text-2xl font-bold text-ink mb-6 text-center">Sign in</h1>
+        <form
+          onSubmit={handleSubmit}
+          className="space-y-4"
+          aria-describedby={error ? 'login-error' : undefined}
+        >
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1" htmlFor="email">
+            <label className="block text-sm font-medium text-dim mb-1" htmlFor="email">
               Email
             </label>
             <input
@@ -65,13 +80,15 @@ export default function LoginPage() {
               type="email"
               autoComplete="email"
               required
+              maxLength={254}
+              disabled={submitting}
               value={email}
               onChange={e => setEmail(e.target.value)}
-              className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="w-full border border-wire rounded-md px-3 py-2 text-base text-ink bg-card hover:border-dim focus:outline-none focus:ring-2 focus:ring-prime disabled:opacity-60 disabled:cursor-not-allowed transition-[border-color,box-shadow] duration-150"
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1" htmlFor="password">
+            <label className="block text-sm font-medium text-dim mb-1" htmlFor="password">
               Password
             </label>
             <input
@@ -79,26 +96,31 @@ export default function LoginPage() {
               type="password"
               autoComplete="current-password"
               required
+              maxLength={128}
+              disabled={submitting}
               value={password}
               onChange={e => setPassword(e.target.value)}
-              className="w-full border border-gray-300 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              className="w-full border border-wire rounded-md px-3 py-2 text-base text-ink bg-card hover:border-dim focus:outline-none focus:ring-2 focus:ring-prime disabled:opacity-60 disabled:cursor-not-allowed transition-[border-color,box-shadow] duration-150"
             />
           </div>
           {error && (
-            <p className="text-red-600 text-sm">{error}</p>
+            <p id="login-error" role="alert" className="text-peril text-sm">
+              {error}
+            </p>
           )}
           <button
             type="submit"
             disabled={submitting}
-            className="w-full bg-blue-600 text-white py-2 rounded-md text-sm font-medium hover:bg-blue-700 disabled:bg-gray-400 transition-colors"
+            aria-busy={submitting}
+            className="w-full bg-prime text-prime-fg py-3 rounded-md text-sm font-medium hover:bg-prime-deep disabled:opacity-60 disabled:cursor-not-allowed transition-colors duration-150"
           >
-            {submitting ? 'Signing in...' : 'Sign In'}
+            {submitting ? 'Signing in...' : 'Sign in'}
           </button>
         </form>
-        <p className="text-center text-xs text-gray-400 mt-6">
+        <p className="text-center text-xs text-ghost mt-6">
           IWS Finserv &copy; {new Date().getFullYear()}
         </p>
       </div>
-    </div>
+    </main>
   );
 }

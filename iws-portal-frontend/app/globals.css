@@ -1,26 +1,106 @@
 @import "tailwindcss";
 
+/* ── Semantic color tokens ───────────────────── */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+  /* Surfaces */
+  --page:              oklch(96.5% 0.008 75);   /* warm stone — replaces dead grey-100 */
+  --card:              oklch(99.5% 0.004 75);   /* warm near-white — replaces pure white */
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  /* Text hierarchy */
+  --ink:               oklch(22%  0.012 258);   /* primary text */
+  --dim:               oklch(40%  0.010 258);   /* labels, secondary */
+  --ghost:             oklch(44%  0.008 258);   /* footer, timestamps — 5.3:1 on card, 4.9:1 on page */
+
+  /* Primary action: deep slate-indigo */
+  --prime:             oklch(44%  0.115 258);
+  --prime-deep:        oklch(38%  0.115 258);
+  --prime-fg:          oklch(99%  0.003 258);
+
+  /* Destructive action: deep warm red */
+  --peril:             oklch(44%  0.170  27);
+  --peril-deep:        oklch(38%  0.170  27);
+  --peril-fg:          oklch(99%  0.003  27);
+
+  /* Info notice */
+  --notice:            oklch(96%  0.012 230);
+  --notice-edge:       oklch(85%  0.030 230);
+  --notice-ink:        oklch(30%  0.090 230);   /* 7.9:1 on notice bg */
+  --notice-dim:        oklch(44%  0.080 230);   /* 5.6:1 on notice bg */
+
+  /* Structure */
+  --wire:              oklch(84%  0.010 75);    /* input borders */
+  --rule:              oklch(88%  0.008 75);    /* dividers */
+  --muted:             oklch(78%  0.006 75);    /* disabled state */
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+    --page:              oklch(16%  0.008 258);
+    --card:              oklch(21%  0.008 258);
+
+    --ink:               oklch(94%  0.006 258);
+    --dim:               oklch(75%  0.008 258);
+    --ghost:             oklch(62%  0.007 258);   /* 4.7:1 on dark card */
+
+    --prime:             oklch(68%  0.120 258);
+    --prime-deep:        oklch(73%  0.120 258);
+    --prime-fg:          oklch(12%  0.015 258);
+
+    --peril:             oklch(68%  0.170  27);
+    --peril-deep:        oklch(73%  0.170  27);
+    --peril-fg:          oklch(12%  0.010  27);
+
+    --notice:            oklch(22%  0.020 230);
+    --notice-edge:       oklch(36%  0.050 230);
+    --notice-ink:        oklch(82%  0.090 230);
+    --notice-dim:        oklch(65%  0.070 230);
+
+    --wire:              oklch(33%  0.010 258);
+    --rule:              oklch(28%  0.008 258);
+    --muted:             oklch(35%  0.006 258);
   }
 }
 
+@theme inline {
+  --font-sans:           var(--font-geist-sans);
+  --font-mono:           var(--font-geist-mono);
+
+  --color-page:          var(--page);
+  --color-card:          var(--card);
+
+  --color-ink:           var(--ink);
+  --color-dim:           var(--dim);
+  --color-ghost:         var(--ghost);
+
+  --color-prime:         var(--prime);
+  --color-prime-deep:    var(--prime-deep);
+  --color-prime-fg:      var(--prime-fg);
+
+  --color-peril:         var(--peril);
+  --color-peril-deep:    var(--peril-deep);
+  --color-peril-fg:      var(--peril-fg);
+
+  --color-notice:        var(--notice);
+  --color-notice-edge:   var(--notice-edge);
+  --color-notice-ink:    var(--notice-ink);
+  --color-notice-dim:    var(--notice-dim);
+
+  --color-wire:          var(--wire);
+  --color-rule:          var(--rule);
+  --color-muted:         var(--muted);
+}
+
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--page);
+  color: var(--ink);
+  font-family: var(--font-geist-sans, Arial, Helvetica, sans-serif);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
