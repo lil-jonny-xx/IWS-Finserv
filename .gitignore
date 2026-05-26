@@ -1,0 +1,13 @@
+# Python
+mis-portal/venv/
+mis-portal/__pycache__/
+mis-portal/*.pyc
+mis-portal/.env
+
+# Node / Next.js
+iws-portal-frontend/node_modules/
+iws-portal-frontend/.next/
+iws-portal-frontend/.env.local
+
+# Nginx default page
+html/
