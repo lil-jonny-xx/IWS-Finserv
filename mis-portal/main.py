@@ -464,3 +464,244 @@ def get_entities(request: Request, authorization: Optional[str] = Header(None)):
 @app.get("/api/entities")
 def get_entities_legacy(request: Request, authorization: Optional[str] = Header(None)):
     return get_entities(request, authorization)
+
+
+def _require_auth(request: Request, authorization: Optional[str]) -> dict:
+    """Validate token and return JWT payload. Raises 401 on failure."""
+    token = get_token_from_request(request, authorization)
+    if is_token_blacklisted(token):
+        raise HTTPException(status_code=401, detail="Token has been revoked")
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired. Please log in again.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+@app.get("/api/v1/holdings")
+def get_holdings(
+    request: Request,
+    entity_id: Optional[int] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Return MF holdings for the requesting user's entity.
+    Admin users may pass ?entity_id=N to view any entity.
+    """
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        user_role = payload.get("role", "member")
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Resolve the entity_id to query
+        if entity_id is not None and user_role == "admin":
+            eid = entity_id
+        else:
+            cursor.execute(
+                "SELECT entity_id FROM users WHERE email = %s AND is_active = TRUE",
+                (payload["email"],)
+            )
+            row = cursor.fetchone()
+            if not row or not row["entity_id"]:
+                if user_role == "admin":
+                    cursor.close()
+                    return {
+                        "entity_id": 0,
+                        "entity_name": "Administrator",
+                        "total_holdings": 0,
+                        "total_invested": 0.0,
+                        "holdings": [],
+                    }
+                raise HTTPException(status_code=404, detail="No entity linked to this user")
+            eid = row["entity_id"]
+
+        cursor.execute(
+            "SELECT entity_name FROM entity WHERE id = %s",
+            (eid,)
+        )
+        entity_row = cursor.fetchone()
+        if not entity_row:
+            raise HTTPException(status_code=404, detail="Entity not found")
+
+        cursor.execute("""
+            SELECT
+                h.id,
+                h.folio_number,
+                h.quantity,
+                h.cost_basis,
+                h.avg_cost,
+                h.invested_amount,
+                h.first_invested_date,
+                h.last_updated_nav     AS nav,
+                h.current_value,
+                h.last_updated,
+                sm.isin,
+                sm.security_name,
+                sm.security_type,
+                sm.asset_class,
+                sm.amfi_code
+            FROM holding h
+            JOIN security_master sm ON sm.id = h.security_id
+            WHERE h.entity_id = %s
+            ORDER BY sm.asset_class, sm.security_name, h.folio_number
+        """, (eid,))
+        rows = cursor.fetchall()
+        cursor.close()
+
+        holdings = []
+        total_invested = 0.0
+        for r in rows:
+            invested = float(r["invested_amount"]) if r["invested_amount"] else 0.0
+            nav_val  = float(r["nav"]) if r["nav"] else None
+            qty      = float(r["quantity"]) if r["quantity"] else 0.0
+            cur_val  = float(r["current_value"]) if r["current_value"] else (
+                round(qty * nav_val, 2) if nav_val else None
+            )
+            total_invested += invested
+            holdings.append({
+                "id":                   r["id"],
+                "isin":                 r["isin"],
+                "security_name":        r["security_name"],
+                "security_type":        r["security_type"],
+                "asset_class":          r["asset_class"],
+                "amfi_code":            r["amfi_code"],
+                "folio_number":         r["folio_number"],
+                "quantity":             qty,
+                "avg_cost":             float(r["avg_cost"]) if r["avg_cost"] else None,
+                "cost_basis":           float(r["cost_basis"]) if r["cost_basis"] else None,
+                "invested_amount":      invested,
+                "nav":                  nav_val,
+                "current_value":        cur_val,
+                "first_invested_date":  str(r["first_invested_date"]) if r["first_invested_date"] else None,
+                "last_updated":         r["last_updated"].isoformat() if r["last_updated"] else None,
+            })
+
+        return {
+            "entity_id":       eid,
+            "entity_name":     entity_row["entity_name"],
+            "total_holdings":  len(holdings),
+            "total_invested":  round(total_invested, 2),
+            "holdings":        holdings,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/v1/holdings: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.get("/api/holdings")
+def get_holdings_legacy(
+    request: Request,
+    entity_id: Optional[int] = None,
+    authorization: Optional[str] = Header(None),
+):
+    return get_holdings(request, entity_id, authorization)
+
+
+@app.get("/api/v1/transactions")
+def get_transactions(
+    request: Request,
+    entity_id: Optional[int] = None,
+    limit: int = 100,
+    offset: int = 0,
+    authorization: Optional[str] = Header(None),
+):
+    """Return MF transactions for the requesting user's entity."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        user_role = payload.get("role", "member")
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        if entity_id is not None and user_role == "admin":
+            eid = entity_id
+        else:
+            cursor.execute(
+                "SELECT entity_id FROM users WHERE email = %s AND is_active = TRUE",
+                (payload["email"],)
+            )
+            row = cursor.fetchone()
+            if not row or not row["entity_id"]:
+                if user_role == "admin":
+                    cursor.close()
+                    return {
+                        "entity_id": 0,
+                        "total":     0,
+                        "limit":     limit,
+                        "offset":    offset,
+                        "transactions": [],
+                    }
+                raise HTTPException(status_code=404, detail="No entity linked to this user")
+            eid = row["entity_id"]
+
+        limit  = max(1, min(limit, 500))
+        offset = max(0, offset)
+
+        cursor.execute("""
+            SELECT
+                t.id,
+                t.transaction_date,
+                t.description,
+                t.transaction_type,
+                t.amount,
+                t.units,
+                t.nav,
+                t.balance_units,
+                t.folio_number,
+                sm.security_name,
+                sm.isin
+            FROM mf_transaction t
+            JOIN security_master sm ON sm.id = t.security_id
+            WHERE t.entity_id = %s
+            ORDER BY t.transaction_date DESC, t.id DESC
+            LIMIT %s OFFSET %s
+        """, (eid, limit, offset))
+        rows = cursor.fetchall()
+
+        cursor.execute(
+            "SELECT COUNT(*) AS total FROM mf_transaction WHERE entity_id = %s",
+            (eid,)
+        )
+        total = cursor.fetchone()["total"]
+        cursor.close()
+
+        return {
+            "entity_id":  eid,
+            "total":      total,
+            "limit":      limit,
+            "offset":     offset,
+            "transactions": [
+                {
+                    "id":               r["id"],
+                    "date":             str(r["transaction_date"]),
+                    "description":      r["description"],
+                    "type":             r["transaction_type"],
+                    "amount":           float(r["amount"]) if r["amount"] else None,
+                    "units":            float(r["units"])  if r["units"]  else None,
+                    "nav":              float(r["nav"])    if r["nav"]    else None,
+                    "balance_units":    float(r["balance_units"]) if r["balance_units"] else None,
+                    "folio_number":     r["folio_number"],
+                    "security_name":    r["security_name"],
+                    "isin":             r["isin"],
+                }
+                for r in rows
+            ],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/v1/transactions: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
