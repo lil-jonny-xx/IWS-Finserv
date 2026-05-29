@@ -4,6 +4,10 @@ mis-portal/__pycache__/
 mis-portal/*.pyc
 mis-portal/.env
 
+# Gmail OAuth — never commit
+mis-portal/workers/gmail_credentials.json
+mis-portal/workers/gmail_token_central.json
+
 # Node / Next.js
 iws-portal-frontend/node_modules/
 iws-portal-frontend/.next/

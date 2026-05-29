@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+"""
+CAMS Trigger Worker — IWS MIS Portal
+Submits the CAMS CAS request form via headless Playwright.
+CAMS skips OTP for registered email addresses — PDF arrives directly by email.
+
+IMPORTANT: The email entered MUST be registered in the investor's folio with CAMS/KFintech.
+Unregistered emails cause silent failures (no OTP, no email, no error shown).
+Register via CAMS GoGreen service or CAMServ chatbot before running automation.
+"""
+import logging
+import time
+from datetime import date
+
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+logger = logging.getLogger(__name__)
+
+CAMS_CAS_URL = (
+    "https://www.camsonline.com/Investors/Statements/Consolidated-Account-Statement"
+)
+
+NAV_TIMEOUT    = 60_000
+ACTION_TIMEOUT = 10_000
+
+
+def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
+    """
+    Open CAMS CAS page, fill the form, and submit.
+    Returns True on detected success, False on failure.
+    The pdf_password is the password used to protect the emailed PDF.
+    """
+    logger.info(f"Triggering CAMS CAS for PAN: {pan_number[:4]}**** email: {email}")
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        ctx = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            java_script_enabled=True,
+            ignore_https_errors=False,
+        )
+        ctx.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+        page = ctx.new_page()
+
+        try:
+            page.goto(CAMS_CAS_URL, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
+            # Wait for Angular to render (mat-radio-button signals app is ready)
+            page.wait_for_selector("mat-radio-button", timeout=NAV_TIMEOUT)
+            logger.info("CAMS page loaded")
+
+            _dismiss_tnc(page)
+
+            # --- Statement type: Detailed (includes transaction listing) ---
+            _click_radio_by_value_or_text(page, "detailed", "Detailed", "Statement type")
+
+            # --- Folio listing: With zero balance folios (all history) ---
+            # The form default is "Without zero balance folios". We want "With zero balance"
+            # to capture complete history including fully-redeemed folios.
+            # Value "Y" = include zero balance folios on CAMS CAS-CAMS+KFintech form.
+            try:
+                _click_radio_by_value_or_text(page, "Y", "With zero balance folios", "Folio listing")
+            except RuntimeError:
+                logger.warning("Could not click 'With zero balance folios' radio — using default")
+
+            # --- Email ---
+            _fill_field(page, [
+                'input[formcontrolname="email_id"]',
+                'input[placeholder*="Email" i]',
+                'input[type="email"]',
+            ], email, "email")
+
+            # --- PAN (optional but helps CAMS match folios) ---
+            _fill_field(page, [
+                'input[formcontrolname="pan"]',
+                'input[placeholder*="PAN" i]',
+            ], pan_number.upper(), "PAN")
+
+            # --- PDF Password ---
+            _fill_field(page, [
+                'input[formcontrolname="password"]',
+                'input[placeholder*="Password" i]:not([placeholder*="Confirm" i]):not([placeholder*="Retype" i])',
+            ], pdf_password, "PDF password")
+
+            # --- Confirm Password ---
+            _fill_field(page, [
+                'input[formcontrolname="confirmPassword"]',
+                'input[formcontrolname="confirm_password"]',
+                'input[placeholder*="Confirm" i]',
+                'input[placeholder*="Retype" i]',
+            ], pdf_password, "confirm password")
+
+            _save_screenshot(page, f"cams_preflight_{pan_number[:4]}.png")
+
+            # --- Submit ---
+            page.locator('button:has-text("Submit")').first.click(
+                timeout=ACTION_TIMEOUT, force=True
+            )
+            logger.debug("Clicked Submit")
+
+            # Wait for CAMS to process and show a result
+            page.wait_for_timeout(4_000)
+            _save_screenshot(page, f"cams_postsubmit_{pan_number[:4]}.png")
+
+            success = _check_submit_result(page)
+            if success:
+                logger.info("CAMS form submitted successfully. CAS will arrive by email.")
+            else:
+                logger.error(
+                    "CAMS submission did not show a success indicator. "
+                    "Possible causes: email not registered with CAMS, form validation error, "
+                    "or CAMS showed OTP screen. Check screenshot at "
+                    f"/tmp/cams_postsubmit_{pan_number[:4]}.png"
+                )
+            return success
+
+        except PWTimeout as e:
+            logger.error(f"CAMS page timeout: {e}")
+            _save_screenshot(page, f"cams_timeout_{pan_number[:4]}.png")
+            return False
+        except Exception as e:
+            logger.error(f"CAMS trigger failed: {e}")
+            _save_screenshot(page, f"cams_error_{pan_number[:4]}.png")
+            return False
+        finally:
+            browser.close()
+
+
+def _dismiss_tnc(page):
+    """Accept the T&C/Disclaimer modal that CAMS shows on each fresh session."""
+    try:
+        dialog = page.query_selector("mat-dialog-container")
+        if not dialog:
+            logger.debug("No T&C dialog found — skipping")
+            return
+
+        # Select ACCEPT radio via JavaScript.
+        # The dialog uses plain HTML <input type="radio"> inside mat-dialog-container,
+        # not Angular Material mat-radio-button, so the mat-radio-button selector fails.
+        page.evaluate("""
+            const dialog = document.querySelector('mat-dialog-container');
+            if (!dialog) return;
+
+            // Try Angular Material mat-radio-button first
+            const matRadios = dialog.querySelectorAll('mat-radio-button');
+            for (const mr of matRadios) {
+                const val = (mr.getAttribute('value') || '').toUpperCase();
+                const txt = mr.textContent.trim().toUpperCase();
+                if (val === 'ACCEPT' || txt.startsWith('ACCEPT')) {
+                    mr.click();
+                    return;
+                }
+            }
+
+            // Fall back to plain HTML radio inputs
+            const inputs = dialog.querySelectorAll('input[type="radio"]');
+            for (const inp of inputs) {
+                const val = (inp.value || '').toUpperCase();
+                const parent = inp.closest('label,div,span') || inp.parentElement;
+                const txt = (parent?.textContent || '').trim().toUpperCase();
+                if (val === 'ACCEPT' || txt.startsWith('ACCEPT')) {
+                    inp.checked = true;
+                    inp.dispatchEvent(new Event('change', {bubbles: true}));
+                    inp.dispatchEvent(new Event('input', {bubbles: true}));
+                    return;
+                }
+            }
+        """)
+        page.wait_for_timeout(400)
+        logger.debug("ACCEPT radio selected via JS")
+
+        # Click PROCEED / Accept / Submit button inside the dialog
+        clicked = False
+        for btn_text in ["PROCEED", "Proceed", "Accept", "Submit", "OK", "Continue"]:
+            btn = page.locator(f'mat-dialog-container button:has-text("{btn_text}")')
+            if btn.count() > 0:
+                try:
+                    btn.first.click(timeout=3_000, force=True)
+                    logger.debug(f"Clicked T&C dialog button: {btn_text}")
+                    clicked = True
+                    break
+                except Exception:
+                    continue
+
+        if not clicked:
+            # Angular button click failed — forcibly remove the overlay via JS
+            page.evaluate("""
+                document.querySelector('mat-dialog-container')?.remove();
+                document.querySelector('.cdk-overlay-backdrop')?.remove();
+                document.querySelector('.cdk-overlay-container')?.remove();
+            """)
+            logger.debug("T&C overlay removed via JS (button click failed)")
+
+        # Wait for dialog to fully detach
+        try:
+            page.wait_for_selector("mat-dialog-container", state="detached", timeout=5_000)
+        except Exception:
+            pass
+        try:
+            page.wait_for_selector(".cdk-overlay-backdrop-showing", state="detached", timeout=3_000)
+        except Exception:
+            pass
+
+        page.wait_for_timeout(500)
+        logger.info("T&C dialog dismissed")
+    except Exception as e:
+        logger.debug(f"T&C dismiss error (may be ok): {e}")
+
+
+def _check_submit_result(page) -> bool:
+    """
+    Inspect page after Submit to determine success or failure.
+    Returns True on success, False on detected error or OTP prompt.
+    """
+    try:
+        content = page.content().lower()
+
+        # OTP / verification screen — email not registered with CAMS
+        otp_signals = ["otp", "one time password", "verify your email", "enter otp"]
+        if any(s in content for s in otp_signals):
+            logger.error(
+                "CAMS is asking for OTP — email is NOT registered in the folio. "
+                "Register the email via CAMS GoGreen or CAMServ, then re-run."
+            )
+            return False
+
+        # Explicit error messages
+        error_signals = [
+            "invalid email", "email not registered", "email id not found",
+            "no records found", "pan not found", "invalid pan",
+            "error occurred", "failed to submit",
+        ]
+        if any(s in content for s in error_signals):
+            logger.error(f"CAMS showed an error after Submit")
+            return False
+
+        # Success indicators
+        success_signals = [
+            "request has been submitted",
+            "statement will be sent",
+            "will be emailed",
+            "sent to your registered",
+            "sent to your email",
+            "thank you",
+            "request received",
+            "successfully submitted",
+        ]
+        if any(s in content for s in success_signals):
+            return True
+
+        # No clear signal — ambiguous. Log a warning and assume submitted.
+        logger.warning(
+            "Could not confirm CAMS submission result from page content. "
+            "Treating as submitted — monitor the inbox."
+        )
+        return True
+
+    except Exception as e:
+        logger.warning(f"Could not check submit result: {e}")
+        return True
+
+
+def _fill_field(page, selectors: list, value: str, label: str):
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            loc.wait_for(state="visible", timeout=ACTION_TIMEOUT)
+            loc.fill(value, timeout=ACTION_TIMEOUT)
+            logger.debug(f"Filled {label} via: {sel}")
+            return
+        except Exception:
+            continue
+    raise RuntimeError(
+        f"Could not find {label} field. CAMS may have changed their form. "
+        f"Tried: {selectors}"
+    )
+
+
+def _click_radio_by_value_or_text(page, value: str, text: str, label: str):
+    """Click a mat-radio-button by value attribute, falling back to visible text."""
+    # Try by value attribute first
+    by_value = page.locator(f'mat-radio-button[value="{value}"]')
+    if by_value.count() > 0:
+        by_value.first.click(timeout=ACTION_TIMEOUT, force=True)
+        logger.debug(f"Clicked radio '{label}' by value={value}")
+        return
+
+    # Fall back to text content match
+    by_text = page.locator(f'mat-radio-button:has-text("{text}")')
+    if by_text.count() > 0:
+        by_text.first.click(timeout=ACTION_TIMEOUT, force=True)
+        logger.debug(f"Clicked radio '{label}' by text='{text}'")
+        return
+
+    raise RuntimeError(
+        f"Could not find radio '{label}' (value={value}, text='{text}'). "
+        "CAMS may have changed their form."
+    )
+
+
+_SCREENSHOT_DIR = "/home/SAdmin/.cams-screenshots"
+
+def _save_screenshot(page, filename: str):
+    try:
+        import os as _os
+        _os.makedirs(_SCREENSHOT_DIR, exist_ok=True)
+        # mode=0o700: only owner can read — screenshots may contain form fields
+        _os.chmod(_SCREENSHOT_DIR, 0o700)
+        path = f"{_SCREENSHOT_DIR}/{filename}"
+        page.screenshot(path=path)
+        logger.info(f"Screenshot: {path}")
+    except Exception:
+        pass

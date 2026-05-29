@@ -14,6 +14,7 @@ import redis
 from slowapi import Limiter
 from slowapi.middleware import SlowAPIMiddleware
 import logging
+import hashlib
 import atexit
 
 # Load .env file
@@ -137,22 +138,27 @@ def write_audit_log(conn, user_id, action, table_name, record_id=None, details=N
         conn.rollback()
         logger.error(f"Audit log write failed: {e}")
 
+def _token_key(token: str) -> str:
+    # Hash the JWT before using as Redis key — prevents large-key DoS
+    # and avoids storing raw tokens in Redis memory/logs.
+    return "blacklist:" + hashlib.sha256(token.encode()).hexdigest()
+
 def is_token_blacklisted(token: str) -> bool:
     if redis_client is None:
         logger.error("Redis unavailable - denying token as precaution")
         return True
     try:
-        return redis_client.exists(f"blacklist:{token}") > 0
+        return redis_client.exists(_token_key(token)) > 0
     except Exception as e:
         logger.error(f"Redis blacklist check failed: {e}")
         return True
 
-def blacklist_token(token: str, expiry_seconds: int = 2592000) -> bool:
+def blacklist_token(token: str, expiry_seconds: int = 86400) -> bool:
     if redis_client is None:
         logger.error("Redis unavailable - cannot revoke token")
         return False
     try:
-        redis_client.setex(f"blacklist:{token}", expiry_seconds, "revoked")
+        redis_client.setex(_token_key(token), expiry_seconds, "1")
         return True
     except Exception as e:
         logger.error(f"Redis blacklist set failed: {e}")
@@ -249,8 +255,8 @@ def _login_impl(request: Request, login_request: LoginRequest, response: Respons
 
         if user_row.get("locked_until") and user_row["locked_until"] > datetime.utcnow():
             raise HTTPException(
-                status_code=423,
-                detail=f"Account locked until {user_row['locked_until'].strftime('%H:%M UTC')}. Try again later."
+                status_code=401,
+                detail="Invalid email or password"
             )
 
         if not verify_password(password, user_row["password_hash"]):
@@ -260,7 +266,7 @@ def _login_impl(request: Request, login_request: LoginRequest, response: Respons
                    SET
                      failed_attempts = failed_attempts + 1,
                      locked_until = CASE
-                       WHEN failed_attempts + 1 >= 10
+                       WHEN failed_attempts + 1 >= 5
                        THEN NOW() AT TIME ZONE 'UTC' + INTERVAL '30 minutes'
                        ELSE NULL
                      END
@@ -293,7 +299,7 @@ def _login_impl(request: Request, login_request: LoginRequest, response: Respons
             "user_id": user_row["id"],
             "email": email,
             "role": user_row["role"],
-            "exp": datetime.utcnow() + timedelta(days=30)
+            "exp": datetime.utcnow() + timedelta(hours=24)
         }
         token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
         logger.info(f"Successful login: {email}")
@@ -304,7 +310,7 @@ def _login_impl(request: Request, login_request: LoginRequest, response: Respons
             httponly=True,
             secure=True,
             samesite="strict",
-            max_age=2592000
+            max_age=86400
         )
 
         return {
