@@ -1,0 +1,12 @@
+{
+  "venvPath": "/var/www/mis-portal",
+  "venv": "venv",
+  "pythonVersion": "3.12",
+  "pythonPlatform": "Linux",
+  "include": [
+    "."
+  ],
+  "exclude": [
+    "venv"
+  ]
+}

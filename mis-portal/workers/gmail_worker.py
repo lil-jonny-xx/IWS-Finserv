@@ -4,6 +4,7 @@ Gmail Worker — IWS MIS Portal
 OAuth2 Gmail access: poll for CAMS CAS emails, download PDF attachments.
 """
 import os
+import re
 import base64
 import logging
 import threading
@@ -75,7 +76,17 @@ def _download_attachment(service, msg_id: str, save_dir: str) -> str | None:
             continue
 
         pdf_bytes = base64.urlsafe_b64decode(data)
-        save_path = os.path.join(save_dir, filename or f"cas_{msg_id}.pdf")
+        # Strip path components and non-safe characters from sender-controlled filename.
+        # os.path.join does NOT prevent traversal — an absolute or ../.. filename
+        # would write outside save_dir.
+        safe_name = re.sub(r"[^\w\-.]", "_", os.path.basename(filename)) if filename else ""
+        if not safe_name.lower().endswith(".pdf"):
+            safe_name = f"cas_{msg_id}.pdf"
+        save_path = os.path.join(save_dir, safe_name)
+        # Confirm confinement after join (defense-in-depth).
+        if not os.path.realpath(save_path).startswith(os.path.realpath(save_dir) + os.sep):
+            logger.error(f"Attachment filename rejected (traversal): {filename!r}")
+            continue
         Path(save_path).write_bytes(pdf_bytes)
         logger.info(f"Downloaded attachment: {save_path} ({len(pdf_bytes)} bytes)")
         return save_path
