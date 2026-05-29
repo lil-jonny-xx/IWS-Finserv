@@ -462,7 +462,7 @@ export default function DashboardPage() {
 
         {/* Header */}
         <div className="flex flex-wrap justify-between items-start gap-3 mb-6">
-          <h1 className="text-2xl sm:text-3xl font-bold text-ink break-words min-w-0 flex-1">
+          <h1 className="text-2xl sm:text-3xl font-bold text-ink wrap-break-word min-w-0 flex-1">
             Welcome, {user.full_name}
           </h1>
           <button
