@@ -31,6 +31,14 @@
   --wire:              oklch(84%  0.010 75);    /* input borders */
   --rule:              oklch(88%  0.008 75);    /* dividers */
   --muted:             oklch(78%  0.006 75);    /* disabled state */
+
+  /* Gain / loss */
+  --gain:              oklch(42%  0.140 145);
+
+  /* Chart palette */
+  --chart-equity:      oklch(58%  0.160  40);
+  --chart-fixed:       oklch(44%  0.115 258);
+  --chart-alt:         oklch(50%  0.130 155);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -58,6 +66,11 @@
     --wire:              oklch(33%  0.010 258);
     --rule:              oklch(28%  0.008 258);
     --muted:             oklch(35%  0.006 258);
+
+    --gain:              oklch(68%  0.140 145);
+    --chart-equity:      oklch(72%  0.160  40);
+    --chart-fixed:       oklch(68%  0.120 258);
+    --chart-alt:         oklch(65%  0.130 155);
   }
 }
 
@@ -88,6 +101,11 @@
   --color-wire:          var(--wire);
   --color-rule:          var(--rule);
   --color-muted:         var(--muted);
+
+  --color-gain:          var(--gain);
+  --color-chart-equity:  var(--chart-equity);
+  --color-chart-fixed:   var(--chart-fixed);
+  --color-chart-alt:     var(--chart-alt);
 }
 
 body {

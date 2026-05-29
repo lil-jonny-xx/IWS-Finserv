@@ -142,8 +142,136 @@ function HoldingsEmpty() {
   );
 }
 
+const ASSET_CLASS_COLORS: Record<string, string> = {
+  EQUITY:       'var(--chart-equity)',
+  FIXED_INCOME: 'var(--chart-fixed)',
+  ALTERNATES:   'var(--chart-alt)',
+};
+
+interface DonutSegment {
+  cls:   string;
+  label: string;
+  value: number;
+  pct:   number;
+}
+
+function DonutChart({ segments }: { segments: DonutSegment[] }) {
+  const r     = 36;
+  const sw    = 13;
+  const circ  = 2 * Math.PI * r;
+  const size  = 100;
+  const c     = size / 2;
+
+  const valid = segments.filter(s => s.pct > 0.005);
+  let cumLen  = 0;
+  const arcs  = valid.map(seg => {
+    const len        = seg.pct * circ;
+    const dashoffset = circ - cumLen;
+    cumLen += len;
+    return { ...seg, len, dashoffset };
+  });
+
+  return (
+    <div className="flex items-center gap-4 shrink-0">
+      <svg
+        viewBox={`0 0 ${size} ${size}`}
+        width="72"
+        height="72"
+        aria-hidden="true"
+        style={{ transform: 'rotate(-90deg)' }}
+      >
+        <circle
+          cx={c} cy={c} r={r}
+          fill="none"
+          stroke="var(--rule)"
+          strokeWidth={sw}
+        />
+        {arcs.map(arc => (
+          <circle
+            key={arc.cls}
+            cx={c} cy={c} r={r}
+            fill="none"
+            strokeWidth={sw}
+            strokeLinecap="butt"
+            strokeDasharray={`${arc.len} ${circ - arc.len}`}
+            strokeDashoffset={arc.dashoffset}
+            style={{ stroke: ASSET_CLASS_COLORS[arc.cls] ?? 'var(--muted)' }}
+          />
+        ))}
+      </svg>
+      <div className="space-y-1.5">
+        {valid.map(seg => (
+          <div key={seg.cls} className="flex items-center gap-2">
+            <span
+              className="w-2 h-2 rounded-full shrink-0"
+              style={{ background: ASSET_CLASS_COLORS[seg.cls] ?? 'var(--muted)' }}
+            />
+            <span className="text-xs text-ghost whitespace-nowrap">{seg.label}</span>
+            <span className="text-xs font-medium text-dim tabular-nums ml-1">
+              {Math.round(seg.pct * 100)}%
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+type SortKey = 'scheme' | 'units' | 'invested' | 'nav' | 'currentValue';
+type SortDir = 'asc' | 'desc';
+
+function sortHoldings(holdings: Holding[], key: SortKey, dir: SortDir): Holding[] {
+  return [...holdings].sort((a, b) => {
+    let va: number | string, vb: number | string;
+    switch (key) {
+      case 'scheme':
+        va = a.security_name.toLowerCase(); vb = b.security_name.toLowerCase(); break;
+      case 'units':
+        va = a.quantity; vb = b.quantity; break;
+      case 'invested':
+        va = a.invested_amount; vb = b.invested_amount; break;
+      case 'nav':
+        va = a.nav ?? -Infinity; vb = b.nav ?? -Infinity; break;
+      case 'currentValue':
+      default:
+        va = a.current_value ?? (a.nav != null ? a.quantity * a.nav : -Infinity);
+        vb = b.current_value ?? (b.nav != null ? b.quantity * b.nav : -Infinity);
+    }
+    if (va < vb) return dir === 'asc' ? -1 : 1;
+    if (va > vb) return dir === 'asc' ? 1 : -1;
+    return 0;
+  });
+}
+
+function formatDate(iso: string): string {
+  return new Date(iso).toLocaleDateString('en-IN', {
+    day: 'numeric', month: 'short', year: 'numeric',
+  });
+}
+
 function HoldingsSection({ data }: { data: HoldingsData }) {
+  const [sortKey, setSortKey] = useState<SortKey>('currentValue');
+  const [sortDir, setSortDir] = useState<SortDir>('desc');
+
   if (data.holdings.length === 0) return <HoldingsEmpty />;
+
+  function handleSort(key: SortKey) {
+    if (key === sortKey) {
+      setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortKey(key);
+      setSortDir('desc');
+    }
+  }
+
+  function SortHint({ col }: { col: SortKey }) {
+    const active = sortKey === col;
+    return (
+      <span aria-hidden className={`ml-1 text-[9px] ${active ? 'text-prime' : 'opacity-30'}`}>
+        {active ? (sortDir === 'asc' ? '↑' : '↓') : '↕'}
+      </span>
+    );
+  }
 
   const grouped: Record<string, Holding[]> = Object.fromEntries(
     ASSET_CLASS_ORDER.map(cls => [
@@ -152,40 +280,90 @@ function HoldingsSection({ data }: { data: HoldingsData }) {
     ])
   );
 
-  const activeClassCount = ASSET_CLASS_ORDER.filter(
+  const activeClasses = ASSET_CLASS_ORDER.filter(
     cls => (grouped[cls]?.length ?? 0) > 0
-  ).length;
+  );
+
+  const totalCurrentValue = data.holdings.reduce((sum, h) => {
+    const cv = h.current_value ?? (h.nav != null ? Math.round(h.quantity * h.nav) : null);
+    return cv != null ? sum + cv : sum;
+  }, 0);
+  const allHaveNav = data.holdings.every(h => h.current_value != null || h.nav != null);
+  const gain    = allHaveNav && totalCurrentValue > 0 ? totalCurrentValue - data.total_invested : null;
+  const gainPct = gain != null && data.total_invested > 0 ? (gain / data.total_invested) * 100 : null;
+
+  const allocationSegments: DonutSegment[] = activeClasses.map(cls => {
+    const subtotal = grouped[cls]!.reduce((s, h) => s + h.invested_amount, 0);
+    return {
+      cls,
+      label: ASSET_CLASS_LABELS[cls] ?? cls,
+      value: subtotal,
+      pct:   data.total_invested > 0 ? subtotal / data.total_invested : 0,
+    };
+  });
+
+  const lastUpdated = data.holdings
+    .map(h => h.last_updated)
+    .filter((d): d is string => d != null)
+    .sort()
+    .at(-1) ?? null;
 
   return (
     <section aria-label="MF Holdings">
       <div className="bg-card rounded-lg border border-rule overflow-hidden">
 
-        {/* Card header: title + summary stats */}
-        <div className="px-5 sm:px-6 pt-5 pb-4 border-b border-rule">
-          <h2 className="text-base font-semibold text-dim mb-4">MF Holdings</h2>
-          <div className="flex flex-wrap gap-x-8 gap-y-3">
-            <div>
-              <p className="text-xs text-ghost mb-0.5">Total Invested</p>
-              <p className="text-sm font-semibold text-ink tabular-nums">
-                {formatINR(data.total_invested)}
-              </p>
+        <div className="px-5 sm:px-6 pt-5 pb-5 border-b border-rule">
+          <h2 className="text-base font-semibold text-ink mb-4">
+            MF Holdings
+            {lastUpdated && (
+              <span className="ml-3 text-xs font-normal text-ghost">
+                as of {formatDate(lastUpdated)}
+              </span>
+            )}
+          </h2>
+          <div className="flex flex-col sm:flex-row sm:items-start gap-5">
+            <div className="flex flex-wrap gap-x-8 gap-y-3 flex-1">
+              <div>
+                <p className="text-xs text-ghost mb-0.5">Total Invested</p>
+                <p className="text-sm font-semibold text-ink tabular-nums">
+                  {formatINR(data.total_invested)}
+                </p>
+              </div>
+              {totalCurrentValue > 0 && (
+                <div>
+                  <p className="text-xs text-ghost mb-0.5">Current Value</p>
+                  <p className="text-sm font-semibold text-ink tabular-nums">
+                    {formatINR(totalCurrentValue)}
+                  </p>
+                </div>
+              )}
+              {gain != null && gainPct != null && (
+                <div>
+                  <p className="text-xs text-ghost mb-0.5">Unrealized P&amp;L</p>
+                  <p
+                    className="text-sm font-semibold tabular-nums"
+                    style={{ color: gain >= 0 ? 'var(--gain)' : 'var(--peril)' }}
+                  >
+                    {gain >= 0 ? '+' : '−'}{formatINR(Math.abs(gain))}{' '}
+                    <span className="text-xs font-medium opacity-75">
+                      ({gain >= 0 ? '+' : '−'}{Math.abs(gainPct).toFixed(1)}%)
+                    </span>
+                  </p>
+                </div>
+              )}
+              <div>
+                <p className="text-xs text-ghost mb-0.5">Holdings</p>
+                <p className="text-sm font-semibold text-ink tabular-nums">
+                  {data.total_holdings}
+                </p>
+              </div>
             </div>
-            <div>
-              <p className="text-xs text-ghost mb-0.5">Holdings</p>
-              <p className="text-sm font-semibold text-ink tabular-nums">
-                {data.total_holdings}
-              </p>
-            </div>
-            <div>
-              <p className="text-xs text-ghost mb-0.5">Asset Classes</p>
-              <p className="text-sm font-semibold text-ink tabular-nums">
-                {activeClassCount}
-              </p>
-            </div>
+            {allocationSegments.length > 1 && (
+              <DonutChart segments={allocationSegments} />
+            )}
           </div>
         </div>
 
-        {/* Table — horizontally scrollable on mobile */}
         <div
           className="overflow-x-auto"
           role="region"
@@ -198,8 +376,14 @@ function HoldingsSection({ data }: { data: HoldingsData }) {
                 <th
                   scope="col"
                   className="text-left px-5 sm:px-6 py-3 text-xs font-medium text-ghost border-b border-rule"
+                  aria-sort={sortKey === 'scheme' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}
                 >
-                  Scheme
+                  <button
+                    onClick={() => handleSort('scheme')}
+                    className="inline-flex items-center hover:text-ink transition-colors"
+                  >
+                    Scheme<SortHint col="scheme" />
+                  </button>
                 </th>
                 <th
                   scope="col"
@@ -210,26 +394,50 @@ function HoldingsSection({ data }: { data: HoldingsData }) {
                 <th
                   scope="col"
                   className="text-right px-4 py-3 text-xs font-medium text-ghost border-b border-rule whitespace-nowrap"
+                  aria-sort={sortKey === 'units' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}
                 >
-                  Units
+                  <button
+                    onClick={() => handleSort('units')}
+                    className="inline-flex items-center ml-auto hover:text-ink transition-colors"
+                  >
+                    Units<SortHint col="units" />
+                  </button>
                 </th>
                 <th
                   scope="col"
                   className="text-right px-4 py-3 text-xs font-medium text-ghost border-b border-rule whitespace-nowrap"
+                  aria-sort={sortKey === 'invested' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}
                 >
-                  Invested
+                  <button
+                    onClick={() => handleSort('invested')}
+                    className="inline-flex items-center ml-auto hover:text-ink transition-colors"
+                  >
+                    Invested<SortHint col="invested" />
+                  </button>
                 </th>
                 <th
                   scope="col"
                   className="text-right px-4 py-3 text-xs font-medium text-ghost border-b border-rule whitespace-nowrap"
+                  aria-sort={sortKey === 'nav' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}
                 >
-                  NAV
+                  <button
+                    onClick={() => handleSort('nav')}
+                    className="inline-flex items-center ml-auto hover:text-ink transition-colors"
+                  >
+                    NAV<SortHint col="nav" />
+                  </button>
                 </th>
                 <th
                   scope="col"
                   className="text-right px-5 sm:px-6 py-3 text-xs font-medium text-ghost border-b border-rule whitespace-nowrap"
+                  aria-sort={sortKey === 'currentValue' ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}
                 >
-                  Current Value
+                  <button
+                    onClick={() => handleSort('currentValue')}
+                    className="inline-flex items-center ml-auto hover:text-ink transition-colors"
+                  >
+                    Current Value<SortHint col="currentValue" />
+                  </button>
                 </th>
               </tr>
             </thead>
@@ -239,10 +447,10 @@ function HoldingsSection({ data }: { data: HoldingsData }) {
                 if (!group || group.length === 0) return null;
 
                 const subtotal = group.reduce((s, h) => s + h.invested_amount, 0);
+                const sorted   = sortHoldings(group, sortKey, sortDir);
 
                 return (
                   <Fragment key={cls}>
-                    {/* Asset class group header */}
                     <tr>
                       <td colSpan={6} className="px-5 sm:px-6 py-2 bg-page">
                         <span className="text-xs font-semibold text-dim">
@@ -253,13 +461,10 @@ function HoldingsSection({ data }: { data: HoldingsData }) {
                         </span>
                       </td>
                     </tr>
-
-                    {/* Holding rows */}
-                    {group.map(h => {
+                    {sorted.map(h => {
                       const currentVal =
                         h.current_value ??
                         (h.nav != null ? Math.round(h.quantity * h.nav) : null);
-
                       return (
                         <tr
                           key={h.id}
@@ -412,15 +617,11 @@ export default function DashboardPage() {
       <span role="status" aria-live="polite" className="sr-only">Loading dashboard</span>
       <div className="max-w-4xl mx-auto">
         <div className="flex flex-wrap justify-between items-start gap-3 mb-6" aria-hidden="true">
-          <div className="h-8 sm:h-9 bg-rule rounded-md w-52 animate-pulse" />
-          <div className="h-9 bg-rule rounded-md w-24 animate-pulse" />
-        </div>
-        <div className="bg-card p-5 sm:p-6 rounded-lg border border-rule mb-4 animate-pulse" aria-hidden="true">
-          <div className="h-3.5 bg-rule rounded w-20 mb-4" />
-          <div className="space-y-3">
-            <div className="h-3 bg-rule rounded w-64" />
-            <div className="h-3 bg-rule rounded w-24" />
+          <div className="space-y-2">
+            <div className="h-8 sm:h-9 bg-rule rounded-md w-52 animate-pulse" />
+            <div className="h-3 bg-rule rounded w-44 animate-pulse" />
           </div>
+          <div className="h-9 bg-rule rounded-md w-24 animate-pulse" />
         </div>
         <div className="bg-card rounded-lg border border-rule overflow-hidden animate-pulse" aria-hidden="true">
           <div className="px-5 sm:px-6 pt-5 pb-4 border-b border-rule">
@@ -462,9 +663,12 @@ export default function DashboardPage() {
 
         {/* Header */}
         <div className="flex flex-wrap justify-between items-start gap-3 mb-6">
-          <h1 className="text-2xl sm:text-3xl font-bold text-ink wrap-break-word min-w-0 flex-1">
-            Welcome, {user.full_name}
-          </h1>
+          <div className="min-w-0 flex-1">
+            <h1 className="text-2xl sm:text-3xl font-bold text-ink wrap-break-word">
+              Welcome, {user.full_name}
+            </h1>
+            <p className="text-sm text-ghost mt-0.5">{user.email} · {formatRole(user.role)}</p>
+          </div>
           <button
             onClick={handleLogout}
             disabled={loggingOut}
@@ -473,17 +677,6 @@ export default function DashboardPage() {
           >
             {loggingOut ? 'Signing out...' : 'Sign out'}
           </button>
-        </div>
-
-        {/* Profile card — unchanged */}
-        <div className="bg-card p-5 sm:p-6 rounded-lg shadow-sm border border-rule mb-4">
-          <h2 className="text-base font-semibold text-dim mb-3">Your profile</h2>
-          <dl className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-2 text-sm">
-            <dt className="font-medium text-dim">Email</dt>
-            <dd className="text-ink break-all">{user.email}</dd>
-            <dt className="font-medium text-dim">Role</dt>
-            <dd className="text-ink">{formatRole(user.role)}</dd>
-          </dl>
         </div>
 
         {/* Holdings — skeleton while loading, inline error on failure */}
