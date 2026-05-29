@@ -18,3 +18,8 @@ html/
 .agents/.claude/
 .impeccable/
 skills-lock.json
+__pycache__/
+*.pyc
+mis-portal/workers/misc.txt
+iws-portal-frontend/AGENTS.md
+iws-portal-frontend/CLAUDE.md
