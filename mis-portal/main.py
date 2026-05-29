@@ -513,17 +513,76 @@ def get_holdings(
             )
             row = cursor.fetchone()
             if not row or not row["entity_id"]:
-                if user_role == "admin":
-                    cursor.close()
-                    return {
-                        "entity_id": 0,
-                        "entity_name": "Administrator",
-                        "total_holdings": 0,
-                        "total_invested": 0.0,
-                        "holdings": [],
-                    }
-                raise HTTPException(status_code=404, detail="No entity linked to this user")
-            eid = row["entity_id"]
+                if user_role != "admin":
+                    raise HTTPException(status_code=404, detail="No entity linked to this user")
+                eid = None  # admin all-entities view
+            else:
+                eid = row["entity_id"]
+
+        # Admin with no entity filter → return all holdings across all entities
+        if eid is None and user_role == "admin":
+            cursor.execute("""
+                SELECT
+                    h.id,
+                    h.folio_number,
+                    h.quantity,
+                    h.cost_basis,
+                    h.avg_cost,
+                    h.invested_amount,
+                    h.first_invested_date,
+                    h.last_updated_nav     AS nav,
+                    h.current_value,
+                    h.last_updated,
+                    sm.isin,
+                    sm.security_name,
+                    sm.security_type,
+                    sm.asset_class,
+                    sm.amfi_code,
+                    e.entity_name
+                FROM holding h
+                JOIN security_master sm ON sm.id = h.security_id
+                JOIN entity e ON e.id = h.entity_id
+                ORDER BY sm.asset_class, sm.security_name, h.folio_number
+            """)
+            rows = cursor.fetchall()
+            cursor.close()
+
+            holdings = []
+            total_invested = 0.0
+            for r in rows:
+                invested = float(r["invested_amount"]) if r["invested_amount"] else 0.0
+                nav_val  = float(r["nav"]) if r["nav"] else None
+                qty      = float(r["quantity"]) if r["quantity"] else 0.0
+                cur_val  = float(r["current_value"]) if r["current_value"] else (
+                    round(qty * nav_val, 2) if nav_val else None
+                )
+                total_invested += invested
+                holdings.append({
+                    "id":                   r["id"],
+                    "isin":                 r["isin"],
+                    "security_name":        r["security_name"],
+                    "security_type":        r["security_type"],
+                    "asset_class":          r["asset_class"],
+                    "amfi_code":            r["amfi_code"],
+                    "folio_number":         r["folio_number"],
+                    "quantity":             qty,
+                    "avg_cost":             float(r["avg_cost"]) if r["avg_cost"] else None,
+                    "cost_basis":           float(r["cost_basis"]) if r["cost_basis"] else None,
+                    "invested_amount":      invested,
+                    "nav":                  nav_val,
+                    "current_value":        cur_val,
+                    "first_invested_date":  str(r["first_invested_date"]) if r["first_invested_date"] else None,
+                    "last_updated":         r["last_updated"].isoformat() if r["last_updated"] else None,
+                    "entity_name":          r["entity_name"],
+                })
+
+            return {
+                "entity_id":       0,
+                "entity_name":     "All Entities",
+                "total_holdings":  len(holdings),
+                "total_invested":  round(total_invested, 2),
+                "holdings":        holdings,
+            }
 
         cursor.execute(
             "SELECT entity_name FROM entity WHERE id = %s",
