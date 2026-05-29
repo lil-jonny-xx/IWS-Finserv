@@ -15,4 +15,6 @@ iws-portal-frontend/.env.local
 
 # Nginx default page
 html/
-.agents/
+.agents/.claude/
+.impeccable/
+skills-lock.json
