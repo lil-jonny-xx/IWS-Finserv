@@ -19,6 +19,7 @@ Cron:     30 21 * * * /var/www/.venv/bin/python /var/www/mis-portal/workers/cas_
 import os
 import sys
 import time
+import random
 import secrets
 import logging
 import tempfile
@@ -144,11 +145,11 @@ def main():
         # Sequential processing: CAMS rate-limits / blocks IPs when multiple
         # browser sessions hit it simultaneously. Process one entity at a time
         # with a cooldown between requests to avoid triggering bot detection.
-        INTER_ENTITY_DELAY_SECS = 90
         for idx, cfg in enumerate(configs):
             if idx > 0:
-                logger.info(f"Cooling down {INTER_ENTITY_DELAY_SECS}s before next entity...")
-                time.sleep(INTER_ENTITY_DELAY_SECS)
+                delay = random.randint(75, 150)
+                logger.info(f"Cooling down {delay}s before next entity...")
+                time.sleep(delay)
             try:
                 results[cfg.code] = process_entity(cfg, central_token, tmp_dir)
             except Exception as exc:

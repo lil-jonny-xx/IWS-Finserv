@@ -9,6 +9,7 @@ Unregistered emails cause silent failures (no OTP, no email, no error shown).
 Register via CAMS GoGreen service or CAMServ chatbot before running automation.
 """
 import logging
+import random
 import time
 from datetime import date
 
@@ -19,6 +20,13 @@ logger = logging.getLogger(__name__)
 CAMS_CAS_URL = (
     "https://www.camsonline.com/Investors/Statements/Consolidated-Account-Statement"
 )
+
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+]
 
 NAV_TIMEOUT    = 60_000
 ACTION_TIMEOUT = 10_000
@@ -42,11 +50,7 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
             ],
         )
         ctx = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+            user_agent=random.choice(_USER_AGENTS),
             java_script_enabled=True,
             ignore_https_errors=False,
         )
@@ -62,9 +66,11 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
             logger.info("CAMS page loaded")
 
             _dismiss_tnc(page)
+            page.wait_for_timeout(random.randint(400, 900))
 
             # --- Statement type: Detailed (includes transaction listing) ---
             _click_radio_by_value_or_text(page, "detailed", "Detailed", "Statement type")
+            page.wait_for_timeout(random.randint(300, 700))
 
             # --- Folio listing: With zero balance folios (all history) ---
             # The form default is "Without zero balance folios". We want "With zero balance"
@@ -72,6 +78,7 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
             # Value "Y" = include zero balance folios on CAMS CAS-CAMS+KFintech form.
             try:
                 _click_radio_by_value_or_text(page, "Y", "With zero balance folios", "Folio listing")
+                page.wait_for_timeout(random.randint(300, 700))
             except RuntimeError:
                 logger.warning("Could not click 'With zero balance folios' radio — using default")
 
@@ -81,18 +88,21 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
                 'input[placeholder*="Email" i]',
                 'input[type="email"]',
             ], email, "email")
+            page.wait_for_timeout(random.randint(400, 900))
 
             # --- PAN (optional but helps CAMS match folios) ---
             _fill_field(page, [
                 'input[formcontrolname="pan"]',
                 'input[placeholder*="PAN" i]',
             ], pan_number.upper(), "PAN")
+            page.wait_for_timeout(random.randint(400, 900))
 
             # --- PDF Password ---
             _fill_field(page, [
                 'input[formcontrolname="password"]',
                 'input[placeholder*="Password" i]:not([placeholder*="Confirm" i]):not([placeholder*="Retype" i])',
             ], pdf_password, "PDF password")
+            page.wait_for_timeout(random.randint(300, 700))
 
             # --- Confirm Password ---
             _fill_field(page, [
@@ -101,6 +111,7 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
                 'input[placeholder*="Confirm" i]',
                 'input[placeholder*="Retype" i]',
             ], pdf_password, "confirm password")
+            page.wait_for_timeout(random.randint(400, 800))
 
             _save_screenshot(page, f"cams_preflight_{pan_number[:4]}.png")
 
@@ -277,7 +288,9 @@ def _fill_field(page, selectors: list, value: str, label: str):
         try:
             loc = page.locator(sel).first
             loc.wait_for(state="visible", timeout=ACTION_TIMEOUT)
-            loc.fill(value, timeout=ACTION_TIMEOUT)
+            loc.click(timeout=ACTION_TIMEOUT)
+            page.wait_for_timeout(random.randint(150, 400))
+            loc.type(value, delay=random.randint(40, 90))
             logger.debug(f"Filled {label} via: {sel}")
             return
         except Exception:
