@@ -83,10 +83,10 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
                 logger.warning("Could not click 'With zero balance folios' radio — using default")
 
             # --- Email ---
+            _save_screenshot(page, f"cams_prefill_{pan_number[:4]}.png")
             _fill_field(page, [
                 'input[formcontrolname="email_id"]',
                 'input[placeholder*="Email" i]',
-                'input[type="email"]',
             ], email, "email")
             page.wait_for_timeout(random.randint(400, 900))
 
@@ -152,80 +152,86 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
 def _dismiss_tnc(page):
     """Accept the T&C/Disclaimer modal that CAMS shows on each fresh session."""
     try:
-        dialog = page.query_selector("mat-dialog-container")
-        if not dialog:
+        if page.locator("mat-dialog-container").count() == 0:
             logger.debug("No T&C dialog found — skipping")
             return
 
-        # Select ACCEPT radio via JavaScript.
-        # The dialog uses plain HTML <input type="radio"> inside mat-dialog-container,
-        # not Angular Material mat-radio-button, so the mat-radio-button selector fails.
-        page.evaluate("""
-            const dialog = document.querySelector('mat-dialog-container');
-            if (!dialog) return;
+        dialog = page.locator("mat-dialog-container")
 
-            // Try Angular Material mat-radio-button first
-            const matRadios = dialog.querySelectorAll('mat-radio-button');
-            for (const mr of matRadios) {
-                const val = (mr.getAttribute('value') || '').toUpperCase();
-                const txt = mr.textContent.trim().toUpperCase();
-                if (val === 'ACCEPT' || txt.startsWith('ACCEPT')) {
-                    mr.click();
-                    return;
+        # Step 1: Click ACCEPT radio — try Playwright first (respects Angular bindings),
+        # then JS click fallback (fires click event which Angular listens to).
+        clicked_radio = False
+        accept_mat = dialog.locator('mat-radio-button').filter(has_text="ACCEPT")
+        if accept_mat.count() > 0:
+            try:
+                accept_mat.first.click(timeout=5_000, force=True)
+                clicked_radio = True
+                logger.debug("Clicked ACCEPT mat-radio-button via Playwright")
+            except Exception:
+                pass
+
+        if not clicked_radio:
+            # Plain HTML radio inputs — fire click() so Angular sees the event
+            page.evaluate("""
+                const dialog = document.querySelector('mat-dialog-container');
+                if (!dialog) return;
+                const inputs = dialog.querySelectorAll('input[type="radio"]');
+                for (const inp of inputs) {
+                    const val = (inp.value || '').toUpperCase();
+                    const parent = inp.closest('label,div,span') || inp.parentElement;
+                    const txt = (parent?.textContent || '').trim().toUpperCase();
+                    if (val === 'ACCEPT' || txt.startsWith('ACCEPT')) {
+                        inp.click();
+                        inp.dispatchEvent(new Event('change', {bubbles: true}));
+                        inp.dispatchEvent(new Event('input',  {bubbles: true}));
+                        return;
+                    }
                 }
-            }
+                // Last resort: click whichever mat-radio-button comes first
+                const first = dialog.querySelector('mat-radio-button');
+                if (first) first.click();
+            """)
+            logger.debug("Clicked ACCEPT radio via JS click()")
 
-            // Fall back to plain HTML radio inputs
-            const inputs = dialog.querySelectorAll('input[type="radio"]');
-            for (const inp of inputs) {
-                const val = (inp.value || '').toUpperCase();
-                const parent = inp.closest('label,div,span') || inp.parentElement;
-                const txt = (parent?.textContent || '').trim().toUpperCase();
-                if (val === 'ACCEPT' || txt.startsWith('ACCEPT')) {
-                    inp.checked = true;
-                    inp.dispatchEvent(new Event('change', {bubbles: true}));
-                    inp.dispatchEvent(new Event('input', {bubbles: true}));
-                    return;
-                }
-            }
-        """)
-        page.wait_for_timeout(400)
-        logger.debug("ACCEPT radio selected via JS")
+        page.wait_for_timeout(700)
 
-        # Click PROCEED / Accept / Submit button inside the dialog
-        clicked = False
+        # Step 2: Click PROCEED button
+        button_clicked = False
         for btn_text in ["PROCEED", "Proceed", "Accept", "Submit", "OK", "Continue"]:
-            btn = page.locator(f'mat-dialog-container button:has-text("{btn_text}")')
+            btn = dialog.locator(f'button:has-text("{btn_text}")')
             if btn.count() > 0:
                 try:
-                    btn.first.click(timeout=3_000, force=True)
+                    btn.first.click(timeout=6_000, force=True)
                     logger.debug(f"Clicked T&C dialog button: {btn_text}")
-                    clicked = True
+                    button_clicked = True
                     break
                 except Exception:
                     continue
 
-        if not clicked:
-            # Angular button click failed — forcibly remove the overlay via JS
-            page.evaluate("""
-                document.querySelector('mat-dialog-container')?.remove();
-                document.querySelector('.cdk-overlay-backdrop')?.remove();
-                document.querySelector('.cdk-overlay-container')?.remove();
-            """)
-            logger.debug("T&C overlay removed via JS (button click failed)")
+        if button_clicked:
+            try:
+                page.wait_for_selector("mat-dialog-container", state="detached", timeout=10_000)
+                page.wait_for_timeout(400)
+                logger.info("T&C dialog dismissed via PROCEED button")
+                return
+            except Exception:
+                logger.debug("Dialog still present after PROCEED click — falling back to JS removal")
 
-        # Wait for dialog to fully detach
-        try:
-            page.wait_for_selector("mat-dialog-container", state="detached", timeout=5_000)
-        except Exception:
-            pass
-        try:
-            page.wait_for_selector(".cdk-overlay-backdrop-showing", state="detached", timeout=3_000)
-        except Exception:
-            pass
+        # Step 3: JS removal fallback — remove ALL CDK overlay elements
+        page.evaluate("""
+            for (const sel of [
+                'mat-dialog-container',
+                '.cdk-overlay-backdrop',
+                '.cdk-overlay-pane',
+                '.cdk-global-overlay-wrapper',
+                '.cdk-overlay-container',
+            ]) {
+                document.querySelectorAll(sel).forEach(el => el.remove());
+            }
+        """)
+        page.wait_for_timeout(600)
+        logger.info("T&C overlay removed via JS")
 
-        page.wait_for_timeout(500)
-        logger.info("T&C dialog dismissed")
     except Exception as e:
         logger.debug(f"T&C dismiss error (may be ok): {e}")
 
@@ -288,7 +294,7 @@ def _fill_field(page, selectors: list, value: str, label: str):
         try:
             loc = page.locator(sel).first
             loc.wait_for(state="visible", timeout=ACTION_TIMEOUT)
-            loc.click(timeout=ACTION_TIMEOUT)
+            loc.click(timeout=ACTION_TIMEOUT, force=True)
             page.wait_for_timeout(random.randint(150, 400))
             loc.type(value, delay=random.randint(40, 90))
             logger.debug(f"Filled {label} via: {sel}")
