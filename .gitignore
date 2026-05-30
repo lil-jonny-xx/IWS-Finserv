@@ -23,3 +23,8 @@ __pycache__/
 mis-portal/workers/misc.txt
 iws-portal-frontend/AGENTS.md
 iws-portal-frontend/CLAUDE.md
+.agents/
+.claude/
+skills-lock.json
+.impeccable/
+.xlsx bas.xlsx

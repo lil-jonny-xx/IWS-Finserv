@@ -94,6 +94,36 @@ def _download_attachment(service, msg_id: str, save_dir: str) -> str | None:
     return None
 
 
+def collect_new_cas_pdfs(
+    token_file: str,
+    save_dir: str,
+    after_ts: int,
+    exclude_ids: set,
+) -> list[tuple[str, str]]:
+    """
+    One-shot poll: find all CAS emails received after `after_ts` (Unix timestamp)
+    that are not in `exclude_ids`. Returns [(msg_id, pdf_path), ...].
+    Uses subject + sender filter — no per-entity to: filter needed.
+    """
+    service = _get_service(token_file)
+    query = (
+        f"from:{CAMS_SENDER} "
+        f"subject:\"{CAMS_SUBJECT_KEYWORD}\" "
+        f"has:attachment "
+        f"after:{after_ts}"
+    )
+    messages = _search_messages(service, query)
+    results = []
+    for msg in messages:
+        msg_id = msg["id"]
+        if msg_id in exclude_ids:
+            continue
+        path = _download_attachment(service, msg_id, save_dir)
+        if path:
+            results.append((msg_id, path))
+    return results
+
+
 def wait_for_cas_email(
     token_file: str,
     save_dir: str,

@@ -698,19 +698,55 @@ def get_transactions(
             row = cursor.fetchone()
             if not row or not row["entity_id"]:
                 if user_role == "admin":
-                    cursor.close()
-                    return {
-                        "entity_id": 0,
-                        "total":     0,
-                        "limit":     limit,
-                        "offset":    offset,
-                        "transactions": [],
-                    }
-                raise HTTPException(status_code=404, detail="No entity linked to this user")
-            eid = row["entity_id"]
+                    eid = None  # all-entities view
+                else:
+                    raise HTTPException(status_code=404, detail="No entity linked to this user")
+            else:
+                eid = row["entity_id"]
 
         limit  = max(1, min(limit, 500))
         offset = max(0, offset)
+
+        if eid is None:
+            # Admin all-entities view
+            cursor.execute("""
+                SELECT
+                    t.id, t.transaction_date, t.description, t.transaction_type,
+                    t.amount, t.units, t.nav, t.balance_units, t.folio_number,
+                    sm.security_name, sm.isin, e.entity_name
+                FROM mf_transaction t
+                JOIN security_master sm ON sm.id = t.security_id
+                JOIN entity e ON e.id = t.entity_id
+                ORDER BY t.transaction_date DESC, t.id DESC
+                LIMIT %s OFFSET %s
+            """, (limit, offset))
+            rows = cursor.fetchall()
+            cursor.execute("SELECT COUNT(*) AS total FROM mf_transaction")
+            total = cursor.fetchone()["total"]
+            cursor.close()
+            return {
+                "entity_id": 0,
+                "total":     total,
+                "limit":     limit,
+                "offset":    offset,
+                "transactions": [
+                    {
+                        "id":            r["id"],
+                        "date":          str(r["transaction_date"]),
+                        "description":   r["description"],
+                        "type":          r["transaction_type"],
+                        "amount":        float(r["amount"]) if r["amount"] else None,
+                        "units":         float(r["units"])  if r["units"]  else None,
+                        "nav":           float(r["nav"])    if r["nav"]    else None,
+                        "balance_units": float(r["balance_units"]) if r["balance_units"] else None,
+                        "folio_number":  r["folio_number"],
+                        "security_name": r["security_name"],
+                        "isin":          r["isin"],
+                        "entity_name":   r["entity_name"],
+                    }
+                    for r in rows
+                ],
+            }
 
         cursor.execute("""
             SELECT

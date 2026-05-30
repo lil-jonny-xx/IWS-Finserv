@@ -10,6 +10,7 @@ Register via CAMS GoGreen service or CAMServ chatbot before running automation.
 """
 import logging
 import random
+import socket
 import time
 from datetime import date
 
@@ -30,6 +31,16 @@ _USER_AGENTS = [
 
 NAV_TIMEOUT    = 60_000
 ACTION_TIMEOUT = 10_000
+TOR_PROXY      = "socks5://127.0.0.1:9050"
+
+
+def _tor_available() -> bool:
+    try:
+        s = socket.create_connection(("127.0.0.1", 9050), timeout=2)
+        s.close()
+        return True
+    except OSError:
+        return False
 
 
 def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
@@ -114,6 +125,10 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
             page.wait_for_timeout(random.randint(400, 800))
 
             _save_screenshot(page, f"cams_preflight_{pan_number[:4]}.png")
+
+            # Post-fill verification screenshot — confirms fields were actually populated
+            # before Submit so failures can be distinguished from CAMS server errors.
+            _save_screenshot(page, f"cams_postfill_{pan_number[:4]}.png")
 
             # --- Submit ---
             page.locator('button:has-text("Submit")').first.click(
@@ -244,8 +259,18 @@ def _check_submit_result(page) -> bool:
     try:
         content = page.content().lower()
 
+        # Transient server rejection — rate-limit or bot detection, NOT an OTP/email issue
+        if "unable to process your request" in content or "please try again later" in content:
+            logger.error(
+                "CAMS returned 'unable to process your request' — likely rate-limited "
+                "or bot-detected. Try again after a delay."
+            )
+            return False
+
         # OTP / verification screen — email not registered with CAMS
-        otp_signals = ["otp", "one time password", "verify your email", "enter otp"]
+        # NOTE: check AFTER rate-limit so CAMS static page text mentioning 'otp'
+        # doesn't cause a false positive on the "unable to process" error page.
+        otp_signals = ["enter otp", "verify your email", "one time password"]
         if any(s in content for s in otp_signals):
             logger.error(
                 "CAMS is asking for OTP — email is NOT registered in the folio. "
