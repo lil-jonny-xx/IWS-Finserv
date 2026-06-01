@@ -5,16 +5,17 @@ Orchestrates daily CAS fetch for all 6 entities via one central Gmail inbox.
 All entity emails (or their aliases) forward CAMS CAS emails to ***REMOVED***.
 
 Flow:
-  1. Start a Gmail collector thread that polls for new CAS PDFs continuously
-  2. Fire CAMS requests for all entities sequentially (staggered to avoid rate-limits),
-     spawning a parser thread for each entity immediately after its trigger
-  3. Each parser thread claims the first PDF in the shared queue that opens with
+  1. Start a Gmail collector thread that polls for new CAS PDFs until 8 AM IST
+  2. Shuffle entities so no two consecutive entries share the same PAN
+  3. Fire CAMS requests one by one; between each trigger wait a random delay
+     where the ceiling is itself randomised between 45–75 min (floor always 30 min)
+  4. Each parser thread claims the first PDF in the shared queue that opens with
      its entity's password (fitz.authenticate), then parses + upserts to DB
-  4. All parser threads run concurrently — wall time ≈ slowest email delivery
-  5. After all threads complete, refresh NAVs once
+  5. All parser threads run concurrently — wall time ≈ slowest email delivery
+  6. After all threads complete (or 8 AM IST deadline), refresh NAVs once
 
-Schedule: Daily at 3 AM IST (21:30 UTC previous day)
-Cron:     30 21 * * * /var/www/.venv/bin/python /var/www/mis-portal/workers/cas_automation_worker.py
+Schedule: Daily at 11 PM IST (17:30 UTC)
+Cron:     30 17 * * * /var/www/.venv/bin/python /var/www/mis-portal/workers/cas_automation_worker.py
 """
 import os
 import sys
@@ -24,6 +25,9 @@ import secrets
 import logging
 import tempfile
 import threading
+import datetime
+import zoneinfo
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -51,8 +55,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-WORKERS_DIR          = Path(__file__).parent
-EMAIL_TIMEOUT_MINUTES = 30
+WORKERS_DIR = Path(__file__).parent
+IST         = zoneinfo.ZoneInfo("Asia/Kolkata")
+
+
+def _deadline_8am_ist() -> float:
+    """Unix timestamp for 8:00 AM IST — same day if before 8 AM, next day otherwise."""
+    now    = datetime.datetime.now(IST)
+    target = now.replace(hour=8, minute=0, second=0, microsecond=0)
+    if now >= target:
+        target += datetime.timedelta(days=1)
+    return target.timestamp()
 
 
 @dataclass
@@ -74,6 +87,42 @@ def _entity_configs() -> list[EntityConfig]:
     ]
 
 
+def _shuffled_no_consecutive_pan(configs: list[EntityConfig]) -> list[EntityConfig]:
+    """
+    Returns configs in a random order where no two consecutive entries share a PAN.
+    Tries up to 200 random shuffles first; falls back to a greedy interleave if needed.
+    """
+    result = list(configs)
+    for _ in range(200):
+        random.shuffle(result)
+        if all(result[i].pan != result[i + 1].pan for i in range(len(result) - 1)):
+            return result
+
+    # Greedy fallback: always pick from the largest PAN group that differs from the last,
+    # breaking ties randomly so the output is still non-deterministic.
+    groups: dict[str, list[EntityConfig]] = defaultdict(list)
+    for cfg in configs:
+        groups[cfg.pan].append(cfg)
+    for grp in groups.values():
+        random.shuffle(grp)
+
+    ordered: list[EntityConfig] = []
+    last_pan: str | None = None
+    while groups:
+        eligible = [(pan, lst) for pan, lst in groups.items() if pan != last_pan]
+        if not eligible:
+            eligible = list(groups.items())  # unavoidable consecutive — pick anything
+        max_len  = max(len(lst) for _, lst in eligible)
+        top      = [(pan, lst) for pan, lst in eligible if len(lst) == max_len]
+        pan, lst = random.choice(top)
+        ordered.append(lst.pop())
+        last_pan = pan
+        if not groups[pan]:
+            del groups[pan]
+
+    return ordered
+
+
 def _random_pdf_password() -> str:
     return secrets.token_urlsafe(12)
 
@@ -84,7 +133,7 @@ def _pdf_matches_password(pdf_path: str, password: str) -> bool:
     fitz.Document.authenticate() returns 0 on wrong password, non-zero on correct.
     """
     try:
-        doc = fitz.open(pdf_path)
+        doc    = fitz.open(pdf_path)
         result = doc.authenticate(password)
         doc.close()
         return result != 0
@@ -159,14 +208,12 @@ def _entity_worker(
     claimed_path = None
 
     while time.time() < deadline and claimed_path is None:
-        # Take a snapshot of pending outside the lock to avoid holding it during I/O
         with pending_lock:
             snapshot = list(pending)
 
         for item in snapshot:
             msg_id, pdf_path = item
             if _pdf_matches_password(pdf_path, pdf_password):
-                # Atomically claim it
                 with pending_lock:
                     if item in pending:
                         pending.remove(item)
@@ -177,7 +224,8 @@ def _entity_worker(
             time.sleep(15)
 
     if not claimed_path:
-        logger.error(f"[{cfg.code}] Timed out — no matching PDF arrived within {EMAIL_TIMEOUT_MINUTES}m")
+        deadline_str = datetime.datetime.fromtimestamp(deadline, IST).strftime("%H:%M IST")
+        logger.error(f"[{cfg.code}] Timed out — no matching PDF arrived before {deadline_str}")
         results[cfg.code] = False
         return
 
@@ -218,17 +266,23 @@ def main():
         )
         sys.exit(1)
 
-    run_start_ts  = int(time.time())
-    deadline      = run_start_ts + EMAIL_TIMEOUT_MINUTES * 60
-    results       = {}
-    pending       = []   # [(msg_id, pdf_path), ...]
-    pending_lock  = threading.Lock()
-    seen_ids      = set()
+    run_start_ts   = int(time.time())
+    deadline       = _deadline_8am_ist()
+    deadline_str   = datetime.datetime.fromtimestamp(deadline, IST).strftime("%H:%M IST")
+    results        = {}
+    pending        = []
+    pending_lock   = threading.Lock()
+    seen_ids       = set()
     stop_collector = threading.Event()
+
+    # Shuffle so no two consecutive triggers share a PAN
+    ordered = _shuffled_no_consecutive_pan(configs)
+    order_str = " → ".join(f"{c.code}({c.pan[:4]}****)" for c in ordered)
+    logger.info(f"Gmail collector active until {deadline_str}")
+    logger.info(f"Trigger order: {order_str}")
 
     with tempfile.TemporaryDirectory(prefix="cas_auto_") as tmp_dir:
 
-        # Start the single shared Gmail collector thread
         collector_thread = threading.Thread(
             target=_gmail_collector,
             args=(central_token, tmp_dir, run_start_ts,
@@ -238,13 +292,21 @@ def main():
         )
         collector_thread.start()
 
-        # Fire CAMS triggers one by one (staggered), spawn parser thread after each
         entity_threads = []
-        for idx, cfg in enumerate(configs):
+        for idx, cfg in enumerate(ordered):
             if idx > 0:
-                delay = random.randint(75, 150)
-                logger.info(f"Cooling {delay}s before triggering [{cfg.code}]...")
-                time.sleep(delay)
+                # Randomise the ceiling between 45–75 min, then pick a delay
+                # uniformly between 30 min and that ceiling.
+                ceil_s  = random.uniform(45 * 60, 75 * 60)
+                delay_s = random.uniform(30 * 60, ceil_s)
+                fire_at = datetime.datetime.fromtimestamp(
+                    time.time() + delay_s, IST
+                ).strftime("%H:%M IST")
+                logger.info(
+                    f"Next trigger [{cfg.code}] in {delay_s/60:.0f}m "
+                    f"(ceil {ceil_s/60:.0f}m, fires ~{fire_at})"
+                )
+                time.sleep(delay_s)
 
             logger.info(f"━━━ [{cfg.code}] {cfg.email} ━━━")
             pdf_password = _random_pdf_password()
@@ -264,8 +326,7 @@ def main():
             t.start()
             entity_threads.append(t)
 
-        # Wait for all parser threads
-        logger.info(f"All triggers fired. Waiting up to {EMAIL_TIMEOUT_MINUTES}m for PDFs...")
+        logger.info(f"All triggers fired. Waiting until {deadline_str} for PDFs...")
         for t in entity_threads:
             remaining = max(0.0, deadline - time.time())
             t.join(timeout=remaining)
@@ -273,7 +334,6 @@ def main():
         stop_collector.set()
         collector_thread.join(timeout=5)
 
-    # NAV refresh once after all entities
     logger.info("━━━ Refreshing NAVs ━━━")
     try:
         amfi_nav_worker.run()
