@@ -1172,6 +1172,28 @@ export default function DashboardPage() {
           </button>
         </div>
 
+        {/* Section nav */}
+        <nav className="flex gap-1.5 mb-5" aria-label="Sections">
+          {[
+            { href: '/dashboard',     label: 'Overview',      active: true  },
+            { href: '/mutual-funds',  label: 'Mutual Funds',  active: false },
+            { href: '/equity',        label: 'Equity',        active: false },
+          ].map(({ href, label, active }) => (
+            <a
+              key={href}
+              href={href}
+              aria-current={active ? 'page' : undefined}
+              className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
+                active
+                  ? 'bg-prime text-prime-fg'
+                  : 'bg-card border border-rule text-dim hover:border-dim hover:text-ink'
+              }`}
+            >
+              {label}
+            </a>
+          ))}
+        </nav>
+
         {/* Entity switcher — admin only */}
         {isAdmin && entities.length > 0 && (
           <EntitySwitcher

@@ -8,6 +8,9 @@ mis-portal/.env
 mis-portal/workers/gmail_credentials.json
 mis-portal/workers/gmail_token_central.json
 
+# Broker access tokens — never commit
+mis-portal/equity/equity_tokens.json
+
 # Node / Next.js
 iws-portal-frontend/node_modules/
 iws-portal-frontend/.next/
