@@ -1,3 +1,6 @@
+# Graphify knowledge graph — local only
+graphify-out/
+
 # Python
 mis-portal/venv/
 mis-portal/__pycache__/
@@ -7,6 +10,9 @@ mis-portal/.env
 # Gmail OAuth — never commit
 mis-portal/workers/gmail_credentials.json
 mis-portal/workers/gmail_token_central.json
+
+# Broker access tokens — never commit
+mis-portal/equity/equity_tokens.json
 
 # Node / Next.js
 iws-portal-frontend/node_modules/
@@ -28,3 +34,5 @@ iws-portal-frontend/CLAUDE.md
 skills-lock.json
 .impeccable/
 .xlsx bas.xlsx
+mis-portal/.cams_browser_profile/
+mis-portal/.cams_browser_profile/

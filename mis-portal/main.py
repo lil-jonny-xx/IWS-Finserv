@@ -548,6 +548,8 @@ def get_holdings(
             cursor.execute("""
                 SELECT
                     h.id,
+                    h.entity_id,
+                    h.security_id,
                     h.folio_number,
                     h.quantity,
                     h.cost_basis,
@@ -574,14 +576,18 @@ def get_holdings(
                     sm.security_type,
                     sm.asset_class,
                     sm.amfi_code,
-                    e.entity_name
+                    e.entity_name,
+                    pg.pan_name AS pan_group_name
                 FROM holding h
                 JOIN security_master sm ON sm.id = h.security_id
                 JOIN entity e ON e.id = h.entity_id
+                JOIN pan_group pg ON pg.id = e.pan_group_id
                 ORDER BY sm.asset_class, sm.security_name, h.folio_number
             """)
             rows = cursor.fetchall()
             cursor.close()
+
+            realized_gains = _compute_realized_gains(conn)
 
             holdings = []
             total_invested = 0.0
@@ -593,6 +599,7 @@ def get_holdings(
                     round(qty * nav_val, 2) if nav_val else None
                 )
                 total_invested += invested
+                rg_key = (r["entity_id"], r["security_id"], r["folio_number"])
                 holdings.append({
                     "id":                   r["id"],
                     "isin":                 r["isin"],
@@ -610,6 +617,8 @@ def get_holdings(
                     "first_invested_date":  str(r["first_invested_date"]) if r["first_invested_date"] else None,
                     "last_updated":         r["last_updated"].isoformat() if r["last_updated"] else None,
                     "entity_name":          r["entity_name"],
+                    "pan_group_name":       r["pan_group_name"],
+                    "realized_gain":        realized_gains.get(rg_key, 0.0),
                     "prev_week_value":      float(r["prev_week_value"])    if r["prev_week_value"]    else None,
                     "market_value_as_on":   float(r["market_value_as_on"]) if r["market_value_as_on"] else None,
                     "as_of_date":           str(r["as_of_date"])           if r["as_of_date"]         else None,
@@ -643,6 +652,7 @@ def get_holdings(
         cursor.execute("""
             SELECT
                 h.id,
+                h.security_id,
                 h.folio_number,
                 h.quantity,
                 h.cost_basis,
@@ -668,14 +678,19 @@ def get_holdings(
                 sm.security_name,
                 sm.security_type,
                 sm.asset_class,
-                sm.amfi_code
+                sm.amfi_code,
+                pg.pan_name AS pan_group_name
             FROM holding h
             JOIN security_master sm ON sm.id = h.security_id
+            JOIN entity e ON e.id = h.entity_id
+            JOIN pan_group pg ON pg.id = e.pan_group_id
             WHERE h.entity_id = %s
             ORDER BY sm.asset_class, sm.security_name, h.folio_number
         """, (eid,))
         rows = cursor.fetchall()
         cursor.close()
+
+        realized_gains = _compute_realized_gains(conn, entity_id=eid)
 
         holdings = []
         total_invested = 0.0
@@ -687,6 +702,7 @@ def get_holdings(
                 round(qty * nav_val, 2) if nav_val else None
             )
             total_invested += invested
+            rg_key = (eid, r["security_id"], r["folio_number"])
             holdings.append({
                 "id":                   r["id"],
                 "isin":                 r["isin"],
@@ -703,6 +719,8 @@ def get_holdings(
                 "current_value":        cur_val,
                 "first_invested_date":  str(r["first_invested_date"]) if r["first_invested_date"] else None,
                 "last_updated":         r["last_updated"].isoformat() if r["last_updated"] else None,
+                "pan_group_name":       r["pan_group_name"],
+                "realized_gain":        realized_gains.get(rg_key, 0.0),
                 "prev_week_value":      float(r["prev_week_value"])    if r["prev_week_value"]    else None,
                 "market_value_as_on":   float(r["market_value_as_on"]) if r["market_value_as_on"] else None,
                 "as_of_date":           str(r["as_of_date"])           if r["as_of_date"]         else None,
@@ -1056,6 +1074,179 @@ def get_equity_summary_legacy(
     authorization: Optional[str] = Header(None),
 ):
     return get_equity_summary(request, entity_id, authorization)
+
+
+# ---------------------------------------------------------------------------
+# Portfolio overview — aggregate MF + equity across all entities
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/overview")
+def get_overview(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Aggregate portfolio overview across ALL entities, all asset classes.
+    Returns:
+      - summary: totals across MF + equity
+      - asset_class_breakdown: combined allocation
+      - entities: per-entity breakdown with MF + equity subtotals
+    """
+    conn = None
+    try:
+        payload   = _require_auth(request, authorization)
+        conn      = get_db_connection()
+        cursor    = conn.cursor()
+
+        cursor.execute("""
+            SELECT
+                h.entity_id,
+                e.entity_name,
+                h.asset_class,
+                h.security_type,
+                COALESCE(h.invested_amount, 0)                         AS invested,
+                COALESCE(h.market_value_as_on, h.current_value, 0)    AS mkt_value,
+                COALESCE(h.pnl_inception, 0)                           AS pnl_inception,
+                COALESCE(h.pnl_ytd, 0)                                 AS pnl_ytd,
+                COALESCE(h.weekly_change, 0)                           AS weekly_change,
+                h.cagr_inception_pct,
+                COALESCE(h.market_value_as_on, h.current_value, 0)    AS weight
+            FROM holding h
+            JOIN entity e ON e.id = h.entity_id
+        """)
+        mf_rows = cursor.fetchall()
+
+        cursor.execute("""
+            SELECT
+                eh.entity_id,
+                e.entity_name,
+                'DIRECT_EQUITY'                       AS asset_class,
+                'DIRECT_EQUITY'                       AS security_type,
+                COALESCE(eh.cost, 0)                  AS invested,
+                COALESCE(eh.current_market_value, 0)  AS mkt_value,
+                COALESCE(eh.pnl_inception, 0)         AS pnl_inception,
+                COALESCE(eh.pnl_ytd, 0)               AS pnl_ytd,
+                COALESCE(eh.weekly_change, 0)         AS weekly_change,
+                eh.cagr_inception_pct,
+                COALESCE(eh.current_market_value, 0)  AS weight
+            FROM equity_holding eh
+            JOIN entity e ON e.id = eh.entity_id
+        """)
+        eq_rows = cursor.fetchall()
+        cursor.close()
+
+        all_rows = list(mf_rows) + list(eq_rows)
+
+        def row_val(r, key):
+            v = r[key]
+            return float(v) if v is not None else 0.0
+
+        total_invested = sum(row_val(r, "invested")      for r in all_rows)
+        total_value    = sum(row_val(r, "mkt_value")     for r in all_rows)
+        total_pnl      = sum(row_val(r, "pnl_inception") for r in all_rows)
+        total_pnl_ytd  = sum(row_val(r, "pnl_ytd")      for r in all_rows)
+        total_weekly   = sum(row_val(r, "weekly_change") for r in all_rows)
+
+        w_sum, w_cagr = 0.0, 0.0
+        for r in all_rows:
+            if r["cagr_inception_pct"] is not None:
+                w = row_val(r, "weight")
+                w_cagr += float(r["cagr_inception_pct"]) * w
+                w_sum  += w
+        weighted_cagr = round(w_cagr / w_sum, 4) if w_sum > 0 else None
+
+        class_totals: dict = {}
+        for r in all_rows:
+            cls = r["asset_class"]
+            class_totals.setdefault(cls, {"invested": 0.0, "value": 0.0, "pnl": 0.0})
+            class_totals[cls]["invested"] += row_val(r, "invested")
+            class_totals[cls]["value"]    += row_val(r, "mkt_value")
+            class_totals[cls]["pnl"]      += row_val(r, "pnl_inception")
+
+        asset_class_breakdown = [
+            {
+                "asset_class": cls,
+                "invested":    round(v["invested"], 2),
+                "value":       round(v["value"],    2),
+                "pnl":         round(v["pnl"],      2),
+                "pct":         round(v["value"] / total_value * 100, 2) if total_value else 0,
+            }
+            for cls, v in sorted(class_totals.items(), key=lambda x: -x[1]["value"])
+        ]
+
+        entity_map: dict = {}
+        for r in all_rows:
+            eid   = r["entity_id"]
+            ename = r["entity_name"]
+            cls   = r["asset_class"]
+            if eid not in entity_map:
+                entity_map[eid] = {
+                    "entity_id":     eid,
+                    "entity_name":   ename,
+                    "total_invested": 0.0,
+                    "total_value":    0.0,
+                    "total_pnl":      0.0,
+                    "total_pnl_ytd":  0.0,
+                    "total_weekly":   0.0,
+                    "asset_classes":  {},
+                }
+            em = entity_map[eid]
+            em["total_invested"] += row_val(r, "invested")
+            em["total_value"]    += row_val(r, "mkt_value")
+            em["total_pnl"]      += row_val(r, "pnl_inception")
+            em["total_pnl_ytd"]  += row_val(r, "pnl_ytd")
+            em["total_weekly"]   += row_val(r, "weekly_change")
+
+            broad = "DIRECT_EQUITY" if cls == "DIRECT_EQUITY" else "MF"
+            em["asset_classes"].setdefault(broad, {"invested": 0.0, "value": 0.0, "pnl": 0.0})
+            em["asset_classes"][broad]["invested"] += row_val(r, "invested")
+            em["asset_classes"][broad]["value"]    += row_val(r, "mkt_value")
+            em["asset_classes"][broad]["pnl"]      += row_val(r, "pnl_inception")
+
+        entities_out = []
+        for em in sorted(entity_map.values(), key=lambda x: -x["total_value"]):
+            ev      = em["total_value"]
+            classes = [
+                {
+                    "asset_class": broad,
+                    "invested":    round(v["invested"], 2),
+                    "value":       round(v["value"],    2),
+                    "pnl":         round(v["pnl"],      2),
+                    "pct":         round(v["value"] / ev * 100, 2) if ev else 0,
+                }
+                for broad, v in sorted(em["asset_classes"].items(), key=lambda x: -x[1]["value"])
+            ]
+            entities_out.append({
+                "entity_id":      em["entity_id"],
+                "entity_name":    em["entity_name"],
+                "total_invested": round(em["total_invested"], 2),
+                "total_value":    round(em["total_value"],    2),
+                "total_pnl":      round(em["total_pnl"],      2),
+                "total_pnl_ytd":  round(em["total_pnl_ytd"],  2),
+                "total_weekly":   round(em["total_weekly"],   2),
+                "asset_classes":  classes,
+            })
+
+        return {
+            "summary": {
+                "total_invested": round(total_invested, 2),
+                "total_value":    round(total_value,    2),
+                "total_pnl":      round(total_pnl,      2),
+                "total_pnl_ytd":  round(total_pnl_ytd,  2),
+                "total_weekly":   round(total_weekly,   2),
+                "weighted_cagr":  weighted_cagr,
+            },
+            "asset_class_breakdown": asset_class_breakdown,
+            "entities": entities_out,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/v1/overview: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
 
 
 @app.get("/api/v1/transactions")

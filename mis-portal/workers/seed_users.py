@@ -18,7 +18,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 
-load_dotenv('/var/www/mis-portal/.env')
+load_dotenv('/var/www/mis-portal/.env', override=True)
 
 DB_CONFIG = {
     "host":     os.getenv("DB_HOST", "localhost"),

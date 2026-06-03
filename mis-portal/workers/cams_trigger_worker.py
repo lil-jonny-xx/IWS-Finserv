@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
 CAMS Trigger Worker — IWS MIS Portal
-Submits the CAMS CAS request form via headless Playwright.
+Submits the CAMS CAS request form via Playwright (headed via Xvfb).
 CAMS skips OTP for registered email addresses — PDF arrives directly by email.
+
+Anti-bot measures:
+  - Headed Chromium on a virtual display (Xvfb) — reCAPTCHA v3 scores headless poorly
+  - Persistent browser profile — cookies/history make the session look like a returning user
+  - playwright-stealth — patches ~15 fingerprinting vectors probed by reCAPTCHA
 
 IMPORTANT: The email entered MUST be registered in the investor's folio with CAMS/KFintech.
 Unregistered emails cause silent failures (no OTP, no email, no error shown).
@@ -13,8 +18,11 @@ import random
 import socket
 import time
 from datetime import date
+from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright_stealth import Stealth
+from pyvirtualdisplay import Display
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +40,10 @@ _USER_AGENTS = [
 NAV_TIMEOUT    = 60_000
 ACTION_TIMEOUT = 10_000
 TOR_PROXY      = "socks5://127.0.0.1:9050"
+
+# Persistent Chromium profile — cookies/history accumulate across daily runs,
+# improving reCAPTCHA v3 trust score over time.
+BROWSER_PROFILE_DIR = Path("/var/www/mis-portal/.cams_browser_profile")
 
 
 def _tor_available() -> bool:
@@ -51,117 +63,128 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
     """
     logger.info(f"Triggering CAMS CAS for PAN: {pan_number[:4]}**** email: {email}")
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
-        ctx = browser.new_context(
-            user_agent=random.choice(_USER_AGENTS),
-            java_script_enabled=True,
-            ignore_https_errors=False,
-        )
-        ctx.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
-        page = ctx.new_page()
+    BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
-        try:
-            page.goto(CAMS_CAS_URL, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
-            # Wait for Angular to render (mat-radio-button signals app is ready)
-            page.wait_for_selector("mat-radio-button", timeout=NAV_TIMEOUT)
-            logger.info("CAMS page loaded")
+    display = Display(visible=False, size=(1366, 768))
+    display.start()
+    logger.debug("Xvfb display started")
 
-            _dismiss_tnc(page)
-            page.wait_for_timeout(random.randint(400, 900))
-
-            # --- Statement type: Detailed (includes transaction listing) ---
-            _click_radio_by_value_or_text(page, "detailed", "Detailed", "Statement type")
-            page.wait_for_timeout(random.randint(300, 700))
-
-            # --- Folio listing: With zero balance folios (all history) ---
-            # The form default is "Without zero balance folios". We want "With zero balance"
-            # to capture complete history including fully-redeemed folios.
-            # Value "Y" = include zero balance folios on CAMS CAS-CAMS+KFintech form.
-            try:
-                _click_radio_by_value_or_text(page, "Y", "With zero balance folios", "Folio listing")
-                page.wait_for_timeout(random.randint(300, 700))
-            except RuntimeError:
-                logger.warning("Could not click 'With zero balance folios' radio — using default")
-
-            # --- Email ---
-            _save_screenshot(page, f"cams_prefill_{pan_number[:4]}.png")
-            _fill_field(page, [
-                'input[formcontrolname="email_id"]',
-                'input[placeholder*="Email" i]',
-            ], email, "email")
-            page.wait_for_timeout(random.randint(400, 900))
-
-            # --- PAN (optional but helps CAMS match folios) ---
-            _fill_field(page, [
-                'input[formcontrolname="pan"]',
-                'input[placeholder*="PAN" i]',
-            ], pan_number.upper(), "PAN")
-            page.wait_for_timeout(random.randint(400, 900))
-
-            # --- PDF Password ---
-            _fill_field(page, [
-                'input[formcontrolname="password"]',
-                'input[placeholder*="Password" i]:not([placeholder*="Confirm" i]):not([placeholder*="Retype" i])',
-            ], pdf_password, "PDF password")
-            page.wait_for_timeout(random.randint(300, 700))
-
-            # --- Confirm Password ---
-            _fill_field(page, [
-                'input[formcontrolname="confirmPassword"]',
-                'input[formcontrolname="confirm_password"]',
-                'input[placeholder*="Confirm" i]',
-                'input[placeholder*="Retype" i]',
-            ], pdf_password, "confirm password")
-            page.wait_for_timeout(random.randint(400, 800))
-
-            _save_screenshot(page, f"cams_preflight_{pan_number[:4]}.png")
-
-            # Post-fill verification screenshot — confirms fields were actually populated
-            # before Submit so failures can be distinguished from CAMS server errors.
-            _save_screenshot(page, f"cams_postfill_{pan_number[:4]}.png")
-
-            # --- Submit ---
-            page.locator('button:has-text("Submit")').first.click(
-                timeout=ACTION_TIMEOUT, force=True
+    try:
+        with sync_playwright() as pw:
+            ctx = pw.chromium.launch_persistent_context(
+                user_data_dir=str(BROWSER_PROFILE_DIR),
+                headless=False,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
+                user_agent=random.choice(_USER_AGENTS),
+                java_script_enabled=True,
+                ignore_https_errors=False,
+                viewport={"width": 1366, "height": 768},
             )
-            logger.debug("Clicked Submit")
+            ctx.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+            page = ctx.new_page()
+            Stealth().apply_stealth_sync(page)
 
-            # Wait for CAMS to process and show a result
-            page.wait_for_timeout(4_000)
-            _save_screenshot(page, f"cams_postsubmit_{pan_number[:4]}.png")
+            try:
+                page.goto(CAMS_CAS_URL, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
+                # Wait for Angular to render (mat-radio-button signals app is ready)
+                page.wait_for_selector("mat-radio-button", timeout=NAV_TIMEOUT)
+                logger.info("CAMS page loaded")
 
-            success = _check_submit_result(page)
-            if success:
-                logger.info("CAMS form submitted successfully. CAS will arrive by email.")
-            else:
-                logger.error(
-                    "CAMS submission did not show a success indicator. "
-                    "Possible causes: email not registered with CAMS, form validation error, "
-                    "or CAMS showed OTP screen. Check screenshot at "
-                    f"/tmp/cams_postsubmit_{pan_number[:4]}.png"
+                _dismiss_tnc(page)
+                page.wait_for_timeout(random.randint(400, 900))
+
+                # --- Statement type: Detailed (includes transaction listing) ---
+                _click_radio_by_value_or_text(page, "detailed", "Detailed", "Statement type")
+                page.wait_for_timeout(random.randint(300, 700))
+
+                # --- Folio listing: With zero balance folios (all history) ---
+                # The form default is "Without zero balance folios". We want "With zero balance"
+                # to capture complete history including fully-redeemed folios.
+                # Value "Y" = include zero balance folios on CAMS CAS-CAMS+KFintech form.
+                try:
+                    _click_radio_by_value_or_text(page, "Y", "With zero balance folios", "Folio listing")
+                    page.wait_for_timeout(random.randint(300, 700))
+                except RuntimeError:
+                    logger.warning("Could not click 'With zero balance folios' radio — using default")
+
+                # --- Email ---
+                _save_screenshot(page, f"cams_prefill_{pan_number[:4]}.png")
+                _fill_field(page, [
+                    'input[formcontrolname="email_id"]',
+                    'input[placeholder*="Email" i]',
+                ], email, "email")
+                page.wait_for_timeout(random.randint(400, 900))
+
+                # --- PAN (optional but helps CAMS match folios) ---
+                _fill_field(page, [
+                    'input[formcontrolname="pan"]',
+                    'input[placeholder*="PAN" i]',
+                ], pan_number.upper(), "PAN")
+                page.wait_for_timeout(random.randint(400, 900))
+
+                # --- PDF Password ---
+                _fill_field(page, [
+                    'input[formcontrolname="password"]',
+                    'input[placeholder*="Password" i]:not([placeholder*="Confirm" i]):not([placeholder*="Retype" i])',
+                ], pdf_password, "PDF password")
+                page.wait_for_timeout(random.randint(300, 700))
+
+                # --- Confirm Password ---
+                _fill_field(page, [
+                    'input[formcontrolname="confirmPassword"]',
+                    'input[formcontrolname="confirm_password"]',
+                    'input[placeholder*="Confirm" i]',
+                    'input[placeholder*="Retype" i]',
+                ], pdf_password, "confirm password")
+                page.wait_for_timeout(random.randint(400, 800))
+
+                _save_screenshot(page, f"cams_preflight_{pan_number[:4]}.png")
+
+                # Post-fill verification screenshot — confirms fields were actually populated
+                # before Submit so failures can be distinguished from CAMS server errors.
+                _save_screenshot(page, f"cams_postfill_{pan_number[:4]}.png")
+
+                # --- Submit ---
+                page.locator('button:has-text("Submit")').first.click(
+                    timeout=ACTION_TIMEOUT, force=True
                 )
-            return success
+                logger.debug("Clicked Submit")
 
-        except PWTimeout as e:
-            logger.error(f"CAMS page timeout: {e}")
-            _save_screenshot(page, f"cams_timeout_{pan_number[:4]}.png")
-            return False
-        except Exception as e:
-            logger.error(f"CAMS trigger failed: {e}")
-            _save_screenshot(page, f"cams_error_{pan_number[:4]}.png")
-            return False
-        finally:
-            browser.close()
+                # Wait for CAMS to process and show a result
+                page.wait_for_timeout(4_000)
+                _save_screenshot(page, f"cams_postsubmit_{pan_number[:4]}.png")
+
+                success = _check_submit_result(page)
+                if success:
+                    logger.info("CAMS form submitted successfully. CAS will arrive by email.")
+                else:
+                    logger.error(
+                        "CAMS submission did not show a success indicator. "
+                        "Possible causes: email not registered with CAMS, form validation error, "
+                        "or CAMS showed OTP screen. Check screenshot at "
+                        f"/tmp/cams_postsubmit_{pan_number[:4]}.png"
+                    )
+                return success
+
+            except PWTimeout as e:
+                logger.error(f"CAMS page timeout: {e}")
+                _save_screenshot(page, f"cams_timeout_{pan_number[:4]}.png")
+                return False
+            except Exception as e:
+                logger.error(f"CAMS trigger failed: {e}")
+                _save_screenshot(page, f"cams_error_{pan_number[:4]}.png")
+                return False
+            finally:
+                ctx.close()
+    finally:
+        display.stop()
+        logger.debug("Xvfb display stopped")
 
 
 def _dismiss_tnc(page):
