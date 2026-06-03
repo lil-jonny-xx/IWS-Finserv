@@ -1,5 +1,5 @@
 'use client';
-import { useState, Fragment } from 'react';
+import { useState, Fragment, useMemo } from 'react';
 
 export interface MFHoldingRow {
   id: number;
@@ -18,7 +18,8 @@ export interface MFHoldingRow {
   first_invested_date?: string;
   last_updated?: string;
   entity_name?: string;
-  // metric columns (written by mf_metrics_worker)
+  pan_group_name?: string;
+  realized_gain?: number;
   prev_week_value?: number;
   market_value_as_on?: number;
   as_of_date?: string;
@@ -45,6 +46,8 @@ interface Props {
   showEntityCol: boolean;
 }
 
+// ── formatters ───────────────────────────────────────────────────────────────
+
 function fmtINR(n: number | null | undefined): string {
   if (n == null) return '—';
   const abs = Math.round(Math.abs(n));
@@ -67,6 +70,19 @@ function fmtDate(iso: string | undefined): string {
   return new Date(iso).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
 }
 
+function fmtDuration(iso: string | undefined): string {
+  if (!iso) return '—';
+  const start = new Date(iso);
+  const now = new Date();
+  let years = now.getFullYear() - start.getFullYear();
+  let months = now.getMonth() - start.getMonth();
+  if (months < 0) { years--; months += 12; }
+  if (years === 0 && months === 0) return '< 1m';
+  if (years === 0) return `${months}m`;
+  if (months === 0) return `${years}y`;
+  return `${years}y ${months}m`;
+}
+
 function ColorNum({ n, fmt }: { n: number | null | undefined; fmt: (v: number) => string }) {
   if (n == null) return <span className="text-ghost">—</span>;
   return (
@@ -76,7 +92,9 @@ function ColorNum({ n, fmt }: { n: number | null | undefined; fmt: (v: number) =
   );
 }
 
-const ASSET_CLASS_ORDER = ['EQUITY', 'FIXED_INCOME', 'ALTERNATES'] as const;
+// ── constants ─────────────────────────────────────────────────────────────────
+
+const ASSET_CLASS_ORDER = ['EQUITY', 'ALTERNATES', 'FIXED_INCOME'] as const;
 const ASSET_CLASS_LABELS: Record<string, string> = {
   EQUITY:       'Equity',
   FIXED_INCOME: 'Fixed Income',
@@ -97,6 +115,22 @@ const SEC_TYPE_LABELS: Record<string, string> = {
 
 type SortKey = keyof MFHoldingRow;
 type SortDir = 'asc' | 'desc';
+type GroupMode = 'entity' | 'pan';
+
+// ── weighted avg CAGR ────────────────────────────────────────────────────────
+
+function weightedAvgCagr(rows: MFHoldingRow[]): number | null {
+  let sumWeight = 0, sumWeighted = 0;
+  for (const h of rows) {
+    if (h.cagr_inception_pct == null) continue;
+    const w = h.market_value_as_on ?? h.current_value ?? 0;
+    sumWeighted += h.cagr_inception_pct * w;
+    sumWeight += w;
+  }
+  return sumWeight > 0 ? sumWeighted / sumWeight : null;
+}
+
+// ── sort ──────────────────────────────────────────────────────────────────────
 
 function sortRows(rows: MFHoldingRow[], key: SortKey, dir: SortDir): MFHoldingRow[] {
   return [...rows].sort((a, b) => {
@@ -108,6 +142,39 @@ function sortRows(rows: MFHoldingRow[], key: SortKey, dir: SortDir): MFHoldingRo
   });
 }
 
+// ── filter pills ─────────────────────────────────────────────────────────────
+
+function FilterPills({
+  label, options, selected, onChange,
+}: {
+  label: string;
+  options: string[];
+  selected: string | null;
+  onChange: (v: string | null) => void;
+}) {
+  if (options.length < 2) return null;
+  return (
+    <div className="flex items-center gap-1.5 flex-wrap">
+      <span className="text-[10px] text-ghost font-medium shrink-0">{label}:</span>
+      {[{ value: null, label: 'All' }, ...options.map(o => ({ value: o, label: ASSET_CLASS_LABELS[o] ?? SEC_TYPE_LABELS[o] ?? o }))].map(opt => (
+        <button
+          key={opt.value ?? 'all'}
+          onClick={() => onChange(opt.value === selected ? null : opt.value)}
+          className={`px-2 py-0.5 rounded text-[10px] font-medium transition-colors whitespace-nowrap ${
+            selected === opt.value
+              ? 'bg-prime text-prime-fg'
+              : 'bg-page border border-wire text-dim hover:border-dim hover:text-ink'
+          }`}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ── sort arrow ────────────────────────────────────────────────────────────────
+
 function SortArrow({ col, sortKey, sortDir }: { col: SortKey; sortKey: SortKey; sortDir: SortDir }) {
   const active = col === sortKey;
   return (
@@ -117,91 +184,207 @@ function SortArrow({ col, sortKey, sortDir }: { col: SortKey; sortKey: SortKey; 
   );
 }
 
-function HeaderRow1({
-  showEntityCol, sortKey, sortDir, onSort,
+// ── group header row ──────────────────────────────────────────────────────────
+
+function GroupHeader({
+  label, rows, colCount,
 }: {
-  showEntityCol: boolean; sortKey: SortKey; sortDir: SortDir; onSort: (k: SortKey) => void;
+  label: string; rows: MFHoldingRow[]; colCount: number;
+}) {
+  const invested    = rows.reduce((s, h) => s + h.invested_amount, 0);
+  const mktVal      = rows.reduce((s, h) => s + (h.market_value_as_on ?? h.current_value ?? 0), 0);
+  const pnl         = rows.reduce((s, h) => s + (h.pnl_inception ?? 0), 0);
+  const realized    = rows.reduce((s, h) => s + (h.realized_gain ?? 0), 0);
+  const avgCagr     = weightedAvgCagr(rows);
+  const hasPnl      = rows.some(h => h.pnl_inception != null);
+
+  return (
+    <tr>
+      <td colSpan={colCount} className="px-4 pl-5 sm:pl-6 py-2.5 bg-page border-t border-rule">
+        <div className="flex flex-wrap items-baseline gap-x-5 gap-y-1">
+          <span className="text-xs font-semibold text-ink">{label}</span>
+          <span className="text-[11px] text-ghost">Invested {fmtINR(invested)}</span>
+          <span className="text-[11px] text-ghost">Mkt Value {fmtINR(mktVal)}</span>
+          {hasPnl && (
+            <span className="text-[11px] font-medium" style={{ color: pnl >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
+              P&amp;L {pnl >= 0 ? '+' : ''}{fmtINR(pnl)}
+            </span>
+          )}
+          {realized > 0 && (
+            <span className="text-[11px] text-ghost">Realized {fmtINR(realized)}</span>
+          )}
+          {avgCagr != null && (
+            <span className="text-[11px] font-medium" style={{ color: avgCagr >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
+              Avg CAGR {fmtPct(avgCagr)} p.a.
+            </span>
+          )}
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+// ── asset class sub-header ────────────────────────────────────────────────────
+
+function AssetClassHeader({ cls, rows, colCount }: { cls: string; rows: MFHoldingRow[]; colCount: number }) {
+  const subtotal = rows.reduce((s, h) => s + (h.market_value_as_on ?? h.current_value ?? 0), 0);
+  return (
+    <tr>
+      <td colSpan={colCount} className="px-4 pl-8 py-1.5 bg-page/60">
+        <span className="text-[10px] font-semibold text-dim uppercase tracking-wide">
+          {ASSET_CLASS_LABELS[cls] ?? cls}
+        </span>
+        <span className="ml-2 text-[10px] text-ghost">{fmtINR(subtotal)}</span>
+      </td>
+    </tr>
+  );
+}
+
+// ── table headers ─────────────────────────────────────────────────────────────
+
+function TableHead({
+  showEntityCol, showPanCol, sortKey, sortDir, onSort,
+}: {
+  showEntityCol: boolean;
+  showPanCol: boolean;
+  sortKey: SortKey;
+  sortDir: SortDir;
+  onSort: (k: SortKey) => void;
 }) {
   const base = 'px-3 py-2.5 text-xs font-medium text-ghost bg-card border-b border-rule whitespace-nowrap';
 
-  function SortTh({ col, label, right = true, rowSpan = 1, first = false }: {
-    col: SortKey; label: string; right?: boolean; rowSpan?: number; first?: boolean;
+  function Th({ col, label, right = true, rowSpan = 1, colSpan = 1, borderL = false, first = false, last = false }: {
+    col: SortKey; label: string; right?: boolean; rowSpan?: number; colSpan?: number;
+    borderL?: boolean; first?: boolean; last?: boolean;
   }) {
     return (
-      <th
-        scope="col"
-        rowSpan={rowSpan}
-        className={`${base} ${right ? 'text-right' : 'text-left'} ${first ? 'pl-5 sm:pl-6' : ''}`}
+      <th scope="col" rowSpan={rowSpan} colSpan={colSpan}
+        className={`${base} ${right ? 'text-right' : 'text-left'} ${borderL ? 'border-l border-rule' : ''} ${first ? 'pl-5 sm:pl-6' : ''} ${last ? 'pr-5 sm:pr-6' : ''}`}
         aria-sort={sortKey === col ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}
       >
-        <button
-          onClick={() => onSort(col)}
-          className={`inline-flex items-center hover:text-ink transition-colors ${right ? 'ml-auto' : ''}`}
-        >
+        <button onClick={() => onSort(col)} className={`inline-flex items-center hover:text-ink transition-colors ${right ? 'ml-auto' : ''}`}>
           {label}<SortArrow col={col} sortKey={sortKey} sortDir={sortDir} />
         </button>
       </th>
     );
   }
 
-  return (
-    <tr>
-      <SortTh col="security_name" label="Fund"     right={false} rowSpan={2} first />
-      {showEntityCol && <SortTh col="entity_name"  label="Entity"  right={false} rowSpan={2} />}
-      <SortTh col="folio_number"  label="Folio"    right={false} rowSpan={2} />
-      <SortTh col="quantity"      label="Units"    rowSpan={2} />
-      <SortTh col="invested_amount" label="Cost"   rowSpan={2} />
-      <SortTh col="exposure_pct"  label="Exp %"    rowSpan={2} />
-      <SortTh col="market_value_as_on" label="Mkt Value" rowSpan={2} />
-      <SortTh col="prev_week_value"    label="Prev Week" rowSpan={2} />
-      <SortTh col="weekly_change"      label="Wkly Chg"  rowSpan={2} />
-      {/* P&L group */}
-      <th colSpan={3} className={`${base} text-center border-l border-rule`}>P&amp;L</th>
-      {/* Returns group */}
-      <th colSpan={3} className={`${base} text-center border-l border-rule`}>Returns</th>
-      <th scope="col" rowSpan={2} className={`${base} text-left pr-5 sm:pr-6`}>Remarks</th>
-    </tr>
-  );
-}
-
-function HeaderRow2({ sortKey, sortDir, onSort }: {
-  sortKey: SortKey; sortDir: SortDir; onSort: (k: SortKey) => void;
-}) {
-  const base = 'px-3 py-2 text-xs font-medium text-ghost bg-card border-b border-rule whitespace-nowrap text-right';
-
-  function SortTh({ col, label, borderL = false }: { col: SortKey; label: string; borderL?: boolean }) {
+  function StaticTh({ label, colSpan = 1, borderL = false }: { label: string; colSpan?: number; borderL?: boolean }) {
     return (
-      <th
-        scope="col"
-        className={`${base} ${borderL ? 'border-l border-rule' : ''}`}
-        aria-sort={sortKey === col ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}
-      >
-        <button
-          onClick={() => onSort(col)}
-          className="inline-flex items-center ml-auto hover:text-ink transition-colors"
-        >
-          {label}<SortArrow col={col} sortKey={sortKey} sortDir={sortDir} />
-        </button>
+      <th scope="col" colSpan={colSpan}
+        className={`${base} text-center ${borderL ? 'border-l border-rule' : ''}`}>
+        {label}
       </th>
     );
   }
 
   return (
-    <tr>
-      <SortTh col="pnl_ytd"             label="YTD"      borderL />
-      <SortTh col="pnl_inception"        label="Inception" />
-      <SortTh col="pnl_weekly_change"    label="Wkly Chg" />
-      <SortTh col="returns_ytd_pct"      label="YTD %"   borderL />
-      <SortTh col="returns_inception_pct" label="Inc %" />
-      <SortTh col="cagr_inception_pct"   label="CAGR" />
+    <thead>
+      <tr>
+        {/* Sr. No. */}
+        <th scope="col" rowSpan={2} className={`${base} text-right pl-5 sm:pl-6 w-8`}>#</th>
+        <Th col="security_name"     label="Fund"          right={false} rowSpan={2} />
+        {showEntityCol && <Th col="entity_name"  label="Entity"        right={false} rowSpan={2} />}
+        {showPanCol    && <Th col="pan_group_name" label="PAN"         right={false} rowSpan={2} />}
+        <Th col="folio_number"      label="Folio"         right={false} rowSpan={2} />
+        <Th col="quantity"          label="Units"                       rowSpan={2} />
+        <Th col="invested_amount"   label="Cost"                        rowSpan={2} />
+        <Th col="first_invested_date" label="Since"                     rowSpan={2} />
+        <Th col="exposure_pct"      label="Exp %"                       rowSpan={2} />
+        <Th col="market_value_as_on" label="Mkt Value"                  rowSpan={2} />
+        <Th col="prev_week_value"   label="Prev Week"                   rowSpan={2} />
+        <Th col="weekly_change"     label="Wkly Chg"                    rowSpan={2} />
+        {/* P&L group */}
+        <StaticTh label="P&L" colSpan={3} borderL />
+        {/* Returns group */}
+        <StaticTh label="Returns" colSpan={3} borderL />
+        {/* Realized */}
+        <th scope="col" rowSpan={2} className={`${base} text-right border-l border-rule`}>Realized</th>
+        <th scope="col" rowSpan={2} className={`${base} text-left pr-5 sm:pr-6`}>Remarks</th>
+      </tr>
+      <tr>
+        {/* P&L sub-headers */}
+        <Th col="pnl_ytd"             label="YTD"      borderL />
+        <Th col="pnl_inception"       label="Inception" />
+        <Th col="pnl_weekly_change"   label="Wkly Chg" />
+        {/* Returns sub-headers */}
+        <Th col="returns_ytd_pct"     label="YTD %"    borderL />
+        <Th col="returns_inception_pct" label="Inc %" />
+        <Th col="cagr_inception_pct"  label="CAGR" />
+      </tr>
+    </thead>
+  );
+}
+
+// ── data row ──────────────────────────────────────────────────────────────────
+
+function DataRow({
+  h, srNo, showEntityCol, showPanCol,
+}: {
+  h: MFHoldingRow; srNo: number; showEntityCol: boolean; showPanCol: boolean;
+}) {
+  const mktVal = h.market_value_as_on ?? h.current_value;
+  return (
+    <tr className="border-t border-rule hover:bg-page transition-colors duration-100">
+      <td className="px-3 pl-5 sm:pl-6 py-3 text-right tabular-nums text-xs text-ghost align-top">{srNo}</td>
+      <td className="px-3 py-3 align-top">
+        <p className="text-xs text-ink leading-snug">{h.security_name}</p>
+        <p className="text-[10px] text-ghost mt-0.5">{SEC_TYPE_LABELS[h.security_type] ?? h.security_type}</p>
+      </td>
+      {showEntityCol && (
+        <td className="px-3 py-3 text-xs font-medium text-dim whitespace-nowrap align-top">{h.entity_name ?? '—'}</td>
+      )}
+      {showPanCol && (
+        <td className="px-3 py-3 text-xs font-medium text-dim whitespace-nowrap align-top">{h.pan_group_name ?? '—'}</td>
+      )}
+      <td className="px-3 py-3 font-mono text-xs text-dim whitespace-nowrap align-top">{h.folio_number}</td>
+      <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{h.quantity.toFixed(3)}</td>
+      <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{fmtINR(h.invested_amount)}</td>
+      <td className="px-3 py-3 text-right tabular-nums text-xs align-top whitespace-nowrap">
+        <span className="text-ink">{fmtDate(h.first_invested_date)}</span>
+        {h.first_invested_date && (
+          <p className="text-[10px] text-ghost mt-0.5">{fmtDuration(h.first_invested_date)}</p>
+        )}
+      </td>
+      <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">
+        {h.exposure_pct != null ? h.exposure_pct.toFixed(2) + '%' : '—'}
+      </td>
+      <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{fmtINR(mktVal)}</td>
+      <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">{fmtINR(h.prev_week_value)}</td>
+      <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top"><ColorNum n={h.weekly_change} fmt={fmtINR} /></td>
+      {/* P&L */}
+      <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top border-l border-rule"><ColorNum n={h.pnl_ytd} fmt={fmtINR} /></td>
+      <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top"><ColorNum n={h.pnl_inception} fmt={fmtINR} /></td>
+      <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top"><ColorNum n={h.pnl_weekly_change} fmt={fmtINR} /></td>
+      {/* Returns */}
+      <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top border-l border-rule"><ColorNum n={h.returns_ytd_pct} fmt={fmtPct} /></td>
+      <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top"><ColorNum n={h.returns_inception_pct} fmt={fmtPct} /></td>
+      <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top">
+        {h.cagr_inception_pct != null
+          ? <span style={{ color: h.cagr_inception_pct >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(h.cagr_inception_pct)} p.a.</span>
+          : <span className="text-ghost">—</span>}
+      </td>
+      {/* Realized */}
+      <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top border-l border-rule">
+        {(h.realized_gain ?? 0) > 0
+          ? <span className="text-dim">{fmtINR(h.realized_gain)}</span>
+          : <span className="text-ghost">—</span>}
+      </td>
+      <td className="px-3 pr-5 sm:pr-6 py-3 text-xs text-ghost align-top max-w-[160px]">{h.remarks ?? '—'}</td>
     </tr>
   );
 }
+
+// ── main component ────────────────────────────────────────────────────────────
 
 export default function MFTable({ holdings, totals, showEntityCol }: Props) {
-  const [sortKey, setSortKey]   = useState<SortKey>('market_value_as_on');
-  const [sortDir, setSortDir]   = useState<SortDir>('desc');
-  const [search, setSearch]     = useState('');
+  const [sortKey, setSortKey]       = useState<SortKey>('market_value_as_on');
+  const [sortDir, setSortDir]       = useState<SortDir>('desc');
+  const [search, setSearch]         = useState('');
+  const [groupMode, setGroupMode]   = useState<GroupMode>('entity');
+  const [filterClass, setFilterClass]   = useState<string | null>(null);
+  const [filterType, setFilterType]     = useState<string | null>(null);
+  const [filterEntity, setFilterEntity] = useState<string | null>(null);
 
   if (holdings.length === 0) {
     return (
@@ -217,31 +400,76 @@ export default function MFTable({ holdings, totals, showEntityCol }: Props) {
     else { setSortKey(key); setSortDir('desc'); }
   }
 
-  const q = search.toLowerCase();
-  const filtered = q
-    ? holdings.filter(h =>
-        h.security_name.toLowerCase().includes(q) ||
-        h.folio_number.toLowerCase().includes(q) ||
-        (h.entity_name ?? '').toLowerCase().includes(q)
-      )
-    : holdings;
+  // unique filter option values
+  const assetClasses  = [...new Set(holdings.map(h => h.asset_class))].sort();
+  const secTypes      = [...new Set(holdings.map(h => h.security_type))].sort();
+  const entityNames   = [...new Set(holdings.map(h => h.entity_name).filter(Boolean) as string[])].sort();
 
-  const asOfDate = holdings.find(h => h.as_of_date)?.as_of_date;
+  // apply all filters
+  const filtered = useMemo(() => {
+    const q = search.toLowerCase();
+    return holdings.filter(h => {
+      if (filterClass  && h.asset_class    !== filterClass)  return false;
+      if (filterType   && h.security_type  !== filterType)   return false;
+      if (filterEntity && h.entity_name    !== filterEntity) return false;
+      if (q && !h.security_name.toLowerCase().includes(q) &&
+               !h.folio_number.toLowerCase().includes(q) &&
+               !(h.entity_name ?? '').toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [holdings, search, filterClass, filterType, filterEntity]);
 
-  const grouped: Record<string, MFHoldingRow[]> = Object.fromEntries(
-    ASSET_CLASS_ORDER.map(cls => [
-      cls,
-      sortRows(filtered.filter(h => h.asset_class === cls), sortKey, sortDir),
-    ])
-  );
-  const activeClasses = ASSET_CLASS_ORDER.filter(cls => (grouped[cls]?.length ?? 0) > 0);
+  const asOfDate   = holdings.find(h => h.as_of_date)?.as_of_date;
+  const avgCagr    = weightedAvgCagr(holdings);
+  const hasMath    = holdings.some(h => h.pnl_inception != null);
 
-  const colCount = (showEntityCol ? 1 : 0) + 15;
+  const totalPnlInception  = holdings.reduce((s, h) => s + (h.pnl_inception  ?? 0), 0);
+  const totalPnlYtd        = holdings.reduce((s, h) => s + (h.pnl_ytd        ?? 0), 0);
+  const totalWeeklyChg     = holdings.reduce((s, h) => s + (h.weekly_change  ?? 0), 0);
+  const totalRealized      = holdings.reduce((s, h) => s + (h.realized_gain ?? 0), 0);
 
-  const totalPnlInception = holdings.reduce((s, h) => s + (h.pnl_inception ?? 0), 0);
-  const totalPnlYtd       = holdings.reduce((s, h) => s + (h.pnl_ytd ?? 0), 0);
-  const totalWeeklyChg    = holdings.reduce((s, h) => s + (h.weekly_change ?? 0), 0);
-  const hasMath           = holdings.some(h => h.pnl_inception != null);
+  // show PAN col only when groupMode=entity AND admin all-entities; in PAN mode grouping replaces it
+  const showPanCol  = showEntityCol && groupMode === 'entity';
+  const colCount    = 3                          // sr + fund + folio
+    + (showEntityCol && groupMode === 'entity' ? 1 : 0)
+    + (showPanCol ? 1 : 0)
+    + 10                                         // units cost since exp mktval prevwk wklychg
+    + 6                                          // pnl×3 returns×3
+    + 2;                                         // realized remarks
+
+  // group rows
+  type GroupEntry = { key: string; label: string; rows: MFHoldingRow[] };
+
+  const groups: GroupEntry[] = useMemo(() => {
+    if (groupMode === 'pan') {
+      const map = new Map<string, MFHoldingRow[]>();
+      for (const h of filtered) {
+        const key = h.pan_group_name ?? 'Unknown';
+        if (!map.has(key)) map.set(key, []);
+        map.get(key)!.push(h);
+      }
+      return [...map.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([key, rows]) => ({
+        key, label: key, rows,
+      }));
+    }
+    // entity grouping
+    if (showEntityCol) {
+      const map = new Map<string, MFHoldingRow[]>();
+      for (const h of filtered) {
+        const key = h.entity_name ?? 'Unknown';
+        if (!map.has(key)) map.set(key, []);
+        map.get(key)!.push(h);
+      }
+      return [...map.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([key, rows]) => ({
+        key, label: key, rows,
+      }));
+    }
+    // single entity — one group, no header
+    return [{ key: 'all', label: '', rows: filtered }];
+  }, [filtered, groupMode, showEntityCol]);
+
+  // serial number is global across all groups
+  let srCounter = 0;
 
   return (
     <div className="bg-card rounded-lg border border-rule overflow-hidden">
@@ -251,9 +479,7 @@ export default function MFTable({ holdings, totals, showEntityCol }: Props) {
         <div className="flex items-start justify-between gap-3 mb-3">
           <h2 className="text-base font-semibold text-ink">
             Mutual Fund Holdings
-            {asOfDate && (
-              <span className="ml-3 text-xs font-normal text-ghost">as of {fmtDate(asOfDate)}</span>
-            )}
+            {asOfDate && <span className="ml-3 text-xs font-normal text-ghost">as of {fmtDate(asOfDate)}</span>}
           </h2>
         </div>
         <div className="flex flex-wrap gap-x-8 gap-y-3">
@@ -292,7 +518,22 @@ export default function MFTable({ holdings, totals, showEntityCol }: Props) {
                   {totalWeeklyChg >= 0 ? '+' : ''}{fmtINR(totalWeeklyChg)}
                 </p>
               </div>
+              {avgCagr != null && (
+                <div>
+                  <p className="text-xs text-ghost mb-0.5">Avg CAGR</p>
+                  <p className="text-sm font-semibold tabular-nums"
+                    style={{ color: avgCagr >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
+                    {fmtPct(avgCagr)} p.a.
+                  </p>
+                </div>
+              )}
             </>
+          )}
+          {totalRealized > 0 && (
+            <div>
+              <p className="text-xs text-ghost mb-0.5">Total Realized</p>
+              <p className="text-sm font-semibold text-dim tabular-nums">{fmtINR(totalRealized)}</p>
+            </div>
           )}
           {totals.total_holdings != null && (
             <div>
@@ -303,118 +544,111 @@ export default function MFTable({ holdings, totals, showEntityCol }: Props) {
         </div>
       </div>
 
-      {/* Search */}
-      <div className="px-5 sm:px-6 py-3 border-b border-rule">
+      {/* Toolbar: search + grouping toggle + filters */}
+      <div className="px-5 sm:px-6 py-3 border-b border-rule flex flex-wrap gap-3 items-start">
+        {/* Search */}
         <input
           type="search"
           value={search}
           onChange={e => setSearch(e.target.value)}
           placeholder="Search fund, folio or entity…"
           aria-label="Search mutual fund holdings"
-          className="w-full max-w-sm text-xs bg-page border border-wire rounded px-3 py-1.5 text-ink placeholder:text-ghost focus:outline-none focus:border-prime transition-colors"
+          className="text-xs bg-page border border-wire rounded px-3 py-1.5 text-ink placeholder:text-ghost focus:outline-none focus:border-prime transition-colors w-52 shrink-0"
         />
+
+        {/* Group-by toggle */}
+        {showEntityCol && (
+          <div className="flex items-center gap-1 bg-page border border-wire rounded p-0.5 shrink-0">
+            <span className="text-[10px] text-ghost px-1.5 font-medium">Group by</span>
+            {(['entity', 'pan'] as GroupMode[]).map(m => (
+              <button
+                key={m}
+                onClick={() => setGroupMode(m)}
+                className={`px-2.5 py-1 rounded text-[10px] font-medium transition-colors ${
+                  groupMode === m
+                    ? 'bg-prime text-prime-fg'
+                    : 'text-dim hover:text-ink'
+                }`}
+              >
+                {m === 'entity' ? 'Entity' : 'PAN'}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Filter pills */}
+        <div className="flex flex-wrap gap-x-5 gap-y-2 items-center">
+          <FilterPills
+            label="Class"
+            options={assetClasses}
+            selected={filterClass}
+            onChange={setFilterClass}
+          />
+          <FilterPills
+            label="Type"
+            options={secTypes}
+            selected={filterType}
+            onChange={setFilterType}
+          />
+          {showEntityCol && (
+            <FilterPills
+              label="Entity"
+              options={entityNames}
+              selected={filterEntity}
+              onChange={setFilterEntity}
+            />
+          )}
+        </div>
       </div>
 
       {/* Table */}
       <div className="overflow-x-auto" role="region" aria-label="MF holdings table" tabIndex={0}>
-        <table className="w-full text-sm" style={{ minWidth: '1500px' }}>
-          <thead>
-            <HeaderRow1
-              showEntityCol={showEntityCol}
-              sortKey={sortKey}
-              sortDir={sortDir}
-              onSort={handleSort}
-            />
-            <HeaderRow2 sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
-          </thead>
+        <table className="w-full text-sm" style={{ minWidth: '1700px' }}>
+          <TableHead
+            showEntityCol={showEntityCol && groupMode === 'entity'}
+            showPanCol={showPanCol}
+            sortKey={sortKey}
+            sortDir={sortDir}
+            onSort={handleSort}
+          />
           <tbody>
-            {activeClasses.length === 0 ? (
+            {filtered.length === 0 ? (
               <tr>
                 <td colSpan={colCount} className="px-5 sm:px-6 py-8 text-center text-xs text-ghost">
-                  No holdings match your search.
+                  No holdings match your filters.
                 </td>
               </tr>
-            ) : activeClasses.map(cls => {
-              const group = grouped[cls];
-              if (!group?.length) return null;
-              const subtotal = group.reduce((s, h) => s + (h.market_value_as_on ?? h.current_value ?? 0), 0);
+            ) : groups.map(group => {
+              const showGroupHeader = showEntityCol || groupMode === 'pan';
+
+              // within each group, split by asset class
+              const byClass: Record<string, MFHoldingRow[]> = Object.fromEntries(
+                ASSET_CLASS_ORDER.map(cls => [
+                  cls,
+                  sortRows(group.rows.filter(h => h.asset_class === cls), sortKey, sortDir),
+                ])
+              );
+              const activeClasses = ASSET_CLASS_ORDER.filter(cls => (byClass[cls]?.length ?? 0) > 0);
 
               return (
-                <Fragment key={cls}>
-                  <tr>
-                    <td colSpan={colCount} className="px-5 sm:px-6 py-2 bg-page">
-                      <span className="text-xs font-semibold text-dim">
-                        {ASSET_CLASS_LABELS[cls] ?? cls}
-                      </span>
-                      <span className="ml-2 text-xs text-ghost">{fmtINR(subtotal)}</span>
-                    </td>
-                  </tr>
-                  {group.map(h => {
-                    const mktVal = h.market_value_as_on ?? h.current_value;
-                    return (
-                      <tr key={h.id} className="border-t border-rule hover:bg-page transition-colors duration-100">
-                        <td className="px-3 pl-5 sm:pl-6 py-3 align-top">
-                          <p className="text-xs text-ink leading-snug">{h.security_name}</p>
-                          <p className="text-[10px] text-ghost mt-0.5">
-                            {SEC_TYPE_LABELS[h.security_type] ?? h.security_type}
-                          </p>
-                        </td>
-                        {showEntityCol && (
-                          <td className="px-3 py-3 text-xs font-medium text-dim whitespace-nowrap align-top">
-                            {h.entity_name ?? '—'}
-                          </td>
-                        )}
-                        <td className="px-3 py-3 font-mono text-xs text-dim whitespace-nowrap align-top">
-                          {h.folio_number}
-                        </td>
-                        <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">
-                          {h.quantity.toFixed(3)}
-                        </td>
-                        <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">
-                          {fmtINR(h.invested_amount)}
-                        </td>
-                        <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">
-                          {h.exposure_pct != null ? h.exposure_pct.toFixed(2) + '%' : '—'}
-                        </td>
-                        <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">
-                          {fmtINR(mktVal)}
-                        </td>
-                        <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">
-                          {fmtINR(h.prev_week_value)}
-                        </td>
-                        <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top">
-                          <ColorNum n={h.weekly_change} fmt={fmtINR} />
-                        </td>
-                        {/* P&L group */}
-                        <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top border-l border-rule">
-                          <ColorNum n={h.pnl_ytd} fmt={fmtINR} />
-                        </td>
-                        <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top">
-                          <ColorNum n={h.pnl_inception} fmt={fmtINR} />
-                        </td>
-                        <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top">
-                          <ColorNum n={h.pnl_weekly_change} fmt={fmtINR} />
-                        </td>
-                        {/* Returns group */}
-                        <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top border-l border-rule">
-                          <ColorNum n={h.returns_ytd_pct} fmt={fmtPct} />
-                        </td>
-                        <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top">
-                          <ColorNum n={h.returns_inception_pct} fmt={fmtPct} />
-                        </td>
-                        <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top">
-                          {h.cagr_inception_pct != null ? (
-                            <span style={{ color: h.cagr_inception_pct >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
-                              {fmtPct(h.cagr_inception_pct)} p.a.
-                            </span>
-                          ) : <span className="text-ghost">—</span>}
-                        </td>
-                        <td className="px-3 pr-5 sm:pr-6 py-3 text-xs text-ghost align-top max-w-[160px]">
-                          {h.remarks ?? '—'}
-                        </td>
-                      </tr>
-                    );
-                  })}
+                <Fragment key={group.key}>
+                  {showGroupHeader && (
+                    <GroupHeader label={group.label} rows={group.rows} colCount={colCount} />
+                  )}
+                  {activeClasses.map(cls => (
+                    <Fragment key={cls}>
+                      <AssetClassHeader cls={cls} rows={byClass[cls]} colCount={colCount} />
+                      {byClass[cls].map(h => (
+                        <DataRow
+                          key={h.id}
+                          h={h}
+                          srNo={++srCounter}
+                          showEntityCol={showEntityCol && groupMode === 'entity'}
+                          showPanCol={showPanCol}
+                        />
+                      ))}
+                    </Fragment>
+                  ))}
                 </Fragment>
               );
             })}

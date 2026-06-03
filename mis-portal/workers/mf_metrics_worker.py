@@ -31,7 +31,7 @@ from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
 from dotenv import load_dotenv
-load_dotenv("/var/www/mis-portal/.env")
+load_dotenv("/var/www/mis-portal/.env", override=True)
 
 logging.basicConfig(
     level=logging.INFO,

@@ -81,9 +81,20 @@ def refresh_access_token(entity_code: str) -> str:
 
     logger.info(f"[{entity_code}] Zerodha: starting headless login")
 
+    redirect_url = None
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page    = browser.new_page()
+
+        # Capture the redirect to http://127.0.0.1?request_token=... via request event.
+        # Chrome can't load the URL (no server there) but the request fires before the error.
+        def on_request(req):
+            nonlocal redirect_url
+            if "request_token" in req.url:
+                redirect_url = req.url
+
+        page.on("request", on_request)
 
         page.goto(login_url)
 
@@ -93,30 +104,19 @@ def refresh_access_token(entity_code: str) -> str:
         page.fill("input#password", password)
         page.click("button[type='submit']")
 
-        # Step 2 — TOTP screen
-        page.wait_for_selector("input#totp", timeout=10_000)
+        # Step 2 — TOTP screen (Zerodha reuses id=userid with type=number for the TOTP field)
+        page.wait_for_selector("input#userid[type='number']", timeout=10_000)
         totp_code = pyotp.TOTP(totp_secret).now()
-        page.fill("input#totp", totp_code)
-        page.click("button[type='submit']")
-
-        # Step 3 — wait for redirect to our redirect URL (http://127.0.0.1)
-        # The page won't load (no server running there), but the URL contains request_token
-        try:
-            page.wait_for_url(
-                lambda url: "request_token" in url,
-                timeout=15_000,
-            )
-        except PWTimeout:
-            screenshot = f"/tmp/zerodha_login_fail_{entity_code}.png"
-            page.screenshot(path=screenshot)
-            browser.close()
-            raise RuntimeError(
-                f"[{entity_code}] Zerodha login timed out waiting for redirect. "
-                f"Screenshot: {screenshot}"
-            )
-
-        redirect_url = page.url
+        page.fill("input#userid[type='number']", totp_code)
+        # Zerodha auto-submits on 6 digits — wait for the redirect request to fire
+        page.wait_for_timeout(10_000)
         browser.close()
+
+    if not redirect_url or "request_token" not in redirect_url:
+        raise RuntimeError(
+            f"[{entity_code}] Zerodha login failed: request_token not captured. "
+            f"Got: {redirect_url}"
+        )
 
     # Extract request_token from redirect URL query string
     params        = parse_qs(urlparse(redirect_url).query)

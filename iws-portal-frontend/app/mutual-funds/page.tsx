@@ -16,6 +16,7 @@ interface HoldingsResponse {
   holdings: MFHoldingRow[];
 }
 
+
 function EntitySwitcher({
   entities, selectedId, onSelect,
 }: {

@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-load_dotenv("/var/www/mis-portal/.env")
+load_dotenv("/var/www/mis-portal/.env", override=True)
 
 import psycopg2
 from psycopg2.extras import RealDictCursor

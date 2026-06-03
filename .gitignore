@@ -1,3 +1,6 @@
+# Graphify knowledge graph — local only
+graphify-out/
+
 # Python
 mis-portal/venv/
 mis-portal/__pycache__/
@@ -31,3 +34,5 @@ iws-portal-frontend/CLAUDE.md
 skills-lock.json
 .impeccable/
 .xlsx bas.xlsx
+mis-portal/.cams_browser_profile/
+mis-portal/.cams_browser_profile/

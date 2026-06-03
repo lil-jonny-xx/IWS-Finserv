@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from isin_resolver import resolve_all_missing
 
-load_dotenv('/var/www/mis-portal/.env')
+load_dotenv('/var/www/mis-portal/.env', override=True)
 
 logging.basicConfig(
     level=logging.INFO,

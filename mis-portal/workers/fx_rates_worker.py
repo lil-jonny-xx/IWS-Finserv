@@ -16,7 +16,7 @@ from psycopg2.extras import RealDictCursor
 from datetime import datetime, date, timezone
 from dotenv import load_dotenv
 
-load_dotenv('/var/www/mis-portal/.env')
+load_dotenv('/var/www/mis-portal/.env', override=True)
 
 logging.basicConfig(
     level=logging.INFO,

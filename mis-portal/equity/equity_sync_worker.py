@@ -30,18 +30,20 @@ import psycopg2.extras
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
-load_dotenv("/var/www/mis-portal/.env")
+load_dotenv("/var/www/mis-portal/.env", override=True)
 
 from equity.brokers import zerodha, angel_one, dhan
 from equity.models import EquityHolding
 
+_LOG_FILE = "/var/log/mis-portal-equity-sync.log"
+try:
+    _log_handler = logging.FileHandler(_LOG_FILE)
+except PermissionError:
+    _log_handler = logging.FileHandler("/tmp/mis-portal-equity-sync.log")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("/var/log/mis-portal-equity-sync.log"),
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=[_log_handler, logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
 

@@ -30,7 +30,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 
-load_dotenv('/var/www/mis-portal/.env')
+load_dotenv('/var/www/mis-portal/.env', override=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -193,13 +193,14 @@ def upsert_holding(cur, entity_id, security_id, folio_number,
                    units, cost_basis, avg_cost, first_date, nav):
     cur.execute("""
         UPDATE holding SET
-            quantity         = %s,
-            cost_basis       = %s,
-            avg_cost         = %s,
-            invested_amount  = %s,
-            last_updated_nav = %s,
-            source           = 'CAS',
-            last_updated     = %s
+            quantity             = %s,
+            cost_basis           = %s,
+            avg_cost             = %s,
+            invested_amount      = %s,
+            last_updated_nav     = %s,
+            source               = 'CAS',
+            last_updated         = %s,
+            first_invested_date  = COALESCE(first_invested_date, %s)
         WHERE entity_id    = %s
         AND   security_id  = %s
         AND   folio_number = %s
@@ -211,6 +212,7 @@ def upsert_holding(cur, entity_id, security_id, folio_number,
         float(cost_basis) if cost_basis else None,
         float(nav)        if nav        else None,
         now_utc(),
+        first_date,
         entity_id, security_id, folio_number.strip()
     ))
 
