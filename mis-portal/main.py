@@ -28,7 +28,8 @@ app = FastAPI(
     title="IWS MIS Portal API",
     version="1.0.0",
     docs_url=None,
-    redoc_url=None
+    redoc_url=None,
+    openapi_url=None,
 )
 
 # Redis connection
@@ -299,7 +300,7 @@ def _login_impl(request: Request, login_request: LoginRequest, response: Respons
             "user_id": user_row["id"],
             "email": email,
             "role": user_row["role"],
-            "exp": datetime.utcnow() + timedelta(hours=24)
+            "exp": datetime.utcnow() + timedelta(hours=2)
         }
         token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
         logger.info(f"Successful login: {email}")
@@ -310,7 +311,7 @@ def _login_impl(request: Request, login_request: LoginRequest, response: Respons
             httponly=True,
             secure=True,
             samesite="strict",
-            max_age=86400
+            max_age=7200
         )
 
         return {
@@ -374,6 +375,36 @@ def logout(request: Request, response: Response, authorization: Optional[str] = 
 def logout_legacy(request: Request, response: Response, authorization: Optional[str] = Header(None)):
     return logout(request, response, authorization)
 
+@app.post("/api/v1/auth/refresh")
+def refresh_token(request: Request, response: Response, authorization: Optional[str] = Header(None)):
+    """Issue a new 2-hour token if the current token is valid and not blacklisted."""
+    try:
+        payload = _require_auth(request, authorization)
+
+        new_payload = {
+            "user_id": payload["user_id"],
+            "email": payload["email"],
+            "role": payload["role"],
+            "exp": datetime.utcnow() + timedelta(hours=2),
+        }
+        new_token = jwt.encode(new_payload, SECRET_KEY, algorithm="HS256")
+
+        response.set_cookie(
+            key="access_token",
+            value=new_token,
+            httponly=True,
+            secure=True,
+            samesite="strict",
+            max_age=7200,
+        )
+        return {"message": "Token refreshed"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Token refresh error: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+
 @app.get("/api/v1/me")
 def get_current_user(request: Request, authorization: Optional[str] = Header(None)):
     """Get current user from JWT cookie or header."""
@@ -425,15 +456,12 @@ def get_current_user_legacy(request: Request, authorization: Optional[str] = Hea
 
 @app.get("/api/v1/entities")
 def get_entities(request: Request, authorization: Optional[str] = Header(None)):
-    """Get all entities - requires auth."""
+    """Get all entities - admin only."""
     conn = None
     try:
-        token = get_token_from_request(request, authorization)
-
-        if is_token_blacklisted(token):
-            raise HTTPException(status_code=401, detail="Token has been revoked")
-
-        jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        payload = _require_auth(request, authorization)
+        if payload.get("role") != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
 
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -455,10 +483,6 @@ def get_entities(request: Request, authorization: Optional[str] = Header(None)):
             for entity in entities
         ]
 
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token has expired.")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
     except HTTPException:
         raise
     except Exception as e:
@@ -533,6 +557,18 @@ def get_holdings(
                     h.last_updated_nav     AS nav,
                     h.current_value,
                     h.last_updated,
+                    h.prev_week_value,
+                    h.market_value_as_on,
+                    h.as_of_date,
+                    h.exposure_pct,
+                    h.weekly_change,
+                    h.pnl_ytd,
+                    h.pnl_inception,
+                    h.pnl_weekly_change,
+                    h.returns_ytd_pct,
+                    h.returns_inception_pct,
+                    h.cagr_inception_pct,
+                    h.remarks,
                     sm.isin,
                     sm.security_name,
                     sm.security_type,
@@ -574,6 +610,18 @@ def get_holdings(
                     "first_invested_date":  str(r["first_invested_date"]) if r["first_invested_date"] else None,
                     "last_updated":         r["last_updated"].isoformat() if r["last_updated"] else None,
                     "entity_name":          r["entity_name"],
+                    "prev_week_value":      float(r["prev_week_value"])    if r["prev_week_value"]    else None,
+                    "market_value_as_on":   float(r["market_value_as_on"]) if r["market_value_as_on"] else None,
+                    "as_of_date":           str(r["as_of_date"])           if r["as_of_date"]         else None,
+                    "exposure_pct":         float(r["exposure_pct"])       if r["exposure_pct"]       else None,
+                    "weekly_change":        float(r["weekly_change"])      if r["weekly_change"]      else None,
+                    "pnl_ytd":              float(r["pnl_ytd"])            if r["pnl_ytd"]            else None,
+                    "pnl_inception":        float(r["pnl_inception"])      if r["pnl_inception"]      else None,
+                    "pnl_weekly_change":    float(r["pnl_weekly_change"])  if r["pnl_weekly_change"]  else None,
+                    "returns_ytd_pct":      float(r["returns_ytd_pct"])    if r["returns_ytd_pct"]    else None,
+                    "returns_inception_pct":float(r["returns_inception_pct"]) if r["returns_inception_pct"] else None,
+                    "cagr_inception_pct":   float(r["cagr_inception_pct"]) if r["cagr_inception_pct"] else None,
+                    "remarks":              r["remarks"],
                 })
 
             return {
@@ -604,6 +652,18 @@ def get_holdings(
                 h.last_updated_nav     AS nav,
                 h.current_value,
                 h.last_updated,
+                h.prev_week_value,
+                h.market_value_as_on,
+                h.as_of_date,
+                h.exposure_pct,
+                h.weekly_change,
+                h.pnl_ytd,
+                h.pnl_inception,
+                h.pnl_weekly_change,
+                h.returns_ytd_pct,
+                h.returns_inception_pct,
+                h.cagr_inception_pct,
+                h.remarks,
                 sm.isin,
                 sm.security_name,
                 sm.security_type,
@@ -643,6 +703,18 @@ def get_holdings(
                 "current_value":        cur_val,
                 "first_invested_date":  str(r["first_invested_date"]) if r["first_invested_date"] else None,
                 "last_updated":         r["last_updated"].isoformat() if r["last_updated"] else None,
+                "prev_week_value":      float(r["prev_week_value"])    if r["prev_week_value"]    else None,
+                "market_value_as_on":   float(r["market_value_as_on"]) if r["market_value_as_on"] else None,
+                "as_of_date":           str(r["as_of_date"])           if r["as_of_date"]         else None,
+                "exposure_pct":         float(r["exposure_pct"])       if r["exposure_pct"]       else None,
+                "weekly_change":        float(r["weekly_change"])      if r["weekly_change"]      else None,
+                "pnl_ytd":              float(r["pnl_ytd"])            if r["pnl_ytd"]            else None,
+                "pnl_inception":        float(r["pnl_inception"])      if r["pnl_inception"]      else None,
+                "pnl_weekly_change":    float(r["pnl_weekly_change"])  if r["pnl_weekly_change"]  else None,
+                "returns_ytd_pct":      float(r["returns_ytd_pct"])    if r["returns_ytd_pct"]    else None,
+                "returns_inception_pct":float(r["returns_inception_pct"]) if r["returns_inception_pct"] else None,
+                "cagr_inception_pct":   float(r["cagr_inception_pct"]) if r["cagr_inception_pct"] else None,
+                "remarks":              r["remarks"],
             })
 
         return {
@@ -669,6 +741,321 @@ def get_holdings_legacy(
     authorization: Optional[str] = Header(None),
 ):
     return get_holdings(request, entity_id, authorization)
+
+
+def _resolve_entity(cursor, payload: dict, entity_id_param: Optional[int]) -> Optional[int]:
+    """
+    Returns the entity_id to query.
+    - Admin + entity_id_param  → use the param
+    - Admin + no param         → None (all entities)
+    - Member                   → their own entity_id from users table
+    """
+    role = payload.get("role", "member")
+    if entity_id_param is not None and role == "admin":
+        return entity_id_param
+    cursor.execute(
+        "SELECT entity_id FROM users WHERE email = %s AND is_active = TRUE",
+        (payload["email"],),
+    )
+    row = cursor.fetchone()
+    if row and row["entity_id"]:
+        return row["entity_id"]
+    if role == "admin":
+        return None  # all-entities view
+    raise HTTPException(status_code=404, detail="No entity linked to this user")
+
+
+# ---------------------------------------------------------------------------
+# Equity holdings
+# ---------------------------------------------------------------------------
+
+def _fmt(v) -> Optional[float]:
+    return float(v) if v is not None else None
+
+
+_EQUITY_HOLDING_COLS = """
+    eh.id,
+    eh.entity_id,
+    e.entity_name,
+    eh.broker,
+    eh.symbol,
+    eh.isin,
+    eh.exchange,
+    eh.quantity,
+    eh.avg_cost,
+    eh.cost,
+    eh.current_price,
+    eh.current_market_value,
+    eh.market_value_as_on,
+    eh.as_of_date,
+    eh.prev_week_value,
+    eh.exposure_pct,
+    eh.weekly_change,
+    eh.pnl_ytd,
+    eh.pnl_inception,
+    eh.pnl_weekly_change,
+    eh.returns_ytd_pct,
+    eh.returns_inception_pct,
+    eh.cagr_inception_pct,
+    eh.first_invested_date,
+    eh.remarks,
+    eh.updated_at
+"""
+
+
+def _row_to_holding(r: dict) -> dict:
+    return {
+        "id":                    r["id"],
+        "entity_id":             r["entity_id"],
+        "entity_name":           r.get("entity_name"),
+        "broker":                r["broker"],
+        "symbol":                r["symbol"],
+        "isin":                  r["isin"],
+        "exchange":              r["exchange"],
+        "quantity":              _fmt(r["quantity"]),
+        "avg_cost":              _fmt(r["avg_cost"]),
+        "cost":                  _fmt(r["cost"]),
+        "current_price":         _fmt(r["current_price"]),
+        "current_market_value":  _fmt(r["current_market_value"]),
+        "market_value_as_on":    _fmt(r["market_value_as_on"]),
+        "as_of_date":            str(r["as_of_date"]) if r["as_of_date"] else None,
+        "prev_week_value":       _fmt(r["prev_week_value"]),
+        "exposure_pct":          _fmt(r["exposure_pct"]),
+        "weekly_change":         _fmt(r["weekly_change"]),
+        "pnl_ytd":               _fmt(r["pnl_ytd"]),
+        "pnl_inception":         _fmt(r["pnl_inception"]),
+        "pnl_weekly_change":     _fmt(r["pnl_weekly_change"]),
+        "returns_ytd_pct":       _fmt(r["returns_ytd_pct"]),
+        "returns_inception_pct": _fmt(r["returns_inception_pct"]),
+        "cagr_inception_pct":    _fmt(r["cagr_inception_pct"]),
+        "first_invested_date":   str(r["first_invested_date"]) if r["first_invested_date"] else None,
+        "remarks":               r["remarks"],
+        "updated_at":            r["updated_at"].isoformat() if r["updated_at"] else None,
+    }
+
+
+def _equity_totals(rows: list[dict]) -> dict:
+    def s(key):
+        return round(sum(r[key] or 0 for r in rows), 2)
+    return {
+        "total_cost":             s("cost"),
+        "total_current_value":    s("current_market_value"),
+        "total_prev_week_value":  s("prev_week_value"),
+        "total_weekly_change":    s("weekly_change"),
+        "total_pnl_inception":    s("pnl_inception"),
+        "total_pnl_ytd":          s("pnl_ytd"),
+        "total_pnl_weekly_change":s("pnl_weekly_change"),
+    }
+
+
+@app.get("/api/v1/equity/holdings")
+def get_equity_holdings(
+    request: Request,
+    entity_id: Optional[int] = None,
+    broker: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Equity holdings with all portfolio metrics.
+    Admin: optional ?entity_id=N to filter by entity, ?broker=zerodha|angel_one|dhan
+    Member: always returns their own entity only.
+    """
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        eid  = _resolve_entity(cur, payload, entity_id)
+
+        # Build WHERE clause
+        conditions = []
+        params     = []
+        if eid is not None:
+            conditions.append("eh.entity_id = %s")
+            params.append(eid)
+        if broker:
+            conditions.append("eh.broker = %s")
+            params.append(broker)
+
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        cur.execute(
+            f"""
+            SELECT {_EQUITY_HOLDING_COLS}
+            FROM   equity_holding eh
+            JOIN   entity e ON e.id = eh.entity_id
+            {where}
+            ORDER BY e.entity_name, eh.broker, eh.symbol
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+        cur.close()
+
+        holdings = [_row_to_holding(r) for r in rows]
+        totals   = _equity_totals(rows)
+
+        entity_name = "All Entities" if eid is None else (
+            rows[0]["entity_name"] if rows else ""
+        )
+
+        return {
+            "entity_id":   eid or 0,
+            "entity_name": entity_name,
+            "broker":      broker,
+            "count":       len(holdings),
+            **totals,
+            "holdings":    holdings,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/v1/equity/holdings: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.get("/api/equity/holdings")
+def get_equity_holdings_legacy(
+    request: Request,
+    entity_id: Optional[int] = None,
+    broker: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
+):
+    return get_equity_holdings(request, entity_id, broker, authorization)
+
+
+# ---------------------------------------------------------------------------
+# Equity summary — aggregate totals per entity, broken down by broker
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/equity/summary")
+def get_equity_summary(
+    request: Request,
+    entity_id: Optional[int] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Aggregated equity portfolio totals.
+    Returns one row per (entity, broker) with summed cost, value, P&L, returns.
+    Admin: all entities unless ?entity_id=N is passed.
+    Member: their entity only.
+    """
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        eid  = _resolve_entity(cur, payload, entity_id)
+
+        where  = "WHERE eh.entity_id = %s" if eid is not None else ""
+        params = [eid] if eid is not None else []
+
+        cur.execute(
+            f"""
+            SELECT
+                e.id                                          AS entity_id,
+                e.entity_name,
+                eh.broker,
+                COUNT(*)                                      AS holding_count,
+                SUM(eh.cost)                                  AS total_cost,
+                SUM(eh.current_market_value)                  AS total_current_value,
+                SUM(eh.prev_week_value)                       AS total_prev_week_value,
+                SUM(eh.weekly_change)                         AS total_weekly_change,
+                SUM(eh.pnl_inception)                         AS total_pnl_inception,
+                SUM(eh.pnl_ytd)                               AS total_pnl_ytd,
+                SUM(eh.pnl_weekly_change)                     AS total_pnl_weekly_change,
+                CASE
+                    WHEN SUM(eh.cost) > 0
+                    THEN ROUND(SUM(eh.pnl_inception) / SUM(eh.cost) * 100, 4)
+                END                                           AS returns_inception_pct,
+                CASE
+                    WHEN SUM(eh.prev_week_value) > 0
+                    THEN ROUND(SUM(eh.pnl_ytd) / SUM(eh.prev_week_value) * 100, 4)
+                END                                           AS returns_ytd_pct,
+                MAX(eh.as_of_date)                            AS as_of_date,
+                MAX(eh.updated_at)                            AS last_updated
+            FROM equity_holding eh
+            JOIN entity e ON e.id = eh.entity_id
+            {where}
+            GROUP BY e.id, e.entity_name, eh.broker
+            ORDER BY e.entity_name, eh.broker
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+
+        # Also compute grand total across all brokers for the entity/entities
+        cur.execute(
+            f"""
+            SELECT
+                SUM(eh.cost)                 AS total_cost,
+                SUM(eh.current_market_value) AS total_current_value,
+                SUM(eh.prev_week_value)      AS total_prev_week_value,
+                SUM(eh.weekly_change)        AS total_weekly_change,
+                SUM(eh.pnl_inception)        AS total_pnl_inception,
+                SUM(eh.pnl_ytd)              AS total_pnl_ytd
+            FROM equity_holding eh
+            {where}
+            """,
+            params,
+        )
+        grand = cur.fetchone()
+        cur.close()
+
+        return {
+            "entity_id":   eid or 0,
+            "entity_name": "All Entities" if eid is None else (rows[0]["entity_name"] if rows else ""),
+            "grand_total": {
+                "total_cost":            _fmt(grand["total_cost"]),
+                "total_current_value":   _fmt(grand["total_current_value"]),
+                "total_prev_week_value": _fmt(grand["total_prev_week_value"]),
+                "total_weekly_change":   _fmt(grand["total_weekly_change"]),
+                "total_pnl_inception":   _fmt(grand["total_pnl_inception"]),
+                "total_pnl_ytd":         _fmt(grand["total_pnl_ytd"]),
+            },
+            "by_broker": [
+                {
+                    "entity_id":             r["entity_id"],
+                    "entity_name":           r["entity_name"],
+                    "broker":                r["broker"],
+                    "holding_count":         r["holding_count"],
+                    "total_cost":            _fmt(r["total_cost"]),
+                    "total_current_value":   _fmt(r["total_current_value"]),
+                    "total_prev_week_value": _fmt(r["total_prev_week_value"]),
+                    "total_weekly_change":   _fmt(r["total_weekly_change"]),
+                    "total_pnl_inception":   _fmt(r["total_pnl_inception"]),
+                    "total_pnl_ytd":         _fmt(r["total_pnl_ytd"]),
+                    "total_pnl_weekly_change":_fmt(r["total_pnl_weekly_change"]),
+                    "returns_inception_pct": _fmt(r["returns_inception_pct"]),
+                    "returns_ytd_pct":       _fmt(r["returns_ytd_pct"]),
+                    "as_of_date":            str(r["as_of_date"]) if r["as_of_date"] else None,
+                    "last_updated":          r["last_updated"].isoformat() if r["last_updated"] else None,
+                }
+                for r in rows
+            ],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/v1/equity/summary: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.get("/api/equity/summary")
+def get_equity_summary_legacy(
+    request: Request,
+    entity_id: Optional[int] = None,
+    authorization: Optional[str] = Header(None),
+):
+    return get_equity_summary(request, entity_id, authorization)
 
 
 @app.get("/api/v1/transactions")

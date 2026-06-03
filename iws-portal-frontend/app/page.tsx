@@ -38,7 +38,7 @@ export default function LoginPage() {
       });
       const data = await res.json();
       if (!res.ok) {
-        setError(data.detail || 'Login failed. Please try again.');
+        setError('Invalid credentials or account locked. Please try again.');
         return;
       }
       router.push('/dashboard');

@@ -100,10 +100,7 @@ def main():
     cur.close()
     conn.close()
 
-    print("\n=== Credentials (temporary — change after first login) ===")
-    for u in USERS:
-        print(f"  {u['email']:<28} password: {u['password']}")
-    print()
+    print("\n=== Seeding complete. Passwords are defined in seed_users.py — change them after first login. ===")
 
 
 if __name__ == "__main__":
