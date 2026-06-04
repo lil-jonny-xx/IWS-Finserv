@@ -80,7 +80,7 @@ def refresh_access_token(entity_code: str) -> str:
             f"[{entity_code}] Angel One generateSession failed: {resp.get('message')}"
         )
 
-    access_token  = resp["data"]["jwtToken"]
+    access_token  = resp["data"]["jwtToken"].removeprefix("Bearer ")
     refresh_token = resp["data"].get("refreshToken", "")
 
     tokens.save(f"angel_one_{entity_code}", access_token)

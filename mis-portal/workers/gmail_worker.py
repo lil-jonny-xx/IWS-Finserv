@@ -22,7 +22,7 @@ SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 CREDENTIALS_FILE = Path(__file__).parent / "gmail_credentials.json"
 
 # CAMS sends CAS from this address
-CAMS_SENDER = "noreply@camsonline.com"
+CAMS_SENDER = "donotreply@camsonline.com"
 CAMS_SUBJECT_KEYWORD = "Consolidated Account Statement"
 
 _token_refresh_lock = threading.Lock()

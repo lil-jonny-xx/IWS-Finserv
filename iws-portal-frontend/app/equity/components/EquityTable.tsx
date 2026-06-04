@@ -9,6 +9,7 @@ export interface EquityHoldingRow {
   symbol: string;
   isin?: string;
   exchange?: string;
+  sector?: string;
   quantity: number;
   avg_cost: number;
   cost: number;
@@ -98,6 +99,25 @@ const BROKER_LABELS: Record<string, string> = {
   dhan:      'Dhan',
 };
 
+const BROKER_COLORS: Record<string, string> = {
+  zerodha:   '#3772ff',
+  angel_one: '#e05c00',
+  dhan:      '#059669',
+};
+
+// Sector display name, sort order, accent color
+const SECTOR_META: Record<string, { label: string; order: number; accent: string }> = {
+  'Equity':               { label: 'Equities',            order: 0, accent: 'var(--prime)' },
+  'ETF':                  { label: 'ETF',                  order: 1, accent: '#6366f1' },
+  'Gold ETF':             { label: 'Gold ETF',             order: 2, accent: '#d97706' },
+  'Silver ETF':           { label: 'Silver ETF',           order: 3, accent: '#64748b' },
+  'Sovereign Gold Bond':  { label: 'Sovereign Gold Bond',  order: 4, accent: '#b45309' },
+};
+
+function sectorMeta(sector: string | undefined | null) {
+  return SECTOR_META[sector ?? 'Equity'] ?? { label: sector ?? 'Other', order: 99, accent: 'var(--prime)' };
+}
+
 type SortKey = keyof EquityHoldingRow;
 type SortDir = 'asc' | 'desc';
 
@@ -169,9 +189,10 @@ function SortArrow({ col, sortKey, sortDir }: { col: SortKey; sortKey: SortKey; 
   );
 }
 
-// ── broker group header ───────────────────────────────────────────────────────
+// ── section header (by sector) ────────────────────────────────────────────────
 
-function BrokerHeader({ broker, rows, colCount }: { broker: string; rows: EquityHoldingRow[]; colCount: number }) {
+function SectionHeader({ sector, rows, colCount }: { sector: string; rows: EquityHoldingRow[]; colCount: number }) {
+  const meta    = sectorMeta(sector);
   const cost    = rows.reduce((s, h) => s + h.cost, 0);
   const value   = rows.reduce((s, h) => s + (h.current_market_value ?? 0), 0);
   const pnl     = rows.reduce((s, h) => s + (h.pnl_inception ?? 0), 0);
@@ -182,7 +203,7 @@ function BrokerHeader({ broker, rows, colCount }: { broker: string; rows: Equity
     <tr>
       <td colSpan={colCount} className="px-4 pl-5 sm:pl-6 py-2.5 bg-page border-t border-rule sticky left-0">
         <div className="flex flex-wrap items-baseline gap-x-5 gap-y-1">
-          <span className="text-xs font-semibold text-ink">{BROKER_LABELS[broker] ?? broker}</span>
+          <span className="text-xs font-semibold" style={{ color: meta.accent }}>{meta.label}</span>
           <span className="text-[11px] text-ghost">Cost {fmtINR(cost)}</span>
           <span className="text-[11px] text-ghost">Mkt Value {fmtINR(value)}</span>
           {hasPnl && (
@@ -195,7 +216,7 @@ function BrokerHeader({ broker, rows, colCount }: { broker: string; rows: Equity
               Avg CAGR {fmtPct(avgCagr)} p.a.
             </span>
           )}
-          <span className="text-[11px] text-ghost">{rows.length} stocks</span>
+          <span className="text-[11px] text-ghost">{rows.length} holding{rows.length !== 1 ? 's' : ''}</span>
         </div>
       </td>
     </tr>
@@ -241,9 +262,8 @@ function TableHead({
     <thead>
       <tr>
         <th scope="col" rowSpan={2} className={`${base} text-right pl-5 sm:pl-6 w-8`}>#</th>
-        <Th col="symbol"              label="Symbol"    right={false} rowSpan={2} className="sticky left-0 z-20 bg-card" />
+        <Th col="symbol"              label="Stock"     right={false} rowSpan={2} className="sticky left-0 z-20 bg-card" />
         {showEntityCol && <Th col="entity_name" label="Entity"  right={false} rowSpan={2} />}
-        <Th col="broker"              label="Broker"    right={false} rowSpan={2} />
         <Th col="exchange"            label="Exch"      right={false} rowSpan={2} />
         <Th col="quantity"            label="Qty"                     rowSpan={2} />
         <Th col="avg_cost"            label="Avg Cost"                rowSpan={2} />
@@ -269,13 +289,28 @@ function TableHead({
   );
 }
 
+// ── broker badge ──────────────────────────────────────────────────────────────
+
+function BrokerBadge({ broker }: { broker: string }) {
+  const color = BROKER_COLORS[broker] ?? '#888';
+  return (
+    <span
+      className="inline-block mt-0.5 px-1.5 py-px rounded text-[9px] font-semibold tracking-wide"
+      style={{ background: color + '22', color }}
+    >
+      {BROKER_LABELS[broker] ?? broker}
+    </span>
+  );
+}
+
 // ── main component ────────────────────────────────────────────────────────────
 
 export default function EquityTable({ holdings, totals, showEntityCol }: Props) {
-  const [sortKey, setSortKey]       = useState<SortKey>('current_market_value');
-  const [sortDir, setSortDir]       = useState<SortDir>('desc');
-  const [search, setSearch]         = useState('');
+  const [sortKey, setSortKey]         = useState<SortKey>('current_market_value');
+  const [sortDir, setSortDir]         = useState<SortDir>('desc');
+  const [search, setSearch]           = useState('');
   const [filterBroker, setFilterBroker]   = useState<string | null>(null);
+  const [filterSector, setFilterSector]   = useState<string | null>(null);
   const [filterEntity, setFilterEntity]   = useState<string | null>(null);
 
   if (holdings.length === 0) {
@@ -292,37 +327,42 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
     else { setSortKey(key); setSortDir('desc'); }
   }
 
-  const brokers      = [...new Set(holdings.map(h => h.broker))].sort();
-  const entityNames  = [...new Set(holdings.map(h => h.entity_name).filter(Boolean) as string[])].sort();
+  const brokers     = [...new Set(holdings.map(h => h.broker))].sort();
+  const sectors     = [...new Set(holdings.map(h => h.sector ?? 'Equity'))]
+    .sort((a, b) => (sectorMeta(a).order - sectorMeta(b).order));
+  const entityNames = [...new Set(holdings.map(h => h.entity_name).filter(Boolean) as string[])].sort();
 
   const filtered = useMemo(() => {
     const q = search.toLowerCase();
     return holdings.filter(h => {
-      if (filterBroker && h.broker          !== filterBroker) return false;
-      if (filterEntity && h.entity_name     !== filterEntity) return false;
+      if (filterBroker && h.broker                      !== filterBroker) return false;
+      if (filterSector && (h.sector ?? 'Equity')        !== filterSector) return false;
+      if (filterEntity && h.entity_name                 !== filterEntity) return false;
       if (q && !h.symbol.toLowerCase().includes(q) &&
                !(h.entity_name ?? '').toLowerCase().includes(q) &&
                !(h.isin ?? '').toLowerCase().includes(q) &&
                !BROKER_LABELS[h.broker]?.toLowerCase().includes(q)) return false;
       return true;
     });
-  }, [holdings, search, filterBroker, filterEntity]);
+  }, [holdings, search, filterBroker, filterSector, filterEntity]);
 
   const rows = sortRows(filtered, sortKey, sortDir);
 
-  const activeBrokers = [...new Set(rows.map(h => h.broker))];
-  const byBroker: Record<string, EquityHoldingRow[]> = {};
-  for (const b of activeBrokers) byBroker[b] = rows.filter(h => h.broker === b);
+  // Group by sector, in defined order
+  const activeSectors = [...new Set(rows.map(h => h.sector ?? 'Equity'))]
+    .sort((a, b) => sectorMeta(a).order - sectorMeta(b).order);
+  const bySector: Record<string, EquityHoldingRow[]> = {};
+  for (const s of activeSectors) bySector[s] = rows.filter(h => (h.sector ?? 'Equity') === s);
 
-  const asOfDate        = holdings.find(h => h.as_of_date)?.as_of_date;
-  const avgCagrAll      = weightedAvgCagr(holdings);
-  const totalPnlInc     = holdings.reduce((s, h) => s + (h.pnl_inception ?? 0), 0);
-  const totalPnlYtd     = holdings.reduce((s, h) => s + (h.pnl_ytd ?? 0), 0);
-  const totalWeekly     = holdings.reduce((s, h) => s + (h.weekly_change ?? 0), 0);
-  const hasPnl          = holdings.some(h => h.pnl_inception != null);
+  const asOfDate    = holdings.find(h => h.as_of_date)?.as_of_date;
+  const avgCagrAll  = weightedAvgCagr(holdings);
+  const totalPnlInc = holdings.reduce((s, h) => s + (h.pnl_inception ?? 0), 0);
+  const totalPnlYtd = holdings.reduce((s, h) => s + (h.pnl_ytd ?? 0), 0);
+  const totalWeekly = holdings.reduce((s, h) => s + (h.weekly_change ?? 0), 0);
+  const hasPnl      = holdings.some(h => h.pnl_inception != null);
 
-  // col count for colSpan calculations
-  const colCount = 2 + (showEntityCol ? 1 : 0) + 15;
+  // col count: # + symbol + [entity] + exch + qty + avg_cost + cost + since + mkt_val + prev_wk + wkly_chg + exp% + pnl×3 + ret×3 + remarks
+  const colCount = 2 + (showEntityCol ? 1 : 0) + 14;
 
   return (
     <div className="bg-card rounded-lg border border-rule overflow-hidden">
@@ -396,13 +436,20 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
           placeholder="Search symbol, ISIN, broker…"
           className="w-full max-w-xs text-xs bg-page border border-wire rounded px-3 py-1.5 text-ink placeholder:text-ghost focus:outline-none focus:border-prime transition-colors"
         />
+        <FilterPills
+          label="Sector"
+          options={sectors}
+          labelMap={Object.fromEntries(Object.entries(SECTOR_META).map(([k, v]) => [k, v.label]))}
+          selected={filterSector}
+          onChange={setFilterSector}
+        />
         <FilterPills label="Broker" options={brokers} labelMap={BROKER_LABELS} selected={filterBroker} onChange={setFilterBroker} />
         {showEntityCol && <FilterPills label="Entity" options={entityNames} selected={filterEntity} onChange={setFilterEntity} />}
       </div>
 
       {/* Table */}
       <div className="overflow-x-auto" role="region" aria-label="Equity holdings table" tabIndex={0}>
-        <table className="w-full text-sm" style={{ minWidth: '1500px' }}>
+        <table className="w-full text-sm" style={{ minWidth: '1400px' }}>
           <TableHead showEntityCol={showEntityCol} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
           <tbody>
             {rows.length === 0 ? (
@@ -412,23 +459,23 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
                 </td>
               </tr>
             ) : (
-              activeBrokers.map(broker => {
-                const group = byBroker[broker];
+              activeSectors.map(sector => {
+                const group = bySector[sector];
                 if (!group?.length) return null;
                 return (
-                  <Fragment key={broker}>
-                    <BrokerHeader broker={broker} rows={group} colCount={colCount} />
+                  <Fragment key={sector}>
+                    <SectionHeader sector={sector} rows={group} colCount={colCount} />
                     {group.map((h, i) => (
                       <tr key={h.id} className="border-t border-rule hover:bg-page transition-colors duration-100">
                         <td className="px-3 pl-5 sm:pl-6 py-3 text-right tabular-nums text-xs text-ghost align-top">{i + 1}</td>
-                        <td className="px-3 py-3 align-top sticky left-0 bg-card hover:bg-page whitespace-nowrap">
-                          <p className="text-xs font-medium text-ink">{h.symbol}</p>
+                        <td className="px-3 py-3 align-top sticky left-0 bg-card hover:bg-page">
+                          <p className="text-xs font-medium text-ink whitespace-nowrap">{h.symbol}</p>
+                          <BrokerBadge broker={h.broker} />
                           {h.isin && <p className="text-[10px] text-ghost font-mono mt-0.5">{h.isin}</p>}
                         </td>
                         {showEntityCol && (
                           <td className="px-3 py-3 text-xs font-medium text-dim whitespace-nowrap align-top">{h.entity_name ?? '—'}</td>
                         )}
-                        <td className="px-3 py-3 text-xs text-dim whitespace-nowrap align-top">{BROKER_LABELS[h.broker] ?? h.broker}</td>
                         <td className="px-3 py-3 text-xs text-ghost whitespace-nowrap align-top">{h.exchange ?? '—'}</td>
                         <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{h.quantity.toFixed(0)}</td>
                         <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">{fmtINR(h.avg_cost)}</td>
@@ -464,7 +511,7 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
             {/* Overall totals footer */}
             {rows.length > 0 && (
               <tr className="border-t-2 border-rule bg-page">
-                <td colSpan={7 + (showEntityCol ? 1 : 0)} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim">
+                <td colSpan={6 + (showEntityCol ? 1 : 0)} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim">
                   Total ({rows.length} holdings)
                 </td>
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">

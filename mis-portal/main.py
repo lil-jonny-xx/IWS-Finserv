@@ -154,11 +154,23 @@ def is_token_blacklisted(token: str) -> bool:
         logger.error(f"Redis blacklist check failed: {e}")
         return True
 
-def blacklist_token(token: str, expiry_seconds: int = 86400) -> bool:
+def blacklist_token(token: str, expiry_seconds: Optional[int] = None) -> bool:
     if redis_client is None:
         logger.error("Redis unavailable - cannot revoke token")
         return False
     try:
+        if expiry_seconds is None:
+            try:
+                payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"],
+                                     options={"verify_exp": False})
+                exp = payload.get("exp")
+                if exp:
+                    ttl = int(exp - datetime.utcnow().timestamp())
+                    expiry_seconds = max(ttl, 1)
+                else:
+                    expiry_seconds = 900
+            except Exception:
+                expiry_seconds = 900
         redis_client.setex(_token_key(token), expiry_seconds, "1")
         return True
     except Exception as e:
@@ -300,7 +312,7 @@ def _login_impl(request: Request, login_request: LoginRequest, response: Respons
             "user_id": user_row["id"],
             "email": email,
             "role": user_row["role"],
-            "exp": datetime.utcnow() + timedelta(hours=2)
+            "exp": datetime.utcnow() + timedelta(minutes=15)
         }
         token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
         logger.info(f"Successful login: {email}")
@@ -311,7 +323,7 @@ def _login_impl(request: Request, login_request: LoginRequest, response: Respons
             httponly=True,
             secure=True,
             samesite="strict",
-            max_age=7200
+            max_age=900
         )
 
         return {
@@ -348,9 +360,10 @@ def logout(request: Request, response: Response, authorization: Optional[str] = 
     conn = None
     try:
         token = get_token_from_request(request, authorization)
-        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        if not blacklist_token(token):
-            raise HTTPException(status_code=503, detail="Logout failed - please try again")
+        # Decode without exp verification so logout works even on expired tokens
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"],
+                             options={"verify_exp": False})
+        blacklist_token(token)
         response.delete_cookie(key="access_token", httponly=True, secure=True, samesite="strict")
 
         conn = get_db_connection()
@@ -360,7 +373,9 @@ def logout(request: Request, response: Response, authorization: Optional[str] = 
         return {"message": "Logged out successfully"}
 
     except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        # Token is malformed — still clear the cookie so the browser isn't stuck
+        response.delete_cookie(key="access_token", httponly=True, secure=True, samesite="strict")
+        return {"message": "Logged out successfully"}
     except (KeyError, IndexError):
         raise HTTPException(status_code=401, detail="Invalid token format")
     except HTTPException:
@@ -385,7 +400,7 @@ def refresh_token(request: Request, response: Response, authorization: Optional[
             "user_id": payload["user_id"],
             "email": payload["email"],
             "role": payload["role"],
-            "exp": datetime.utcnow() + timedelta(hours=2),
+            "exp": datetime.utcnow() + timedelta(minutes=15),
         }
         new_token = jwt.encode(new_payload, SECRET_KEY, algorithm="HS256")
 
@@ -395,7 +410,7 @@ def refresh_token(request: Request, response: Response, authorization: Optional[
             httponly=True,
             secure=True,
             samesite="strict",
-            max_age=7200,
+            max_age=900,
         )
         return {"message": "Token refreshed"}
 
@@ -507,6 +522,81 @@ def _require_auth(request: Request, authorization: Optional[str]) -> dict:
         raise HTTPException(status_code=401, detail="Token has expired. Please log in again.")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def _compute_realized_gains(conn, entity_id: Optional[int] = None) -> dict:
+    """
+    Returns realized capital gains per (entity_id, security_id, folio_number)
+    using the average cost method.
+    Inflows (PURCHASE, PURCHASE_SIP, SWITCH_IN, units>0 & amount>0) add to
+    running units + cost. STAMP_DUTY_TAX adds to cost only. REDEMPTION and
+    SWITCH_OUT crystallise gain = proceeds - redeemed_units * avg_cost.
+    """
+    cur = conn.cursor()
+    if entity_id is not None:
+        cur.execute(
+            """
+            SELECT entity_id, security_id, folio_number,
+                   transaction_date, transaction_type, amount, units
+            FROM   mf_transaction
+            WHERE  entity_id = %s
+            ORDER  BY entity_id, security_id, folio_number, transaction_date, id
+            """,
+            (entity_id,),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT entity_id, security_id, folio_number,
+                   transaction_date, transaction_type, amount, units
+            FROM   mf_transaction
+            ORDER  BY entity_id, security_id, folio_number, transaction_date, id
+            """
+        )
+    rows = cur.fetchall()
+    cur.close()
+
+    gains: dict = {}
+    # running state per key
+    state: dict = {}
+
+    INFLOW_TYPES  = {"PURCHASE", "PURCHASE_SIP", "SWITCH_IN"}
+    OUTFLOW_TYPES = {"REDEMPTION", "SWITCH_OUT"}
+
+    for r in rows:
+        key    = (r["entity_id"], r["security_id"], r["folio_number"])
+        txtype = r["transaction_type"] or ""
+        amt    = float(r["amount"] or 0)
+        units  = float(r["units"] or 0)
+
+        if key not in state:
+            state[key] = {"units": 0.0, "cost": 0.0}
+            gains[key] = 0.0
+
+        s = state[key]
+
+        if txtype == "STAMP_DUTY_TAX":
+            s["cost"] += abs(amt)
+
+        elif txtype in INFLOW_TYPES or (units > 0 and amt > 0):
+            s["units"] += abs(units)
+            s["cost"]  += abs(amt)
+
+        elif txtype in OUTFLOW_TYPES:
+            redeemed = abs(units)
+            proceeds = abs(amt)
+            if s["units"] > 0:
+                avg_cost = s["cost"] / s["units"]
+                gains[key] += proceeds - redeemed * avg_cost
+                s["cost"]  -= redeemed * avg_cost
+                s["units"] -= redeemed
+                # clamp to avoid floating-point drift below zero
+                if s["units"] < 0:
+                    s["units"] = 0.0
+                if s["cost"] < 0:
+                    s["cost"] = 0.0
+
+    return gains
 
 
 @app.get("/api/v1/holdings")
@@ -816,6 +906,7 @@ _EQUITY_HOLDING_COLS = """
     eh.returns_inception_pct,
     eh.cagr_inception_pct,
     eh.first_invested_date,
+    eh.sector,
     eh.remarks,
     eh.updated_at
 """
@@ -847,6 +938,7 @@ def _row_to_holding(r: dict) -> dict:
         "returns_inception_pct": _fmt(r["returns_inception_pct"]),
         "cagr_inception_pct":    _fmt(r["cagr_inception_pct"]),
         "first_invested_date":   str(r["first_invested_date"]) if r["first_invested_date"] else None,
+        "sector":                r["sector"],
         "remarks":               r["remarks"],
         "updated_at":            r["updated_at"].isoformat() if r["updated_at"] else None,
     }
@@ -857,7 +949,7 @@ def _equity_totals(rows: list[dict]) -> dict:
         return round(sum(r[key] or 0 for r in rows), 2)
     return {
         "total_cost":             s("cost"),
-        "total_current_value":    s("current_market_value"),
+        "total_current_market_value": s("current_market_value"),
         "total_prev_week_value":  s("prev_week_value"),
         "total_weekly_change":    s("weekly_change"),
         "total_pnl_inception":    s("pnl_inception"),
@@ -919,12 +1011,12 @@ def get_equity_holdings(
         )
 
         return {
-            "entity_id":   eid or 0,
-            "entity_name": entity_name,
-            "broker":      broker,
-            "count":       len(holdings),
-            **totals,
-            "holdings":    holdings,
+            "entity_id":      eid or 0,
+            "entity_name":    entity_name,
+            "broker":         broker,
+            "total_holdings": len(holdings),
+            "totals":         totals,
+            "holdings":       holdings,
         }
 
     except HTTPException:
@@ -1102,8 +1194,8 @@ def get_overview(
             SELECT
                 h.entity_id,
                 e.entity_name,
-                h.asset_class,
-                h.security_type,
+                sm.asset_class,
+                sm.security_type,
                 COALESCE(h.invested_amount, 0)                         AS invested,
                 COALESCE(h.market_value_as_on, h.current_value, 0)    AS mkt_value,
                 COALESCE(h.pnl_inception, 0)                           AS pnl_inception,
@@ -1113,6 +1205,7 @@ def get_overview(
                 COALESCE(h.market_value_as_on, h.current_value, 0)    AS weight
             FROM holding h
             JOIN entity e ON e.id = h.entity_id
+            JOIN security_master sm ON sm.id = h.security_id
         """)
         mf_rows = cursor.fetchall()
 

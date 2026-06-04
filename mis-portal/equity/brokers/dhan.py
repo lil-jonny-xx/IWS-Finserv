@@ -15,6 +15,7 @@ import logging
 from decimal import Decimal
 
 from dhanhq import dhanhq
+from dhanhq.dhan_context import DhanContext
 
 from equity.models import EquityHolding
 
@@ -34,7 +35,7 @@ def _env(entity_code: str, key: str) -> str:
 def _dhan_client(entity_code: str) -> dhanhq:
     client_id    = _env(entity_code, "CLIENT_ID")
     access_token = _env(entity_code, "ACCESS_TOKEN")
-    return dhanhq(client_id, access_token)
+    return dhanhq(DhanContext(client_id, access_token))
 
 
 # ---------------------------------------------------------------------------

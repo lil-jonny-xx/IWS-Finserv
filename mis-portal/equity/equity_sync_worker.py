@@ -118,6 +118,24 @@ def fetch_history_value(
     return Decimal(str(row["market_value"])) if row else None
 
 
+def classify_sector(symbol: str, isin: str) -> str:
+    """Classify a holding into a display sector based on symbol and ISIN prefix."""
+    sym          = (symbol or '').upper()
+    isin_prefix  = (isin or '')[:3].upper()
+
+    if isin_prefix == 'IN0':
+        return 'Sovereign Gold Bond'
+
+    if isin_prefix == 'INF':
+        if 'GOLD' in sym:
+            return 'Gold ETF'
+        if 'SILVER' in sym:
+            return 'Silver ETF'
+        return 'ETF'
+
+    return 'Equity'
+
+
 def fetch_first_invested_date(conn, entity_id: int, broker: str, symbol: str) -> Optional[date]:
     """Preserve the existing first_invested_date so CAGR anchor doesn't drift."""
     cur = conn.cursor()
@@ -205,7 +223,7 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
     cur.execute(
         """
         INSERT INTO equity_holding (
-            entity_id, broker, symbol, isin, exchange,
+            entity_id, broker, symbol, isin, exchange, sector,
             quantity, avg_cost, cost, current_price, current_market_value,
             prev_week_value, market_value_as_on, as_of_date,
             exposure_pct, weekly_change,
@@ -213,7 +231,7 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
             returns_ytd_pct, returns_inception_pct, cagr_inception_pct,
             first_invested_date, remarks, updated_at
         ) VALUES (
-            %(entity_id)s, %(broker)s, %(symbol)s, %(isin)s, %(exchange)s,
+            %(entity_id)s, %(broker)s, %(symbol)s, %(isin)s, %(exchange)s, %(sector)s,
             %(quantity)s, %(avg_cost)s, %(cost)s, %(current_price)s, %(current_market_value)s,
             %(prev_week_value)s, %(market_value_as_on)s, %(as_of_date)s,
             %(exposure_pct)s, %(weekly_change)s,
@@ -224,6 +242,7 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
         ON CONFLICT (entity_id, broker, symbol) DO UPDATE SET
             isin                  = EXCLUDED.isin,
             exchange              = EXCLUDED.exchange,
+            sector                = EXCLUDED.sector,
             quantity              = EXCLUDED.quantity,
             avg_cost              = EXCLUDED.avg_cost,
             cost                  = EXCLUDED.cost,
@@ -249,6 +268,7 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
             "symbol":                h.symbol,
             "isin":                  h.isin,
             "exchange":              h.exchange,
+            "sector":                classify_sector(h.symbol, h.isin),
             "quantity":              float(h.quantity),
             "avg_cost":              float(h.avg_cost),
             "cost":                  float(h.cost),
