@@ -33,6 +33,8 @@ from datetime import date
 from pathlib import Path
 
 import fitz  # PyMuPDF — used for password matching only
+import psycopg2
+import psycopg2.extras
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -76,15 +78,21 @@ class EntityConfig:
 
 
 def _entity_configs() -> list[EntityConfig]:
-    codes = ["DHR", "ADR", "IWS", "HHR", "IWSFC", "SDR"]
-    return [
-        EntityConfig(
-            code=code,
-            email=os.environ[f"ENTITY_{code}_EMAIL"],
-            pan=os.environ[f"ENTITY_{code}_PAN"],
-        )
-        for code in codes
-    ]
+    conn = psycopg2.connect(
+        host=os.environ["DB_HOST"], dbname=os.environ["DB_NAME"],
+        user=os.environ["DB_USER"], password=os.environ["DB_PASSWORD"],
+    )
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT e.entity_name AS code, e.cas_email AS email, pg.pan_number AS pan
+        FROM   entity e
+        JOIN   pan_group pg ON pg.id = e.pan_group_id
+        WHERE  e.cas_email IS NOT NULL AND pg.pan_number IS NOT NULL
+        ORDER  BY e.id
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    return [EntityConfig(code=r["code"], email=r["email"], pan=r["pan"]) for r in rows]
 
 
 def _shuffled_no_consecutive_pan(configs: list[EntityConfig]) -> list[EntityConfig]:
@@ -279,7 +287,7 @@ def main():
     ordered = _shuffled_no_consecutive_pan(configs)
     order_str = " → ".join(f"{c.code}({c.pan[:4]}****)" for c in ordered)
     logger.info(f"Gmail collector active until {deadline_str}")
-    logger.info(f"Trigger order: {order_str}")
+    logger.info(f"Trigger order: {' → '.join(c.code for c in ordered)}")
 
     with tempfile.TemporaryDirectory(prefix="cas_auto_") as tmp_dir:
 
@@ -308,7 +316,7 @@ def main():
                 )
                 time.sleep(delay_s)
 
-            logger.info(f"━━━ [{cfg.code}] {cfg.email} ━━━")
+            logger.info(f"━━━ [{cfg.code}] ━━━")
             pdf_password = _random_pdf_password()
 
             ok = cams_trigger_worker.trigger_cas_request(cfg.pan, cfg.email, pdf_password)

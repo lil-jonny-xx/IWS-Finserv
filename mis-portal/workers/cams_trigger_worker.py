@@ -61,7 +61,7 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
     Returns True on detected success, False on failure.
     The pdf_password is the password used to protect the emailed PDF.
     """
-    logger.info(f"Triggering CAMS CAS for PAN: {pan_number[:4]}**** email: {email}")
+    logger.info("Triggering CAMS CAS request")
 
     BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -387,6 +387,7 @@ def _save_screenshot(page, filename: str):
         _os.chmod(_SCREENSHOT_DIR, 0o700)
         path = f"{_SCREENSHOT_DIR}/{filename}"
         page.screenshot(path=path)
-        logger.info(f"Screenshot: {path}")
+        _os.chmod(path, 0o600)
+        logger.info(f"Screenshot saved")
     except Exception:
         pass

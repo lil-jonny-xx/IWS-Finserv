@@ -475,11 +475,10 @@ def get_entities(request: Request, authorization: Optional[str] = Header(None)):
     conn = None
     try:
         payload = _require_auth(request, authorization)
-        if payload.get("role") != "admin":
-            raise HTTPException(status_code=403, detail="Admin access required")
-
         conn = get_db_connection()
         cursor = conn.cursor()
+        if _live_role(cursor, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
         cursor.execute(
             """SELECT e.id, e.entity_name, p.pan_name
                FROM entity e
@@ -522,6 +521,16 @@ def _require_auth(request: Request, authorization: Optional[str]) -> dict:
         raise HTTPException(status_code=401, detail="Token has expired. Please log in again.")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def _live_role(cursor, email: str) -> str:
+    """Re-query DB for current role — prevents stale JWT role persisting after revocation."""
+    cursor.execute(
+        "SELECT role FROM users WHERE email = %s AND is_active = TRUE",
+        (email,),
+    )
+    row = cursor.fetchone()
+    return row["role"] if row else "member"
 
 
 def _compute_realized_gains(conn, entity_id: Optional[int] = None) -> dict:
@@ -612,10 +621,10 @@ def get_holdings(
     conn = None
     try:
         payload = _require_auth(request, authorization)
-        user_role = payload.get("role", "member")
 
         conn = get_db_connection()
         cursor = conn.cursor()
+        user_role = _live_role(cursor, payload["email"])
 
         # Resolve the entity_id to query
         if entity_id is not None and user_role == "admin":
@@ -857,8 +866,9 @@ def _resolve_entity(cursor, payload: dict, entity_id_param: Optional[int]) -> Op
     - Admin + entity_id_param  → use the param
     - Admin + no param         → None (all entities)
     - Member                   → their own entity_id from users table
+    Uses live DB role to prevent stale JWT role from persisting after revocation.
     """
-    role = payload.get("role", "member")
+    role = _live_role(cursor, payload["email"])
     if entity_id_param is not None and role == "admin":
         return entity_id_param
     cursor.execute(
@@ -1189,6 +1199,8 @@ def get_overview(
         payload   = _require_auth(request, authorization)
         conn      = get_db_connection()
         cursor    = conn.cursor()
+        if _live_role(cursor, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required.")
 
         cursor.execute("""
             SELECT
@@ -1354,10 +1366,10 @@ def get_transactions(
     conn = None
     try:
         payload = _require_auth(request, authorization)
-        user_role = payload.get("role", "member")
 
         conn = get_db_connection()
         cursor = conn.cursor()
+        user_role = _live_role(cursor, payload["email"])
 
         if entity_id is not None and user_role == "admin":
             eid = entity_id

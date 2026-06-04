@@ -298,8 +298,7 @@ def run(pdf_path: str, password: str, entity_id_override: int | None = None):
         # Step 2: parse PDF via casparser
         logger.info("Parsing CAS PDF via casparser...")
         data = casparser.read_cas_pdf(pdf_path, password=password)
-        logger.info(f"Investor: {data.investor_info.name}")
-        logger.info(f"Email:    {data.investor_info.email}")
+        logger.info("CAS PDF parsed successfully")
         logger.info(f"Folios:   {len(data.folios)}")
 
         conn       = get_db()

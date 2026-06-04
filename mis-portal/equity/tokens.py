@@ -26,6 +26,8 @@ def get(key: str, default: str = "") -> str:
 def save(key: str, value: str) -> None:
     data = load()
     data[key] = value
-    _TOKENS_FILE.write_text(json.dumps(data, indent=2))
-    os.chmod(_TOKENS_FILE, 0o600)
+    tmp = _TOKENS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.chmod(tmp, 0o600)
+    tmp.rename(_TOKENS_FILE)
     logger.debug(f"Token saved: {key}")
