@@ -233,7 +233,7 @@ function TableHead({
   sortDir: SortDir;
   onSort: (k: SortKey) => void;
 }) {
-  const base = 'px-3 py-2.5 text-xs font-medium text-ghost bg-card border-b border-rule whitespace-nowrap';
+  const base = 'px-3 py-2.5 text-xs font-medium text-ghost bg-card border-b border-rule whitespace-nowrap sticky top-0 z-10';
 
   function Th({ col, label, right = true, rowSpan = 1, borderL = false, first = false, className = '' }: {
     col: SortKey; label: string; right?: boolean; rowSpan?: number; borderL?: boolean; first?: boolean; className?: string;
@@ -448,7 +448,7 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
       </div>
 
       {/* Table */}
-      <div className="overflow-x-auto" role="region" aria-label="Equity holdings table" tabIndex={0}>
+      <div className="overflow-auto max-h-[75vh]" role="region" aria-label="Equity holdings table" tabIndex={0}>
         <table className="w-full text-sm" style={{ minWidth: '1400px' }}>
           <TableHead showEntityCol={showEntityCol} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
           <tbody>

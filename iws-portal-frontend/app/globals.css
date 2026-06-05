@@ -39,6 +39,8 @@
   --chart-equity:      oklch(58%  0.160  40);
   --chart-fixed:       oklch(44%  0.115 258);
   --chart-alt:         oklch(50%  0.130 155);
+  --chart-hybrid:      oklch(52%  0.140 295);
+  --chart-arbitrage:   oklch(56%  0.130  65);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -71,6 +73,8 @@
     --chart-equity:      oklch(72%  0.160  40);
     --chart-fixed:       oklch(68%  0.120 258);
     --chart-alt:         oklch(65%  0.130 155);
+    --chart-hybrid:      oklch(68%  0.140 295);
+    --chart-arbitrage:   oklch(70%  0.130  65);
   }
 }
 
@@ -106,6 +110,8 @@
   --color-chart-equity:  var(--chart-equity);
   --color-chart-fixed:   var(--chart-fixed);
   --color-chart-alt:     var(--chart-alt);
+  --color-chart-hybrid:     var(--chart-hybrid);
+  --color-chart-arbitrage:  var(--chart-arbitrage);
 }
 
 body {

@@ -31,6 +31,7 @@ export interface MFHoldingRow {
   returns_ytd_pct?: number;
   returns_inception_pct?: number;
   cagr_inception_pct?: number;
+  xirr_inception_pct?: number;
   remarks?: string;
 }
 
@@ -94,9 +95,11 @@ function ColorNum({ n, fmt }: { n: number | null | undefined; fmt: (v: number) =
 
 // ── constants ─────────────────────────────────────────────────────────────────
 
-const ASSET_CLASS_ORDER = ['EQUITY', 'ALTERNATES', 'FIXED_INCOME'] as const;
+const ASSET_CLASS_ORDER = ['EQUITY', 'HYBRID', 'ARBITRAGE', 'ALTERNATES', 'FIXED_INCOME'] as const;
 const ASSET_CLASS_LABELS: Record<string, string> = {
   EQUITY:       'Equity',
+  HYBRID:       'Hybrid',
+  ARBITRAGE:    'Arbitrage',
   FIXED_INCOME: 'Fixed Income',
   ALTERNATES:   'Alternates',
 };
@@ -117,14 +120,14 @@ type SortKey = keyof MFHoldingRow;
 type SortDir = 'asc' | 'desc';
 type GroupMode = 'entity' | 'pan';
 
-// ── weighted avg CAGR ────────────────────────────────────────────────────────
+// ── weighted averages ─────────────────────────────────────────────────────────
 
-function weightedAvgCagr(rows: MFHoldingRow[]): number | null {
+function weightedAvg(rows: MFHoldingRow[], key: 'cagr_inception_pct' | 'xirr_inception_pct'): number | null {
   let sumWeight = 0, sumWeighted = 0;
   for (const h of rows) {
-    if (h.cagr_inception_pct == null) continue;
+    if (h[key] == null) continue;
     const w = h.market_value_as_on ?? h.current_value ?? 0;
-    sumWeighted += h.cagr_inception_pct * w;
+    sumWeighted += (h[key] as number) * w;
     sumWeight += w;
   }
   return sumWeight > 0 ? sumWeighted / sumWeight : null;
@@ -195,7 +198,7 @@ function GroupHeader({
   const mktVal      = rows.reduce((s, h) => s + (h.market_value_as_on ?? h.current_value ?? 0), 0);
   const pnl         = rows.reduce((s, h) => s + (h.pnl_inception ?? 0), 0);
   const realized    = rows.reduce((s, h) => s + (h.realized_gain ?? 0), 0);
-  const avgCagr     = weightedAvgCagr(rows);
+  const avgCagr     = weightedAvg(rows, 'cagr_inception_pct');
   const hasPnl      = rows.some(h => h.pnl_inception != null);
 
   return (
@@ -251,7 +254,7 @@ function TableHead({
   sortDir: SortDir;
   onSort: (k: SortKey) => void;
 }) {
-  const base = 'px-3 py-2.5 text-xs font-medium text-ghost bg-card border-b border-rule whitespace-nowrap';
+  const base = 'px-3 py-2.5 text-xs font-medium text-ghost bg-card border-b border-rule whitespace-nowrap sticky top-0 z-10';
 
   function Th({ col, label, right = true, rowSpan = 1, colSpan = 1, borderL = false, first = false, last = false }: {
     col: SortKey; label: string; right?: boolean; rowSpan?: number; colSpan?: number;
@@ -288,6 +291,7 @@ function TableHead({
         {showPanCol    && <Th col="pan_group_name" label="PAN"         right={false} rowSpan={2} />}
         <Th col="folio_number"      label="Folio"         right={false} rowSpan={2} />
         <Th col="quantity"          label="Units"                       rowSpan={2} />
+        <Th col="nav"               label="NAV"                         rowSpan={2} />
         <Th col="invested_amount"   label="Cost"                        rowSpan={2} />
         <Th col="first_invested_date" label="Since"                     rowSpan={2} />
         <Th col="exposure_pct"      label="Exp %"                       rowSpan={2} />
@@ -297,7 +301,7 @@ function TableHead({
         {/* P&L group */}
         <StaticTh label="P&L" colSpan={3} borderL />
         {/* Returns group */}
-        <StaticTh label="Returns" colSpan={3} borderL />
+        <StaticTh label="Returns" colSpan={4} borderL />
         {/* Realized */}
         <th scope="col" rowSpan={2} className={`${base} text-right border-l border-rule`}>Realized</th>
         <th scope="col" rowSpan={2} className={`${base} text-left pr-5 sm:pr-6`}>Remarks</th>
@@ -311,6 +315,7 @@ function TableHead({
         <Th col="returns_ytd_pct"     label="YTD %"    borderL />
         <Th col="returns_inception_pct" label="Inc %" />
         <Th col="cagr_inception_pct"  label="CAGR" />
+        <Th col="xirr_inception_pct"  label="XIRR" />
       </tr>
     </thead>
   );
@@ -339,6 +344,7 @@ function DataRow({
       )}
       <td className="px-3 py-3 font-mono text-xs text-dim whitespace-nowrap align-top">{h.folio_number}</td>
       <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{h.quantity.toFixed(3)}</td>
+      <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">{h.nav != null ? h.nav.toFixed(4) : '—'}</td>
       <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{fmtINR(h.invested_amount)}</td>
       <td className="px-3 py-3 text-right tabular-nums text-xs align-top whitespace-nowrap">
         <span className="text-ink">{fmtDate(h.first_invested_date)}</span>
@@ -362,6 +368,11 @@ function DataRow({
       <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top">
         {h.cagr_inception_pct != null
           ? <span style={{ color: h.cagr_inception_pct >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(h.cagr_inception_pct)} p.a.</span>
+          : <span className="text-ghost">—</span>}
+      </td>
+      <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top">
+        {h.xirr_inception_pct != null
+          ? <span style={{ color: h.xirr_inception_pct >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(h.xirr_inception_pct)} p.a.</span>
           : <span className="text-ghost">—</span>}
       </td>
       {/* Realized */}
@@ -420,7 +431,8 @@ export default function MFTable({ holdings, totals, showEntityCol }: Props) {
   }, [holdings, search, filterClass, filterType, filterEntity]);
 
   const asOfDate   = holdings.find(h => h.as_of_date)?.as_of_date;
-  const avgCagr    = weightedAvgCagr(holdings);
+  const avgCagr    = weightedAvg(holdings, 'cagr_inception_pct');
+  const avgXirr    = weightedAvg(holdings, 'xirr_inception_pct');
   const hasMath    = holdings.some(h => h.pnl_inception != null);
 
   const totalPnlInception  = holdings.reduce((s, h) => s + (h.pnl_inception  ?? 0), 0);
@@ -433,8 +445,8 @@ export default function MFTable({ holdings, totals, showEntityCol }: Props) {
   const colCount    = 3                          // sr + fund + folio
     + (showEntityCol && groupMode === 'entity' ? 1 : 0)
     + (showPanCol ? 1 : 0)
-    + 10                                         // units cost since exp mktval prevwk wklychg
-    + 6                                          // pnl×3 returns×3
+    + 11                                         // units nav cost since exp mktval prevwk wklychg
+    + 7                                          // pnl×3 returns×3 xirr
     + 2;                                         // realized remarks
 
   // group rows
@@ -518,6 +530,15 @@ export default function MFTable({ holdings, totals, showEntityCol }: Props) {
                   {totalWeeklyChg >= 0 ? '+' : ''}{fmtINR(totalWeeklyChg)}
                 </p>
               </div>
+              {avgXirr != null && (
+                <div>
+                  <p className="text-xs text-ghost mb-0.5">Avg XIRR</p>
+                  <p className="text-sm font-semibold tabular-nums"
+                    style={{ color: avgXirr >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
+                    {fmtPct(avgXirr)} p.a.
+                  </p>
+                </div>
+              )}
               {avgCagr != null && (
                 <div>
                   <p className="text-xs text-ghost mb-0.5">Avg CAGR</p>
@@ -602,8 +623,8 @@ export default function MFTable({ holdings, totals, showEntityCol }: Props) {
       </div>
 
       {/* Table */}
-      <div className="overflow-x-auto" role="region" aria-label="MF holdings table" tabIndex={0}>
-        <table className="w-full text-sm" style={{ minWidth: '1700px' }}>
+      <div className="overflow-auto max-h-[75vh]" role="region" aria-label="MF holdings table" tabIndex={0}>
+        <table className="w-full text-sm" style={{ minWidth: '1800px' }}>
           <TableHead
             showEntityCol={showEntityCol && groupMode === 'entity'}
             showPanCol={showPanCol}

@@ -74,9 +74,11 @@ function gainColor(n: number): string {
 
 const CLASS_COLORS: Record<string, string> = {
   EQUITY:        'var(--chart-equity)',
-  DIRECT_EQUITY: '#6366f1',   // indigo for direct stocks
+  DIRECT_EQUITY: '#6366f1',
   FIXED_INCOME:  'var(--chart-fixed)',
   ALTERNATES:    'var(--chart-alt)',
+  HYBRID:        'var(--chart-hybrid)',
+  ARBITRAGE:     'var(--chart-arbitrage)',
   MF:            'var(--chart-equity)',
 };
 
@@ -85,6 +87,8 @@ const CLASS_LABELS: Record<string, string> = {
   DIRECT_EQUITY: 'Direct Equity',
   FIXED_INCOME:  'Fixed Income',
   ALTERNATES:    'Alternates',
+  HYBRID:        'Hybrid MF',
+  ARBITRAGE:     'Arbitrage MF',
   MF:            'Mutual Funds',
 };
 
