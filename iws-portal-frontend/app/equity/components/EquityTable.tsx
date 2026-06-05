@@ -205,7 +205,7 @@ function SectionHeader({ sector, rows, colCount }: { sector: string; rows: Equit
         <div className="flex flex-wrap items-baseline gap-x-5 gap-y-1">
           <span className="text-xs font-semibold" style={{ color: meta.accent }}>{meta.label}</span>
           <span className="text-[11px] text-ghost">Cost {fmtINR(cost)}</span>
-          <span className="text-[11px] text-ghost">Mkt Value {fmtINR(value)}</span>
+          <span className="text-[11px] text-ghost">Cur Value {fmtINR(value)}</span>
           {hasPnl && (
             <span className="text-[11px] font-medium" style={{ color: pnl >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
               P&amp;L {pnl >= 0 ? '+' : ''}{fmtINR(pnl)}
@@ -269,7 +269,7 @@ function TableHead({
         <Th col="avg_cost"            label="Avg Cost"                rowSpan={2} />
         <Th col="cost"                label="Cost"                    rowSpan={2} />
         <Th col="first_invested_date" label="Since"                   rowSpan={2} />
-        <Th col="current_market_value" label="Mkt Value"              rowSpan={2} />
+        <Th col="current_market_value" label="Cur Value"              rowSpan={2} />
         <Th col="prev_week_value"     label="Prev Week"               rowSpan={2} />
         <Th col="weekly_change"       label="Wkly Chg"                rowSpan={2} />
         <Th col="exposure_pct"        label="Exp %"                   rowSpan={2} />
@@ -381,7 +381,7 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
             <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(totals.total_cost)}</p>
           </div>
           <div>
-            <p className="text-xs text-ghost mb-0.5">Market Value</p>
+            <p className="text-xs text-ghost mb-0.5">Current Value</p>
             <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(totals.total_current_market_value)}</p>
           </div>
           {hasPnl && (
