@@ -37,7 +37,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("/home/SAdmin/mis-portal-equity-price.log"),
+        logging.FileHandler("/var/log/mis-portal-equity-price.log"),
         logging.StreamHandler(sys.stdout),
     ],
 )

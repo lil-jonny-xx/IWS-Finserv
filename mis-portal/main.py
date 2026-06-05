@@ -669,6 +669,7 @@ def get_holdings(
                     h.returns_ytd_pct,
                     h.returns_inception_pct,
                     h.cagr_inception_pct,
+                    h.xirr_inception_pct,
                     h.remarks,
                     sm.isin,
                     sm.security_name,
@@ -729,6 +730,7 @@ def get_holdings(
                     "returns_ytd_pct":      float(r["returns_ytd_pct"])    if r["returns_ytd_pct"]    else None,
                     "returns_inception_pct":float(r["returns_inception_pct"]) if r["returns_inception_pct"] else None,
                     "cagr_inception_pct":   float(r["cagr_inception_pct"]) if r["cagr_inception_pct"] else None,
+                    "xirr_inception_pct":   float(r["xirr_inception_pct"]) if r["xirr_inception_pct"] else None,
                     "remarks":              r["remarks"],
                 })
 
@@ -772,6 +774,7 @@ def get_holdings(
                 h.returns_ytd_pct,
                 h.returns_inception_pct,
                 h.cagr_inception_pct,
+                h.xirr_inception_pct,
                 h.remarks,
                 sm.isin,
                 sm.security_name,
@@ -831,6 +834,7 @@ def get_holdings(
                 "returns_ytd_pct":      float(r["returns_ytd_pct"])    if r["returns_ytd_pct"]    else None,
                 "returns_inception_pct":float(r["returns_inception_pct"]) if r["returns_inception_pct"] else None,
                 "cagr_inception_pct":   float(r["cagr_inception_pct"]) if r["cagr_inception_pct"] else None,
+                "xirr_inception_pct":   float(r["xirr_inception_pct"]) if r["xirr_inception_pct"] else None,
                 "remarks":              r["remarks"],
             })
 
@@ -1358,6 +1362,7 @@ def get_overview(
 def get_transactions(
     request: Request,
     entity_id: Optional[int] = None,
+    txn_type: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
     authorization: Optional[str] = Header(None),
@@ -1390,9 +1395,14 @@ def get_transactions(
         limit  = max(1, min(limit, 500))
         offset = max(0, offset)
 
+        type_filter     = txn_type.strip() if txn_type else None
+        type_clause     = "AND t.transaction_type ILIKE %s" if type_filter else ""
+        type_count_clause = "WHERE transaction_type ILIKE %s" if type_filter else ""
+
         if eid is None:
             # Admin all-entities view
-            cursor.execute("""
+            params = [type_filter, limit, offset] if type_filter else [limit, offset]
+            cursor.execute(f"""
                 SELECT
                     t.id, t.transaction_date, t.description, t.transaction_type,
                     t.amount, t.units, t.nav, t.balance_units, t.folio_number,
@@ -1400,11 +1410,16 @@ def get_transactions(
                 FROM mf_transaction t
                 JOIN security_master sm ON sm.id = t.security_id
                 JOIN entity e ON e.id = t.entity_id
+                WHERE 1=1 {type_clause}
                 ORDER BY t.transaction_date DESC, t.id DESC
                 LIMIT %s OFFSET %s
-            """, (limit, offset))
+            """, params)
             rows = cursor.fetchall()
-            cursor.execute("SELECT COUNT(*) AS total FROM mf_transaction")
+            count_params = [type_filter] if type_filter else []
+            cursor.execute(
+                f"SELECT COUNT(*) AS total FROM mf_transaction {type_count_clause}",
+                count_params
+            )
             total = cursor.fetchone()["total"]
             cursor.close()
             return {
@@ -1431,7 +1446,8 @@ def get_transactions(
                 ],
             }
 
-        cursor.execute("""
+        params = [eid, type_filter, limit, offset] if type_filter else [eid, limit, offset]
+        cursor.execute(f"""
             SELECT
                 t.id,
                 t.transaction_date,
@@ -1446,15 +1462,16 @@ def get_transactions(
                 sm.isin
             FROM mf_transaction t
             JOIN security_master sm ON sm.id = t.security_id
-            WHERE t.entity_id = %s
+            WHERE t.entity_id = %s {type_clause}
             ORDER BY t.transaction_date DESC, t.id DESC
             LIMIT %s OFFSET %s
-        """, (eid, limit, offset))
+        """, params)
         rows = cursor.fetchall()
 
+        count_params = [eid, type_filter] if type_filter else [eid]
         cursor.execute(
-            "SELECT COUNT(*) AS total FROM mf_transaction WHERE entity_id = %s",
-            (eid,)
+            f"SELECT COUNT(*) AS total FROM mf_transaction WHERE entity_id = %s {type_clause}",
+            count_params
         )
         total = cursor.fetchone()["total"]
         cursor.close()

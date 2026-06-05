@@ -64,6 +64,11 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
     logger.info("Triggering CAMS CAS request")
 
     BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    for stale in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        p = BROWSER_PROFILE_DIR / stale
+        if p.exists() or p.is_symlink():
+            p.unlink()
+            logger.warning("Removed stale browser lock: %s", stale)
 
     display = Display(visible=False, size=(1366, 768))
     display.start()
@@ -78,6 +83,7 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
+                    "--disable-crash-reporter",
                 ],
                 user_agent=random.choice(_USER_AGENTS),
                 java_script_enabled=True,
@@ -146,6 +152,9 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
 
                 _save_screenshot(page, f"cams_preflight_{pan_number[:4]}.png")
 
+                # Dismiss any disclaimer that appeared during form filling
+                _dismiss_tnc(page)
+
                 # Post-fill verification screenshot — confirms fields were actually populated
                 # before Submit so failures can be distinguished from CAMS server errors.
                 _save_screenshot(page, f"cams_postfill_{pan_number[:4]}.png")
@@ -188,55 +197,68 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
 
 
 def _dismiss_tnc(page):
-    """Accept the T&C/Disclaimer modal that CAMS shows on each fresh session."""
+    """
+    Accept any T&C / Disclaimer modal CAMS shows — handles both Angular Material
+    (mat-dialog-container) and plain HTML modals (e.g. bootstrap-style Disclaimer
+    that appears mid-session for some entities).
+    """
     try:
-        if page.locator("mat-dialog-container").count() == 0:
-            logger.debug("No T&C dialog found — skipping")
+        # Detect which kind of dialog is present
+        has_mat    = page.locator("mat-dialog-container").count() > 0
+        # Plain modal: look for a visible element whose text contains "Disclaimer"
+        # paired with a radio or proceed button — catches bootstrap / custom modals
+        has_plain  = page.evaluate("""
+            (() => {
+                const candidates = [...document.querySelectorAll('div,section,article')];
+                return candidates.some(el => {
+                    const txt = (el.innerText || '').trim();
+                    return txt.includes('Disclaimer') && el.querySelector('input[type="radio"], button');
+                });
+            })()
+        """)
+
+        if not has_mat and not has_plain:
+            logger.debug("No T&C/Disclaimer dialog found — skipping")
             return
 
-        dialog = page.locator("mat-dialog-container")
+        logger.info(f"Disclaimer modal detected (mat={has_mat}, plain={has_plain})")
 
-        # Step 1: Click ACCEPT radio — try Playwright first (respects Angular bindings),
-        # then JS click fallback (fires click event which Angular listens to).
-        clicked_radio = False
-        accept_mat = dialog.locator('mat-radio-button').filter(has_text="ACCEPT")
-        if accept_mat.count() > 0:
-            try:
-                accept_mat.first.click(timeout=5_000, force=True)
-                clicked_radio = True
-                logger.debug("Clicked ACCEPT mat-radio-button via Playwright")
-            except Exception:
-                pass
-
-        if not clicked_radio:
-            # Plain HTML radio inputs — fire click() so Angular sees the event
-            page.evaluate("""
-                const dialog = document.querySelector('mat-dialog-container');
-                if (!dialog) return;
-                const inputs = dialog.querySelectorAll('input[type="radio"]');
+        # Step 1: Click ACCEPT — works for both mat-radio-button and plain inputs
+        page.evaluate("""
+            (() => {
+                // Try Angular Material radio first
+                const matBtns = [...document.querySelectorAll('mat-radio-button')];
+                for (const b of matBtns) {
+                    if ((b.textContent || '').toUpperCase().includes('ACCEPT')) {
+                        b.click(); return;
+                    }
+                }
+                // Plain HTML radio inputs
+                const inputs = [...document.querySelectorAll('input[type="radio"]')];
                 for (const inp of inputs) {
                     const val = (inp.value || '').toUpperCase();
-                    const parent = inp.closest('label,div,span') || inp.parentElement;
-                    const txt = (parent?.textContent || '').trim().toUpperCase();
+                    const lbl = inp.closest('label') || inp.parentElement;
+                    const txt = (lbl?.textContent || '').trim().toUpperCase();
                     if (val === 'ACCEPT' || txt.startsWith('ACCEPT')) {
+                        inp.checked = true;
                         inp.click();
                         inp.dispatchEvent(new Event('change', {bubbles: true}));
                         inp.dispatchEvent(new Event('input',  {bubbles: true}));
                         return;
                     }
                 }
-                // Last resort: click whichever mat-radio-button comes first
-                const first = dialog.querySelector('mat-radio-button');
+                // Last resort: first radio on page
+                const first = document.querySelector('mat-radio-button, input[type="radio"]');
                 if (first) first.click();
-            """)
-            logger.debug("Clicked ACCEPT radio via JS click()")
-
+            })()
+        """)
         page.wait_for_timeout(700)
 
-        # Step 2: Click PROCEED button
+        # Step 2: Click PROCEED / Accept button
         button_clicked = False
         for btn_text in ["PROCEED", "Proceed", "Accept", "Submit", "OK", "Continue"]:
-            btn = dialog.locator(f'button:has-text("{btn_text}")')
+            # Search page-wide (covers both mat and plain modals)
+            btn = page.locator(f'button:has-text("{btn_text}")')
             if btn.count() > 0:
                 try:
                     btn.first.click(timeout=6_000, force=True)
@@ -248,14 +270,25 @@ def _dismiss_tnc(page):
 
         if button_clicked:
             try:
-                page.wait_for_selector("mat-dialog-container", state="detached", timeout=10_000)
+                # Wait for either mat-dialog or plain modal to disappear
+                page.wait_for_function("""
+                    () => {
+                        const mat = document.querySelector('mat-dialog-container');
+                        if (mat) return false;
+                        const plain = [...document.querySelectorAll('div,section')].some(el =>
+                            (el.innerText || '').includes('Disclaimer') &&
+                            el.querySelector('input[type="radio"]')
+                        );
+                        return !plain;
+                    }
+                """, timeout=10_000)
                 page.wait_for_timeout(400)
-                logger.info("T&C dialog dismissed via PROCEED button")
+                logger.info("T&C/Disclaimer dialog dismissed via PROCEED button")
                 return
             except Exception:
                 logger.debug("Dialog still present after PROCEED click — falling back to JS removal")
 
-        # Step 3: JS removal fallback — remove ALL CDK overlay elements
+        # Step 3: JS removal fallback — nuke all overlay / modal elements
         page.evaluate("""
             for (const sel of [
                 'mat-dialog-container',
@@ -263,12 +296,18 @@ def _dismiss_tnc(page):
                 '.cdk-overlay-pane',
                 '.cdk-global-overlay-wrapper',
                 '.cdk-overlay-container',
+                '.modal-backdrop',
+                '.modal.show',
+                '.modal.in',
             ]) {
                 document.querySelectorAll(sel).forEach(el => el.remove());
             }
+            // Also fix body scroll-lock that modals apply
+            document.body.classList.remove('modal-open', 'cdk-global-scrollblock');
+            document.body.style.overflow = '';
         """)
         page.wait_for_timeout(600)
-        logger.info("T&C overlay removed via JS")
+        logger.info("T&C/Disclaimer overlay removed via JS fallback")
 
     except Exception as e:
         logger.debug(f"T&C dismiss error (may be ok): {e}")
@@ -383,11 +422,29 @@ def _save_screenshot(page, filename: str):
     try:
         import os as _os
         _os.makedirs(_SCREENSHOT_DIR, exist_ok=True)
-        # mode=0o700: only owner can read — screenshots may contain form fields
         _os.chmod(_SCREENSHOT_DIR, 0o700)
         path = f"{_SCREENSHOT_DIR}/{filename}"
-        page.screenshot(path=path)
+        try:
+            page.screenshot(path=path, timeout=15_000)
+        except Exception as e1:
+            logger.warning(f"Screenshot attempt 1 failed ({filename}): {e1}")
+            # Fallback: capture just the viewport without full-page rendering
+            try:
+                page.screenshot(path=path, full_page=False, timeout=15_000)
+            except Exception as e2:
+                logger.warning(f"Screenshot attempt 2 failed ({filename}): {e2}")
+                # Last resort: CDP direct capture
+                try:
+                    cdp = page.context.new_cdp_session(page)
+                    data = cdp.send("Page.captureScreenshot", {"format": "png", "fromSurface": False})
+                    import base64 as _b64
+                    with open(path, "wb") as f:
+                        f.write(_b64.b64decode(data["data"]))
+                    cdp.detach()
+                except Exception as e3:
+                    logger.error(f"All screenshot methods failed ({filename}): e1={e1} e2={e2} e3={e3}")
+                    return
         _os.chmod(path, 0o600)
-        logger.info(f"Screenshot saved")
-    except Exception:
-        pass
+        logger.info(f"Screenshot saved: {filename}")
+    except Exception as _e:
+        logger.warning(f"Screenshot save failed ({filename}): {_e}")

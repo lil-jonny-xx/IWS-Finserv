@@ -255,7 +255,40 @@ def _entity_worker(
 # Main
 # ---------------------------------------------------------------------------
 
+LOCK_FILE = Path("/tmp/cas_automation.lock")
+
+def _acquire_lock() -> bool:
+    """Return True if we got the lock, False if another instance is running."""
+    try:
+        if LOCK_FILE.exists():
+            pid = int(LOCK_FILE.read_text().strip())
+            try:
+                os.kill(pid, 0)  # 0 = check existence only
+                logger.error(f"Another CAS Automation is already running (PID {pid}). Exiting.")
+                return False
+            except (ProcessLookupError, PermissionError):
+                logger.warning(f"Stale lock file (PID {pid} gone) — removing and continuing.")
+        LOCK_FILE.write_text(str(os.getpid()))
+        return True
+    except Exception as e:
+        logger.warning(f"Could not acquire lock: {e} — proceeding anyway")
+        return True
+
+
 def main():
+    if not _acquire_lock():
+        sys.exit(1)
+
+    try:
+        _main()
+    finally:
+        try:
+            LOCK_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _main():
     logger.info(f"╔══ CAS Automation starting — {date.today()} ══╗")
 
     try:

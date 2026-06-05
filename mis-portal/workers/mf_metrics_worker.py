@@ -54,6 +54,38 @@ TWO  = Decimal("0.01")
 FOUR = Decimal("0.0001")
 
 
+def xirr(cash_flows: list[tuple]) -> float | None:
+    """Newton-Raphson XIRR. cash_flows: [(date, amount)] where purchases negative, receipts positive."""
+    if len(cash_flows) < 2:
+        return None
+    dates   = [cf[0] for cf in cash_flows]
+    amounts = [cf[1] for cf in cash_flows]
+    t0      = min(dates)
+    days    = [(d - t0).days for d in dates]
+
+    def npv(r):
+        return sum(a / (1 + r) ** (d / 365.25) for a, d in zip(amounts, days))
+
+    def dnpv(r):
+        return sum(-a * (d / 365.25) / (1 + r) ** (d / 365.25 + 1) for a, d in zip(amounts, days))
+
+    rate = 0.1
+    for _ in range(200):
+        f  = npv(rate)
+        df = dnpv(rate)
+        if abs(df) < 1e-12:
+            break
+        new_rate = rate - f / df
+        if new_rate <= -1:
+            new_rate = -0.9999
+        if abs(new_rate - rate) < 1e-8:
+            rate = new_rate
+            break
+        rate = new_rate
+
+    return round(rate * 100, 4) if -99 < rate < 100 else None
+
+
 def now_utc():
     return datetime.now(timezone.utc)
 
@@ -130,6 +162,35 @@ def batch_latest_nav_date(conn, security_ids: list[int]) -> dict[int, date]:
 # Load holdings
 # ---------------------------------------------------------------------------
 
+def load_transactions(conn) -> dict:
+    """
+    Batch-load all MF transactions.
+    Returns dict keyed by (entity_id, security_id, folio_number) → list of (date, amount).
+    Purchases: negative (money out). Redemptions/payouts: positive (money in).
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT entity_id, security_id, folio_number,
+               transaction_date, amount, units
+        FROM   mf_transaction
+        WHERE  amount IS NOT NULL
+        ORDER  BY entity_id, security_id, folio_number, transaction_date
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    result: dict = {}
+    for r in rows:
+        key = (r["entity_id"], r["security_id"], r["folio_number"])
+        if key not in result:
+            result[key] = []
+        amt   = float(r["amount"])
+        units = float(r["units"]) if r["units"] is not None else 0.0
+        # units > 0 → purchase (money leaves investor) → negative cash flow
+        cf = -abs(amt) if units >= 0 else abs(amt)
+        result[key].append((r["transaction_date"], cf))
+    return result
+
+
 def load_holdings(conn) -> list[dict]:
     """
     All holding rows that have a NAV and positive quantity.
@@ -173,6 +234,7 @@ def compute(
     fy_start_nav: float | None,
     as_of_date: date | None,
     today: date,
+    cash_flows: list | None = None,
 ) -> dict:
     qty       = Decimal(str(h["quantity"]))
     cost      = Decimal(str(h["cost_basis"])) if h["cost_basis"] else None
@@ -191,7 +253,8 @@ def compute(
         "pnl_weekly_change": None,
         "returns_inception_pct": None,
         "returns_ytd_pct": None,
-        "cagr_inception_pct": None,
+        "cagr_inception_pct":  None,
+        "xirr_inception_pct":  None,
     }
 
     # Exposure
@@ -232,6 +295,11 @@ def compute(
                         (ratio ** (1.0 / years) - 1.0) * 100, 4
                     )
 
+        # XIRR inception — uses actual per-transaction cash flows
+        if cash_flows:
+            flows = list(cash_flows) + [(today, float(cur_val))]
+            out["xirr_inception_pct"] = xirr(flows)
+
     # P&L YTD
     if fy_start_nav is not None:
         ytd_val = (qty * Decimal(str(fy_start_nav))).quantize(TWO)
@@ -266,6 +334,7 @@ def bulk_update(conn, metrics: list[dict]):
             returns_inception_pct = %(returns_inception_pct)s,
             returns_ytd_pct       = %(returns_ytd_pct)s,
             cagr_inception_pct    = %(cagr_inception_pct)s,
+            xirr_inception_pct    = %(xirr_inception_pct)s,
             last_updated          = NOW()
         WHERE id = %(id)s
         """,
@@ -307,8 +376,9 @@ def run():
     failed    = 0
 
     try:
-        conn     = get_db()
-        holdings = load_holdings(conn)
+        conn         = get_db()
+        holdings     = load_holdings(conn)
+        all_txn_flows = load_transactions(conn)
 
         if not holdings:
             logger.info("No holdings to process.")
@@ -351,7 +421,9 @@ def run():
                 aod     = as_of_dates.get(sid)
                 e_total = entity_totals.get(h["entity_id"], Decimal("0"))
 
-                m = compute(h, e_total, pw_nav, fy_start_nav, aod, today)
+                txn_key = (h["entity_id"], h["security_id"], h["folio_number"])
+                flows   = all_txn_flows.get(txn_key)
+                m = compute(h, e_total, pw_nav, fy_start_nav, aod, today, flows)
                 metrics_batch.append(m)
                 processed += 1
             except Exception as e:

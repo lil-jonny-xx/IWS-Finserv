@@ -147,13 +147,13 @@ def map_type(scheme_type):
     m = {
         "EQUITY":    ("MF_EQUITY",    "EQUITY"),
         "DEBT":      ("MF_DEBT",      "FIXED_INCOME"),
-        "HYBRID":    ("MF_HYBRID",    "EQUITY"),
+        "HYBRID":    ("MF_HYBRID",    "HYBRID"),
         "FOF":       ("MF_FOF",       "EQUITY"),
         "LIQUID":    ("MF_LIQUID",    "FIXED_INCOME"),
         "ELSS":      ("MF_ELSS",      "EQUITY"),
         "GOLD":      ("GOLD_ETF",     "ALTERNATES"),
         "ETF":       ("MF_ETF",       "EQUITY"),
-        "ARBITRAGE": ("MF_ARBITRAGE", "FIXED_INCOME"),
+        "ARBITRAGE": ("MF_ARBITRAGE", "ARBITRAGE"),
     }
     return m.get(
         str(scheme_type).upper() if scheme_type else "OTHER",
@@ -163,6 +163,14 @@ def map_type(scheme_type):
 
 def upsert_security(conn, isin, name, sec_type, asset_class, amfi_code=None):
     cur = conn.cursor()
+    # Honour manual overrides — e.g. Equity Savings funds that CAMS reports as EQUITY
+    cur.execute(
+        "SELECT security_type, asset_class FROM security_type_override WHERE isin = %s",
+        (isin,),
+    )
+    ov = cur.fetchone()
+    if ov:
+        sec_type, asset_class = ov["security_type"], ov["asset_class"]
     cur.execute("""
         INSERT INTO security_master
             (isin, security_name, security_type, asset_class, currency, amfi_code)
