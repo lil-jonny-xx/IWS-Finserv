@@ -243,10 +243,6 @@ def health_check(request: Request, authorization: Optional[str] = Header(None)):
         "environment": "production"
     }
 
-@app.get("/api/health")
-def health_check_legacy(request: Request, authorization: Optional[str] = Header(None)):
-    return health_check(request, authorization)
-
 def _login_impl(request: Request, login_request: LoginRequest, response: Response):
     email = login_request.email.lower()
     password = login_request.password
@@ -349,11 +345,6 @@ def login(request: Request, login_request: LoginRequest, response: Response):
     """Login - 5 attempts per minute per IP."""
     return _login_impl(request, login_request, response)
 
-@app.post("/api/auth/login")
-@limiter.limit("5/minute")
-def login_legacy(request: Request, login_request: LoginRequest, response: Response):
-    return _login_impl(request, login_request, response)
-
 @app.post("/api/v1/auth/logout")
 def logout(request: Request, response: Response, authorization: Optional[str] = Header(None)):
     """Logout - revokes JWT token and clears cookie."""
@@ -385,40 +376,6 @@ def logout(request: Request, response: Response, authorization: Optional[str] = 
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
     finally:
         release_db_connection(conn)
-
-@app.post("/api/auth/logout")
-def logout_legacy(request: Request, response: Response, authorization: Optional[str] = Header(None)):
-    return logout(request, response, authorization)
-
-@app.post("/api/v1/auth/refresh")
-def refresh_token(request: Request, response: Response, authorization: Optional[str] = Header(None)):
-    """Issue a new 2-hour token if the current token is valid and not blacklisted."""
-    try:
-        payload = _require_auth(request, authorization)
-
-        new_payload = {
-            "user_id": payload["user_id"],
-            "email": payload["email"],
-            "role": payload["role"],
-            "exp": datetime.utcnow() + timedelta(minutes=15),
-        }
-        new_token = jwt.encode(new_payload, SECRET_KEY, algorithm="HS256")
-
-        response.set_cookie(
-            key="access_token",
-            value=new_token,
-            httponly=True,
-            secure=True,
-            samesite="strict",
-            max_age=900,
-        )
-        return {"message": "Token refreshed"}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Token refresh error: {e}")
-        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
 
 @app.get("/api/v1/me")
 def get_current_user(request: Request, authorization: Optional[str] = Header(None)):
@@ -465,10 +422,6 @@ def get_current_user(request: Request, authorization: Optional[str] = Header(Non
     finally:
         release_db_connection(conn)
 
-@app.get("/api/me")
-def get_current_user_legacy(request: Request, authorization: Optional[str] = Header(None)):
-    return get_current_user(request, authorization)
-
 @app.get("/api/v1/entities")
 def get_entities(request: Request, authorization: Optional[str] = Header(None)):
     """Get all entities - admin only."""
@@ -504,11 +457,6 @@ def get_entities(request: Request, authorization: Optional[str] = Header(None)):
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
     finally:
         release_db_connection(conn)
-
-@app.get("/api/entities")
-def get_entities_legacy(request: Request, authorization: Optional[str] = Header(None)):
-    return get_entities(request, authorization)
-
 
 def _require_auth(request: Request, authorization: Optional[str]) -> dict:
     """Validate token and return JWT payload. Raises 401 on failure."""
@@ -855,15 +803,6 @@ def get_holdings(
         release_db_connection(conn)
 
 
-@app.get("/api/holdings")
-def get_holdings_legacy(
-    request: Request,
-    entity_id: Optional[int] = None,
-    authorization: Optional[str] = Header(None),
-):
-    return get_holdings(request, entity_id, authorization)
-
-
 def _resolve_entity(cursor, payload: dict, entity_id_param: Optional[int]) -> Optional[int]:
     """
     Returns the entity_id to query.
@@ -1042,14 +981,6 @@ def get_equity_holdings(
         release_db_connection(conn)
 
 
-@app.get("/api/equity/holdings")
-def get_equity_holdings_legacy(
-    request: Request,
-    entity_id: Optional[int] = None,
-    broker: Optional[str] = None,
-    authorization: Optional[str] = Header(None),
-):
-    return get_equity_holdings(request, entity_id, broker, authorization)
 
 
 # ---------------------------------------------------------------------------
@@ -1171,15 +1102,6 @@ def get_equity_summary(
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
     finally:
         release_db_connection(conn)
-
-
-@app.get("/api/equity/summary")
-def get_equity_summary_legacy(
-    request: Request,
-    entity_id: Optional[int] = None,
-    authorization: Optional[str] = Header(None),
-):
-    return get_equity_summary(request, entity_id, authorization)
 
 
 # ---------------------------------------------------------------------------

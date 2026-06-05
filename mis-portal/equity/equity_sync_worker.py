@@ -12,7 +12,7 @@ Metric sources:
   - prev_week_value   : equity_holding_history for last Friday
   - pnl_ytd           : equity_holding_history for Jan 1 (or earliest available)
   - first_invested_date: preserved from existing equity_holding row; set to today on first insert
-  - exposure_pct      : current_market_value / sum(all holdings for entity) × 100
+  - exposure_pct      : current_market_value / sum(ALL broker holdings for entity) × 100
 
 Schedule: Daily at 7:00 AM IST (01:30 UTC) — after token_refresh_worker
 Cron:     30 1 * * * /var/www/.venv/bin/python /var/www/mis-portal/equity/equity_sync_worker.py >> /var/log/mis-portal-equity-sync.log 2>&1
@@ -402,6 +402,28 @@ def main():
             logger.error(f"[{entity_code}/{broker_label}] Failed: {e}")
             conn.rollback()
             errors.append(f"{entity_code}:{broker_label}")
+
+    # Recalculate exposure_pct across all brokers per entity now that all syncs are done.
+    # Per-broker sync uses only that broker's total — this corrects it to entity-wide total.
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE equity_holding eh
+        SET    exposure_pct = ROUND(
+                   eh.current_market_value
+                   / NULLIF(totals.total_cmv, 0) * 100, 2
+               )
+        FROM (
+            SELECT entity_id, SUM(current_market_value) AS total_cmv
+            FROM   equity_holding
+            WHERE  current_market_value IS NOT NULL
+            GROUP  BY entity_id
+        ) totals
+        WHERE eh.entity_id = totals.entity_id
+          AND eh.current_market_value IS NOT NULL
+    """)
+    conn.commit()
+    cur.close()
+    logger.info("Exposure % recalculated across all brokers per entity")
 
     conn.close()
     logger.info(f"=== Done. {total} holdings synced | Errors: {errors or 'none'} ===")
