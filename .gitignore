@@ -17,6 +17,7 @@ mis-portal/equity/equity_tokens.json
 # Node / Next.js
 iws-portal-frontend/node_modules/
 iws-portal-frontend/.next/
+.next/
 iws-portal-frontend/.env.local
 
 # Nginx default page
