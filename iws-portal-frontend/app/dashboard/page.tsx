@@ -377,6 +377,8 @@ export default function DashboardPage() {
                 { href: '/dashboard', label: 'Overview', active: true },
                 { href: '/mutual-funds', label: 'Mutual Funds' },
                 { href: '/equity', label: 'Equity' },
+                { href: '/manual-data', label: 'Manual Data' },
+                { href: '/reports', label: 'Reports' },
               ].map(link => (
                 <a key={link.href} href={link.href}
                   className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${

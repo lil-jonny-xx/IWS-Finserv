@@ -204,6 +204,8 @@ export default function MutualFundsPage() {
               { href: '/dashboard',    label: 'Overview'                },
               { href: '/mutual-funds', label: 'Mutual Funds', active: true },
               { href: '/equity',       label: 'Equity'                  },
+              { href: '/manual-data',  label: 'Manual Data'             },
+              { href: '/reports',      label: 'Reports'                 },
             ].map(({ href, label, active }) => (
               <a
                 key={href}

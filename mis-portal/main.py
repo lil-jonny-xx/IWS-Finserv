@@ -1,10 +1,11 @@
 from fastapi import FastAPI, HTTPException, Header, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, EmailStr, Field
-from typing import Optional
+from typing import Optional, List
 import jwt
 import bcrypt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import os
 from dotenv import load_dotenv
 import psycopg2
@@ -1425,6 +1426,341 @@ def get_transactions(
         raise
     except Exception as e:
         logger.error(f"Error in /api/v1/transactions: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+# ---------------------------------------------------------------------------
+# Manual Inputs
+# ---------------------------------------------------------------------------
+
+VALID_CATEGORIES = {
+    "liquid_fund", "debt_fund", "arbitrage_fund", "ppf",
+    "pms", "direct_equity", "aif",
+    "overseas_fund", "overseas_equity", "forex", "gold_etf",
+    "unlisted", "startup",
+    "funds_transit", "broker_balance", "bank",
+}
+
+VALID_CURRENCIES = {"INR", "USD", "GBP", "EUR", "AED", "SGD", "HKD"}
+
+
+class ManualInputItem(BaseModel):
+    entity_id:       int
+    category:        str
+    label:           str       = Field(min_length=1, max_length=200)
+    cost:            Optional[float] = None
+    current_value:   Optional[float] = None
+    prev_week_value: Optional[float] = None
+    currency:        str = "INR"
+    raw_amount:      Optional[float] = None
+    fx_rate:         Optional[float] = None
+    inception_date:  Optional[str]   = None
+    notes:           Optional[str]   = None
+
+
+class ManualInputsRequest(BaseModel):
+    password: str = Field(min_length=6, max_length=72)
+    inputs:   List[ManualInputItem]
+
+
+@app.get("/api/v1/manual-inputs")
+def get_manual_inputs(
+    request: Request,
+    entity_id: Optional[int] = None,
+    authorization: Optional[str] = Header(None),
+):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+
+        role = _live_role(cur, payload["email"])
+        if role != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+
+        where  = "WHERE m.entity_id = %s" if entity_id else ""
+        params = [entity_id] if entity_id else []
+
+        cur.execute(f"""
+            SELECT DISTINCT ON (m.entity_id, m.category, m.label)
+                m.id, m.entity_id, e.entity_name, m.category, m.label,
+                m.cost, m.current_value, m.prev_week_value,
+                m.currency, m.raw_amount, m.fx_rate,
+                m.inception_date, m.notes, m.updated_at,
+                u.full_name AS updated_by_name
+            FROM manual_input m
+            JOIN entity e ON e.id = m.entity_id
+            LEFT JOIN users u ON u.id = m.updated_by
+            {where}
+            ORDER BY m.entity_id, m.category, m.label, m.updated_at DESC
+        """, params)
+        rows = cur.fetchall()
+        cur.close()
+
+        return [
+            {
+                "id":              r["id"],
+                "entity_id":       r["entity_id"],
+                "entity_name":     r["entity_name"],
+                "category":        r["category"],
+                "label":           r["label"],
+                "cost":            float(r["cost"])            if r["cost"]            else None,
+                "current_value":   float(r["current_value"])   if r["current_value"]   else None,
+                "prev_week_value": float(r["prev_week_value"]) if r["prev_week_value"] else None,
+                "currency":        r["currency"],
+                "raw_amount":      float(r["raw_amount"])      if r["raw_amount"]      else None,
+                "fx_rate":         float(r["fx_rate"])         if r["fx_rate"]         else None,
+                "inception_date":  str(r["inception_date"])    if r["inception_date"]  else None,
+                "notes":           r["notes"],
+                "updated_at":      r["updated_at"].isoformat() if r["updated_at"]      else None,
+                "updated_by":      r["updated_by_name"],
+            }
+            for r in rows
+        ]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/manual-inputs: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/manual-inputs")
+@limiter.limit("20/minute")
+def save_manual_inputs(
+    request: Request,
+    body: ManualInputsRequest,
+    authorization: Optional[str] = Header(None),
+):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+
+        role = _live_role(cur, payload["email"])
+        if role != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+
+        # Re-authenticate
+        cur.execute(
+            "SELECT id, password_hash FROM users WHERE email = %s AND is_active = TRUE",
+            (payload["email"],)
+        )
+        user_row = cur.fetchone()
+        if not user_row or not verify_password(body.password, user_row["password_hash"]):
+            raise HTTPException(status_code=401, detail="Incorrect password")
+
+        user_id = user_row["id"]
+
+        # Validate and insert
+        saved = []
+        for item in body.inputs:
+            if item.category not in VALID_CATEGORIES:
+                raise HTTPException(status_code=422, detail=f"Invalid category: {item.category}")
+            if item.currency not in VALID_CURRENCIES:
+                raise HTTPException(status_code=422, detail=f"Invalid currency: {item.currency}")
+
+            inception = None
+            if item.inception_date:
+                try:
+                    inception = date.fromisoformat(item.inception_date)
+                except ValueError:
+                    raise HTTPException(status_code=422, detail=f"Invalid inception_date: {item.inception_date}")
+
+            cur.execute("""
+                INSERT INTO manual_input
+                    (entity_id, category, label, cost, current_value, prev_week_value,
+                     currency, raw_amount, fx_rate, inception_date, notes, updated_by, updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                RETURNING id
+            """, (
+                item.entity_id, item.category, item.label,
+                item.cost, item.current_value, item.prev_week_value,
+                item.currency, item.raw_amount, item.fx_rate,
+                inception, item.notes, user_id,
+            ))
+            new_id = cur.fetchone()["id"]
+            saved.append(new_id)
+
+        write_audit_log(conn, user_id, "MANUAL_INPUT_SAVE", "manual_input",
+                        None, f"Saved {len(saved)} manual input(s) by {payload['email']}")
+        conn.commit()
+        cur.close()
+
+        return {"saved": len(saved), "ids": saved}
+
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/manual-inputs: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+# ---------------------------------------------------------------------------
+# FX rates (for manual input form reference)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/fx-rates")
+def get_fx_rates(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    conn = None
+    try:
+        _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT ON (from_currency)
+                from_currency, to_currency, rate, rate_date
+            FROM fx_rate
+            WHERE to_currency = 'INR'
+            ORDER BY from_currency, rate_date DESC
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        return {r["from_currency"]: {"rate": float(r["rate"]), "date": str(r["rate_date"])} for r in rows}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/v1/fx-rates: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+# ---------------------------------------------------------------------------
+# Reports
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/reports")
+def list_reports(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+
+        cur.execute("""
+            SELECT r.id, r.report_type, r.entity_name, r.filename,
+                   r.as_of_date, r.generated_at, u.full_name AS generated_by_name
+            FROM generated_report r
+            LEFT JOIN users u ON u.id = r.generated_by
+            ORDER BY r.generated_at DESC
+            LIMIT 100
+        """)
+        rows = cur.fetchall()
+        cur.close()
+
+        return [
+            {
+                "id":           r["id"],
+                "type":         r["report_type"],
+                "entity_name":  r["entity_name"],
+                "filename":     r["filename"],
+                "as_of_date":   str(r["as_of_date"]),
+                "generated_at": r["generated_at"].isoformat(),
+                "generated_by": r["generated_by_name"],
+            }
+            for r in rows
+        ]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/reports: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/reports/generate")
+@limiter.limit("5/minute")
+def generate_reports_endpoint(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+        cur.execute("SELECT id FROM users WHERE email = %s", (payload["email"],))
+        user_id = cur.fetchone()["id"]
+        cur.close()
+
+        from workers.report_generator import generate_reports
+        results = generate_reports(conn, generated_by_user_id=user_id)
+
+        write_audit_log(conn, user_id, "REPORT_GENERATE", "generated_report",
+                        None, f"Generated {len(results)} reports by {payload['email']}")
+        conn.commit()
+
+        return {"generated": len(results), "reports": results}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/reports/generate: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.get("/api/v1/reports/{report_id}/download")
+def download_report(
+    report_id: int,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+
+        cur.execute("SELECT filepath, filename FROM generated_report WHERE id = %s", (report_id,))
+        row = cur.fetchone()
+        cur.close()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Report not found")
+        if not os.path.exists(row["filepath"]):
+            raise HTTPException(status_code=404, detail="Report file not found on disk")
+
+        return FileResponse(
+            path=row["filepath"],
+            filename=row["filename"],
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/reports/{report_id}/download: {e}")
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
     finally:
         release_db_connection(conn)

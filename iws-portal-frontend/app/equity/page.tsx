@@ -170,6 +170,8 @@ export default function EquityPage() {
               { href: '/dashboard',    label: 'Overview'     },
               { href: '/mutual-funds', label: 'Mutual Funds' },
               { href: '/equity',       label: 'Equity',       active: true },
+              { href: '/manual-data',  label: 'Manual Data'  },
+              { href: '/reports',      label: 'Reports'       },
             ].map(({ href, label, active }) => (
               <a
                 key={href}
