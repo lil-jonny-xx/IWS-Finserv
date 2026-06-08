@@ -119,6 +119,34 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
                 except RuntimeError:
                     logger.warning("Could not click 'With zero balance folios' radio — using default")
 
+                # --- Period: Specific Period with full history from date ---
+                # Default is "Current Financial Year" which gives only FY-to-date transactions.
+                # We need the full history to compute CAGR / XIRR from first investment date.
+                try:
+                    _click_radio_by_value_or_text(page, "specific", "Specific Period", "Period")
+                    page.wait_for_timeout(random.randint(400, 800))
+                    from_date_str = "01-Apr-1992"
+                    to_date_str   = date.today().strftime("%d-%b-%Y")
+                    _fill_date_field(page, [
+                        'input[formcontrolname="from_date"]',
+                        'input[formcontrolname="fromDate"]',
+                        'input[formcontrolname="start_date"]',
+                        'input[placeholder*="From" i]',
+                        'input[placeholder*="Start" i]',
+                    ], from_date_str, "From Date")
+                    page.wait_for_timeout(random.randint(200, 500))
+                    _fill_date_field(page, [
+                        'input[formcontrolname="to_date"]',
+                        'input[formcontrolname="toDate"]',
+                        'input[formcontrolname="end_date"]',
+                        'input[placeholder*="To" i]',
+                        'input[placeholder*="End" i]',
+                    ], to_date_str, "To Date")
+                    page.wait_for_timeout(random.randint(300, 600))
+                    logger.info(f"Period set: {from_date_str} → {to_date_str}")
+                except RuntimeError as e:
+                    logger.warning(f"Could not set Specific Period — using CAMS default period: {e}")
+
                 # --- Email ---
                 _save_screenshot(page, f"cams_prefill_{pan_number[:4]}.png")
                 _fill_field(page, [
@@ -159,6 +187,12 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
                 # before Submit so failures can be distinguished from CAMS server errors.
                 _save_screenshot(page, f"cams_postfill_{pan_number[:4]}.png")
 
+                # Guard: dismissing the T&C/Disclaimer can trigger an auto-submit,
+                # putting the success page up before we even attempt to click Submit.
+                if _is_success_page(page):
+                    logger.info("CAMS form submitted successfully. CAS will arrive by email.")
+                    return True
+
                 # --- Submit ---
                 page.locator('button:has-text("Submit")').first.click(
                     timeout=ACTION_TIMEOUT, force=True
@@ -182,8 +216,13 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
                 return success
 
             except PWTimeout as e:
-                logger.error(f"CAMS page timeout: {e}")
                 _save_screenshot(page, f"cams_timeout_{pan_number[:4]}.png")
+                # Submit may have gone through before the timeout fired —
+                # check whether the success page is already showing.
+                if _is_success_page(page):
+                    logger.info("Submit timed out but success page detected — treating as success.")
+                    return True
+                logger.error(f"CAMS page timeout: {e}")
                 return False
             except Exception as e:
                 logger.error(f"CAMS trigger failed: {e}")
@@ -313,6 +352,29 @@ def _dismiss_tnc(page):
         logger.debug(f"T&C dismiss error (may be ok): {e}")
 
 
+def _is_success_page(page) -> bool:
+    """
+    Returns True only on definitive CAMS success signals.
+    Unlike _check_submit_result, does NOT fall through to True on ambiguous content —
+    used for pre-Submit and post-timeout guards where we cannot risk a false positive.
+    """
+    try:
+        content = page.content().lower()
+        success_signals = [
+            "request has been submitted",
+            "statement will be sent",
+            "will be emailed",
+            "sent to your registered",
+            "sent to your email",
+            "thank you",
+            "request received",
+            "successfully submitted",
+        ]
+        return any(s in content for s in success_signals)
+    except Exception:
+        return False
+
+
 def _check_submit_result(page) -> bool:
     """
     Inspect page after Submit to determine success or failure.
@@ -390,6 +452,28 @@ def _fill_field(page, selectors: list, value: str, label: str):
             continue
     raise RuntimeError(
         f"Could not find {label} field. CAMS may have changed their form. "
+        f"Tried: {selectors}"
+    )
+
+
+def _fill_date_field(page, selectors: list, value: str, label: str):
+    """Fill a date input, clearing existing value first (date pickers retain stale text)."""
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            loc.wait_for(state="visible", timeout=ACTION_TIMEOUT)
+            loc.click(timeout=ACTION_TIMEOUT, force=True)
+            page.wait_for_timeout(random.randint(100, 300))
+            loc.fill("")
+            page.wait_for_timeout(random.randint(100, 200))
+            loc.type(value, delay=random.randint(50, 100))
+            page.keyboard.press("Escape")
+            logger.debug(f"Filled date {label} via: {sel}")
+            return
+        except Exception:
+            continue
+    raise RuntimeError(
+        f"Could not find date field '{label}'. CAMS may have changed their form. "
         f"Tried: {selectors}"
     )
 

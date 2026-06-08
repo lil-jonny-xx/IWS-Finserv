@@ -2,34 +2,118 @@
 Dhan broker wrapper.
 
 Entities : HHR
-Auth     : Client ID + access token (30-day lived).
-           No daily refresh — update DHAN_HHR_ACCESS_TOKEN in .env each month
-           from the Dhan developer portal (dhanhq.co/developers).
+Auth     : 24-hour access token, auto-renewed daily via /RenewToken.
+           If renewal fails, falls back to TOTP-based headless generation.
 
 Env vars required:
   DHAN_HHR_CLIENT_ID
-  DHAN_HHR_ACCESS_TOKEN
+  DHAN_HHR_ACCESS_TOKEN     — current token (updated in-place after renewal)
+  DHAN_HHR_API_KEY          — app_id from dhanhq.co/developers
+  DHAN_HHR_API_SECRET       — app_secret from dhanhq.co/developers
+  DHAN_HHR_PIN              — Dhan login PIN (for headless TOTP generation)
+  DHAN_HHR_TOTP_SECRET      — base32 TOTP secret (for headless generation)
 """
 import os
+import re
 import logging
 from decimal import Decimal
+from pathlib import Path
 
+import pyotp
+import requests
 from dhanhq import dhanhq
 from dhanhq.dhan_context import DhanContext
+from dhanhq.auth import DhanLogin
 
 from equity.models import EquityHolding
 
 logger = logging.getLogger(__name__)
 
 SUPPORTED_ENTITIES = ["HHR"]
+ENV_FILE = Path("/var/www/mis-portal/.env")
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _env(entity_code: str, key: str) -> str:
-    return os.environ[f"DHAN_{entity_code}_{key}"]
+def _env(entity_code: str, key: str, required: bool = True) -> str:
+    val = os.environ.get(f"DHAN_{entity_code}_{key}", "")
+    if required and not val:
+        raise KeyError(f"DHAN_{entity_code}_{key} not set in .env")
+    return val
+
+
+def _save_token_to_env(entity_code: str, new_token: str):
+    """Overwrite the access token in .env in-place."""
+    key = f"DHAN_{entity_code}_ACCESS_TOKEN"
+    try:
+        text = ENV_FILE.read_text()
+        updated = re.sub(
+            rf"^({re.escape(key)}=).*$",
+            rf"\g<1>{new_token}",
+            text,
+            flags=re.MULTILINE,
+        )
+        ENV_FILE.write_text(updated)
+        os.environ[key] = new_token
+        logger.info(f"[{entity_code}] Dhan access token saved to .env")
+    except Exception as e:
+        logger.warning(f"[{entity_code}] Could not save Dhan token to .env: {e}")
+
+
+def _renew_token(entity_code: str) -> str:
+    """Try to renew the current token via /RenewToken. Returns new token."""
+    client_id    = _env(entity_code, "CLIENT_ID")
+    access_token = _env(entity_code, "ACCESS_TOKEN")
+    login = DhanLogin(client_id)
+    resp  = login.renew_token(access_token)
+    new_token = resp.get("accessToken") or resp.get("access_token") or resp.get("token")
+    if not new_token:
+        raise RuntimeError(f"RenewToken response missing token: {resp}")
+    _save_token_to_env(entity_code, new_token)
+    logger.info(f"[{entity_code}] Dhan token renewed via /RenewToken")
+    return new_token
+
+
+def _generate_token(entity_code: str) -> str:
+    """Generate a fresh token via PIN + TOTP (headless). Returns new token."""
+    client_id   = _env(entity_code, "CLIENT_ID")
+    pin         = _env(entity_code, "PIN")
+    totp_secret = _env(entity_code, "TOTP_SECRET")
+    totp        = pyotp.TOTP(totp_secret).now()
+    login = DhanLogin(client_id)
+    resp  = login.generate_token(pin, totp)
+    new_token = resp.get("accessToken") or resp.get("access_token") or resp.get("token")
+    if not new_token:
+        raise RuntimeError(f"generateAccessToken response missing token: {resp}")
+    _save_token_to_env(entity_code, new_token)
+    logger.info(f"[{entity_code}] Dhan token generated via PIN+TOTP")
+    return new_token
+
+
+def refresh_access_token(entity_code: str) -> str:
+    """
+    Renew token if possible; fall back to headless generation.
+    Called at the start of each equity sync.
+    """
+    # Try renewal first (works when current token is still valid)
+    try:
+        return _renew_token(entity_code)
+    except Exception as e:
+        logger.warning(f"[{entity_code}] Dhan renewal failed ({e}), trying PIN+TOTP generation")
+
+    # Fall back to TOTP-based generation
+    pin    = _env(entity_code, "PIN",         required=False)
+    secret = _env(entity_code, "TOTP_SECRET", required=False)
+    if pin and secret:
+        return _generate_token(entity_code)
+
+    raise RuntimeError(
+        f"[{entity_code}] Cannot obtain Dhan token: renewal failed and "
+        "DHAN_{entity_code}_PIN / DHAN_{entity_code}_TOTP_SECRET not set. "
+        "Generate a token manually from web.dhan.co and update .env."
+    )
 
 
 def _dhan_client(entity_code: str) -> dhanhq:
@@ -44,7 +128,7 @@ def _dhan_client(entity_code: str) -> dhanhq:
 
 def fetch_holdings(entity_code: str) -> list[dict]:
     """
-    Raw holdings from Dhan.
+    Raw holdings from Dhan. Auto-renews token before fetching.
 
     Relevant fields per item:
       tradingSymbol, securityId, exchangeSegment, isin,

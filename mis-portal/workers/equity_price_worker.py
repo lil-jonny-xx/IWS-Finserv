@@ -185,12 +185,13 @@ class DhanAdapter:
 
     def __init__(self, cred: dict):
         from dhanhq import dhanhq
+        from dhanhq.dhan_context import DhanContext
         c = cred["credentials"]
         access_token = cred.get("access_token") or c.get("access_token", "")
         client_id    = c.get("client_id", "")
         if not access_token or not client_id:
             raise ValueError("Dhan: access_token and client_id required")
-        self.dhan = dhanhq(client_id, access_token)
+        self.dhan = dhanhq(DhanContext(client_id, access_token))
 
     def get_ltp(self, holdings: list[dict]) -> dict[str, float]:
         prices = {}
@@ -229,30 +230,33 @@ def _d(v) -> Decimal:
 def compute_metrics(holding: dict, ltp: float) -> dict:
     qty   = _d(holding["quantity"])
     cost  = _d(holding["cost"])
-    prev  = _d(holding["prev_week_value"])
+    prev  = _d(holding["prev_week_value"]) if holding.get("prev_week_value") is not None else None
     price = Decimal(str(ltp))
 
     cmv            = (qty * price).quantize(TWO, ROUND_HALF_UP)
-    weekly_change  = (cmv - prev).quantize(TWO, ROUND_HALF_UP)
+    weekly_change  = (cmv - prev).quantize(TWO, ROUND_HALF_UP) if prev is not None else None
     pnl_inception  = (cmv - cost).quantize(TWO, ROUND_HALF_UP)
 
     returns_inception_pct = (
         (pnl_inception / cost * 100).quantize(TWO, ROUND_HALF_UP) if cost else None
     )
 
-    # CAGR inception
+    # CAGR inception (requires at least 1 year to be meaningful; tiny years → huge exponent → overflow)
     cagr = None
     if holding.get("first_invested_date") and cost and cost > 0 and cmv > 0:
         years = (date.today() - holding["first_invested_date"]).days / 365.25
-        if years > 0:
-            cagr = (
-                ((cmv / cost) ** Decimal(str(1 / years)) - 1) * 100
-            ).quantize(TWO, ROUND_HALF_UP)
+        if years >= 1.0:
+            try:
+                cagr = (
+                    ((cmv / cost) ** Decimal(str(1 / years)) - 1) * 100
+                ).quantize(TWO, ROUND_HALF_UP)
+            except Exception:
+                cagr = None
 
     return {
         "current_price":         float(price),
         "current_market_value":  float(cmv),
-        "weekly_change":         float(weekly_change),
+        "weekly_change":         float(weekly_change) if weekly_change is not None else None,
         "pnl_inception":         float(pnl_inception),
         "returns_inception_pct": float(returns_inception_pct) if returns_inception_pct is not None else None,
         "cagr_inception_pct":    float(cagr) if cagr is not None else None,

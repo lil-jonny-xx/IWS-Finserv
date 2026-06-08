@@ -354,9 +354,7 @@ def _main():
 
             ok = cams_trigger_worker.trigger_cas_request(cfg.pan, cfg.email, pdf_password)
             if not ok:
-                logger.error(f"[{cfg.code}] CAMS trigger failed — skipping")
-                results[cfg.code] = False
-                continue
+                logger.error(f"[{cfg.code}] CAMS trigger reported failure — watching for PDF anyway")
 
             t = threading.Thread(
                 target=_entity_worker,

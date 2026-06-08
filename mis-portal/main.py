@@ -1764,3 +1764,18 @@ def download_report(
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
     finally:
         release_db_connection(conn)
+
+
+@app.post("/api/v1/dhan/postback")
+async def dhan_postback(request: Request):
+    """
+    Dhan order-update postback (webhook).
+    Dhan POSTs JSON on every order/trade event.
+    We log it and return 200 — downstream processing can be added here.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    logger.info(f"Dhan postback received: {body}")
+    return {"status": "ok"}

@@ -108,8 +108,16 @@ def refresh_access_token(entity_code: str) -> str:
         page.wait_for_selector("input#userid[type='number']", timeout=10_000)
         totp_code = pyotp.TOTP(totp_secret).now()
         page.fill("input#userid[type='number']", totp_code)
-        # Zerodha auto-submits on 6 digits — wait for the redirect request to fire
-        page.wait_for_timeout(10_000)
+
+        # Step 3 — Authorize screen (Zerodha added a permissions consent step)
+        # Click "Authorize" if it appears; redirect fires after this.
+        try:
+            page.wait_for_selector("button:has-text('Authorize')", timeout=10_000)
+            page.click("button:has-text('Authorize')")
+        except Exception:
+            pass  # Screen may not appear on all accounts
+
+        page.wait_for_timeout(8_000)
         browser.close()
 
     if not redirect_url or "request_token" not in redirect_url:

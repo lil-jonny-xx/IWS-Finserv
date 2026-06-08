@@ -28,6 +28,7 @@ export interface EquityHoldingRow {
   cagr_inception_pct?: number;
   first_invested_date?: string;
   remarks?: string;
+  brokers?: string[];  // set only in Combined view — all brokers holding this symbol
 }
 
 export interface EquityTotals {
@@ -97,6 +98,7 @@ const BROKER_LABELS: Record<string, string> = {
   zerodha:   'Zerodha',
   angel_one: 'Angel One',
   dhan:      'Dhan',
+  combined:  'Combined',
 };
 
 const BROKER_COLORS: Record<string, string> = {
@@ -144,6 +146,91 @@ function sortRows(rows: EquityHoldingRow[], key: SortKey, dir: SortDir): EquityH
     if (va > vb) return dir === 'asc' ? 1 : -1;
     return 0;
   });
+}
+
+// ── combined view: merge same symbol across brokers (per entity) ──────────────
+
+function mergeBySymbol(holdings: EquityHoldingRow[]): EquityHoldingRow[] {
+  const map = new Map<string, EquityHoldingRow[]>();
+  for (const h of holdings) {
+    const key = `${h.entity_id}::${h.symbol}`;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key)!.push(h);
+  }
+
+  const merged: EquityHoldingRow[] = [];
+  let syntheticId = 0;
+
+  for (const rows of map.values()) {
+    if (rows.length === 1) {
+      merged.push({ ...rows[0], brokers: [rows[0].broker] });
+      continue;
+    }
+
+    const qty  = rows.reduce((s, h) => s + h.quantity, 0);
+    const cost = rows.reduce((s, h) => s + h.cost, 0);
+
+    const hasCmv      = rows.some(h => h.current_market_value != null);
+    const cmv         = hasCmv ? rows.reduce((s, h) => s + (h.current_market_value ?? 0), 0) : undefined;
+    const prevWeek    = rows.some(h => h.prev_week_value != null)
+                        ? rows.reduce((s, h) => s + (h.prev_week_value ?? 0), 0) : undefined;
+    const weeklyChg   = rows.some(h => h.weekly_change != null)
+                        ? rows.reduce((s, h) => s + (h.weekly_change ?? 0), 0) : undefined;
+    const pnlInc      = rows.some(h => h.pnl_inception != null)
+                        ? rows.reduce((s, h) => s + (h.pnl_inception ?? 0), 0) : undefined;
+    const pnlYtd      = rows.some(h => h.pnl_ytd != null)
+                        ? rows.reduce((s, h) => s + (h.pnl_ytd ?? 0), 0) : undefined;
+    const pnlWeekly   = rows.some(h => h.pnl_weekly_change != null)
+                        ? rows.reduce((s, h) => s + (h.pnl_weekly_change ?? 0), 0) : undefined;
+
+    const returnsInc  = cost > 0 && pnlInc != null ? (pnlInc / cost) * 100 : undefined;
+    const returnsYtd  = cost > 0 && pnlYtd != null ? (pnlYtd / cost) * 100 : undefined;
+
+    const dates = rows.map(h => h.first_invested_date).filter(Boolean) as string[];
+    const firstDate = dates.length > 0 ? [...dates].sort()[0] : undefined;
+    let cagrInc: number | undefined;
+    if (firstDate && cost > 0 && cmv != null && cmv > 0) {
+      const years = (Date.now() - new Date(firstDate).getTime()) / (365.25 * 24 * 3600 * 1000);
+      if (years >= 1.0) {
+        try { cagrInc = (Math.pow(cmv / cost, 1 / years) - 1) * 100; } catch { /* */ }
+      }
+    }
+
+    const brokers = [...new Set(rows.map(h => h.broker))];
+
+    merged.push({
+      ...rows[0],
+      id: -(++syntheticId),
+      broker: rows[0].broker,
+      brokers,
+      quantity: qty,
+      avg_cost: qty > 0 ? cost / qty : 0,
+      cost,
+      current_price: rows.find(h => h.current_price != null)?.current_price,
+      current_market_value: cmv,
+      prev_week_value: prevWeek,
+      weekly_change: weeklyChg,
+      pnl_inception: pnlInc,
+      pnl_ytd: pnlYtd,
+      pnl_weekly_change: pnlWeekly,
+      returns_inception_pct: returnsInc,
+      returns_ytd_pct: returnsYtd,
+      cagr_inception_pct: cagrInc,
+      first_invested_date: firstDate,
+      exposure_pct: undefined,
+    });
+  }
+
+  // Recalculate exposure_pct against merged entity totals
+  const entityTotals = new Map<number, number>();
+  for (const h of merged) entityTotals.set(h.entity_id, (entityTotals.get(h.entity_id) ?? 0) + (h.current_market_value ?? 0));
+  for (const h of merged) {
+    const tot = entityTotals.get(h.entity_id) ?? 0;
+    h.exposure_pct = tot > 0 && h.current_market_value != null
+      ? Math.round(h.current_market_value / tot * 10000) / 100 : undefined;
+  }
+
+  return merged;
 }
 
 // ── filter pills ──────────────────────────────────────────────────────────────
@@ -327,23 +414,36 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
     else { setSortKey(key); setSortDir('desc'); }
   }
 
-  const brokers     = [...new Set(holdings.map(h => h.broker))].sort();
-  const sectors     = [...new Set(holdings.map(h => h.sector ?? 'Equity'))]
+  const brokers       = [...new Set(holdings.map(h => h.broker))].sort();
+  const brokerOptions = brokers.length >= 2 ? [...brokers, 'combined'] : brokers;
+  const sectors       = [...new Set(holdings.map(h => h.sector ?? 'Equity'))]
     .sort((a, b) => (sectorMeta(a).order - sectorMeta(b).order));
-  const entityNames = [...new Set(holdings.map(h => h.entity_name).filter(Boolean) as string[])].sort();
+  const entityNames   = [...new Set(holdings.map(h => h.entity_name).filter(Boolean) as string[])].sort();
 
   const filtered = useMemo(() => {
-    const q = search.toLowerCase();
-    return holdings.filter(h => {
-      if (filterBroker && h.broker                      !== filterBroker) return false;
-      if (filterSector && (h.sector ?? 'Equity')        !== filterSector) return false;
-      if (filterEntity && h.entity_name                 !== filterEntity) return false;
-      if (q && !h.symbol.toLowerCase().includes(q) &&
-               !(h.entity_name ?? '').toLowerCase().includes(q) &&
-               !(h.isin ?? '').toLowerCase().includes(q) &&
-               !BROKER_LABELS[h.broker]?.toLowerCase().includes(q)) return false;
+    // Step 1: broker/sector/entity filters on raw holdings
+    let rows = holdings.filter(h => {
+      if (filterBroker && filterBroker !== 'combined' && h.broker !== filterBroker) return false;
+      if (filterSector && (h.sector ?? 'Equity') !== filterSector) return false;
+      if (filterEntity && h.entity_name          !== filterEntity) return false;
       return true;
     });
+
+    // Step 2: merge by symbol+entity when Combined is selected
+    if (filterBroker === 'combined') rows = mergeBySymbol(rows);
+
+    // Step 3: text search (runs on merged rows so broker badges are matched correctly)
+    if (search) {
+      const q = search.toLowerCase();
+      rows = rows.filter(h => {
+        if (h.symbol.toLowerCase().includes(q)) return true;
+        if ((h.entity_name ?? '').toLowerCase().includes(q)) return true;
+        if ((h.isin ?? '').toLowerCase().includes(q)) return true;
+        return (h.brokers ?? [h.broker]).some(b => BROKER_LABELS[b]?.toLowerCase().includes(q));
+      });
+    }
+
+    return rows;
   }, [holdings, search, filterBroker, filterSector, filterEntity]);
 
   const rows = sortRows(filtered, sortKey, sortDir);
@@ -443,7 +543,7 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
           selected={filterSector}
           onChange={setFilterSector}
         />
-        <FilterPills label="Broker" options={brokers} labelMap={BROKER_LABELS} selected={filterBroker} onChange={setFilterBroker} />
+        <FilterPills label="Broker" options={brokerOptions} labelMap={BROKER_LABELS} selected={filterBroker} onChange={setFilterBroker} />
         {showEntityCol && <FilterPills label="Entity" options={entityNames} selected={filterEntity} onChange={setFilterEntity} />}
       </div>
 
@@ -470,7 +570,9 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
                         <td className="px-3 pl-5 sm:pl-6 py-3 text-right tabular-nums text-xs text-ghost align-top">{i + 1}</td>
                         <td className="px-3 py-3 align-top sticky left-0 bg-card hover:bg-page">
                           <p className="text-xs font-medium text-ink whitespace-nowrap">{h.symbol}</p>
-                          <BrokerBadge broker={h.broker} />
+                          <div className="flex flex-wrap gap-0.5 mt-0.5">
+                            {(h.brokers ?? [h.broker]).map(b => <BrokerBadge key={b} broker={b} />)}
+                          </div>
                           {h.isin && <p className="text-[10px] text-ghost font-mono mt-0.5">{h.isin}</p>}
                         </td>
                         {showEntityCol && (
