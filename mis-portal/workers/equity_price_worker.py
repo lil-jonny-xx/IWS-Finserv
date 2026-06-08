@@ -103,7 +103,8 @@ def load_holdings(conn) -> list[dict]:
     cur.execute(
         """
         SELECT eh.id, eh.entity_id, eh.broker, eh.symbol, eh.exchange,
-               eh.quantity, eh.cost, eh.prev_week_value, eh.first_invested_date
+               eh.quantity, eh.cost, eh.prev_week_value, eh.first_invested_date,
+               eh.isin, eh.angel_one_token
         FROM   equity_holding eh
         ORDER  BY eh.broker, eh.symbol
         """
@@ -165,14 +166,15 @@ class AngelOneAdapter:
         self.smart.generateSession(c["client_id"], c["password"], totp)
 
     def get_ltp(self, holdings: list[dict]) -> dict[str, float]:
-        symbols = [h["symbol"] for h in holdings]
-        # SmartAPI getMarketData requires exchange + symboltoken
-        # symboltoken is fetched from the master scrip list; use LTP mode for speed.
         prices = {}
         for h in holdings:
+            token = (h.get("angel_one_token") or "").strip()
+            if not token:
+                logger.debug(f"Angel One: no symboltoken for {h['symbol']} — skipping LTP")
+                continue
             try:
                 exchange = (h.get("exchange") or "NSE").upper()
-                resp = self.smart.ltpData(exchange, h["symbol"], h.get("isin", ""))
+                resp = self.smart.ltpData(exchange, h["symbol"], token)
                 if resp and resp.get("status") and resp.get("data"):
                     prices[h["symbol"]] = float(resp["data"]["ltp"])
             except Exception as e:

@@ -138,7 +138,7 @@ def normalise(entity_id: int, entity_code: str, raw: list[dict]) -> list[EquityH
         result.append(EquityHolding(
             entity_id            = entity_id,
             broker               = "angel_one",
-            symbol               = h["tradingsymbol"],
+            symbol               = h["tradingsymbol"] or h.get("isin", ""),
             isin                 = h.get("isin", ""),
             exchange             = h.get("exchange", "NSE"),
             quantity             = qty,
@@ -146,6 +146,7 @@ def normalise(entity_id: int, entity_code: str, raw: list[dict]) -> list[EquityH
             cost                 = (qty * avg).quantize(Decimal("0.01")),
             current_price        = ltp,
             current_market_value = (qty * ltp).quantize(Decimal("0.01")),
+            angel_one_token      = str(h.get("symboltoken", "") or ""),
         ))
 
     return result

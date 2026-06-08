@@ -153,7 +153,7 @@ function sortRows(rows: EquityHoldingRow[], key: SortKey, dir: SortDir): EquityH
 function mergeBySymbol(holdings: EquityHoldingRow[]): EquityHoldingRow[] {
   const map = new Map<string, EquityHoldingRow[]>();
   for (const h of holdings) {
-    const key = `${h.entity_id}::${h.symbol}`;
+    const key = `${h.entity_id}::${h.isin || h.symbol}`;
     if (!map.has(key)) map.set(key, []);
     map.get(key)!.push(h);
   }
@@ -198,9 +198,11 @@ function mergeBySymbol(holdings: EquityHoldingRow[]): EquityHoldingRow[] {
 
     const brokers = [...new Set(rows.map(h => h.broker))];
 
+    const displaySymbol = rows.find(r => r.symbol)?.symbol ?? rows[0].isin ?? '';
     merged.push({
       ...rows[0],
       id: -(++syntheticId),
+      symbol: displaySymbol,
       broker: rows[0].broker,
       brokers,
       quantity: qty,
@@ -569,7 +571,7 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
                       <tr key={h.id} className="border-t border-rule hover:bg-page transition-colors duration-100">
                         <td className="px-3 pl-5 sm:pl-6 py-3 text-right tabular-nums text-xs text-ghost align-top">{i + 1}</td>
                         <td className="px-3 py-3 align-top sticky left-0 bg-card hover:bg-page">
-                          <p className="text-xs font-medium text-ink whitespace-nowrap">{h.symbol}</p>
+                          <p className="text-xs font-medium text-ink whitespace-nowrap">{h.symbol || h.isin}</p>
                           <div className="flex flex-wrap gap-0.5 mt-0.5">
                             {(h.brokers ?? [h.broker]).map(b => <BrokerBadge key={b} broker={b} />)}
                           </div>

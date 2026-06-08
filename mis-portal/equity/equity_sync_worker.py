@@ -220,6 +220,16 @@ def compute_metrics(
 # ---------------------------------------------------------------------------
 
 def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[date]):
+    # If symbol was previously stored as empty string (before ISIN fallback was added),
+    # remove the stale row so the new upsert doesn't create a duplicate.
+    if h.isin:
+        cur.execute(
+            """
+            DELETE FROM equity_holding
+            WHERE entity_id = %s AND broker = %s AND symbol = '' AND isin = %s
+            """,
+            (h.entity_id, h.broker, h.isin),
+        )
     cur.execute(
         """
         INSERT INTO equity_holding (
@@ -229,7 +239,7 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
             exposure_pct, weekly_change,
             pnl_ytd, pnl_inception, pnl_weekly_change,
             returns_ytd_pct, returns_inception_pct, cagr_inception_pct,
-            first_invested_date, remarks, updated_at
+            first_invested_date, remarks, angel_one_token, updated_at
         ) VALUES (
             %(entity_id)s, %(broker)s, %(symbol)s, %(isin)s, %(exchange)s, %(sector)s,
             %(quantity)s, %(avg_cost)s, %(cost)s, %(current_price)s, %(current_market_value)s,
@@ -237,7 +247,7 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
             %(exposure_pct)s, %(weekly_change)s,
             %(pnl_ytd)s, %(pnl_inception)s, %(pnl_weekly_change)s,
             %(returns_ytd_pct)s, %(returns_inception_pct)s, %(cagr_inception_pct)s,
-            %(first_invested_date)s, %(remarks)s, NOW()
+            %(first_invested_date)s, %(remarks)s, %(angel_one_token)s, NOW()
         )
         ON CONFLICT (entity_id, broker, symbol) DO UPDATE SET
             isin                  = EXCLUDED.isin,
@@ -260,6 +270,7 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
             returns_inception_pct = EXCLUDED.returns_inception_pct,
             cagr_inception_pct    = EXCLUDED.cagr_inception_pct,
             remarks               = EXCLUDED.remarks,
+            angel_one_token       = COALESCE(EXCLUDED.angel_one_token, equity_holding.angel_one_token),
             updated_at            = NOW()
         """,
         {
@@ -287,6 +298,7 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
             "cagr_inception_pct":    float(h.cagr_inception_pct)    if h.cagr_inception_pct    else None,
             "first_invested_date":   first_invested_date,
             "remarks":               h.remarks,
+            "angel_one_token":       h.angel_one_token or None,
         },
     )
 

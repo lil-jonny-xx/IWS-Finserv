@@ -63,6 +63,8 @@ class EquityHolding:
 
     as_of_date:          Optional[date] = None      # trading date of price data
 
+    angel_one_token:     Optional[str] = None       # symboltoken from Angel One API (needed for LTP)
+
 
 # ---------------------------------------------------------------------------
 # DB DDL (run once via migration)
