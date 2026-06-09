@@ -3,7 +3,7 @@
 One-shot manual re-trigger for specific entities.
 Usage: python workers/manual_cas_retrigger.py
 """
-import os, sys, secrets, logging, tempfile, time
+import os, sys, secrets, random, string, logging, tempfile, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -37,7 +37,10 @@ TARGETS = [
 
 def run_entity(name, pan, email, tmp_dir, seen_ids):
     logger.info(f"━━━ [{name}] manual re-trigger ━━━")
-    pdf_password = secrets.token_urlsafe(12)
+    parts = [secrets.choice(string.digits), secrets.choice(string.digits)]
+    parts += [secrets.choice(string.ascii_letters + string.digits) for _ in range(10)]
+    random.shuffle(parts)
+    pdf_password = "".join(parts)
     start_ts     = int(time.time()) - 60
 
     ok = cams_trigger_worker.trigger_cas_request(pan, email, pdf_password)

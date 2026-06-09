@@ -132,7 +132,20 @@ def _shuffled_no_consecutive_pan(configs: list[EntityConfig]) -> list[EntityConf
 
 
 def _random_pdf_password() -> str:
-    return secrets.token_urlsafe(12)
+    """
+    Generate a CAMS-compliant PDF password.
+    CAMS requires: ≥2 digits, allowed special chars are only @ # $ * _
+    token_urlsafe produces '-' which CAMS rejects — build manually instead.
+    """
+    import string as _string
+    letters = _string.ascii_letters
+    digits  = _string.digits
+    # Guarantee 2 digits; fill remaining 10 from alphanumeric only (no special
+    # chars needed — simpler and universally accepted by CAMS).
+    parts = [secrets.choice(digits), secrets.choice(digits)]
+    parts += [secrets.choice(letters + digits) for _ in range(10)]
+    random.shuffle(parts)
+    return "".join(parts)
 
 
 def _pdf_matches_password(pdf_path: str, password: str) -> bool:

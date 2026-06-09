@@ -78,15 +78,21 @@ def _renew_token(entity_code: str) -> str:
 
 def _generate_token(entity_code: str) -> str:
     """Generate a fresh token via PIN + TOTP (headless). Returns new token."""
-    client_id   = _env(entity_code, "CLIENT_ID")
-    pin         = _env(entity_code, "PIN")
-    totp_secret = _env(entity_code, "TOTP_SECRET")
-    totp        = pyotp.TOTP(totp_secret).now()
-    login = DhanLogin(client_id)
-    resp  = login.generate_token(pin, totp)
-    new_token = resp.get("accessToken") or resp.get("access_token") or resp.get("token")
+    client_id  = _env(entity_code, "CLIENT_ID")
+    api_key    = _env(entity_code, "API_KEY")
+    api_secret = _env(entity_code, "API_SECRET")
+    pin        = _env(entity_code, "PIN")
+    totp       = pyotp.TOTP(_env(entity_code, "TOTP_SECRET")).now()
+    # SDK's generate_token() omits app_id/app_secret headers — call directly.
+    resp = requests.post(
+        "https://auth.dhan.co/app/generateAccessToken",
+        params={"dhanClientId": client_id, "pin": pin, "totp": totp},
+        headers={"app_id": api_key, "app_secret": api_secret},
+    )
+    data = resp.json()
+    new_token = data.get("accessToken") or data.get("access_token") or data.get("token")
     if not new_token:
-        raise RuntimeError(f"generateAccessToken response missing token: {resp}")
+        raise RuntimeError(f"generateAccessToken response missing token: {data}")
     _save_token_to_env(entity_code, new_token)
     logger.info(f"[{entity_code}] Dhan token generated via PIN+TOTP")
     return new_token

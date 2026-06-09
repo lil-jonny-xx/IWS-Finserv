@@ -804,6 +804,216 @@ def get_holdings(
         release_db_connection(conn)
 
 
+@app.get("/api/v1/holdings/combined")
+def get_combined_holdings(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    MF holdings merged by security across all entities.
+    Units summed, cost weighted-averaged, XIRR from pooled transactions.
+    Admin only.
+    """
+    from collections import OrderedDict, defaultdict
+    from datetime import date as _date
+    conn = None
+    try:
+        payload   = _require_auth(request, authorization)
+        conn      = get_db_connection()
+        cursor    = conn.cursor()
+        user_role = _live_role(cursor, payload["email"])
+        if user_role != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+
+        cursor.execute("""
+            SELECT
+                h.id, h.entity_id, h.security_id, h.folio_number,
+                h.quantity, h.avg_cost, h.invested_amount,
+                h.first_invested_date,
+                h.last_updated_nav     AS nav,
+                h.current_value, h.prev_week_value, h.market_value_as_on,
+                h.as_of_date, h.exposure_pct, h.weekly_change,
+                h.pnl_ytd, h.pnl_inception, h.pnl_weekly_change,
+                h.returns_ytd_pct, h.returns_inception_pct,
+                h.cagr_inception_pct, h.xirr_inception_pct, h.remarks,
+                sm.isin, sm.security_name, sm.security_type,
+                sm.asset_class, sm.amfi_code,
+                e.entity_name
+            FROM holding h
+            JOIN security_master sm ON sm.id = h.security_id
+            JOIN entity e ON e.id = h.entity_id
+            ORDER BY sm.asset_class, sm.security_name, e.entity_name
+        """)
+        rows = cursor.fetchall()
+
+        cursor.execute("""
+            SELECT security_id, transaction_date, amount, units
+            FROM mf_transaction
+            WHERE amount IS NOT NULL
+            ORDER BY security_id, transaction_date
+        """)
+        txn_rows = cursor.fetchall()
+        cursor.close()
+
+        realized_gains = _compute_realized_gains(conn)
+
+        # Pool transactions per security for XIRR
+        txn_by_sec: dict = defaultdict(list)
+        for t in txn_rows:
+            amt   = float(t["amount"])
+            units = float(t["units"]) if t["units"] is not None else 0.0
+            cf    = -abs(amt) if units >= 0 else abs(amt)
+            txn_by_sec[t["security_id"]].append((t["transaction_date"], cf))
+
+        # First pass — accumulate per security
+        sec_map: dict = OrderedDict()
+        for r in rows:
+            sid = r["security_id"]
+            if sid not in sec_map:
+                sec_map[sid] = {
+                    "security_id":    sid,
+                    "isin":           r["isin"],
+                    "security_name":  r["security_name"],
+                    "security_type":  r["security_type"],
+                    "asset_class":    r["asset_class"],
+                    "amfi_code":      r["amfi_code"],
+                    "nav":            float(r["nav"]) if r["nav"] else None,
+                    "as_of_date":     str(r["as_of_date"]) if r["as_of_date"] else None,
+                    "_total_qty":     0.0,
+                    "_total_inv":     0.0,
+                    "_total_cur":     0.0,
+                    "_total_mkt":     0.0,
+                    "_wavg_num":      0.0,
+                    "_prev_week":     0.0,
+                    "_weekly_chg":    0.0,
+                    "_pnl_ytd":       0.0,
+                    "_pnl_inc":       0.0,
+                    "_pnl_wkly":      0.0,
+                    "_exp_pct":       0.0,
+                    "_realized":      0.0,
+                    "_first_dates":   [],
+                    "_entities":      set(),
+                    "rows":           [],
+                }
+
+            qty      = float(r["quantity"])      if r["quantity"]      else 0.0
+            invested = float(r["invested_amount"]) if r["invested_amount"] else 0.0
+            nav_val  = float(r["nav"])             if r["nav"]            else None
+            cur_val  = float(r["current_value"])   if r["current_value"]  else (
+                round(qty * nav_val, 2) if nav_val else 0.0
+            )
+            mkt_val  = float(r["market_value_as_on"]) if r["market_value_as_on"] else cur_val
+            avg_cost = float(r["avg_cost"]) if r["avg_cost"] else None
+            rg_key   = (r["entity_id"], sid, r["folio_number"])
+            realized = realized_gains.get(rg_key, 0.0)
+
+            s = sec_map[sid]
+            s["_total_qty"]  += qty
+            s["_total_inv"]  += invested
+            s["_total_cur"]  += cur_val
+            s["_total_mkt"]  += mkt_val
+            if avg_cost is not None:
+                s["_wavg_num"] += qty * avg_cost
+            s["_prev_week"]  += float(r["prev_week_value"])   if r["prev_week_value"]   else 0.0
+            s["_weekly_chg"] += float(r["weekly_change"])     if r["weekly_change"]     else 0.0
+            s["_pnl_ytd"]    += float(r["pnl_ytd"])           if r["pnl_ytd"]           else 0.0
+            s["_pnl_inc"]    += float(r["pnl_inception"])     if r["pnl_inception"]     else 0.0
+            s["_pnl_wkly"]   += float(r["pnl_weekly_change"]) if r["pnl_weekly_change"] else 0.0
+            s["_exp_pct"]    += float(r["exposure_pct"])      if r["exposure_pct"]      else 0.0
+            s["_realized"]   += realized
+            if r["first_invested_date"]:
+                s["_first_dates"].append(str(r["first_invested_date"]))
+            s["_entities"].add(r["entity_name"])
+            s["rows"].append({
+                "entity_name":        r["entity_name"],
+                "folio_number":       r["folio_number"],
+                "quantity":           qty,
+                "avg_cost":           avg_cost,
+                "invested_amount":    invested,
+                "nav":                nav_val,
+                "current_value":      cur_val,
+                "market_value_as_on": mkt_val,
+                "pnl_inception":      float(r["pnl_inception"])      if r["pnl_inception"]      else None,
+                "xirr_inception_pct": float(r["xirr_inception_pct"]) if r["xirr_inception_pct"] else None,
+                "cagr_inception_pct": float(r["cagr_inception_pct"]) if r["cagr_inception_pct"] else None,
+                "first_invested_date": str(r["first_invested_date"]) if r["first_invested_date"] else None,
+                "realized_gain":      realized,
+            })
+
+        # Second pass — compute derived metrics and build response
+        from workers.mf_metrics_worker import xirr as _xirr
+        today      = _date.today()
+        combined   = []
+        total_inv_all = 0.0
+
+        for sid, s in sec_map.items():
+            tqty = s["_total_qty"]
+            tinv = s["_total_inv"]
+            tmkt = s["_total_mkt"]
+
+            wavg_cost      = s["_wavg_num"] / tqty if tqty > 0 else None
+            first_date_str = min(s["_first_dates"]) if s["_first_dates"] else None
+
+            returns_inc = round((tmkt - tinv) / tinv * 100, 4) if tinv > 0 else None
+
+            cagr = None
+            if first_date_str and tinv > 0 and tmkt > 0:
+                fd    = _date.fromisoformat(first_date_str)
+                years = (today - fd).days / 365.25
+                if years > 0.01:
+                    cagr = round(((tmkt / tinv) ** (1 / years) - 1) * 100, 4)
+
+            xirr_val = None
+            txn_flows = list(txn_by_sec.get(sid, []))
+            if txn_flows and tmkt > 0:
+                xirr_val = _xirr(txn_flows + [(today, tmkt)])
+
+            total_inv_all += tinv
+            combined.append({
+                "security_id":          sid,
+                "isin":                 s["isin"],
+                "security_name":        s["security_name"],
+                "security_type":        s["security_type"],
+                "asset_class":          s["asset_class"],
+                "amfi_code":            s["amfi_code"],
+                "quantity":             round(tqty, 6),
+                "avg_cost":             round(wavg_cost, 4) if wavg_cost else None,
+                "invested_amount":      round(tinv, 2),
+                "nav":                  s["nav"],
+                "current_value":        round(s["_total_cur"], 2),
+                "market_value_as_on":   round(tmkt, 2),
+                "first_invested_date":  first_date_str,
+                "as_of_date":           s["as_of_date"],
+                "exposure_pct":         round(s["_exp_pct"], 4) if s["_exp_pct"] else None,
+                "weekly_change":        round(s["_weekly_chg"], 2) if s["_weekly_chg"] else None,
+                "prev_week_value":      round(s["_prev_week"], 2)  if s["_prev_week"]  else None,
+                "pnl_ytd":              round(s["_pnl_ytd"], 2)    if s["_pnl_ytd"]    else None,
+                "pnl_inception":        round(s["_pnl_inc"], 2)    if s["_pnl_inc"]    else None,
+                "pnl_weekly_change":    round(s["_pnl_wkly"], 2)   if s["_pnl_wkly"]  else None,
+                "returns_ytd_pct":      None,
+                "returns_inception_pct": returns_inc,
+                "cagr_inception_pct":   cagr,
+                "xirr_inception_pct":   xirr_val,
+                "realized_gain":        round(s["_realized"], 2),
+                "entities":             sorted(s["_entities"]),
+                "rows":                 s["rows"],
+            })
+
+        return {
+            "total_combined": len(combined),
+            "total_invested":  round(total_inv_all, 2),
+            "holdings":        combined,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/v1/holdings/combined: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
 def _resolve_entity(cursor, payload: dict, entity_id_param: Optional[int]) -> Optional[int]:
     """
     Returns the entity_id to query.

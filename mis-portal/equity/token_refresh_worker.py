@@ -1,8 +1,7 @@
 """
 Equity Token Refresh Worker
 
-Refreshes daily-expiring broker access tokens for Zerodha and Angel One.
-Dhan tokens are 30-day lived — update DHAN_HHR_ACCESS_TOKEN in .env manually.
+Refreshes daily-expiring broker access tokens for Zerodha, Angel One, and Dhan.
 
 Schedule: Daily at 6:30 AM IST (01:00 UTC) — before equity_sync_worker
 Cron:     0 1 * * * /var/www/.venv/bin/python /var/www/mis-portal/equity/token_refresh_worker.py >> /var/log/mis-portal-equity-token.log 2>&1
@@ -16,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 load_dotenv("/var/www/mis-portal/.env", override=True)
 
-from equity.brokers import zerodha, angel_one
+from equity.brokers import zerodha, angel_one, dhan
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,6 +45,13 @@ def main():
         except Exception as e:
             logger.error(f"[{code}] Angel One token refresh failed: {e}")
             errors.append(f"angel_one:{code}")
+
+    for code in dhan.SUPPORTED_ENTITIES:
+        try:
+            dhan.refresh_access_token(code)
+        except Exception as e:
+            logger.error(f"[{code}] Dhan token refresh failed: {e}")
+            errors.append(f"dhan:{code}")
 
     if errors:
         logger.error(f"=== Done with errors: {errors} ===")

@@ -51,6 +51,76 @@ def _fetch_entities(conn):
     return rows
 
 
+def _fetch_equity_daily_data(conn, entity_ids: list):
+    """Fetch equity holdings with quantity, avg_cost, current_price for Equity Daily Print."""
+    cur = conn.cursor()
+    placeholders = ",".join(["%s"] * len(entity_ids))
+    cur.execute(f"""
+        SELECT
+            eh.entity_id, e.entity_name,
+            COALESCE(eh.symbol_override, eh.symbol) AS symbol,
+            eh.isin, eh.broker,
+            eh.quantity, eh.avg_cost,
+            eh.cost, eh.current_price, eh.current_market_value,
+            eh.pnl_inception, eh.returns_inception_pct
+        FROM equity_holding eh
+        JOIN entity e ON e.id = eh.entity_id
+        WHERE eh.entity_id IN ({placeholders})
+        ORDER BY eh.entity_id, eh.current_market_value DESC NULLS LAST
+    """, entity_ids)
+    rows = cur.fetchall()
+    cur.close()
+    return rows
+
+
+def _merge_edp_rows(rows: list, cross_entity: bool = False) -> list:
+    """
+    Merge same-ISIN holdings. If cross_entity=False, merges within each entity.
+    If cross_entity=True, merges across all entities (for grand total).
+    Returns list sorted by current_market_value desc.
+    """
+    groups: dict = defaultdict(list)
+    for r in rows:
+        isin = (r.get("isin") or "").strip()
+        sym  = r.get("symbol") or ""
+        if cross_entity:
+            key = isin if isin else sym
+        else:
+            key = (r["entity_id"], isin if isin else sym)
+        groups[key].append(r)
+
+    merged = []
+    for key, rrows in groups.items():
+        if len(rrows) == 1:
+            merged.append(dict(rrows[0]))
+            continue
+
+        def _fsum(k):
+            return sum(float(r[k]) for r in rrows if r.get(k) is not None)
+
+        qty     = _fsum("quantity")
+        cost    = _fsum("cost")
+        cmv     = _fsum("current_market_value")
+        pnl     = _fsum("pnl_inception")
+        avg_c   = cost / qty if qty else None
+        ret_inc = pnl / cost * 100 if cost else None
+        cur_p   = next((float(r["current_price"]) for r in rrows if r.get("current_price")), None)
+
+        m = dict(rrows[0])
+        m.update({
+            "quantity":             qty,
+            "avg_cost":             avg_c,
+            "cost":                 cost,
+            "current_price":        cur_p,
+            "current_market_value": cmv,
+            "pnl_inception":        pnl,
+            "returns_inception_pct": ret_inc,
+        })
+        merged.append(m)
+
+    return sorted(merged, key=lambda r: -(float(r.get("current_market_value") or 0)))
+
+
 def _fetch_mf_holdings(conn, entity_id: Optional[int] = None):
     """Fetch MF holdings. DB security_type values: MF_DEBT, MF_EQUITY, MF_HYBRID."""
     cur = conn.cursor()
@@ -229,6 +299,147 @@ def _holding_label(h):
         broker = h.get("broker", "")
         label  = f"{sym}  [{broker}]" if broker else sym
     return label
+
+
+# ── equity daily print helpers ────────────────────────────────────────────────
+
+EDP_COLS = [
+    ("Script Name",               24),
+    ("Ticker\nName",              12),
+    ("Last Purchase\nDate",       13),
+    ("Quantity",                  12),
+    ("Avg Purchase\nPrice (₹)",   13),
+    ("Total Purchase\nCost (₹)",  15),
+    ("Current\nMkt Price (₹)",    13),
+    ("Total Current\nMkt Val (₹)", 16),
+    ("Total P&L\nInception (₹)",  14),
+    ("Inception\nReturns %",      11),
+    ("Stock Exp.\n(CMP) %",       11),
+    ("Stock Exp.\n(Cost) %",      11),
+    ("Change in\nExposure",       11),
+]
+NC_EDP = len(EDP_COLS)  # 13
+
+
+def _edp_col_headers(ws, row):
+    for c, (name, _) in enumerate(EDP_COLS, 1):
+        cell = ws.cell(row=row, column=c, value=name)
+        cell.font      = SUB_FONT
+        cell.fill      = SUB_FILL
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border    = THIN_BORDER
+    ws.row_dimensions[row].height = 30
+    return row + 1
+
+
+def _edp_section_header(ws, row, title):
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=NC_EDP)
+    cell = ws.cell(row=row, column=1, value=title)
+    cell.font      = ENT_FONT
+    cell.fill      = ENT_FILL
+    cell.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[row].height = 18
+    return row + 1
+
+
+def _edp_data_row(ws, row, holding, total_cmv, total_cost, alt=False):
+    fill = ALT_FILL if alt else WHITE_FILL
+    qty         = _v(holding, "quantity")
+    avg_price   = _v(holding, "avg_cost")
+    cost        = _v(holding, "cost")
+    cur_price   = _v(holding, "current_price")
+    cmv         = _v(holding, "current_market_value")
+    pnl         = _v(holding, "pnl_inception")
+    returns_pct = _v(holding, "returns_inception_pct")
+    exp_cmp     = (cmv / total_cmv * 100) if (cmv and total_cmv) else None
+    exp_cost    = (cost / total_cost * 100) if (cost and total_cost) else None
+    chg_exp     = ((exp_cmp - exp_cost) if (exp_cmp is not None and exp_cost is not None) else None)
+
+    vals = [
+        holding.get("symbol") or "",
+        holding.get("symbol") or "",
+        None,                            # Last Purchase Date — no txn history yet
+        qty,
+        avg_price,
+        cost,
+        cur_price,
+        cmv,
+        pnl,
+        returns_pct,
+        exp_cmp,
+        exp_cost,
+        chg_exp,
+    ]
+    for c, val in enumerate(vals, 1):
+        cell = ws.cell(row=row, column=c, value=val)
+        cell.fill   = fill
+        cell.border = THIN_BORDER
+        cell.font   = BODY_FONT
+        if c in (1, 2):
+            cell.alignment = Alignment(horizontal="left", indent=1)
+        elif c == 3:
+            cell.number_format = DATE_FMT
+            cell.alignment     = Alignment(horizontal="center")
+        elif c == 4:
+            cell.number_format = '#,##0.00##'
+            cell.alignment     = Alignment(horizontal="right")
+        elif c in (5, 6, 7, 8, 9):
+            cell.number_format = INR_FMT
+            cell.alignment     = Alignment(horizontal="right")
+        elif c in (10, 11, 12, 13):
+            if val is not None:
+                cell.value = val / 100
+            cell.number_format = PCT_FMT
+            cell.alignment     = Alignment(horizontal="right")
+
+
+def _edp_total_row(ws, row, label, data_start, data_end, section_cmv, section_cost, grand_cmv, grand_cost):
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+    cell = ws.cell(row=row, column=1, value=label)
+    cell.font      = TOT_FONT
+    cell.fill      = TOT_FILL
+    cell.alignment = Alignment(horizontal="left", indent=1)
+    cell.border    = THIN_BORDER
+
+    sum_cols  = {6, 8, 9}    # cost, CMV, P&L
+    exp_cmp   = (section_cmv  / grand_cmv  * 100) if (section_cmv  and grand_cmv)  else None
+    exp_cost  = (section_cost / grand_cost * 100) if (section_cost and grand_cost) else None
+    chg_exp   = ((exp_cmp - exp_cost) if (exp_cmp is not None and exp_cost is not None) else None)
+
+    for c in range(2, NC_EDP + 1):
+        cell = ws.cell(row=row, column=c)
+        cell.fill   = TOT_FILL
+        cell.font   = TOT_FONT
+        cell.border = THIN_BORDER
+        if c in sum_cols and data_start:
+            cl = get_column_letter(c)
+            cell.value         = f"=SUM({cl}{data_start}:{cl}{data_end})"
+            cell.number_format = INR_FMT
+            cell.alignment     = Alignment(horizontal="right")
+        elif c == 4 and data_start:       # qty sum
+            cl = get_column_letter(c)
+            cell.value         = f"=SUM({cl}{data_start}:{cl}{data_end})"
+            cell.number_format = '#,##0.00##'
+            cell.alignment     = Alignment(horizontal="right")
+        elif c == 10 and data_start:      # returns = P&L / cost
+            cell.value         = f"=I{row}/F{row}"
+            cell.number_format = PCT_FMT
+            cell.alignment     = Alignment(horizontal="right")
+        elif c == 11:
+            if exp_cmp is not None:
+                cell.value = exp_cmp / 100
+            cell.number_format = PCT_FMT
+            cell.alignment     = Alignment(horizontal="right")
+        elif c == 12:
+            if exp_cost is not None:
+                cell.value = exp_cost / 100
+            cell.number_format = PCT_FMT
+            cell.alignment     = Alignment(horizontal="right")
+        elif c == 13:
+            if chg_exp is not None:
+                cell.value = chg_exp / 100
+            cell.number_format = PCT_FMT
+            cell.alignment     = Alignment(horizontal="right")
 
 
 # ── individual report helpers ─────────────────────────────────────────────────
@@ -621,14 +832,28 @@ def build_combined_report(conn, as_of: date):
         ppf_man    = man_by_cat.get("ppf", []) + man_by_cat.get("fixed_income", [])
 
         if debt_holds or ppf_man:
-            row = _comb_section(ws, row, "Fixed Income")
-            data_start = row
-            alt = False
-            for h in debt_holds:
-                _comb_data_row(ws, row, h, "CAS", alt); row += 1; alt = not alt
-            for m in ppf_man:
-                _comb_data_row(ws, row, m, "Manual", alt); row += 1; alt = not alt
-            _comb_total(ws, row, "Total Fixed Income", data_start, row - 1); row += 1
+            row = _comb_section(ws, row, "FIXED INCOME")
+            fi_sub_total_rows: list = []
+
+            if debt_holds:
+                row = _comb_section(ws, row, "MF Debt / Liquid Funds")
+                sub_start = row
+                alt = False
+                for h in debt_holds:
+                    _comb_data_row(ws, row, h, "CAS", alt); row += 1; alt = not alt
+                _comb_total(ws, row, "Total MF Debt / Liquid", sub_start, row - 1)
+                fi_sub_total_rows.append(row); row += 1
+
+            if ppf_man:
+                row = _comb_section(ws, row, "PPF / Other Fixed Income")
+                sub_start = row
+                alt = False
+                for m in ppf_man:
+                    _comb_data_row(ws, row, m, "Manual", alt); row += 1; alt = not alt
+                _comb_total(ws, row, "Total PPF / Fixed Income", sub_start, row - 1)
+                fi_sub_total_rows.append(row); row += 1
+
+            _comb_total(ws, row, "Total Fixed Income"); row += 1
 
         # ── Equity ────────────────────────────────────────────────────────────
         eq_mf  = [h for h in mf_rows if h["security_type"] == "MF_EQUITY"]
@@ -637,20 +862,43 @@ def build_combined_report(conn, as_of: date):
         aif    = man_by_cat.get("aif", [])
 
         if eq_mf or hyb_mf or eq_rows or pms or aif:
-            row = _comb_section(ws, row, "Equity")
-            data_start = row
-            alt = False
-            for h in eq_mf:
-                _comb_data_row(ws, row, h, "CAS", alt);    row += 1; alt = not alt
-            for h in hyb_mf:
-                _comb_data_row(ws, row, h, "CAS", alt);    row += 1; alt = not alt
-            for h in eq_rows:
-                _comb_data_row(ws, row, h, h.get("broker", "Broker"), alt); row += 1; alt = not alt
-            for m in pms:
-                _comb_data_row(ws, row, m, "PMS",    alt); row += 1; alt = not alt
-            for m in aif:
-                _comb_data_row(ws, row, m, "AIF",    alt); row += 1; alt = not alt
-            _comb_total(ws, row, "Total Equity", data_start, row - 1); row += 1
+            row = _comb_section(ws, row, "EQUITY")
+
+            if eq_mf or hyb_mf:
+                row = _comb_section(ws, row, "MF Equity / Hybrid Funds")
+                sub_start = row
+                alt = False
+                for h in eq_mf:
+                    _comb_data_row(ws, row, h, "CAS", alt);  row += 1; alt = not alt
+                for h in hyb_mf:
+                    _comb_data_row(ws, row, h, "CAS", alt);  row += 1; alt = not alt
+                _comb_total(ws, row, "Total MF Equity / Hybrid", sub_start, row - 1); row += 1
+
+            if eq_rows:
+                row = _comb_section(ws, row, "Direct Equities")
+                sub_start = row
+                alt = False
+                for h in eq_rows:
+                    _comb_data_row(ws, row, h, h.get("broker", "Broker"), alt); row += 1; alt = not alt
+                _comb_total(ws, row, "Total Direct Equities", sub_start, row - 1); row += 1
+
+            if pms:
+                row = _comb_section(ws, row, "PMS")
+                sub_start = row
+                alt = False
+                for m in pms:
+                    _comb_data_row(ws, row, m, "PMS", alt);  row += 1; alt = not alt
+                _comb_total(ws, row, "Total PMS", sub_start, row - 1); row += 1
+
+            if aif:
+                row = _comb_section(ws, row, "AIF")
+                sub_start = row
+                alt = False
+                for m in aif:
+                    _comb_data_row(ws, row, m, "AIF", alt);  row += 1; alt = not alt
+                _comb_total(ws, row, "Total AIF", sub_start, row - 1); row += 1
+
+            _comb_total(ws, row, "Total Equity"); row += 1
 
         # ── Alternates ────────────────────────────────────────────────────────
         alt_cats = [
@@ -663,13 +911,15 @@ def build_combined_report(conn, as_of: date):
         ]
         alt_items = [(cat, label, man_by_cat.get(cat, [])) for cat, label in alt_cats if man_by_cat.get(cat)]
         if alt_items:
-            row = _comb_section(ws, row, "Alternates")
-            data_start = row
-            alt = False
-            for _cat, _label, items in alt_items:
+            row = _comb_section(ws, row, "ALTERNATES")
+            for _cat, label, items in alt_items:
+                row = _comb_section(ws, row, label)
+                sub_start = row
+                alt = False
                 for m in items:
                     _comb_data_row(ws, row, m, "Manual", alt); row += 1; alt = not alt
-            _comb_total(ws, row, "Total Alternates", data_start, row - 1); row += 1
+                _comb_total(ws, row, f"Total {label}", sub_start, row - 1); row += 1
+            _comb_total(ws, row, "Total Alternates"); row += 1
 
         # ── Below-the-line ────────────────────────────────────────────────────
         btl = []
@@ -701,6 +951,108 @@ def build_combined_report(conn, as_of: date):
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=NC)
 
     for c, (_, width) in enumerate(COMB_COLS, 1):
+        ws.column_dimensions[get_column_letter(c)].width = width
+
+    ws.print_title_rows = "1:2"
+    return wb
+
+
+# ── equity daily print report ─────────────────────────────────────────────────
+
+def build_equity_daily_print(conn, entity_codes: list, as_of: date):
+    """
+    Build a single-sheet Equity Daily Print workbook for the given entity codes
+    (e.g. ['DHR', 'HHR', 'SDR']).  Sections: Grand Total (combined), then per entity.
+    """
+    # Resolve entity codes → IDs + names
+    cur = conn.cursor()
+    placeholders = ",".join(["%s"] * len(entity_codes))
+    cur.execute(
+        f"SELECT id, entity_name FROM entity WHERE entity_name IN ({placeholders}) ORDER BY id",
+        entity_codes,
+    )
+    entity_map = {r["entity_name"]: r["id"] for r in cur.fetchall()}
+    cur.close()
+
+    # Preserve order as requested
+    entities = [(code, entity_map[code]) for code in entity_codes if code in entity_map]
+    entity_ids = [eid for _, eid in entities]
+
+    raw = _fetch_equity_daily_data(conn, entity_ids)
+
+    # Per-entity merged rows (multi-broker same ISIN collapsed, sorted CMV desc)
+    entity_rows: dict = {}
+    for code, eid in entities:
+        rows = [r for r in raw if r["entity_id"] == eid]
+        entity_rows[code] = _merge_edp_rows(rows, cross_entity=False)
+
+    # Grand total: merge across all entities by ISIN/symbol
+    grand_rows = _merge_edp_rows(raw, cross_entity=True)
+
+    # Totals for exposure % denominators
+    def _total(rows, key):
+        return sum(float(r[key]) for r in rows if r.get(key)) or None
+
+    grand_cmv  = _total(grand_rows, "current_market_value")
+    grand_cost = _total(grand_rows, "cost")
+
+    # Build workbook
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Equity Daily Print"
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A3"
+
+    row = 1
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=NC_EDP)
+    hdr = ws.cell(row=row, column=1,
+                  value=f"EQUITY DAILY PRINT — RAJANI GROUP   |   As on {as_of.strftime('%d %b %Y')}")
+    hdr.font      = HDR_FONT
+    hdr.fill      = HDR_FILL
+    hdr.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[row].height = 22
+    row += 1
+
+    def _write_section(title, rows, sec_cmv, sec_cost, denom_cmv, denom_cost):
+        nonlocal row
+        row = _edp_section_header(ws, row, f"{title} as on {as_of.strftime('%d %b %Y')}")
+        row = _edp_col_headers(ws, row)
+        data_start = row
+        for i, h in enumerate(rows):
+            _edp_data_row(ws, row, h, sec_cmv, sec_cost, i % 2 == 1)
+            row += 1
+        data_end = row - 1
+        _edp_total_row(ws, row, f"Total — {title}", data_start, data_end,
+                       sec_cmv, sec_cost, denom_cmv, denom_cost)
+        row += 2
+
+    # Grand total section
+    _write_section(
+        "Total Rajani Group Direct Equity (DOMESTIC)",
+        grand_rows,
+        grand_cmv, grand_cost,
+        grand_cmv, grand_cost,   # denominator = itself → 100 %
+    )
+
+    # Per-entity sections
+    for code, _eid in entities:
+        rows = entity_rows[code]
+        sec_cmv  = _total(rows, "current_market_value")
+        sec_cost = _total(rows, "cost")
+        _write_section(
+            f"{code} Direct Equity (DOMESTIC)",
+            rows,
+            sec_cmv, sec_cost,
+            grand_cmv, grand_cost,   # denominator = grand total
+        )
+
+    note = ws.cell(row=row, column=1,
+                   value=f"Generated {datetime.utcnow().strftime('%d %b %Y %H:%M')} UTC  "
+                         f"|  Equity prices from broker API  |  Last Purchase Date not available (no transaction history)")
+    note.font = LABEL_FONT
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=NC_EDP)
+
+    for c, (_, width) in enumerate(EDP_COLS, 1):
         ws.column_dimensions[get_column_letter(c)].width = width
 
     ws.print_title_rows = "1:2"
@@ -755,6 +1107,23 @@ def generate_reports(conn, generated_by_user_id: Optional[int] = None) -> list[d
     """, (fname, fpath, as_of, generated_by_user_id))
     report_id = cur.fetchone()["id"]
     results.append({"id": report_id, "type": "combined", "entity": "All Entities",
+                     "filename": fname, "path": fpath})
+
+    # Equity Daily Print (DHR, HHR, SDR)
+    EQUITY_DAILY_ENTITIES = ["DHR", "HHR", "SDR"]
+    fname = f"Equity_Daily_Print_{as_of.strftime('%Y%m%d')}.xlsx"
+    fpath = os.path.join(folder, fname)
+    wb    = build_equity_daily_print(conn, EQUITY_DAILY_ENTITIES, as_of)
+    wb.save(fpath)
+
+    cur.execute("""
+        INSERT INTO generated_report
+            (report_type, entity_id, entity_name, filename, filepath, as_of_date, generated_by, generated_at)
+        VALUES ('equity_daily', NULL, 'DHR / HHR / SDR', %s, %s, %s, %s, NOW())
+        RETURNING id
+    """, (fname, fpath, as_of, generated_by_user_id))
+    report_id = cur.fetchone()["id"]
+    results.append({"id": report_id, "type": "equity_daily", "entity": "DHR / HHR / SDR",
                      "filename": fname, "path": fpath})
 
     conn.commit()

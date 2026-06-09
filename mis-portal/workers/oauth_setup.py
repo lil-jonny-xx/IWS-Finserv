@@ -4,19 +4,30 @@ Gmail OAuth2 Setup — IWS MIS Portal
 Run ONCE to authorise the central Gmail inbox that receives all CAS emails.
 All 6 entity alias emails must have auto-forward configured to this inbox.
 
-Usage:
+Usage (run on the server, with an SSH tunnel open for port 8080):
   python workers/oauth_setup.py --token workers/gmail_token_central.json
 
-Opens a browser — sign in with the central Gmail account.
-Token saved to the specified file.
+Step 1 — Open a SEPARATE terminal on your local machine and run:
+  ssh -L 8080:localhost:8080 <your_server_user>@<your_server_ip>
+  (keep this terminal open)
+
+Step 2 — Back in this session, run this script. It will print a URL.
+
+Step 3 — Open that URL in your local browser, sign in, and approve.
+
+Step 4 — The token is saved automatically. Done.
 """
 import argparse
 from pathlib import Path
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+]
 CREDENTIALS_FILE = Path(__file__).parent / "gmail_credentials.json"
+PORT = 8080
 
 
 def main():
@@ -24,7 +35,7 @@ def main():
     parser.add_argument(
         "--token",
         required=True,
-        help="Path to save the token (e.g. workers/gmail_token_pan1.json)",
+        help="Path to save the token (e.g. workers/gmail_token_central.json)",
     )
     args = parser.parse_args()
 
@@ -39,19 +50,19 @@ def main():
         )
         raise SystemExit(1)
 
-    flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
-    auth_url, _ = flow.authorization_url(prompt="consent")
-
     print("\n──────────────────────────────────────────────────────")
-    print("Open this URL in your browser and sign in:")
-    print(f"\n  {auth_url}\n")
-    print("After authorising, copy the 'code=...' value from the")
-    print("redirect URL and paste it below.")
-    print("──────────────────────────────────────────────────────\n")
+    print("BEFORE CONTINUING: open a new local terminal and run:")
+    print(f"\n  ssh -L {PORT}:localhost:{PORT} <user>@<server_ip>\n")
+    print("Then come back here and press Enter.")
+    print("──────────────────────────────────────────────────────")
+    input("Press Enter when the SSH tunnel is open...")
 
-    auth_code = input("Paste authorisation code: ").strip()
-    flow.fetch_token(code=auth_code)
-    creds = flow.credentials
+    flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_FILE), SCOPES)
+    creds = flow.run_local_server(
+        port=PORT,
+        open_browser=False,
+        success_message="Authorised! You can close this tab.",
+    )
 
     token_path.parent.mkdir(parents=True, exist_ok=True)
     token_path.write_text(creds.to_json())

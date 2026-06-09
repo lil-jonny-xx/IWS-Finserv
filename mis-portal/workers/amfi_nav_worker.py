@@ -48,24 +48,31 @@ def get_db():
 
 
 def fetch_nav(amfi_code: str) -> dict:
-    """Fetch latest NAV for a scheme code."""
-    response = requests.get(f"{MFAPI_BASE}/{amfi_code}", timeout=10)
-    response.raise_for_status()
-    data = response.json()
-
-    if data.get("status") != "SUCCESS":
-        return None
-
-    nav_data = data.get("data", [])
-    if not nav_data:
-        return None
-
-    latest = nav_data[0]
-    return {
-        "nav":  float(latest["nav"]),
-        "date": datetime.strptime(latest["date"], "%d-%m-%Y").date(),
-        "name": data.get("meta", {}).get("scheme_name", "")
-    }
+    """Fetch latest NAV from mfapi.in with 3 retries and exponential backoff."""
+    import time
+    last_exc = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(f"{MFAPI_BASE}/{amfi_code}", timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("status") != "SUCCESS":
+                return None
+            nav_data = data.get("data", [])
+            if not nav_data:
+                return None
+            latest = nav_data[0]
+            return {
+                "nav":  float(latest["nav"]),
+                "date": datetime.strptime(latest["date"], "%d-%m-%Y").date(),
+                "name": data.get("meta", {}).get("scheme_name", ""),
+            }
+        except Exception as e:
+            last_exc = e
+            if attempt < 2:
+                logger.warning(f"mfapi.in attempt {attempt + 1} failed for {amfi_code}: {e} — retrying")
+                time.sleep(5 * (attempt + 1))
+    raise last_exc
 
 
 def get_tracked(conn) -> list:

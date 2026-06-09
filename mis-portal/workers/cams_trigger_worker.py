@@ -112,10 +112,10 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
                 # --- Folio listing: With zero balance folios (all history) ---
                 # The form default is "Without zero balance folios". We want "With zero balance"
                 # to capture complete history including fully-redeemed folios.
-                # Value "Y" = include zero balance folios on CAMS CAS-CAMS+KFintech form.
                 try:
                     _click_radio_by_value_or_text(page, "Y", "With zero balance folios", "Folio listing")
                     page.wait_for_timeout(random.randint(300, 700))
+                    logger.info("Folio listing: With zero balance folios selected")
                 except RuntimeError:
                     logger.warning("Could not click 'With zero balance folios' radio — using default")
 
@@ -128,20 +128,26 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
                     from_date_str = "01-Apr-1992"
                     to_date_str   = date.today().strftime("%d-%b-%Y")
                     _fill_date_field(page, [
+                        '#fromDate_new',
                         'input[formcontrolname="from_date"]',
+                        'input[placeholder="fromdate"]',
                         'input[formcontrolname="fromDate"]',
+                        'input[formcontrolname="startDate"]',
                         'input[formcontrolname="start_date"]',
+                        'input[aria-label*="from" i]',
                         'input[placeholder*="From" i]',
-                        'input[placeholder*="Start" i]',
-                    ], from_date_str, "From Date")
+                    ], from_date_str, "FROM DATE")
                     page.wait_for_timeout(random.randint(200, 500))
                     _fill_date_field(page, [
+                        '#to-date-input',
                         'input[formcontrolname="to_date"]',
+                        'input[placeholder="todate"]',
                         'input[formcontrolname="toDate"]',
+                        'input[formcontrolname="endDate"]',
                         'input[formcontrolname="end_date"]',
+                        'input[aria-label*="to" i]',
                         'input[placeholder*="To" i]',
-                        'input[placeholder*="End" i]',
-                    ], to_date_str, "To Date")
+                    ], to_date_str, "TO DATE")
                     page.wait_for_timeout(random.randint(300, 600))
                     logger.info(f"Period set: {from_date_str} → {to_date_str}")
                 except RuntimeError as e:
@@ -426,6 +432,26 @@ def _check_submit_result(page) -> bool:
         if any(s in content for s in success_signals):
             return True
 
+        # Form-reset detection: CAMS navigates back to a blank form on certain
+        # submission failures (invalid password chars, session issues). The fields
+        # are cleared and Angular shows inline "required" validation errors.
+        # This is a definitive hard failure — do NOT treat as submitted.
+        form_reset_signals = [
+            "please enter the email",
+            "email is required",
+            "password is required",
+            "confirm password is required",
+            "password should contain atleast",
+            "password may contain only",
+        ]
+        if any(s in content for s in form_reset_signals):
+            logger.error(
+                "CAMS form was reset after Submit — fields cleared with validation errors. "
+                "Likely cause: invalid PDF password (must contain ≥2 digits; "
+                "allowed special chars: @ # $ * _). Hard failure — will not wait for PDF."
+            )
+            return False
+
         # No clear signal — ambiguous. Log a warning and assume submitted.
         logger.warning(
             "Could not confirm CAMS submission result from page content. "
@@ -456,25 +482,83 @@ def _fill_field(page, selectors: list, value: str, label: str):
     )
 
 
+def _type_into_date_input(loc, value: str, page):
+    """Fill a read-only Angular Material date picker input.
+
+    Angular Material sets readonly on date inputs to block browser autocomplete UI.
+    We remove the attribute via JS, then use page.keyboard (bypasses Playwright's
+    editability guard) and fire Tab/blur so the DateAdapter parses the new string.
+    """
+    try:
+        page.evaluate("el => el.removeAttribute('readonly')", loc.element_handle())
+    except Exception:
+        pass
+    loc.click(force=True)  # focus the element
+    page.wait_for_timeout(random.randint(100, 250))
+    page.keyboard.press("Control+a")
+    page.wait_for_timeout(30)
+    page.keyboard.type(value, delay=random.randint(50, 100))
+    # Tab fires blur → Angular DateAdapter parses the typed string and updates the control
+    page.keyboard.press("Tab")
+    page.wait_for_timeout(200)
+
+
+_SHORT_TIMEOUT = 3_000  # ms — used for date-field probing
+
+
 def _fill_date_field(page, selectors: list, value: str, label: str):
     """Fill a date input, clearing existing value first (date pickers retain stale text)."""
-    for sel in selectors:
+    # Primary: Playwright label-based selection (matches Angular Material aria-labelledby)
+    for label_variant in [label, label.upper(), label.title()]:
         try:
-            loc = page.locator(sel).first
-            loc.wait_for(state="visible", timeout=ACTION_TIMEOUT)
-            loc.click(timeout=ACTION_TIMEOUT, force=True)
-            page.wait_for_timeout(random.randint(100, 300))
-            loc.fill("")
-            page.wait_for_timeout(random.randint(100, 200))
-            loc.type(value, delay=random.randint(50, 100))
-            page.keyboard.press("Escape")
-            logger.debug(f"Filled date {label} via: {sel}")
+            loc = page.get_by_label(label_variant, exact=True).first
+            if loc.count() == 0:
+                continue
+            loc.wait_for(state="visible", timeout=_SHORT_TIMEOUT)
+            _type_into_date_input(loc, value, page)
+            logger.debug(f"Filled date '{label}' via get_by_label('{label_variant}')")
             return
         except Exception:
             continue
+
+    # Secondary: CSS selector list (short timeout — we're probing)
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() == 0:
+                continue
+            loc.wait_for(state="visible", timeout=_SHORT_TIMEOUT)
+            _type_into_date_input(loc, value, page)
+            logger.debug(f"Filled date '{label}' via: {sel}")
+            return
+        except Exception:
+            continue
+
+    # Dump all inputs to help diagnose selector mismatches
+    try:
+        all_inputs = page.evaluate("""() => {
+            return Array.from(document.querySelectorAll('input')).map(el => ({
+                type:             el.type,
+                value:            el.value.substring(0, 30),
+                readOnly:         el.readOnly,
+                formcontrolname:  el.getAttribute('formcontrolname'),
+                ngReflect:        el.getAttribute('ng-reflect-name'),
+                ariaLabel:        el.getAttribute('aria-label'),
+                ariaLabelledBy:   el.getAttribute('aria-labelledby'),
+                labelledByText:   (() => { const id = el.getAttribute('aria-labelledby'); return id ? (document.getElementById(id)||{}).textContent||'' : ''; })(),
+                placeholder:      el.placeholder,
+                id:               el.id,
+                classList:        el.className.substring(0, 80),
+                visible:          el.offsetParent !== null,
+            }));
+        }""")
+        logger.warning(f"DOM input dump for '{label}': {all_inputs}")
+    except Exception as dump_err:
+        logger.warning(f"Could not dump inputs: {dump_err}")
+
     raise RuntimeError(
         f"Could not find date field '{label}'. CAMS may have changed their form. "
-        f"Tried: {selectors}"
+        f"Tried get_by_label variants + selectors: {selectors}"
     )
 
 
