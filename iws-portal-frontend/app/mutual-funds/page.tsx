@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import MFTable, { type MFHoldingRow, type MFTotals } from './components/MFTable';
+import MFTable, { type MFHoldingRow, type MFTotals, type CombinedHolding } from './components/MFTable';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 const TXN_PAGE_SIZE = 25;
@@ -35,6 +35,12 @@ interface HoldingsResponse {
   total_holdings: number;
   total_invested: number;
   holdings: MFHoldingRow[];
+}
+
+interface CombinedResponse {
+  total_combined: number;
+  total_invested: number;
+  holdings: CombinedHolding[];
 }
 
 
@@ -133,8 +139,11 @@ export default function MutualFundsPage() {
   const [data, setData]             = useState<HoldingsResponse | null>(null);
   const [loading, setLoading]       = useState(true);
   const [error, setError]           = useState<string | null>(null);
-  const [retryCount, setRetryCount] = useState(0);
-  const [txnData, setTxnData]       = useState<TxnResponse | null>(null);
+  const [retryCount, setRetryCount]     = useState(0);
+  const [viewMode, setViewMode]         = useState<'normal' | 'combined'>('normal');
+  const [combinedData, setCombinedData] = useState<CombinedResponse | null>(null);
+  const [combinedLoading, setCombinedLoading] = useState(false);
+  const [txnData, setTxnData]           = useState<TxnResponse | null>(null);
   const [txnPage, setTxnPage]       = useState(0);
   const [txnLoading, setTxnLoading] = useState(false);
   const [txnType, setTxnType]       = useState<string | null>(null);
@@ -179,6 +188,21 @@ export default function MutualFundsPage() {
       .catch(err => { if (err.name !== 'AbortError') setTxnLoading(false); });
     return () => controller.abort();
   }, [selectedId, txnPage, txnType]);
+
+  useEffect(() => {
+    if (viewMode !== 'combined') return;
+    const controller = new AbortController();
+    setCombinedLoading(true);
+    fetch(`${API_URL}/api/v1/holdings/combined`, { credentials: 'include', signal: controller.signal })
+      .then(r => { if (!r.ok) throw new Error('Failed to load combined holdings.'); return r.json(); })
+      .then((d: CombinedResponse) => { setCombinedData(d); setCombinedLoading(false); })
+      .catch(err => { if (err.name !== 'AbortError') setCombinedLoading(false); });
+    return () => controller.abort();
+  }, [viewMode]);
+
+  function handleToggleCombined() {
+    setViewMode(m => m === 'combined' ? 'normal' : 'combined');
+  }
 
   const isAdmin       = user?.role === 'admin';
   const showEntityCol = isAdmin && selectedId === null;
@@ -227,8 +251,6 @@ export default function MutualFundsPage() {
           <EntitySwitcher entities={entities} selectedId={selectedId} onSelect={setSelectedId} />
         )}
 
-        {loading && <Skeleton />}
-
         {error && (
           <div role="alert" className="bg-card rounded-lg border border-rule px-5 py-5 flex items-start justify-between gap-4">
             <div>
@@ -244,11 +266,17 @@ export default function MutualFundsPage() {
           </div>
         )}
 
+        {loading && <Skeleton />}
+
         {!loading && !error && data && (
           <MFTable
             holdings={data.holdings}
             totals={totals}
             showEntityCol={showEntityCol}
+            viewMode={viewMode}
+            onToggleCombined={handleToggleCombined}
+            combinedHoldings={combinedData?.holdings}
+            combinedTotals={combinedData ? { total_combined: combinedData.total_combined, total_invested: combinedData.total_invested } : undefined}
           />
         )}
 

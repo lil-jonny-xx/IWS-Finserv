@@ -34,5 +34,10 @@ iws-portal-frontend/CLAUDE.md
 .claude/
 skills-lock.json
 .impeccable/
-.xlsx bas.xlsx
+*.xlsx
 mis-portal/.cams_browser_profile/
+mis-portal/logs/
+mis-portal/reports/
+CLAUDE.md
+PRODUCT.md
+MIS-REPORT.xlsx
