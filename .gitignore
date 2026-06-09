@@ -39,7 +39,6 @@ mis-portal/.cams_browser_profile/
 logs/
 mis-portal/logs/
 mis-portal/reports/
-docs/work-log-*.md
 iws-portal-frontend/docs/work-log-*.md
 CLAUDE.md
 PRODUCT.md
