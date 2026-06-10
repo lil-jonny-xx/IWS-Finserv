@@ -117,14 +117,15 @@ def backfill_entity_broker(conn, entity_id: int, entity_code: str,
 
             cur.execute("""
                 INSERT INTO equity_holding_history
-                    (entity_id, broker, symbol, snapshot_date,
+                    (entity_id, broker, symbol, isin, snapshot_date,
                      quantity, close_price, market_value, cost, pnl)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (entity_id, broker, symbol, snapshot_date) DO UPDATE
-                    SET close_price  = EXCLUDED.close_price,
+                    SET isin         = EXCLUDED.isin,
+                        close_price  = EXCLUDED.close_price,
                         market_value = EXCLUDED.market_value,
                         pnl          = EXCLUDED.pnl
-            """, (entity_id, broker_label, symbol, target,
+            """, (entity_id, broker_label, symbol, h["isin"], target,
                   qty, close, market_value, cost, pnl))
             logger.info(f"  {symbol} @ {target}: ₹{close:.2f} → value ₹{market_value:,.0f}")
 
@@ -149,8 +150,8 @@ def recompute_metrics(conn, entity_id: int, broker_label: str,
     for h in holdings:
         symbol = h["symbol"]
 
-        prev_val  = fetch_history_value(conn, entity_id, broker_label, symbol, prev_friday)
-        ytd_val   = fetch_history_value(conn, entity_id, broker_label, symbol, ytd_date)
+        prev_val  = fetch_history_value(conn, entity_id, broker_label, symbol, prev_friday, h["isin"])
+        ytd_val   = fetch_history_value(conn, entity_id, broker_label, symbol, ytd_date, h["isin"])
         first_inv = h["first_invested_date"]
 
         holding = EquityHolding(

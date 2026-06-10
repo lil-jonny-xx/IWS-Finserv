@@ -365,11 +365,20 @@ def run(pdf_path: str, password: str, entity_id_override: int | None = None):
                     nav      = scheme.valuation.nav  if scheme.valuation else None
                     avg_cost = (cost / units) if units > 0 else None
 
-                    purchases = [
+                    # First acquisition date = earliest transaction that added units.
+                    # Switch-ins, SIPs, mergers and reinvestments all open a position but
+                    # don't contain "PURCHASE" in their type, so keying on positive units
+                    # catches every inflow while excluding tax (units=0) and
+                    # redemption/switch-out (units<0) rows. Falls back to the earliest dated
+                    # transaction if a folio somehow has no positive-units inflow.
+                    inflows = [
                         t for t in scheme.transactions
-                        if t.type and "PURCHASE" in str(t.type.value).upper() and t.date
+                        if t.date and t.units and t.units > 0
                     ]
-                    first_date = min(t.date for t in purchases) if purchases else None
+                    first_date = (
+                        min(t.date for t in inflows) if inflows
+                        else min((t.date for t in scheme.transactions if t.date), default=None)
+                    )
 
                     upsert_holding(
                         cur, eid, security_id, folio_num,

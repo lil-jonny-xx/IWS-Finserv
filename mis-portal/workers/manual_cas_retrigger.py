@@ -30,7 +30,11 @@ POLL_INTERVAL = 30   # seconds between Gmail polls
 TIMEOUT_MIN   = 30   # minutes to wait per entity
 
 TARGETS = [
+    # DHR and IWS share PAN AIAPR7542Q — kept non-adjacent so CAMS doesn't
+    # block consecutive same-PAN requests.
+    ("DHR",         "AIAPR7542Q", "***REMOVED***"),
     ("IWS Fincorp", "BAGPR8013K", "***REMOVED***"),
+    ("IWS",         "AIAPR7542Q", "***REMOVED***"),
     ("SDR",         "AOTPD7980H", "***REMOVED***"),
 ]
 

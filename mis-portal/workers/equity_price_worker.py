@@ -326,13 +326,13 @@ def write_eod_snapshot(conn, holdings: list[dict], ltp_map: dict[str, float]):
             cur.execute(
                 """
                 INSERT INTO equity_holding_history
-                    (entity_id, broker, symbol, snapshot_date,
+                    (entity_id, broker, symbol, isin, snapshot_date,
                      quantity, close_price, market_value, cost, pnl)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT DO NOTHING
                 """,
                 (
-                    h["entity_id"], h["broker"], h["symbol"], today,
+                    h["entity_id"], h["broker"], h["symbol"], h.get("isin") or None, today,
                     float(qty), float(price), float(cmv), float(cost), float(pnl),
                 ),
             )

@@ -94,12 +94,37 @@ def fetch_history_value(
     broker: str,
     symbol: str,
     snapshot_date: date,
+    isin: Optional[str] = None,
 ) -> Optional[Decimal]:
     """
-    Return the market_value from equity_holding_history for the given date,
-    or the nearest earlier date if that exact date has no snapshot.
+    Return the market_value from equity_holding_history at or before snapshot_date
+    (nearest earlier snapshot if the exact date is missing).
+
+    Matches on ISIN first — the stable identifier — so a ticker rename (e.g.
+    SGBAUG28V -> SGBAUG28V-GB, or Angel/Zerodha series suffix changes) doesn't
+    orphan the prior-week snapshots and zero out weekly_change. Falls back to a
+    symbol match for legacy rows written before the isin column existed.
     """
     cur = conn.cursor()
+    if isin:
+        cur.execute(
+            """
+            SELECT market_value
+            FROM   equity_holding_history
+            WHERE  entity_id     = %s
+              AND  broker        = %s
+              AND  isin          = %s
+              AND  snapshot_date <= %s
+            ORDER BY snapshot_date DESC
+            LIMIT 1
+            """,
+            (entity_id, broker, isin, snapshot_date),
+        )
+        row = cur.fetchone()
+        if row:
+            cur.close()
+            return Decimal(str(row["market_value"]))
+
     cur.execute(
         """
         SELECT market_value
@@ -308,12 +333,12 @@ def snapshot_history(cur, h: EquityHolding, today: date):
     cur.execute(
         """
         INSERT INTO equity_holding_history
-            (entity_id, broker, symbol, snapshot_date, quantity, close_price, market_value, cost, pnl)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (entity_id, broker, symbol, isin, snapshot_date, quantity, close_price, market_value, cost, pnl)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (entity_id, broker, symbol, snapshot_date) DO NOTHING
         """,
         (
-            h.entity_id, h.broker, h.symbol, today,
+            h.entity_id, h.broker, h.symbol, h.isin or None, today,
             float(h.quantity),
             float(h.current_price),
             float(h.current_market_value),
@@ -364,8 +389,8 @@ def sync_entity_broker(
     count = 0
 
     for h in holdings:
-        prev_week_val     = fetch_history_value(conn, entity_id, broker_label, h.symbol, prev_friday)
-        ytd_val           = fetch_history_value(conn, entity_id, broker_label, h.symbol, ytd_date)
+        prev_week_val     = fetch_history_value(conn, entity_id, broker_label, h.symbol, prev_friday, h.isin)
+        ytd_val           = fetch_history_value(conn, entity_id, broker_label, h.symbol, ytd_date, h.isin)
         first_invest_date = fetch_first_invested_date(conn, entity_id, broker_label, h.symbol)
 
         # On very first insert, anchor first_invested_date to today as a placeholder
