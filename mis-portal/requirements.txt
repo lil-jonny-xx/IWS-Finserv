@@ -1,0 +1,9 @@
+# Python dependencies for the MIS portal backend.
+# Install into the deployment venv:  /var/www/.venv/bin/pip install -r requirements.txt
+#
+# Note: the API/worker runtime depends on more than this (fastapi, uvicorn, psycopg2,
+# redis, slowapi, pyjwt, bcrypt, python-dotenv, openpyxl, ...). This file pins the
+# packages the Jarvis assistant adds plus the numeric stack it relies on.
+anthropic>=0.69
+numpy>=1.26
+pandas>=2.0
