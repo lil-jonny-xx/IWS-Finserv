@@ -14,6 +14,7 @@ Unregistered emails cause silent failures (no OTP, no email, no error shown).
 Register via CAMS GoGreen service or CAMServ chatbot before running automation.
 """
 import logging
+import os
 import random
 import socket
 import time
@@ -44,6 +45,17 @@ TOR_PROXY      = "socks5://127.0.0.1:9050"
 # Persistent Chromium profile — cookies/history accumulate across daily runs,
 # improving reCAPTCHA v3 trust score over time.
 BROWSER_PROFILE_DIR = Path("/var/www/mis-portal/.cams_browser_profile")
+
+# Auto-retry on transient CAMS rate-limit / bot-detection (e.g. the IWS entity).
+# Exponential backoff: attempt N waits CAMS_RETRY_BASE_DELAY * 2**(N-1) seconds.
+CAMS_RETRY_MAX_ATTEMPTS = int(os.getenv("CAMS_RETRY_MAX_ATTEMPTS", "3"))
+CAMS_RETRY_BASE_DELAY   = int(os.getenv("CAMS_RETRY_BASE_DELAY", "60"))  # seconds
+
+
+class CamsRateLimited(Exception):
+    """Raised when CAMS rejects the submission with a transient rate-limit /
+    bot-detection page (retryable), as opposed to a hard failure such as an
+    unregistered email (not retryable)."""
 
 
 def _tor_available() -> bool:
@@ -230,6 +242,10 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
                     return True
                 logger.error(f"CAMS page timeout: {e}")
                 return False
+            except CamsRateLimited:
+                # Retryable — let it propagate to trigger_cas_request_with_retry.
+                _save_screenshot(page, f"cams_ratelimit_{pan_number[:4]}.png")
+                raise
             except Exception as e:
                 logger.error(f"CAMS trigger failed: {e}")
                 _save_screenshot(page, f"cams_error_{pan_number[:4]}.png")
@@ -239,6 +255,38 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
     finally:
         display.stop()
         logger.debug("Xvfb display stopped")
+
+
+def trigger_cas_request_with_retry(
+    pan_number: str,
+    email: str,
+    pdf_password: str,
+    max_attempts: int = CAMS_RETRY_MAX_ATTEMPTS,
+    base_delay: int = CAMS_RETRY_BASE_DELAY,
+) -> bool:
+    """trigger_cas_request with bounded exponential backoff on CAMS rate-limiting.
+
+    Retries ONLY transient rate-limit / bot-detection rejections (CamsRateLimited);
+    hard failures (e.g. unregistered email) return False immediately without retry.
+    Returns True on success, False if all attempts are exhausted or a hard failure
+    occurs. Keeps the bool contract expected by callers.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return trigger_cas_request(pan_number, email, pdf_password)
+        except CamsRateLimited:
+            if attempt >= max_attempts:
+                logger.error(
+                    f"CAMS rate-limited after {max_attempts} attempt(s) — giving up."
+                )
+                return False
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.warning(
+                f"CAMS rate-limited (attempt {attempt}/{max_attempts}) — "
+                f"backing off {delay}s before retry."
+            )
+            time.sleep(delay)
+    return False
 
 
 def _dismiss_tnc(page):
@@ -389,13 +437,15 @@ def _check_submit_result(page) -> bool:
     try:
         content = page.content().lower()
 
-        # Transient server rejection — rate-limit or bot detection, NOT an OTP/email issue
+        # Transient server rejection — rate-limit or bot detection, NOT an OTP/email issue.
+        # Raise (not return False) so the retry wrapper can distinguish it from a hard
+        # failure and back off + retry.
         if "unable to process your request" in content or "please try again later" in content:
             logger.error(
                 "CAMS returned 'unable to process your request' — likely rate-limited "
-                "or bot-detected. Try again after a delay."
+                "or bot-detected. Will back off and retry."
             )
-            return False
+            raise CamsRateLimited("CAMS transient rejection (rate-limit / bot-detection)")
 
         # OTP / verification screen — email not registered with CAMS
         # NOTE: check AFTER rate-limit so CAMS static page text mentioning 'otp'

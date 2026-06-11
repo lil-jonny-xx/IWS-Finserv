@@ -47,7 +47,7 @@ def run_entity(name, pan, email, tmp_dir, seen_ids):
     pdf_password = "".join(parts)
     start_ts     = int(time.time()) - 60
 
-    ok = cams_trigger_worker.trigger_cas_request(pan, email, pdf_password)
+    ok = cams_trigger_worker.trigger_cas_request_with_retry(pan, email, pdf_password)
     if not ok:
         logger.error(f"[{name}] CAMS trigger reported failure — watching for PDF anyway")
 

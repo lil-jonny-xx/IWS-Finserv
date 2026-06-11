@@ -51,7 +51,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("/var/log/mis-portal-cas-auto.log"),
+        # File persistence handled by cron_wrapper stdout -> crontab log redirect
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -365,7 +365,7 @@ def _main():
             logger.info(f"━━━ [{cfg.code}] ━━━")
             pdf_password = _random_pdf_password()
 
-            ok = cams_trigger_worker.trigger_cas_request(cfg.pan, cfg.email, pdf_password)
+            ok = cams_trigger_worker.trigger_cas_request_with_retry(cfg.pan, cfg.email, pdf_password)
             if not ok:
                 logger.error(f"[{cfg.code}] CAMS trigger reported failure — watching for PDF anyway")
 
