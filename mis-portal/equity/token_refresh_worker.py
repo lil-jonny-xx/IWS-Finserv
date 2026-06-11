@@ -21,7 +21,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("/var/log/mis-portal-equity-token.log"),
+        # File persistence handled by cron_wrapper stdout -> crontab log redirect
         logging.StreamHandler(sys.stdout),
     ],
 )

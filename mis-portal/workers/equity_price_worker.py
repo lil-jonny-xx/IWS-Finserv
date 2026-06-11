@@ -37,7 +37,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("/var/log/mis-portal-equity-price.log"),
+        # File persistence handled by systemd StandardOutput=append (see .service unit)
         logging.StreamHandler(sys.stdout),
     ],
 )
