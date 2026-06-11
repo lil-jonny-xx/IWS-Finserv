@@ -94,6 +94,7 @@ export default function ReportsPage() {
               { href: '/equity',       label: 'Equity' },
               { href: '/manual-data',  label: 'Manual Data' },
               { href: '/reports',      label: 'Reports', active: true },
+              { href: '/assistant',    label: 'Assistant' },
             ].map(link => (
               <a key={link.href} href={link.href}
                  className="text-xs font-medium transition-colors"

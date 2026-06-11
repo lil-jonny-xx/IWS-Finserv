@@ -379,6 +379,7 @@ export default function DashboardPage() {
                 { href: '/equity', label: 'Equity' },
                 { href: '/manual-data', label: 'Manual Data' },
                 { href: '/reports', label: 'Reports' },
+                { href: '/assistant', label: 'Assistant' },
               ].map(link => (
                 <a key={link.href} href={link.href}
                   className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
