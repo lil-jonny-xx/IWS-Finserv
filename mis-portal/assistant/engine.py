@@ -23,8 +23,8 @@ from typing import Iterator, Optional
 
 from . import tools as tools_mod
 from .prompts import SYSTEM_PROMPT
+from .routing import choose_model, effort_for
 
-MODEL = "claude-opus-4-8"
 MAX_TURNS = 8
 MAX_TOKENS = 16000
 WEB_SEARCH_MAX_USES = 5
@@ -95,6 +95,10 @@ def run_stream(history: list[dict], user_text: str, eid: Optional[int],
 
     messages = _build_messages(history, user_text)
     api_tools = _api_tools()
+    # Pick the model once for this user turn; the agentic loop reuses it across
+    # internal tool turns so the cached prefix and reasoning stay consistent.
+    model = choose_model(user_text, history)
+    effort = effort_for(model)
     full_text_parts: list[str] = []
     all_citations: list[dict] = []
     tool_names: list[str] = []
@@ -102,12 +106,12 @@ def run_stream(history: list[dict], user_text: str, eid: Optional[int],
     try:
         for _turn in range(MAX_TURNS):
             with client.messages.stream(
-                model=MODEL,
+                model=model,
                 max_tokens=MAX_TOKENS,
                 system=SYSTEM_PROMPT,
                 tools=api_tools,
                 thinking={"type": "adaptive"},
-                output_config={"effort": "high"},
+                output_config={"effort": effort},
                 messages=messages,
             ) as stream:
                 for event in stream:
@@ -164,6 +168,7 @@ def run_stream(history: list[dict], user_text: str, eid: Optional[int],
             "content": "".join(full_text_parts).strip(),
             "citations": all_citations,
             "tool_names": tool_names,
+            "model": model,
         }
     except Exception as e:
         yield {"type": "error", "message": f"engine error: {e}"}
