@@ -1,18 +1,22 @@
 // Renders the message list plus the live streaming assistant bubble.
 import { useEffect, useRef } from 'react';
-import type { Citation, Message } from '../types';
+import type { Citation, ChartSpec, Message } from '../types';
 import Citations from './Citations';
+import { ChartList } from './charts/Chart';
 
 export interface StreamingState {
   active: boolean;          // a turn is in flight
   text: string;             // accumulated assistant deltas
   tool: string | null;      // tool currently running (affordance)
   citations: Citation[];    // staged citation chips
+  charts: ChartSpec[];      // staged charts (render_chart)
   error: string | null;     // clean error event (e.g. API key pending)
 }
 
 const TOOL_LABELS: Record<string, string> = {
   web_search: 'Searching the web',
+  code_execution: 'Crunching the numbers',
+  render_chart: 'Drawing a chart',
 };
 
 function toolLabel(name: string): string {
@@ -47,7 +51,7 @@ export default function ChatThread({
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
-  }, [messages, streaming.text, streaming.tool, streaming.active]);
+  }, [messages, streaming.text, streaming.tool, streaming.active, streaming.charts.length]);
 
   const empty = messages.length === 0 && !streaming.active;
 
@@ -69,6 +73,11 @@ export default function ChatThread({
             <Bubble role={m.role}>
               <span className="whitespace-pre-wrap">{m.content}</span>
             </Bubble>
+            {m.role === 'assistant' && m.charts?.length ? (
+              <div className="mt-1 flex justify-start">
+                <ChartList charts={m.charts} />
+              </div>
+            ) : null}
             {m.role === 'assistant' && m.citations?.length ? (
               <div className="mt-1 flex justify-start">
                 <div className="max-w-[90%]">
@@ -103,6 +112,11 @@ export default function ChatThread({
                 </span>
               )}
             </Bubble>
+            {streaming.charts.length > 0 && (
+              <div className="mt-1 flex justify-start">
+                <ChartList charts={streaming.charts} />
+              </div>
+            )}
             {streaming.citations.length > 0 && (
               <div className="mt-1 flex justify-start">
                 <div className="max-w-[90%]">

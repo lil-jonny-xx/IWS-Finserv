@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import type {
   Citation,
+  ChartSpec,
   Conversation,
   ConversationDetail,
   Entity,
@@ -32,6 +33,7 @@ const EMPTY_STREAM: StreamingState = {
   text: '',
   tool: null,
   citations: [],
+  charts: [],
   error: null,
 };
 
@@ -174,6 +176,7 @@ export default function AssistantPage() {
 
     let acc = '';
     let cites: Citation[] = [];
+    let chartsAcc: ChartSpec[] = [];
 
     try {
       for await (const ev of streamChat(activeId, text, controller.signal)) {
@@ -182,6 +185,9 @@ export default function AssistantPage() {
           setStreaming(s => ({ ...s, text: acc }));
         } else if (ev.type === 'tool') {
           setStreaming(s => ({ ...s, tool: ev.name }));
+        } else if (ev.type === 'chart') {
+          chartsAcc = [...chartsAcc, ev.spec];
+          setStreaming(s => ({ ...s, charts: chartsAcc }));
         } else if (ev.type === 'citations') {
           cites = ev.items;
           setStreaming(s => ({ ...s, citations: ev.items }));
@@ -191,6 +197,7 @@ export default function AssistantPage() {
             role: 'assistant',
             content: ev.content || acc,
             citations: ev.citations?.length ? ev.citations : cites,
+            charts: ev.charts?.length ? ev.charts : (chartsAcc.length ? chartsAcc : null),
             tool_calls: ev.tool_names ?? null,
             created_at: new Date().toISOString(),
           };

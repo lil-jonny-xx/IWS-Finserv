@@ -18,6 +18,7 @@ web_search is an Anthropic-hosted server tool; results stream back inline with c
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Iterator, Optional
 
@@ -28,6 +29,13 @@ from .routing import choose_model, effort_for
 MAX_TURNS = 8
 MAX_TOKENS = 16000
 WEB_SEARCH_MAX_USES = 5
+
+# Anthropic-hosted server tools. web_search and code_execution both run in Anthropic's
+# sandbox (code_execution CANNOT reach our DB/filesystem — the read-only mandate holds;
+# the model computes only on data it has already pulled via our entity-scoped tools).
+WEB_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search",
+                   "max_uses": WEB_SEARCH_MAX_USES}
+CODE_EXECUTION_TOOL = {"type": "code_execution_20260120", "name": "code_execution"}
 
 _client = None
 
@@ -44,9 +52,7 @@ def get_client():
 
 
 def _api_tools() -> list:
-    return tools_mod.TOOL_SCHEMAS + [
-        {"type": "web_search_20260209", "name": "web_search", "max_uses": WEB_SEARCH_MAX_USES}
-    ]
+    return tools_mod.TOOL_SCHEMAS + [WEB_SEARCH_TOOL, CODE_EXECUTION_TOOL]
 
 
 def _build_messages(history: list[dict], user_text: str) -> list[dict]:
@@ -82,10 +88,11 @@ def run_stream(history: list[dict], user_text: str, eid: Optional[int],
     Drive one assistant turn. Yields event dicts:
       {"type": "text", "text": str}        incremental answer text
       {"type": "tool", "name": str}        a tool is being run (for UI affordance)
+      {"type": "chart", "spec": {...}}     a chart to render in the thread
       {"type": "citations", "items": [...]} citations discovered so far
-      {"type": "done", "content": str, "citations": [...], "tool_names": [...]}
+      {"type": "done", "content": str, "citations": [...], "tool_names": [...], "charts": [...]}
       {"type": "error", "message": str}
-    The caller persists the final `content`/`citations` and serialises events as SSE.
+    The caller persists the final `content`/`citations`/`charts` and serialises events as SSE.
     """
     try:
         client = get_client()
@@ -102,6 +109,7 @@ def run_stream(history: list[dict], user_text: str, eid: Optional[int],
     full_text_parts: list[str] = []
     all_citations: list[dict] = []
     tool_names: list[str] = []
+    all_charts: list[dict] = []
 
     try:
         for _turn in range(MAX_TURNS):
@@ -120,6 +128,15 @@ def run_stream(history: list[dict], user_text: str, eid: Optional[int],
                         text = event.delta.text
                         full_text_parts.append(text)
                         yield {"type": "text", "text": text}
+                    elif event.type == "content_block_start":
+                        # Surface server-tool activity (web_search, code_execution) as a
+                        # UI affordance — these run inside the API, not via our dispatch.
+                        blk = getattr(event, "content_block", None)
+                        if getattr(blk, "type", None) == "server_tool_use":
+                            nm = getattr(blk, "name", None)
+                            if nm:
+                                tool_names.append(nm)
+                                yield {"type": "tool", "name": nm}
                 final = stream.get_final_message()
 
             messages.append({"role": "assistant", "content": final.content})
@@ -140,6 +157,29 @@ def run_stream(history: list[dict], user_text: str, eid: Optional[int],
                         continue
                     tool_names.append(block.name)
                     yield {"type": "tool", "name": block.name}
+
+                    # render_chart is intent-only: validate the spec, emit a chart event for
+                    # the UI, and hand the model a short confirmation (no DB access).
+                    if block.name == "render_chart":
+                        try:
+                            spec = tools_mod.validate_chart_spec(dict(block.input))
+                            all_charts.append(spec)
+                            yield {"type": "chart", "spec": spec}
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": json.dumps({"status": "rendered",
+                                                       "chart_type": spec["chart_type"]}),
+                            })
+                        except Exception as ce:
+                            tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": f"chart error: {ce}",
+                                "is_error": True,
+                            })
+                        continue
+
                     try:
                         result = tools_mod.dispatch(block.name, dict(block.input), conn, eid)
                         tool_results.append({
@@ -168,6 +208,7 @@ def run_stream(history: list[dict], user_text: str, eid: Optional[int],
             "content": "".join(full_text_parts).strip(),
             "citations": all_citations,
             "tool_names": tool_names,
+            "charts": all_charts,
             "model": model,
         }
     except Exception as e:

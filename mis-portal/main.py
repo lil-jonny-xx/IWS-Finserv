@@ -2228,17 +2228,19 @@ def assistant_chat(
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
 
     def event_stream():
-        final_content, citations, tool_names = "", [], []
+        final_content, citations, tool_names, charts = "", [], [], []
         try:
             for ev in assistant_engine.run_stream(history, body.message, scope_eid, conn):
                 if ev.get("type") == "done":
                     final_content = ev.get("content", "")
                     citations = ev.get("citations", [])
                     tool_names = ev.get("tool_names", [])
+                    charts = ev.get("charts", [])
                 yield f"data: {json.dumps(ev)}\n\n"
             assistant_persistence.add_message(
                 conn, conv["id"], "assistant", final_content,
                 tool_calls=(tool_names or None), citations=(citations or None),
+                charts=(charts or None),
             )
             conn.commit()
         except Exception as e:

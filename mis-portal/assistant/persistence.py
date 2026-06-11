@@ -69,7 +69,7 @@ def get_messages(conn, conversation_id: int) -> list[dict]:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT id, role, content, tool_calls, citations, created_at
+        SELECT id, role, content, tool_calls, citations, charts, created_at
         FROM assistant_message
         WHERE conversation_id = %s
         ORDER BY created_at ASC, id ASC
@@ -84,24 +84,28 @@ def get_messages(conn, conversation_id: int) -> list[dict]:
         "content": r["content"],
         "tool_calls": r["tool_calls"],
         "citations": r["citations"],
+        "charts": r["charts"],
         "created_at": r["created_at"].isoformat() if r["created_at"] else None,
     } for r in rows]
 
 
 def add_message(conn, conversation_id: int, role: str, content: Optional[str],
                 tool_calls: Optional[list] = None,
-                citations: Optional[list] = None) -> int:
+                citations: Optional[list] = None,
+                charts: Optional[list] = None) -> int:
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO assistant_message (conversation_id, role, content, tool_calls, citations)
-        VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO assistant_message
+            (conversation_id, role, content, tool_calls, citations, charts)
+        VALUES (%s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
             conversation_id, role, content,
             json.dumps(tool_calls) if tool_calls is not None else None,
             json.dumps(citations) if citations is not None else None,
+            json.dumps(charts) if charts is not None else None,
         ),
     )
     mid = cur.fetchone()["id"]

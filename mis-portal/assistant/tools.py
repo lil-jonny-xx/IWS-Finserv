@@ -16,6 +16,7 @@ refactor those handlers.
 from __future__ import annotations
 
 import json
+import math
 from typing import Optional
 
 from . import analytics
@@ -190,6 +191,73 @@ TOOL_SCHEMAS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "render_chart",
+        "description": (
+            "Render a chart in the chat to visualise numbers you ALREADY obtained from the "
+            "data/compute tools — never invent values. Use when a picture beats prose: asset "
+            "allocation or sector mix (donut or bar), a value/drawdown path over time (line), "
+            "or a correlation matrix (heatmap). Keep to 1-2 charts per answer and still state "
+            "the takeaway in text."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chart_type": {"type": "string", "enum": ["donut", "bar", "line", "heatmap"]},
+                "title": {"type": "string", "description": "Short chart title."},
+                "unit": {"type": "string", "description": "Optional value unit, e.g. '₹' or '%'."},
+                "series": {
+                    "type": "array",
+                    "description": "For donut/bar: categories and their values.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string"},
+                            "value": {"type": "number"},
+                        },
+                        "required": ["label", "value"],
+                        "additionalProperties": False,
+                    },
+                },
+                "points": {
+                    "type": "array",
+                    "description": "For line: ordered points (x label, y value).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "x": {"type": "string"},
+                            "y": {"type": "number"},
+                        },
+                        "required": ["x", "y"],
+                        "additionalProperties": False,
+                    },
+                },
+                "labels": {
+                    "type": "array",
+                    "description": "For heatmap: axis labels (square matrix).",
+                    "items": {"type": "string"},
+                },
+                "matrix": {
+                    "type": "array",
+                    "description": "For heatmap: rows of values aligned to labels.",
+                    "items": {"type": "array", "items": {"type": "number"}},
+                },
+            },
+            "required": ["chart_type"],
+            "additionalProperties": False,
+        },
+    },
+    # ── Fundamentals seam (Phase 3 uses web_search for fundamentals; this is the
+    # documented hook for a future structured provider). To enable a paid API later,
+    # add a schema like the following and a `get_fundamentals` branch in dispatch():
+    #   {
+    #     "name": "get_fundamentals",
+    #     "description": "Structured fundamentals for a listed symbol (P/E, ROE, growth, D/E ...).",
+    #     "input_schema": {"type": "object",
+    #         "properties": {"symbol": {"type": "string"}},
+    #         "required": ["symbol"], "additionalProperties": False},
+    #   },
+    # No engine change is needed — it is a client tool like the get_* tools above.
 ]
 
 
@@ -488,6 +556,90 @@ def _scenario(conn, eid: Optional[int], shocks: dict) -> dict:
         else:
             norm_shocks[group_lookup.get(str(k).lower(), k)] = float(v)
     return analytics.scenario_shock(positions, norm_shocks)
+
+
+# ---------------------------------------------------------------------------
+# Chart spec validation (render_chart is intent-only — no DB, no model data trust)
+# ---------------------------------------------------------------------------
+
+_CHART_TYPES = {"donut", "bar", "line", "heatmap"}
+
+
+def validate_chart_spec(tool_input: dict) -> dict:
+    """
+    Validate + normalise a render_chart spec. The model supplies the numbers (sourced from
+    prior tool results); we only sanity-check shape and coerce types — no DB access. Returns
+    a clean spec dict; raises ValueError on malformed input so the engine can hand the model
+    a recoverable error rather than rendering garbage.
+    """
+    ti = tool_input or {}
+    ctype = ti.get("chart_type")
+    if ctype not in _CHART_TYPES:
+        raise ValueError(f"chart_type must be one of {sorted(_CHART_TYPES)}")
+
+    spec: dict = {"chart_type": ctype, "title": str(ti.get("title") or "").strip()}
+    unit = ti.get("unit")
+    if unit:
+        spec["unit"] = str(unit)[:8]
+
+    if ctype in ("donut", "bar"):
+        series = []
+        for item in (ti.get("series") or []):
+            if not isinstance(item, dict):
+                continue
+            label, val = item.get("label"), item.get("value")
+            try:
+                fval = float(val)
+            except (TypeError, ValueError):
+                continue
+            if label is None or not math.isfinite(fval):
+                continue
+            series.append({"label": str(label), "value": round(fval, 4)})
+        if not series:
+            raise ValueError(f"{ctype} chart needs a non-empty 'series' of {{label, value}}")
+        spec["series"] = series[:30]
+
+    elif ctype == "line":
+        points = []
+        for item in (ti.get("points") or []):
+            if not isinstance(item, dict):
+                continue
+            x, y = item.get("x"), item.get("y")
+            try:
+                fy = float(y)
+            except (TypeError, ValueError):
+                continue
+            if x is None or not math.isfinite(fy):
+                continue
+            points.append({"x": str(x), "y": round(fy, 4)})
+        if len(points) < 2:
+            raise ValueError("line chart needs at least two 'points' of {x, y}")
+        spec["points"] = points[:500]
+
+    elif ctype == "heatmap":
+        labels = [str(l) for l in (ti.get("labels") or [])]
+        matrix_in = ti.get("matrix") or []
+        n = len(labels)
+        if n < 2:
+            raise ValueError("heatmap needs at least two 'labels'")
+        if len(matrix_in) != n:
+            raise ValueError("heatmap 'matrix' rows must match the number of labels")
+        matrix = []
+        for row in matrix_in:
+            if not isinstance(row, (list, tuple)) or len(row) != n:
+                raise ValueError("heatmap 'matrix' must be square (labels x labels)")
+            out_row = []
+            for v in row:
+                try:
+                    fv = float(v)
+                    out_row.append(round(fv, 4) if math.isfinite(fv) else None)
+                except (TypeError, ValueError):
+                    out_row.append(None)
+            matrix.append(out_row)
+        spec["labels"] = labels
+        spec["matrix"] = matrix
+
+    return spec
 
 
 # ---------------------------------------------------------------------------

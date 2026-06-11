@@ -136,3 +136,55 @@ def test_scenario_via_exposure():
     assert out["base_value"] == pytest.approx(500.0)
     assert out["impact"] == pytest.approx(-10.0)
     assert out["impact_pct"] == pytest.approx(-2.0)
+
+
+# ---------------------------------------------------------------------------
+# render_chart spec validation (intent-only — no DB touched)
+# ---------------------------------------------------------------------------
+
+def test_chart_donut_valid():
+    spec = tools.validate_chart_spec({
+        "chart_type": "donut", "title": " Mix ", "unit": "₹",
+        "series": [{"label": "Equity", "value": 60}, {"label": "Debt", "value": 40}],
+    })
+    assert spec["chart_type"] == "donut"
+    assert spec["title"] == "Mix"          # trimmed
+    assert spec["unit"] == "₹"
+    assert spec["series"] == [{"label": "Equity", "value": 60.0},
+                              {"label": "Debt", "value": 40.0}]
+
+
+def test_chart_bar_drops_bad_points_keeps_good():
+    spec = tools.validate_chart_spec({
+        "chart_type": "bar",
+        "series": [{"label": "A", "value": "12.5"}, {"label": "B", "value": "x"},
+                   {"value": 5}, {"label": "C", "value": 7}],
+    })
+    # "x" (unparseable) and the label-less entry are dropped; "12.5" coerces
+    assert spec["series"] == [{"label": "A", "value": 12.5}, {"label": "C", "value": 7.0}]
+
+
+def test_chart_line_needs_two_points():
+    with pytest.raises(ValueError):
+        tools.validate_chart_spec({"chart_type": "line", "points": [{"x": "Jan", "y": 1}]})
+    spec = tools.validate_chart_spec({
+        "chart_type": "line",
+        "points": [{"x": "Jan", "y": 1}, {"x": "Feb", "y": 2.5}],
+    })
+    assert spec["points"] == [{"x": "Jan", "y": 1.0}, {"x": "Feb", "y": 2.5}]
+
+
+def test_chart_heatmap_must_be_square():
+    with pytest.raises(ValueError):
+        tools.validate_chart_spec({"chart_type": "heatmap", "labels": ["A", "B"],
+                                   "matrix": [[1, 0.5]]})  # only one row
+    spec = tools.validate_chart_spec({"chart_type": "heatmap", "labels": ["A", "B"],
+                                      "matrix": [[1, 0.5], [0.5, 1]]})
+    assert spec["matrix"] == [[1.0, 0.5], [0.5, 1.0]]
+
+
+def test_chart_rejects_unknown_type_and_empty_series():
+    with pytest.raises(ValueError):
+        tools.validate_chart_spec({"chart_type": "pie"})
+    with pytest.raises(ValueError):
+        tools.validate_chart_spec({"chart_type": "donut", "series": []})
