@@ -557,6 +557,56 @@ def _compute_realized_gains(conn, entity_id: Optional[int] = None) -> dict:
     return gains
 
 
+# Realized-gains are derived purely from mf_transaction, which only changes on the
+# daily CAS run. Cache the result in Redis keyed by a cheap (row-count, max-id)
+# version stamp so new transactions auto-invalidate the entry; the TTL is only a
+# memory backstop. Falls back to a direct compute whenever Redis is unavailable.
+_REALIZED_GAINS_TTL = 24 * 3600  # seconds
+
+
+def _realized_gains_version(conn, entity_id: Optional[int]) -> str:
+    """Cheap version stamp of mf_transaction (changes on any insert/delete)."""
+    cur = conn.cursor()
+    if entity_id is not None:
+        cur.execute(
+            "SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS m "
+            "FROM mf_transaction WHERE entity_id = %s",
+            (entity_id,),
+        )
+    else:
+        cur.execute("SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS m FROM mf_transaction")
+    row = cur.fetchone()
+    cur.close()
+    return f"{row['n']}-{row['m']}"
+
+
+def _compute_realized_gains_cached(conn, entity_id: Optional[int] = None) -> dict:
+    """Redis-cached wrapper around _compute_realized_gains (same return shape)."""
+    if redis_client is None:
+        return _compute_realized_gains(conn, entity_id)
+
+    scope = entity_id if entity_id is not None else "all"
+    cache_key = None
+    try:
+        version   = _realized_gains_version(conn, entity_id)
+        cache_key = f"realized_gains:{scope}:{version}"
+        cached    = redis_client.get(cache_key)
+        if cached:
+            data = json.loads(cached)
+            return {(rec[0], rec[1], rec[2]): rec[3] for rec in data}
+    except Exception as e:
+        logger.warning(f"realized_gains cache read failed: {e}")
+        return _compute_realized_gains(conn, entity_id)
+
+    gains = _compute_realized_gains(conn, entity_id)
+    try:
+        payload = json.dumps([[e, s, f, g] for (e, s, f), g in gains.items()])
+        redis_client.setex(cache_key, _REALIZED_GAINS_TTL, payload)
+    except Exception as e:
+        logger.warning(f"realized_gains cache write failed: {e}")
+    return gains
+
+
 @app.get("/api/v1/holdings")
 def get_holdings(
     request: Request,
@@ -636,7 +686,7 @@ def get_holdings(
             rows = cursor.fetchall()
             cursor.close()
 
-            realized_gains = _compute_realized_gains(conn)
+            realized_gains = _compute_realized_gains_cached(conn)
 
             holdings = []
             total_invested = 0.0
@@ -741,7 +791,7 @@ def get_holdings(
         rows = cursor.fetchall()
         cursor.close()
 
-        realized_gains = _compute_realized_gains(conn, entity_id=eid)
+        realized_gains = _compute_realized_gains_cached(conn, entity_id=eid)
 
         holdings = []
         total_invested = 0.0
@@ -855,7 +905,7 @@ def get_combined_holdings(
         txn_rows = cursor.fetchall()
         cursor.close()
 
-        realized_gains = _compute_realized_gains(conn)
+        realized_gains = _compute_realized_gains_cached(conn)
 
         # Pool transactions per security for XIRR
         txn_by_sec: dict = defaultdict(list)
@@ -1604,7 +1654,7 @@ def get_transactions(
 
         count_params = [eid, type_filter] if type_filter else [eid]
         cursor.execute(
-            f"SELECT COUNT(*) AS total FROM mf_transaction WHERE entity_id = %s {type_clause}",
+            f"SELECT COUNT(*) AS total FROM mf_transaction t WHERE t.entity_id = %s {type_clause}",
             count_params
         )
         total = cursor.fetchone()["total"]
