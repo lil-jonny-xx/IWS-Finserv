@@ -3,6 +3,7 @@ import { Geist, Geist_Mono } from "next/font/google";
 
 export const dynamic = 'force-dynamic';
 import "./globals.css";
+import IdleTimeout from "./IdleTimeout";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -36,6 +37,7 @@ export default function RootLayout({
         >
           Skip to main content
         </a>
+        <IdleTimeout />
         {children}
       </body>
     </html>
