@@ -28,7 +28,10 @@ from .routing import choose_model, effort_for
 
 MAX_TURNS = 8
 MAX_TOKENS = 16000
-WEB_SEARCH_MAX_USES = 5
+# Cap web searches per answer. This is the main Jarvis cost dial — each search pulls
+# results into context that get re-read across the agentic loop. 4 keeps fundamentals
+# research useful while trimming the per-turn token cost.
+WEB_SEARCH_MAX_USES = 4
 
 # Anthropic-hosted server tools. web_search and code_execution both run in Anthropic's
 # sandbox (code_execution CANNOT reach our DB/filesystem — the read-only mandate holds;
