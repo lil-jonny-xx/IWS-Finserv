@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import MFTable, { type MFHoldingRow, type MFTotals, type CombinedHolding } from './components/MFTable';
 
@@ -147,6 +147,7 @@ export default function MutualFundsPage() {
   const [txnPage, setTxnPage]       = useState(0);
   const [txnLoading, setTxnLoading] = useState(false);
   const [txnType, setTxnType]       = useState<string | null>(null);
+  const didInitialLoad              = useRef(false);
 
   useEffect(() => {
     fetch(`${API_URL}/api/v1/me`, { credentials: 'include' })
@@ -166,12 +167,14 @@ export default function MutualFundsPage() {
 
   useEffect(() => {
     const controller = new AbortController();
-    setLoading(true);
+    // Skeleton only on the first load; later fetches (entity switch / retry) update in
+    // place without unmounting MFTable, so the user's sort/filters/search are preserved.
+    if (!didInitialLoad.current) setLoading(true);
     setError(null);
     const qs = selectedId !== null ? `?entity_id=${selectedId}` : '';
     fetch(`${API_URL}/api/v1/holdings${qs}`, { credentials: 'include', signal: controller.signal })
       .then(r => { if (r.status === 401) { router.push('/'); return null; } if (!r.ok) throw new Error('Failed to load holdings.'); return r.json(); })
-      .then((d: HoldingsResponse | null) => { if (d) setData(d); setLoading(false); })
+      .then((d: HoldingsResponse | null) => { if (d) setData(d); setLoading(false); didInitialLoad.current = true; })
       .catch(err => { if (err.name !== 'AbortError') { setError(err.message); setLoading(false); } });
     return () => controller.abort();
   }, [router, selectedId, retryCount]);
@@ -251,7 +254,8 @@ export default function MutualFundsPage() {
           <EntitySwitcher entities={entities} selectedId={selectedId} onSelect={setSelectedId} />
         )}
 
-        {error && (
+        {/* Initial-load failure: no data to show, so surface the full error + retry. */}
+        {error && !data && (
           <div role="alert" className="bg-card rounded-lg border border-rule px-5 py-5 flex items-start justify-between gap-4">
             <div>
               <p className="text-sm font-medium text-dim">Could not load holdings</p>
@@ -266,18 +270,32 @@ export default function MutualFundsPage() {
           </div>
         )}
 
-        {loading && <Skeleton />}
+        {loading && !data && <Skeleton />}
 
-        {!loading && !error && data && (
-          <MFTable
-            holdings={data.holdings}
-            totals={totals}
-            showEntityCol={showEntityCol}
-            viewMode={viewMode}
-            onToggleCombined={handleToggleCombined}
-            combinedHoldings={combinedData?.holdings}
-            combinedTotals={combinedData ? { total_combined: combinedData.total_combined, total_invested: combinedData.total_invested } : undefined}
-          />
+        {data && (
+          <>
+            {/* Background-refresh failure: keep the last-loaded table, show a quiet notice. */}
+            {error && (
+              <div role="status" className="mb-3 flex items-center justify-between gap-3 bg-card rounded-lg border border-rule px-4 py-2">
+                <p className="text-xs text-ghost">Couldn’t refresh — showing last loaded values.</p>
+                <button
+                  onClick={handleRetry}
+                  className="shrink-0 text-xs border border-wire text-dim px-2.5 py-1 rounded hover:border-dim hover:text-ink transition-colors"
+                >
+                  Retry
+                </button>
+              </div>
+            )}
+            <MFTable
+              holdings={data.holdings}
+              totals={totals}
+              showEntityCol={showEntityCol}
+              viewMode={viewMode}
+              onToggleCombined={handleToggleCombined}
+              combinedHoldings={combinedData?.holdings}
+              combinedTotals={combinedData ? { total_combined: combinedData.total_combined, total_invested: combinedData.total_invested } : undefined}
+            />
+          </>
         )}
 
         {/* Transactions */}
