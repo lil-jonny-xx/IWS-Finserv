@@ -1,8 +1,9 @@
 from fastapi import FastAPI, HTTPException, Header, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, EmailStr, Field
 from typing import Optional, List
+import json
 import jwt
 import bcrypt
 from datetime import datetime, timedelta, date
@@ -17,6 +18,9 @@ from slowapi.middleware import SlowAPIMiddleware
 import logging
 import hashlib
 import atexit
+
+from assistant import engine as assistant_engine
+from assistant import persistence as assistant_persistence
 
 # Load .env file
 load_dotenv('/var/www/mis-portal/.env')
@@ -2189,3 +2193,213 @@ async def dhan_postback(request: Request):
         body = {}
     logger.info(f"Dhan postback received: {body}")
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Jarvis — read-only portfolio advisory assistant
+# ---------------------------------------------------------------------------
+
+class AssistantConversationCreate(BaseModel):
+    title:     Optional[str] = Field(default=None, max_length=300)
+    entity_id: Optional[int] = None   # admins only; ignored for members
+
+
+class AssistantChatRequest(BaseModel):
+    conversation_id: int
+    message:         str = Field(min_length=1, max_length=4000)
+
+
+def _assistant_user_id(cursor, email: str) -> int:
+    """Numeric users.id for the authenticated email, or 401 if not active."""
+    cursor.execute(
+        "SELECT id FROM users WHERE email = %s AND is_active = TRUE",
+        (email,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return row["id"]
+
+
+def _resolve_assistant_scope(cursor, payload: dict, requested_entity_id: Optional[int]) -> Optional[int]:
+    """
+    Scope rules for the assistant (stricter than _resolve_entity for the admin all-entities
+    case): admins may scope to a specific entity OR to all entities (None); members are always
+    pinned to their own entity regardless of what was requested. Uses the live DB role.
+    """
+    role = _live_role(cursor, payload["email"])
+    if role == "admin":
+        return requested_entity_id  # None = whole family, N = single entity
+    cursor.execute(
+        "SELECT entity_id FROM users WHERE email = %s AND is_active = TRUE",
+        (payload["email"],),
+    )
+    row = cursor.fetchone()
+    if not row or not row["entity_id"]:
+        raise HTTPException(status_code=404, detail="No entity linked to this user")
+    return row["entity_id"]
+
+
+@app.post("/api/v1/assistant/conversations")
+@limiter.limit("30/minute")
+def assistant_create_conversation(
+    request: Request,
+    body: AssistantConversationCreate,
+    authorization: Optional[str] = Header(None),
+):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        user_id = _assistant_user_id(cursor, payload["email"])
+        scope_eid = _resolve_assistant_scope(cursor, payload, body.entity_id)
+        conv = assistant_persistence.create_conversation(conn, user_id, body.title, scope_eid)
+        conn.commit()
+        return conv
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in POST /api/v1/assistant/conversations: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.get("/api/v1/assistant/conversations")
+def assistant_list_conversations(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        user_id = _assistant_user_id(cursor, payload["email"])
+        return {"conversations": assistant_persistence.list_conversations(conn, user_id)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/assistant/conversations: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.get("/api/v1/assistant/conversations/{conversation_id}")
+def assistant_get_conversation(
+    request: Request,
+    conversation_id: int,
+    authorization: Optional[str] = Header(None),
+):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        user_id = _assistant_user_id(cursor, payload["email"])
+        conv = assistant_persistence.get_conversation(conn, user_id, conversation_id)
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        conv["messages"] = assistant_persistence.get_messages(conn, conversation_id)
+        return conv
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/assistant/conversations/{conversation_id}: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/assistant/conversations/{conversation_id}/archive")
+@limiter.limit("30/minute")
+def assistant_archive_conversation(
+    request: Request,
+    conversation_id: int,
+    authorization: Optional[str] = Header(None),
+):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        user_id = _assistant_user_id(cursor, payload["email"])
+        ok = assistant_persistence.archive_conversation(conn, user_id, conversation_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        conn.commit()
+        return {"status": "archived", "conversation_id": conversation_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in POST /api/v1/assistant/conversations/{conversation_id}/archive: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/assistant/chat")
+@limiter.limit("15/minute")
+def assistant_chat(
+    request: Request,
+    body: AssistantChatRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Send a message in a conversation; stream the answer as Server-Sent Events.
+    The DB connection is held for the lifetime of the stream (tools query it under the
+    conversation's entity scope) and released when the generator completes.
+    """
+    payload = _require_auth(request, authorization)
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        user_id = _assistant_user_id(cursor, payload["email"])
+        conv = assistant_persistence.get_conversation(conn, user_id, body.conversation_id)
+        if not conv:
+            release_db_connection(conn)
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        scope_eid = _resolve_assistant_scope(cursor, payload, conv["scope_entity_id"])
+        history = assistant_persistence.get_messages(conn, conv["id"])
+
+        assistant_persistence.add_message(conn, conv["id"], "user", body.message)
+        write_audit_log(conn, user_id, "assistant_chat", "assistant_conversation",
+                        conv["id"], body.message[:500])
+        conn.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        release_db_connection(conn)
+        logger.error(f"Error preparing assistant chat: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+
+    def event_stream():
+        final_content, citations, tool_names, charts = "", [], [], []
+        try:
+            for ev in assistant_engine.run_stream(history, body.message, scope_eid, conn):
+                if ev.get("type") == "done":
+                    final_content = ev.get("content", "")
+                    citations = ev.get("citations", [])
+                    tool_names = ev.get("tool_names", [])
+                    charts = ev.get("charts", [])
+                yield f"data: {json.dumps(ev)}\n\n"
+            assistant_persistence.add_message(
+                conn, conv["id"], "assistant", final_content,
+                tool_calls=(tool_names or None), citations=(citations or None),
+                charts=(charts or None),
+            )
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Error during assistant stream: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            yield f"data: {json.dumps({'type': 'error', 'message': 'stream failed'})}\n\n"
+        finally:
+            release_db_connection(conn)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
