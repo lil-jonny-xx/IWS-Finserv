@@ -172,6 +172,9 @@ export default function EquityPage() {
               { href: '/equity',       label: 'Equity',       active: true },
               { href: '/manual-data',  label: 'Manual Data'  },
               { href: '/reports',      label: 'Reports'       },
+              { href: '/benchmarks',   label: 'Benchmarks'    },
+              { href: '/realised-gains', label: 'Realised Gains' },
+              { href: '/assistant',    label: 'Assistant'     },
             ].map(({ href, label, active }) => (
               <a
                 key={href}

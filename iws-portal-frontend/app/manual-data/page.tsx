@@ -249,6 +249,9 @@ export default function ManualDataPage() {
               { href: '/equity',      label: 'Equity' },
               { href: '/manual-data', label: 'Manual Data', active: true },
               { href: '/reports',     label: 'Reports' },
+              { href: '/benchmarks',  label: 'Benchmarks' },
+              { href: '/realised-gains', label: 'Realised Gains' },
+              { href: '/assistant',   label: 'Assistant' },
             ].map(link => (
               <a key={link.href} href={link.href}
                  className="text-xs font-medium transition-colors"

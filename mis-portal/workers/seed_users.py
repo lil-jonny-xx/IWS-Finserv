@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-Seed real users and update entity emails for DHR, ADR, IWS.
+Seed real users and update entity emails for all entities.
 
 Usage:
   python workers/seed_users.py
 
 Default temporary passwords (change after first login):
-  ***REMOVED***     → ***REMOVED***
-  ***REMOVED***     → ***REMOVED***
-  ***REMOVED***     → ***REMOVED***
-  ***REMOVED***    → ***REMOVED***   (admin)
+  ***REMOVED***          → ***REMOVED***
+  ***REMOVED***          → ***REMOVED***
+  ***REMOVED***          → ***REMOVED***
+  ***REMOVED***         → ***REMOVED***          (admin)
+  ***REMOVED***          → ***REMOVED***
+  ***REMOVED***   → ***REMOVED***
+  ***REMOVED***          → ***REMOVED***
+  ***REMOVED***  → ***REMOVED***
 """
 import os
 import sys
@@ -56,12 +60,44 @@ USERS = [
         "role":      "admin",
         "entity_id": 9,   # Admin linked to IWS entity
     },
+    {
+        "email":     "***REMOVED***",
+        "password":  "***REMOVED***",
+        "full_name": "***REMOVED***",
+        "role":      "member",
+        "entity_id": 10,  # HHR
+    },
+    {
+        "email":     "***REMOVED***",
+        "password":  "***REMOVED***",
+        "full_name": "IWS Fincorp",
+        "role":      "member",
+        "entity_id": 11,  # IWS Fincorp
+    },
+    {
+        "email":     "***REMOVED***",
+        "password":  "***REMOVED***",
+        "full_name": "***REMOVED***",
+        "role":      "member",
+        "entity_id": 12,  # SDR
+    },
+    {
+        "email":     "***REMOVED***",
+        "password":  "***REMOVED***",
+        "full_name": "Rajani Corp",
+        "role":      "member",
+        "entity_id": 14,  # Rajani Corp
+    },
 ]
 
 ENTITY_EMAILS = {
-    7: "***REMOVED***",
-    8: "***REMOVED***",
-    9: "***REMOVED***",
+    7:  "***REMOVED***",
+    8:  "***REMOVED***",
+    9:  "***REMOVED***",
+    10: "***REMOVED***",
+    11: "***REMOVED***",
+    12: "***REMOVED***",
+    14: "***REMOVED***",
 }
 
 

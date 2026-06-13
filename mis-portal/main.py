@@ -1903,6 +1903,147 @@ def get_fx_rates(
 
 
 # ---------------------------------------------------------------------------
+# Market benchmarks (Nifty/Sensex auto; GS bonds manual)
+# ---------------------------------------------------------------------------
+
+class BenchmarkEntry(BaseModel):
+    code:       str
+    label:      Optional[str] = None
+    as_of_date: str                      # ISO yyyy-mm-dd
+    value:      Optional[float] = None
+    unit:       Optional[str] = "index"
+
+
+class BenchmarkUpsertRequest(BaseModel):
+    password: str
+    entries:  list[BenchmarkEntry]
+
+
+@app.get("/api/v1/benchmarks")
+def get_benchmarks(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    """Current / prev-week / 31-Mar values + week%/YTD% per benchmark."""
+    conn = None
+    try:
+        _require_auth(request, authorization)
+        conn = get_db_connection()
+        from workers.report_generator import _fetch_benchmarks
+        return _fetch_benchmarks(conn, date.today())
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/benchmarks: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/benchmarks")
+@limiter.limit("20/minute")
+def save_benchmarks(
+    request: Request,
+    body: BenchmarkUpsertRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """Admin manual entry/override (used for GS-bond YTM/price which have no live feed)."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+
+        cur.execute("SELECT id, password_hash FROM users WHERE email = %s AND is_active = TRUE",
+                    (payload["email"],))
+        user_row = cur.fetchone()
+        if not user_row or not verify_password(body.password, user_row["password_hash"]):
+            raise HTTPException(status_code=401, detail="Incorrect password")
+        user_id = user_row["id"]
+
+        saved = 0
+        for e in body.entries:
+            try:
+                as_of = date.fromisoformat(e.as_of_date)
+            except ValueError:
+                raise HTTPException(status_code=422, detail=f"Invalid as_of_date: {e.as_of_date}")
+            cur.execute("""
+                INSERT INTO market_benchmark (code, label, as_of_date, value, unit, source, updated_by, updated_at)
+                VALUES (%s, COALESCE(%s, (SELECT label FROM market_benchmark WHERE code=%s ORDER BY as_of_date LIMIT 1), %s),
+                        %s, %s, %s, 'manual', %s, NOW())
+                ON CONFLICT (code, as_of_date)
+                DO UPDATE SET value = EXCLUDED.value, label = EXCLUDED.label,
+                              source = 'manual', updated_by = EXCLUDED.updated_by, updated_at = NOW()
+            """, (e.code, e.label, e.code, e.code, as_of, e.value, e.unit or "index", user_id))
+            saved += 1
+
+        write_audit_log(conn, user_id, "BENCHMARK_SAVE", "market_benchmark",
+                        None, f"Saved {saved} benchmark value(s) by {payload['email']}")
+        conn.commit()
+        cur.close()
+        return {"saved": saved}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/benchmarks: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+# ---------------------------------------------------------------------------
+# Realised gains (FY-to-date; MF auto from CAS, equity from imported trades)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/realised-gains")
+def get_realised_gains(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    """FY-to-date realised gains across all entities (admin)."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+
+        from workers.report_generator import _fetch_realised_gains
+        cur.execute("SELECT id, entity_name FROM entity ORDER BY id")
+        entities = cur.fetchall()
+        cur.close()
+
+        out = []
+        for e in entities:
+            for r in _fetch_realised_gains(conn, [e["id"]], date.today()):
+                out.append({
+                    "entity":          e["entity_name"],
+                    "group":           r["group"],
+                    "security_name":   r["security_name"],
+                    "purchase_amount": r["purchase_amount"],
+                    "sale_date":       str(r["sale_date"]),
+                    "sale_amount":     r["sale_amount"],
+                    "pnl":             r["pnl"],
+                    "return_pct":      r["return_pct"],
+                })
+        return out
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/realised-gains: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+# ---------------------------------------------------------------------------
 # Reports
 # ---------------------------------------------------------------------------
 

@@ -88,14 +88,25 @@ def get_db():
 
 
 def load_credentials(conn) -> dict:
-    """Return {broker: cred_row} for all active credentials."""
+    """Return {broker: cred_row} — one row per broker, preferring rows with a live access_token."""
     cur = conn.cursor()
     cur.execute(
-        "SELECT broker, credentials, access_token, token_expiry FROM broker_api_credentials WHERE is_active = TRUE"
+        """
+        SELECT broker, entity_id, credentials, access_token, token_expiry
+        FROM broker_api_credentials
+        WHERE is_active = TRUE
+        ORDER BY broker,
+                 CASE WHEN access_token IS NOT NULL AND access_token != '' THEN 0 ELSE 1 END
+        """
     )
     rows = cur.fetchall()
     cur.close()
-    return {r["broker"]: r for r in rows}
+    result = {}
+    for r in rows:
+        broker = r["broker"]
+        if broker not in result:
+            result[broker] = r
+    return result
 
 
 def load_holdings(conn) -> list[dict]:

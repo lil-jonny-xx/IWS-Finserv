@@ -350,12 +350,14 @@ def snapshot_history(cur, h: EquityHolding, today: date):
 
 # (entity_code, broker_module, broker_label)
 BROKER_ENTITY_MAP = [
-    ("DHR", zerodha,   "zerodha"),
-    ("DHR", angel_one, "angel_one"),
-    ("HHR", zerodha,   "zerodha"),
-    ("HHR", angel_one, "angel_one"),
-    ("HHR", dhan,      "dhan"),
-    ("SDR", zerodha,   "zerodha"),
+    ("DHR",         zerodha,   "zerodha"),
+    ("DHR",         angel_one, "angel_one"),
+    ("HHR",         zerodha,   "zerodha"),
+    ("HHR",         angel_one, "angel_one"),
+    ("HHR",         dhan,      "dhan"),
+    ("SDR",         zerodha,   "zerodha"),
+    ("Rajani Corp", zerodha,   "zerodha"),
+    ("Rajani Corp", dhan,      "dhan"),
 ]
 
 

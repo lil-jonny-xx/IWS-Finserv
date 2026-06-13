@@ -6,7 +6,7 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
 interface Report {
   id: number;
-  type: 'individual' | 'combined';
+  type: 'individual' | 'combined' | 'master';
   entity_name: string;
   filename: string;
   as_of_date: string;
@@ -94,6 +94,9 @@ export default function ReportsPage() {
               { href: '/equity',       label: 'Equity' },
               { href: '/manual-data',  label: 'Manual Data' },
               { href: '/reports',      label: 'Reports', active: true },
+              { href: '/benchmarks',   label: 'Benchmarks' },
+              { href: '/realised-gains', label: 'Realised Gains' },
+              { href: '/assistant',    label: 'Assistant' },
             ].map(link => (
               <a key={link.href} href={link.href}
                  className="text-xs font-medium transition-colors"
@@ -110,7 +113,7 @@ export default function ReportsPage() {
           <div>
             <h1 className="text-lg font-bold" style={{ color: 'var(--ink)' }}>Portfolio Reports</h1>
             <p className="text-xs mt-0.5" style={{ color: 'var(--ghost)' }}>
-              Generate on-demand Excel reports — individual per entity + combined all-entities
+              Generate the consolidated MIS workbook — one file, with a sheet per PAN group and per entity
             </p>
           </div>
           <button
@@ -152,7 +155,8 @@ export default function ReportsPage() {
           MF holdings & NAV auto-populated from CAS data · Direct equity from broker sync ·
           Manual values (PMS, bank, overseas, gold) from the{' '}
           <a href="/manual-data" style={{ color: 'var(--prime)', textDecoration: 'underline' }}>Manual Data</a> page.
-          Each run generates {'{'}N+1{'}'} files: one per entity + one combined.
+          Each run produces a single consolidated workbook with the shared sheets plus a Weekly Report
+          and Realised P&L sheet for every PAN group and entity.
         </div>
 
         {loading ? (
@@ -166,7 +170,8 @@ export default function ReportsPage() {
           <div className="space-y-6">
             {dates.map(d => {
               const reps = grouped[d];
-              const combined   = reps.filter(r => r.type === 'combined');
+              // 'master' = the single consolidated workbook; show it like the combined download.
+              const combined   = reps.filter(r => r.type === 'combined' || r.type === 'master');
               const individual = reps.filter(r => r.type === 'individual');
 
               return (
@@ -189,7 +194,7 @@ export default function ReportsPage() {
                         onClick={() => downloadReport(combined[0].id, combined[0].filename)}
                         className="px-3 py-1 rounded text-xs font-medium transition-colors"
                         style={{ background: 'var(--prime)', color: 'var(--prime-fg)' }}>
-                        ⬇ Combined Report
+                        {combined[0].type === 'master' ? '⬇ MIS Report' : '⬇ Combined Report'}
                       </button>
                     )}
                   </div>

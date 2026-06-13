@@ -1,7 +1,7 @@
 """
 Dhan broker wrapper.
 
-Entities : HHR
+Entities : HHR, Rajani Corp
 Auth     : 24-hour access token, auto-renewed daily via /RenewToken.
            If renewal fails, falls back to TOTP-based headless generation.
 
@@ -29,8 +29,13 @@ from equity.models import EquityHolding
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_ENTITIES = ["HHR"]
+SUPPORTED_ENTITIES = ["HHR", "Rajani Corp"]
 ENV_FILE = Path("/var/www/mis-portal/.env")
+
+# Maps entity_name (DB) → env var prefix when they differ
+_ENV_PREFIX = {
+    "Rajani Corp": "RAJANIRCORP",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -38,15 +43,17 @@ ENV_FILE = Path("/var/www/mis-portal/.env")
 # ---------------------------------------------------------------------------
 
 def _env(entity_code: str, key: str, required: bool = True) -> str:
-    val = os.environ.get(f"DHAN_{entity_code}_{key}", "")
+    prefix = _ENV_PREFIX.get(entity_code, entity_code)
+    val = os.environ.get(f"DHAN_{prefix}_{key}", "")
     if required and not val:
-        raise KeyError(f"DHAN_{entity_code}_{key} not set in .env")
+        raise KeyError(f"DHAN_{prefix}_{key} not set in .env")
     return val
 
 
 def _save_token_to_env(entity_code: str, new_token: str):
     """Overwrite the access token in .env in-place."""
-    key = f"DHAN_{entity_code}_ACCESS_TOKEN"
+    prefix = _ENV_PREFIX.get(entity_code, entity_code)
+    key = f"DHAN_{prefix}_ACCESS_TOKEN"
     try:
         text = ENV_FILE.read_text()
         updated = re.sub(

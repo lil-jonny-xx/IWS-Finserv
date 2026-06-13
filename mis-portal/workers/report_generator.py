@@ -15,6 +15,24 @@ from openpyxl.utils import get_column_letter
 
 REPORTS_DIR = "/var/www/mis-portal/reports"
 
+# Canonical master template — every generated workbook is cloned from this so the output
+# is formatting-identical to the client's MIS-REPORT.xlsx.
+TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "report_template.xlsx")
+
+# Names of the per-group template sheets inside TEMPLATE_PATH that we clone from.
+WEEKLY_TPL_SHEET   = "Dhruv Weekly Report"
+REALISED_TPL_SHEET = "FY2627 Realised Profit & Loss"
+SHARED_SHEETS      = ["Equity Daily Print", "All Assets Daily MIS", "All Entities Weekly Report"]
+
+# PAN groups that bundle more than one entity. label -> member entity codes.
+# (Membership is informational for now; data population is a follow-up — the cloned sheet
+#  already carries the group's hardcoded fund rows.)  Standalone entities (SDR, Rajani Corp)
+#  get only their own per-entity sheet.
+PAN_GROUPS = {
+    "Dhruv Group": ["DHR", "ADR", "IWS"],
+    "Harsh Group": ["HHR", "IWS Fincorp"],
+}
+
 # ── colour palette ────────────────────────────────────────────────────────────
 HDR_FILL   = PatternFill("solid", fgColor="1F3864")   # dark navy
 ENT_FILL   = PatternFill("solid", fgColor="2E4B8A")   # entity header (lighter navy)
@@ -781,9 +799,10 @@ def _comb_total(ws, row, label, data_start=None, data_end=None):
             cell.alignment     = Alignment(horizontal="right")
 
 
-def build_combined_report(conn, as_of: date):
-    wb = openpyxl.Workbook()
-    ws = wb.active
+def build_combined_report(conn, as_of: date, ws=None):
+    if ws is None:
+        wb = openpyxl.Workbook()
+        ws = wb.active
     ws.title = "All Assets Daily MIS"
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = "A3"
@@ -954,15 +973,16 @@ def build_combined_report(conn, as_of: date):
         ws.column_dimensions[get_column_letter(c)].width = width
 
     ws.print_title_rows = "1:2"
-    return wb
+    return ws
 
 
 # ── equity daily print report ─────────────────────────────────────────────────
 
-def build_equity_daily_print(conn, entity_codes: list, as_of: date):
+def build_equity_daily_print(conn, entity_codes: list, as_of: date, ws=None):
     """
-    Build a single-sheet Equity Daily Print workbook for the given entity codes
+    Build a single-sheet Equity Daily Print for the given entity codes
     (e.g. ['DHR', 'HHR', 'SDR']).  Sections: Grand Total (combined), then per entity.
+    Writes into `ws` if provided, else into a fresh workbook.
     """
     # Resolve entity codes → IDs + names
     cur = conn.cursor()
@@ -997,8 +1017,9 @@ def build_equity_daily_print(conn, entity_codes: list, as_of: date):
     grand_cost = _total(grand_rows, "cost")
 
     # Build workbook
-    wb = openpyxl.Workbook()
-    ws = wb.active
+    if ws is None:
+        wb = openpyxl.Workbook()
+        ws = wb.active
     ws.title = "Equity Daily Print"
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = "A3"
@@ -1056,6 +1077,621 @@ def build_equity_daily_print(conn, entity_codes: list, as_of: date):
         ws.column_dimensions[get_column_letter(c)].width = width
 
     ws.print_title_rows = "1:2"
+    return ws
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Data-driven per-entity / per-group sheets (styled to match MIS-REPORT.xlsx)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+#  The Dhruv sheets in MIS-REPORT.xlsx are a hand-built model with hardcoded fund
+#  rows; we DO NOT clone them anymore.  Instead we build each entity/group sheet
+#  from its real DB holdings, reproducing the template's gold/yellow look, and emit
+#  a section only when the entity actually holds something in it.
+
+# Template palette (gold header / yellow section-total / salmon benchmark).
+GOLD_FILL    = PatternFill("solid", fgColor="BF9000")
+YELLOW_FILL  = PatternFill("solid", fgColor="FFD965")
+BAND_FILL    = PatternFill("solid", fgColor="FFF2CC")   # light gold band (alt rows)
+GOLD_HDR_FONT = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
+GOLD_COL_FONT = Font(name="Calibri", bold=True, color="FFFFFF", size=8)
+SUBSEC_FONT   = Font(name="Calibri", bold=True, color="3F2E00", size=9)
+GTOT_FONT     = Font(name="Calibri", bold=True, color="000000", size=9)
+
+MONEY_FMT = '#,##0'
+GOLD_BORDER = Border(left=Side(style="thin", color="D6B656"), right=Side(style="thin", color="D6B656"),
+                     top=Side(style="thin", color="D6B656"), bottom=Side(style="thin", color="D6B656"))
+
+# Weekly-sheet columns (mirror the template's column set).
+WK_COLS = [
+    ("ASSET CLASS / HOLDING", 42),
+    ("Inception",             12),
+    ("Prev Week Value",       14),
+    ("Mkt Value 31-Mar",      15),
+    ("Cost",                  14),
+    ("Exposure %",            11),
+    ("Current Mkt Value",     16),
+    ("Weekly Change",         13),
+    ("P&L YTD",               13),
+    ("P&L Inception",         14),
+    ("Returns YTD %",         11),
+    ("Returns Incept. %",     13),
+    ("CAGR %",                10),
+    ("Brokers / Remarks",     24),
+]
+NWK = len(WK_COLS)
+# Column groups (1-based) by format.
+_MONEY_COLS = (3, 4, 5, 7, 8, 9, 10)
+_PCT_COLS   = (6, 11, 12, 13)
+
+
+# Friendly group label keyed by the group's lead (first) entity code.
+GROUP_DISPLAY = {"DHR": "Dhruv", "HHR": "Harsh"}
+
+
+def _pan_groups(conn) -> list[dict]:
+    """PAN groups that bundle >1 entity → [{label, entity_ids}] in member order."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT pg.id, pg.pan_name, e.id AS entity_id, e.entity_name
+        FROM pan_group pg JOIN entity e ON e.pan_group_id = pg.id
+        ORDER BY pg.id, e.id
+    """)
+    rows = cur.fetchall(); cur.close()
+    by_group: dict = defaultdict(list)
+    for r in rows:
+        by_group[r["id"]].append(r)
+    groups = []
+    for members in by_group.values():
+        if len(members) < 2:
+            continue                      # standalone → covered by its own entity sheet
+        lead = members[0]["entity_name"]  # group label from its first (lead) entity
+        name = GROUP_DISPLAY.get(lead, lead)
+        groups.append({"label": f"{name} Group",
+                       "entity_ids": [m["entity_id"] for m in members]})
+    return groups
+
+
+def _bundle_for(conn, entity_ids: list) -> dict:
+    """
+    Gather + merge holdings for one entity or a set of entities (a group).
+    Direct equity is merged by ISIN ACROSS the whole bundle so the same share held
+    via several brokers (or several entities in a group) collapses to one line, with
+    every broker named.  Returns {mf, eq, manual_by_cat}.
+    """
+    mf_rows, eq_raw, man_rows = [], [], []
+    for eid in entity_ids:
+        mf_rows.extend(_fetch_mf_holdings(conn, eid))
+        eq_raw.extend(_fetch_equity_holdings(conn, eid))
+        man_rows.extend(_fetch_manual_inputs(conn, eid))
+
+    # Collapse entity_id so _merge_equity_by_symbol merges across the whole bundle.
+    for r in eq_raw:
+        r["entity_id"] = 0
+    eq = _merge_equity_by_symbol(eq_raw)
+
+    # Normalise broker labels (single-broker rows arrive raw e.g. "zerodha").
+    _BROKER_LABELS = {"zerodha": "Zerodha", "angel_one": "Angel One", "dhan": "Dhan"}
+    for r in eq:
+        b = r.get("broker")
+        if b:
+            r["broker"] = ", ".join(
+                _BROKER_LABELS.get(p.strip(), p.strip().title()) for p in str(b).split(","))
+
+    man_by_cat: dict = defaultdict(list)
+    for m in man_rows:
+        man_by_cat[m["category"]].append(m)
+    return {"mf": mf_rows, "eq": eq, "manual_by_cat": man_by_cat}
+
+
+def _wk_pct(h, key):
+    v = h.get(key)
+    return (float(v) / 100.0) if v is not None else None
+
+
+# Display order of benchmarks in the Market Statistics block.
+_BENCHMARK_ORDER = ["SENSEX", "NIFTY", "GS2032_YTM", "GS2032_PRICE", "GS2030_YTM", "GS2030_PRICE"]
+
+
+def _fy_mar31(as_of: date) -> date:
+    """31-Mar that opens the current financial year (FY starts 1-Apr)."""
+    return date(as_of.year if as_of.month >= 4 else as_of.year - 1, 3, 31)
+
+
+def _fetch_benchmarks(conn, as_of: date) -> list[dict]:
+    """
+    Current / previous-week / 31-Mar values per benchmark (derived from the
+    market_benchmark history) + week% and YTD% change.  Returns [] if the table
+    is absent (migration not yet run) so the report still builds.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT code, label, as_of_date, value, unit
+            FROM market_benchmark
+            WHERE value IS NOT NULL AND as_of_date <= %s
+            ORDER BY code, as_of_date
+        """, (as_of,))
+        rows = cur.fetchall()
+    except Exception:
+        conn.rollback(); cur.close()
+        return []
+    cur.close()
+
+    from collections import OrderedDict
+    series: dict = defaultdict(list)
+    label_of, unit_of = {}, {}
+    for r in rows:
+        series[r["code"]].append((r["as_of_date"], float(r["value"])))
+        label_of[r["code"]] = r["label"]
+        unit_of[r["code"]] = r["unit"]
+
+    prev_cut = as_of.fromordinal(as_of.toordinal() - 7)
+    mar31    = _fy_mar31(as_of)
+
+    def _at_or_before(pairs, cutoff):
+        val = None
+        for d, v in pairs:                       # pairs sorted ascending
+            if d <= cutoff:
+                val = v
+        return val
+
+    out = []
+    codes = [c for c in _BENCHMARK_ORDER if c in series] + \
+            [c for c in series if c not in _BENCHMARK_ORDER]
+    for code in codes:
+        pairs = series[code]
+        current   = pairs[-1][1]
+        prev_week = _at_or_before(pairs, prev_cut)
+        mar       = _at_or_before(pairs, mar31)
+        week_pct  = ((current - prev_week) / prev_week) if (prev_week) else None
+        ytd_pct   = ((current - mar) / mar) if (mar) else None
+        out.append({"code": code, "label": label_of[code], "unit": unit_of[code],
+                    "current": current, "prev_week": prev_week, "mar31": mar,
+                    "week_pct": week_pct, "ytd_pct": ytd_pct})
+    return out
+
+
+def _fy_start(as_of: date) -> date:
+    """1-Apr that opens the current financial year."""
+    return date(as_of.year if as_of.month >= 4 else as_of.year - 1, 4, 1)
+
+
+def _avg_cost_realised(seq: list, fy_start: date) -> list:
+    """
+    Average-cost realised P&L from a chronological buy/sell sequence for one security.
+    Each item: {date, kind: 'buy'|'sell', units, amount, name, group}.
+    Records a realised row for every sell ON/AFTER fy_start.  If a sell has no known
+    cost basis (no prior buys in the data — common when CAS omits old purchases),
+    purchase_amount/pnl are left None rather than overstating the gain.
+    """
+    held, cost, out = 0.0, 0.0, []
+    for t in seq:
+        u   = abs(float(t["units"] or 0))
+        amt = abs(float(t["amount"] or 0))
+        if t["kind"] == "buy":
+            held += u; cost += amt
+            continue
+        # sell
+        if held > 1e-9 and u > 0:
+            avg       = cost / held
+            sold      = min(u, held)
+            cost_sold = avg * sold
+            held -= sold; cost -= cost_sold
+        else:
+            cost_sold = None
+        pnl = (amt - cost_sold) if cost_sold is not None else None
+        if t["date"] >= fy_start:
+            ret = (pnl / cost_sold) if (pnl is not None and cost_sold) else None
+            out.append({"group": t["group"], "security_name": t["name"],
+                        "purchase_amount": cost_sold, "sale_date": t["date"],
+                        "sale_amount": amt, "pnl": pnl, "return_pct": ret})
+    return out
+
+
+def _fetch_realised_gains(conn, entity_ids: list, as_of: date) -> list:
+    """
+    FY-to-date realised gains for the given entity/entities.
+    MF — auto from mf_transaction (REDEMPTION/SWITCH_OUT vs avg cost).
+    Equity — from stock_transaction (SELL vs avg cost) once trades are imported.
+    """
+    fy = _fy_start(as_of)
+    out: list = []
+    cur = conn.cursor()
+    ph = ",".join(["%s"] * len(entity_ids))
+
+    # ---- MF ----
+    cur.execute(f"""
+        SELECT t.security_id, sm.security_name, sm.security_type,
+               t.transaction_date AS d, t.transaction_type AS tt, t.amount, t.units
+        FROM mf_transaction t JOIN security_master sm ON sm.id = t.security_id
+        WHERE t.entity_id IN ({ph})
+        ORDER BY t.security_id, t.transaction_date
+    """, entity_ids)
+    BUY  = {"PURCHASE", "PURCHASE_SIP", "SWITCH_IN"}
+    SELL = {"REDEMPTION", "SWITCH_OUT"}
+    by_sec: dict = defaultdict(list)
+    for r in cur.fetchall():
+        by_sec[r["security_id"]].append(r)
+    for txns in by_sec.values():
+        seq = []
+        for r in txns:
+            kind = "buy" if r["tt"] in BUY else ("sell" if r["tt"] in SELL else None)
+            if not kind:
+                continue
+            grp = "Fixed Income" if r["security_type"] == "MF_DEBT" else "Equity"
+            seq.append({"date": r["d"], "kind": kind, "units": r["units"],
+                        "amount": r["amount"], "name": r["security_name"], "group": grp})
+        out += _avg_cost_realised(seq, fy)
+
+    # ---- Equity (stock_transaction; empty until tradebooks imported) ----
+    try:
+        cur.execute(f"""
+            SELECT t.security_id, sm.security_name, t.transaction_date AS d,
+                   t.transaction_type AS tt, COALESCE(t.amount_inr, t.amount) AS amount,
+                   t.quantity AS units
+            FROM stock_transaction t JOIN security_master sm ON sm.id = t.security_id
+            WHERE t.entity_id IN ({ph})
+            ORDER BY t.security_id, t.transaction_date
+        """, entity_ids)
+        srows = cur.fetchall()
+    except Exception:
+        conn.rollback(); srows = []
+    eq_by_sec: dict = defaultdict(list)
+    for r in srows:
+        eq_by_sec[r["security_id"]].append(r)
+    for txns in eq_by_sec.values():
+        seq = []
+        for r in txns:
+            tt = (r["tt"] or "").upper()
+            kind = "buy" if tt in ("BUY", "B", "PURCHASE") else ("sell" if tt in ("SELL", "S", "SALE") else None)
+            if not kind:
+                continue
+            seq.append({"date": r["d"], "kind": kind, "units": r["units"],
+                        "amount": r["amount"], "name": r["security_name"], "group": "Equity"})
+        out += _avg_cost_realised(seq, fy)
+
+    cur.close()
+    return out
+
+
+def build_weekly_sheet(wb, sheet_title: str, label: str, bundle: dict, as_of: date,
+                       benchmarks: list = None, realised_total: float = None):
+    """Create a data-driven Weekly Report sheet; sections appear only when non-empty."""
+    ws = wb.create_sheet(sheet_title)
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A3"
+
+    mf  = bundle["mf"]
+    eq  = bundle["eq"]
+    man = bundle["manual_by_cat"]
+
+    def _cmv(rows):
+        return sum(float(r["current_value"]) for r in rows if r.get("current_value")) or 0.0
+    total_cmv = _cmv(mf) + _cmv(eq) + sum(_cmv(v) for v in man.values())
+
+    # Title
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=NWK)
+    t = ws.cell(row=1, column=1,
+                value=f"PERFORMANCE SUMMARY — {label}    |    As on {as_of.strftime('%d %b %Y')}")
+    t.font = GOLD_HDR_FONT; t.fill = GOLD_FILL
+    t.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[1].height = 22
+
+    # Column headers
+    for c, (name, _) in enumerate(WK_COLS, 1):
+        cell = ws.cell(row=2, column=c, value=name)
+        cell.font = GOLD_COL_FONT; cell.fill = GOLD_FILL; cell.border = GOLD_BORDER
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[2].height = 28
+
+    state = {"row": 3, "grand": True}
+
+    def data_row(h, alt):
+        r = state["row"]
+        cmv  = _v(h, "current_value")
+        cost = _v(h, "cost")
+        prev = _v(h, "prev_week_value")
+        m31  = _v(h, "market_value_as_on")
+        wk   = _v(h, "weekly_change")
+        if wk is None and cmv is not None and prev is not None:
+            wk = cmv - prev
+        exp = (cmv / total_cmv) if (cmv and total_cmv) else None
+        label_txt = h.get("security_name") or h.get("symbol") or h.get("label") or ""
+        remark    = h.get("broker") or h.get("remarks") or h.get("notes") or ""
+        inc       = h.get("first_invested_date") or h.get("inception_date")
+        vals = [label_txt, inc, prev, m31, cost, exp, cmv, wk,
+                _v(h, "pnl_ytd"), _v(h, "pnl_inception"),
+                _wk_pct(h, "returns_ytd_pct"), _wk_pct(h, "returns_inception_pct"),
+                _wk_pct(h, "cagr_inception_pct"), remark]
+        fill = BAND_FILL if alt else WHITE_FILL
+        for c, val in enumerate(vals, 1):
+            cell = ws.cell(row=r, column=c, value=val)
+            cell.fill = fill; cell.border = GOLD_BORDER; cell.font = BODY_FONT
+            if c == 1:
+                cell.alignment = Alignment(horizontal="left", indent=1, wrap_text=True)
+            elif c == 2:
+                cell.number_format = "dd-mmm-yy"; cell.alignment = Alignment(horizontal="center")
+            elif c in _MONEY_COLS:
+                cell.number_format = MONEY_FMT;   cell.alignment = Alignment(horizontal="right")
+            elif c in _PCT_COLS:
+                cell.number_format = PCT_FMT;     cell.alignment = Alignment(horizontal="right")
+            else:
+                cell.alignment = Alignment(horizontal="left", wrap_text=True)
+        state["row"] += 1
+
+    def total_row(text, rows, fill=YELLOW_FILL):
+        r = state["row"]
+        def s(k):
+            return sum(float(x[k]) for x in rows if x.get(k) is not None) or None
+        cmv = s("current_value"); cost = s("cost")
+        prev = s("prev_week_value")
+        wk = (cmv - prev) if (cmv is not None and prev is not None) else None
+        pnl_inc = s("pnl_inception")
+        ret_inc = (pnl_inc / cost) if (pnl_inc is not None and cost) else None
+        exp = (cmv / total_cmv) if (cmv and total_cmv) else None
+        vals = [text, None, prev, s("market_value_as_on"), cost, exp, cmv, wk,
+                s("pnl_ytd"), pnl_inc, None, ret_inc, None, None]
+        for c, val in enumerate(vals, 1):
+            cell = ws.cell(row=r, column=c, value=val)
+            cell.fill = fill; cell.border = GOLD_BORDER; cell.font = GTOT_FONT
+            if c == 1:
+                cell.alignment = Alignment(horizontal="left", indent=1)
+            elif c in _MONEY_COLS:
+                cell.number_format = MONEY_FMT; cell.alignment = Alignment(horizontal="right")
+            elif c in _PCT_COLS:
+                cell.number_format = PCT_FMT;   cell.alignment = Alignment(horizontal="right")
+        state["row"] += 1
+
+    def subsection(name, rows):
+        if not rows:
+            return
+        for i, h in enumerate(rows):
+            data_row(h, i % 2 == 1)
+        total_row(f"Total {name}", rows)
+
+    def banner(text):
+        r = state["row"]
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=NWK)
+        cell = ws.cell(row=r, column=1, value=text)
+        cell.font = GOLD_HDR_FONT; cell.fill = GOLD_FILL
+        cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        ws.row_dimensions[r].height = 16
+        state["row"] += 1
+
+    # ---- assemble groups → subsections (rendered only when non-empty) ----
+    mf_by = lambda t: [h for h in mf if h.get("security_type") == t]
+    groups = [
+        ("A. FIXED INCOME", [
+            ("MF Debt / Liquid Funds", mf_by("MF_DEBT")),
+            ("Arbitrage Fund",         man.get("arbitrage_fund", [])),
+            ("Public Provident Fund",  man.get("ppf", [])),
+            ("Other Fixed Income",     man.get("fixed_income", [])),
+        ]),
+        ("B. EQUITY", [
+            ("MF Equity Funds",        mf_by("MF_EQUITY")),
+            ("MF Hybrid Funds",        mf_by("MF_HYBRID")),
+            ("PMS",                    man.get("pms", [])),
+            ("Direct Equities",        eq),
+            ("AIF",                    man.get("aif", [])),
+            ("Foreign Equity & Funds", man.get("overseas_fund", []) + man.get("overseas_equity", [])),
+        ]),
+        ("C. ALTERNATES", [
+            ("Unlisted Equity",        man.get("unlisted", [])),
+            ("Startups",               man.get("startup", [])),
+            ("Gold / Silver ETF",      man.get("gold_etf", [])),
+            ("Forex / Foreign Cash",   man.get("forex", [])),
+        ]),
+        ("D. LIQUIDITY", [
+            ("Funds in Transit",       man.get("funds_transit", [])),
+            ("Broker Balance",         man.get("broker_balance", [])),
+            ("Funds in Bank",          man.get("bank", [])),
+        ]),
+    ]
+
+    all_rows = []
+    for gtitle, subs in groups:
+        if not any(rows for _, rows in subs):
+            continue
+        banner(gtitle)
+        for name, rows in subs:
+            if rows:
+                banner_sub = ws.cell(row=state["row"], column=1, value=name)
+                banner_sub.font = SUBSEC_FONT
+                ws.merge_cells(start_row=state["row"], start_column=1, end_row=state["row"], end_column=NWK)
+                state["row"] += 1
+                subsection(name, rows)
+                all_rows.extend(rows)
+
+    if all_rows:
+        total_row("GRAND TOTAL", all_rows, fill=GOLD_FILL)
+        gr = state["row"] - 1
+        for c in range(1, NWK + 1):
+            ws.cell(row=gr, column=c).font = Font(name="Calibri", bold=True, color="FFFFFF", size=9)
+    else:
+        ws.cell(row=state["row"], column=1,
+                value="No holdings on record for this entity.").font = LABEL_FONT
+
+    # ---- Realised P&L (FY YTD) summary line (detail on the Realised P&L sheet) ----
+    if realised_total is not None:
+        state["row"] += 1
+        r = state["row"]
+        c1 = ws.cell(row=r, column=1, value="Realised Profit & Loss (FY YTD)")
+        c1.font = GTOT_FONT; c1.fill = YELLOW_FILL; c1.alignment = Alignment(horizontal="left", indent=1)
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=9)
+        for c in range(2, 10):
+            ws.cell(row=r, column=c).fill = YELLOW_FILL
+        c2 = ws.cell(row=r, column=10, value=realised_total)
+        c2.font = GTOT_FONT; c2.fill = YELLOW_FILL; c2.number_format = MONEY_FMT
+        c2.alignment = Alignment(horizontal="right"); c2.border = GOLD_BORDER
+        state["row"] += 1
+
+    # ---- Market Statistics block (benchmarks) ----
+    if benchmarks:
+        state["row"] += 1
+        banner("MARKET STATISTICS")
+        hdrs = ["Benchmark", "Current", "Prev Week", "31-Mar", "Week %", "YTD %"]
+        r = state["row"]
+        for c, name in enumerate(hdrs, 1):
+            cell = ws.cell(row=r, column=c, value=name)
+            cell.font = GOLD_COL_FONT; cell.fill = GOLD_FILL; cell.border = GOLD_BORDER
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        state["row"] += 1
+        for i, b in enumerate(benchmarks):
+            r = state["row"]
+            num_fmt = PCT_FMT if b["unit"] == "pct" else '#,##0.00'
+            vals = [b["label"], b["current"], b["prev_week"], b["mar31"],
+                    b["week_pct"], b["ytd_pct"]]
+            fill = BAND_FILL if i % 2 else WHITE_FILL
+            for c, val in enumerate(vals, 1):
+                cell = ws.cell(row=r, column=c, value=val)
+                cell.fill = fill; cell.border = GOLD_BORDER; cell.font = BODY_FONT
+                if c == 1:
+                    cell.alignment = Alignment(horizontal="left", indent=1)
+                elif c in (2, 3, 4):
+                    cell.number_format = num_fmt; cell.alignment = Alignment(horizontal="right")
+                else:
+                    cell.number_format = PCT_FMT; cell.alignment = Alignment(horizontal="right")
+            state["row"] += 1
+
+    for c, (_, width) in enumerate(WK_COLS, 1):
+        ws.column_dimensions[get_column_letter(c)].width = width
+    ws.print_title_rows = "1:2"
+    return ws
+
+
+REAL_COLS = [
+    ("ASSET CLASS / SECURITY", 46),
+    ("Purchase Amount",        16),
+    ("Sale Date",              13),
+    ("Sale Amount",            16),
+    ("Profit / Loss",          16),
+    ("Returns %",              11),
+]
+
+
+def build_realised_sheet(wb, sheet_title: str, label: str, rows: list, as_of: date):
+    """FY-to-date Realised Profit & Loss sheet (sections: Fixed Income / Equity / Alternates)."""
+    ws = wb.create_sheet(sheet_title)
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A3"
+    NRC = len(REAL_COLS)
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=NRC)
+    t = ws.cell(row=1, column=1,
+                value=f"REALISED PROFIT & LOSS — {label}    |    FY {_fy_start(as_of).year}-"
+                      f"{(_fy_start(as_of).year + 1) % 100:02d}   (as on {as_of.strftime('%d %b %Y')})")
+    t.font = GOLD_HDR_FONT; t.fill = GOLD_FILL
+    t.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[1].height = 22
+
+    for c, (name, _) in enumerate(REAL_COLS, 1):
+        cell = ws.cell(row=2, column=c, value=name)
+        cell.font = GOLD_COL_FONT; cell.fill = GOLD_FILL; cell.border = GOLD_BORDER
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[2].height = 26
+
+    state = {"row": 3}
+
+    def emit(text, fill, font, vals):
+        r = state["row"]
+        for c, val in enumerate(vals, 1):
+            cell = ws.cell(row=r, column=c, value=val)
+            cell.fill = fill; cell.border = GOLD_BORDER; cell.font = font
+            if c == 1:
+                cell.alignment = Alignment(horizontal="left", indent=1, wrap_text=True)
+            elif c == 3:
+                cell.number_format = "dd-mmm-yy"; cell.alignment = Alignment(horizontal="center")
+            elif c == 6:
+                cell.number_format = PCT_FMT; cell.alignment = Alignment(horizontal="right")
+            else:
+                cell.number_format = MONEY_FMT; cell.alignment = Alignment(horizontal="right")
+        state["row"] += 1
+
+    any_rows = False
+    for group in ("Fixed Income", "Equity", "Alternates"):
+        grp = [r for r in rows if r["group"] == group]
+        if not grp:
+            continue
+        any_rows = True
+        r = state["row"]
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=NRC)
+        b = ws.cell(row=r, column=1, value=group.upper())
+        b.font = GOLD_HDR_FONT; b.fill = GOLD_FILL
+        b.alignment = Alignment(horizontal="left", indent=1)
+        state["row"] += 1
+        for i, rr in enumerate(grp):
+            emit(None, BAND_FILL if i % 2 else WHITE_FILL, BODY_FONT,
+                 [rr["security_name"], rr["purchase_amount"], rr["sale_date"],
+                  rr["sale_amount"], rr["pnl"], rr["return_pct"]])
+        pa = sum(r["purchase_amount"] for r in grp if r["purchase_amount"] is not None) or None
+        sa = sum(r["sale_amount"] for r in grp if r["sale_amount"] is not None) or None
+        pl = sum(r["pnl"] for r in grp if r["pnl"] is not None) or None
+        ret = (pl / pa) if (pl is not None and pa) else None
+        emit(None, YELLOW_FILL, GTOT_FONT, [f"Total {group}", pa, None, sa, pl, ret])
+
+    if any_rows:
+        pa = sum(r["purchase_amount"] for r in rows if r["purchase_amount"] is not None) or None
+        sa = sum(r["sale_amount"] for r in rows if r["sale_amount"] is not None) or None
+        pl = sum(r["pnl"] for r in rows if r["pnl"] is not None) or None
+        ret = (pl / pa) if (pl is not None and pa) else None
+        gt = state["row"]
+        emit(None, GOLD_FILL, Font(name="Calibri", bold=True, color="FFFFFF", size=9),
+             ["GRAND TOTAL", pa, None, sa, pl, ret])
+        ws.cell(row=gt, column=1).font = Font(name="Calibri", bold=True, color="FFFFFF", size=9)
+    else:
+        ws.cell(row=state["row"], column=1,
+                value="No realised gains/losses recorded for this financial year.").font = LABEL_FONT
+
+    note = ws.cell(row=state["row"] + 2, column=1,
+                   value="MF realised auto-computed from CAS transactions (average cost). "
+                         "Equity realised appears once broker trades are imported. "
+                         "Blank cost basis = original purchase predates available transaction history.")
+    note.font = LABEL_FONT
+    ws.merge_cells(start_row=state["row"] + 2, start_column=1, end_row=state["row"] + 2, end_column=NRC)
+
+    for c, (_, width) in enumerate(REAL_COLS, 1):
+        ws.column_dimensions[get_column_letter(c)].width = width
+    ws.print_title_rows = "1:2"
+    return ws
+
+
+def build_master_workbook(conn, as_of: date):
+    """
+    Consolidated MIS workbook, fully data-driven:
+      • shared sheets: Equity Daily Print, All Assets Daily MIS
+      • per-PAN-group Weekly sheet  (groups with >1 entity, via pan_group)
+      • per-entity   Weekly sheet  (one per DB entity, named by code)
+    Each Weekly sheet shows the entity/group's real holdings; broker-merged equity;
+    a section appears only when it has data.  (Realised P&L sheets: Workstream B.)
+    """
+    wb = openpyxl.Workbook()
+
+    # Shared sheet 1 — Equity Daily Print (uses default active sheet)
+    entities = _fetch_entities(conn)
+    eq_codes = [e["entity_name"] for e in entities]
+    build_equity_daily_print(conn, eq_codes, as_of, ws=wb.active)
+
+    # Shared sheet 2 — All Assets Daily MIS
+    build_combined_report(conn, as_of, ws=wb.create_sheet("All Assets Daily MIS"))
+
+    benchmarks = _fetch_benchmarks(conn, as_of)
+
+    def _emit(label, ids):
+        bundle   = _bundle_for(conn, ids)
+        realised = _fetch_realised_gains(conn, ids, as_of)
+        rtotal   = sum(r["pnl"] for r in realised if r["pnl"] is not None) if realised else None
+        build_weekly_sheet(wb, f"{label} Weekly Report", label, bundle, as_of, benchmarks, rtotal)
+        build_realised_sheet(wb, f"{label} Realised P&L", label, realised, as_of)
+
+    # Per-group sheets (Weekly + Realised)
+    for g in _pan_groups(conn):
+        _emit(g["label"], g["entity_ids"])
+
+    # Per-entity sheets (Weekly + Realised)
+    for e in entities:
+        _emit(e["entity_name"], [e["id"]])
+
     return wb
 
 
@@ -1063,72 +1699,32 @@ def build_equity_daily_print(conn, entity_codes: list, as_of: date):
 
 def generate_reports(conn, generated_by_user_id: Optional[int] = None) -> list[dict]:
     """
-    Generate all reports (one per entity + one combined).
-    Returns list of dicts describing each generated file.
+    Generate the single consolidated MIS workbook (modelled on MIS-REPORT.xlsx) and
+    register it in generated_report.  Returns a one-item list describing the file.
     """
     as_of  = date.today()
     folder = os.path.join(REPORTS_DIR, as_of.strftime("%Y-%m-%d"))
     os.makedirs(folder, exist_ok=True)
 
-    entities = _fetch_entities(conn)
-    results  = []
-    cur      = conn.cursor()
-
-    for entity in entities:
-        eid   = entity["id"]
-        ename = entity["entity_name"]
-        fname = f"{ename.replace(' ', '_')}_{as_of.strftime('%Y%m%d')}.xlsx"
-        fpath = os.path.join(folder, fname)
-
-        wb = build_individual_report(conn, eid, ename, as_of)
-        wb.save(fpath)
-
-        cur.execute("""
-            INSERT INTO generated_report
-                (report_type, entity_id, entity_name, filename, filepath, as_of_date, generated_by, generated_at)
-            VALUES ('individual', %s, %s, %s, %s, %s, %s, NOW())
-            RETURNING id
-        """, (eid, ename, fname, fpath, as_of, generated_by_user_id))
-        report_id = cur.fetchone()["id"]
-        results.append({"id": report_id, "type": "individual", "entity": ename,
-                         "filename": fname, "path": fpath})
-
-    # Combined report
-    fname = f"All_Entities_Combined_{as_of.strftime('%Y%m%d')}.xlsx"
+    fname = f"MIS-Report_{as_of.strftime('%Y%m%d')}.xlsx"
     fpath = os.path.join(folder, fname)
-    wb    = build_combined_report(conn, as_of)
+
+    wb = build_master_workbook(conn, as_of)
     wb.save(fpath)
 
+    cur = conn.cursor()
     cur.execute("""
         INSERT INTO generated_report
             (report_type, entity_id, entity_name, filename, filepath, as_of_date, generated_by, generated_at)
-        VALUES ('combined', NULL, 'All Entities', %s, %s, %s, %s, NOW())
+        VALUES ('master', NULL, 'MIS Report — All Entities', %s, %s, %s, %s, NOW())
         RETURNING id
     """, (fname, fpath, as_of, generated_by_user_id))
     report_id = cur.fetchone()["id"]
-    results.append({"id": report_id, "type": "combined", "entity": "All Entities",
-                     "filename": fname, "path": fpath})
-
-    # Equity Daily Print (DHR, HHR, SDR)
-    EQUITY_DAILY_ENTITIES = ["DHR", "HHR", "SDR"]
-    fname = f"Equity_Daily_Print_{as_of.strftime('%Y%m%d')}.xlsx"
-    fpath = os.path.join(folder, fname)
-    wb    = build_equity_daily_print(conn, EQUITY_DAILY_ENTITIES, as_of)
-    wb.save(fpath)
-
-    cur.execute("""
-        INSERT INTO generated_report
-            (report_type, entity_id, entity_name, filename, filepath, as_of_date, generated_by, generated_at)
-        VALUES ('equity_daily', NULL, 'DHR / HHR / SDR', %s, %s, %s, %s, NOW())
-        RETURNING id
-    """, (fname, fpath, as_of, generated_by_user_id))
-    report_id = cur.fetchone()["id"]
-    results.append({"id": report_id, "type": "equity_daily", "entity": "DHR / HHR / SDR",
-                     "filename": fname, "path": fpath})
-
     conn.commit()
     cur.close()
-    return results
+
+    return [{"id": report_id, "type": "master", "entity": "MIS Report — All Entities",
+             "filename": fname, "path": fpath}]
 
 
 if __name__ == "__main__":
@@ -1143,5 +1739,5 @@ if __name__ == "__main__":
     )
     results = generate_reports(conn)
     for r in results:
-        print(f"✅  {r['type']:12s} {r['entity']:30s} → {r['filename']}")
+        print(f"✅  {r['type']:8s} {r['entity']:30s} → {r['filename']}")
     conn.close()
