@@ -82,6 +82,7 @@ export default function EquityPage() {
   const [lastUpdated, setLastUpdated]     = useState<Date | null>(null);
   const [liveActive, setLiveActive]       = useState(false);
   const intervalRef                       = useRef<ReturnType<typeof setInterval> | null>(null);
+  const didInitialLoad                    = useRef(false);
 
   useEffect(() => {
     fetch(`${API_URL}/api/v1/me`, { credentials: 'include' })
@@ -101,7 +102,10 @@ export default function EquityPage() {
 
   useEffect(() => {
     const controller = new AbortController();
-    setLoading(true);
+    // Show the skeleton only on the very first load. Background refreshes (auto-refresh
+    // every minute) update values in place without unmounting the table, so the user's
+    // sort / filters / search are preserved.
+    if (!didInitialLoad.current) setLoading(true);
     setError(null);
     const qs = selectedId !== null ? `?entity_id=${selectedId}` : '';
     fetch(`${API_URL}/api/v1/equity/holdings${qs}`, { credentials: 'include', signal: controller.signal })
@@ -109,6 +113,7 @@ export default function EquityPage() {
       .then((d: EquityResponse | null) => {
         if (d) { setData(d); setLastUpdated(new Date()); }
         setLoading(false);
+        didInitialLoad.current = true;
       })
       .catch(err => { if (err.name !== 'AbortError') { setError(err.message); setLoading(false); } });
     return () => controller.abort();
@@ -196,9 +201,10 @@ export default function EquityPage() {
           <EntitySwitcher entities={entities} selectedId={selectedId} onSelect={setSelectedId} />
         )}
 
-        {loading && <Skeleton />}
+        {loading && !data && <Skeleton />}
 
-        {error && (
+        {/* Initial-load failure: no data to show, so surface the full error + retry. */}
+        {error && !data && (
           <div role="alert" className="bg-card rounded-lg border border-rule px-5 py-5 flex items-start justify-between gap-4">
             <div>
               <p className="text-sm font-medium text-dim">Could not load equity holdings</p>
@@ -213,12 +219,26 @@ export default function EquityPage() {
           </div>
         )}
 
-        {!loading && !error && data && (
-          <EquityTable
-            holdings={data.holdings}
-            totals={data.totals}
-            showEntityCol={showEntityCol}
-          />
+        {data && (
+          <>
+            {/* Background-refresh failure: keep the last-loaded table, show a quiet notice. */}
+            {error && (
+              <div role="status" className="mb-3 flex items-center justify-between gap-3 bg-card rounded-lg border border-rule px-4 py-2">
+                <p className="text-xs text-ghost">Couldn’t refresh — showing last loaded values.</p>
+                <button
+                  onClick={handleRetry}
+                  className="shrink-0 text-xs border border-wire text-dim px-2.5 py-1 rounded hover:border-dim hover:text-ink transition-colors"
+                >
+                  Retry
+                </button>
+              </div>
+            )}
+            <EquityTable
+              holdings={data.holdings}
+              totals={data.totals}
+              showEntityCol={showEntityCol}
+            />
+          </>
         )}
 
         <p className="text-center text-xs text-ghost mt-8">

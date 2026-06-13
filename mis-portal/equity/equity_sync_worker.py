@@ -11,7 +11,8 @@ For each entity + broker pair:
 Metric sources:
   - prev_week_value   : equity_holding_history for last Friday
   - pnl_ytd           : equity_holding_history for Jan 1 (or earliest available)
-  - first_invested_date: preserved from existing equity_holding row; set to today on first insert
+  - first_invested_date: preserved from existing equity_holding row; left NULL on first insert
+    (real dates are backfilled from the broker tradebook via zerodha_tradebook_import.py)
   - exposure_pct      : current_market_value / sum(ALL broker holdings for entity) × 100
 
 Schedule: Daily at 7:00 AM IST (01:30 UTC) — after token_refresh_worker
@@ -389,12 +390,11 @@ def sync_entity_broker(
     for h in holdings:
         prev_week_val     = fetch_history_value(conn, entity_id, broker_label, h.symbol, prev_friday, h.isin)
         ytd_val           = fetch_history_value(conn, entity_id, broker_label, h.symbol, ytd_date, h.isin)
+        # Leave NULL until the real purchase date is known (backfilled from the broker
+        # tradebook — see zerodha_tradebook_import.py). Defaulting to today stamped a wrong
+        # "Since" date and produced a bogus ~0-year CAGR. Both compute_metrics and the upsert
+        # handle None: "Since" renders "—" and CAGR is skipped until a real date is set.
         first_invest_date = fetch_first_invested_date(conn, entity_id, broker_label, h.symbol)
-
-        # On very first insert, anchor first_invested_date to today as a placeholder
-        # Update this manually or via trade history API later for accurate CAGR
-        if first_invest_date is None:
-            first_invest_date = today
 
         h = compute_metrics(h, prev_week_val, ytd_val, total_value, today, first_invest_date)
 
