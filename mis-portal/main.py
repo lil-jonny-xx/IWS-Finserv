@@ -107,6 +107,12 @@ SECRET_KEY = os.getenv("JWT_SECRET")
 if not SECRET_KEY:
     raise ValueError("FATAL: JWT_SECRET not set.")
 
+# Access-token lifetime. Was a hardcoded 15 minutes, which logged active users out
+# mid-session (the token expires and there is no refresh — _require_auth just 401s).
+# Default to an 8-hour working session; override via env without a code change.
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "480"))
+ACCESS_TOKEN_EXPIRE_SECONDS = ACCESS_TOKEN_EXPIRE_MINUTES * 60
+
 def get_db_connection():
     """Get connection from pool with query timeout."""
     if db_pool is None:
@@ -169,9 +175,9 @@ def blacklist_token(token: str, expiry_seconds: Optional[int] = None) -> bool:
                     ttl = int(exp - datetime.utcnow().timestamp())
                     expiry_seconds = max(ttl, 1)
                 else:
-                    expiry_seconds = 900
+                    expiry_seconds = ACCESS_TOKEN_EXPIRE_SECONDS
             except Exception:
-                expiry_seconds = 900
+                expiry_seconds = ACCESS_TOKEN_EXPIRE_SECONDS
         redis_client.setex(_token_key(token), expiry_seconds, "1")
         return True
     except Exception as e:
@@ -309,7 +315,7 @@ def _login_impl(request: Request, login_request: LoginRequest, response: Respons
             "user_id": user_row["id"],
             "email": email,
             "role": user_row["role"],
-            "exp": datetime.utcnow() + timedelta(minutes=15)
+            "exp": datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         }
         token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
         logger.info(f"Successful login: {email}")
@@ -320,7 +326,9 @@ def _login_impl(request: Request, login_request: LoginRequest, response: Respons
             httponly=True,
             secure=True,
             samesite="strict",
-            max_age=900
+            # No max_age/expires -> a SESSION cookie: the browser clears it on close, so a
+            # closed browser ends the session. The JWT's own exp (ACCESS_TOKEN_EXPIRE_MINUTES,
+            # default 8h) remains the server-side hard cap while the browser stays open.
         )
 
         return {
