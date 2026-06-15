@@ -75,6 +75,49 @@ def fetch_nav(amfi_code: str) -> dict:
     raise last_exc
 
 
+def check_unresolved_held_mfs(conn) -> list:
+    """Guard: flag held MF schemes that still lack an amfi_code after auto-resolution.
+
+    A row in `holding` with no amfi_code on its security can never get a NAV, so it
+    silently shows stale/zero value — exactly the gap this guard surfaces. Emails an
+    alert listing the offenders. Never raises; returns the offending rows (possibly []).
+    """
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT DISTINCT sm.id, sm.security_name, sm.isin
+        FROM   holding h
+        JOIN   security_master sm ON sm.id = h.security_id
+        WHERE  sm.amfi_code IS NULL
+          AND  COALESCE(sm.security_type, '') <> 'EQUITY'
+        ORDER  BY sm.security_name
+    """)
+    rows = cursor.fetchall()
+    cursor.close()
+
+    if not rows:
+        logger.info("Guard OK: every held MF scheme has an amfi_code.")
+        return rows
+
+    listing = "\n".join(
+        f"  - {r['security_name']} (isin={r['isin'] or 'NULL'}, security_id={r['id']})"
+        for r in rows
+    )
+    body = (
+        f"{len(rows)} held mutual-fund scheme(s) have NO amfi_code after auto-resolution.\n"
+        f"They will receive NO NAV and show stale/zero value until fixed:\n\n"
+        f"{listing}\n\n"
+        f"Fix: assign amfi_code in security_master (see workers/isin_resolver.py), "
+        f"then re-run workers/nav_history_backfill.py."
+    )
+    logger.warning("GUARD TRIPPED — held MF(s) without NAV source:\n" + body)
+    try:
+        from alert import send_alert
+        send_alert("Held MF without NAV source", body)
+    except Exception as e:
+        logger.error(f"Guard alert failed to send: {e}")
+    return rows
+
+
 def get_tracked(conn) -> list:
     """Get securities with amfi_code."""
     cursor = conn.cursor()
@@ -155,6 +198,9 @@ def run():
         # Auto-resolve any missing amfi_codes first
         logger.info("Checking for missing amfi_codes...")
         resolve_all_missing(conn)
+
+        # Guard: alert on any held MF that resolution couldn't map (no NAV source)
+        check_unresolved_held_mfs(conn)
 
         # Get tracked securities
         tracked = get_tracked(conn)

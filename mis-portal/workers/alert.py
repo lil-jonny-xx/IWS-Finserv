@@ -32,21 +32,15 @@ def _get_service():
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
-def send_failure_alert(worker_name: str, exit_code: int, output_tail: str = "") -> bool:
+def send_alert(subject: str, body: str) -> bool:
     """
-    Send an email alert for a failed cron worker.
+    Send a generic notification email via the central Gmail token.
+    Prefixes the subject with "[IWS MIS]" if not already present.
     Returns True on success, False on send error (never raises).
     """
-    subject = f"[IWS MIS] Cron Failure: {worker_name}"
-    lines = [
-        f"Worker  : {worker_name}",
-        f"Exit    : {exit_code}",
-        "",
-    ]
-    if output_tail.strip():
-        lines += ["── Last output ──────────────────────────", output_tail.strip()]
+    if not subject.startswith("[IWS MIS]"):
+        subject = f"[IWS MIS] {subject}"
 
-    body = "\n".join(lines)
     msg = email.mime.text.MIMEText(body)
     msg["to"]      = ALERT_TO
     msg["subject"] = subject
@@ -58,5 +52,21 @@ def send_failure_alert(worker_name: str, exit_code: int, output_tail: str = "") 
         logger.info(f"Alert sent: {subject}")
         return True
     except Exception as e:
-        logger.error(f"Failed to send alert for {worker_name}: {e}")
+        logger.error(f"Failed to send alert '{subject}': {e}")
         return False
+
+
+def send_failure_alert(worker_name: str, exit_code: int, output_tail: str = "") -> bool:
+    """
+    Send an email alert for a failed cron worker.
+    Returns True on success, False on send error (never raises).
+    """
+    lines = [
+        f"Worker  : {worker_name}",
+        f"Exit    : {exit_code}",
+        "",
+    ]
+    if output_tail.strip():
+        lines += ["── Last output ──────────────────────────", output_tail.strip()]
+
+    return send_alert(f"Cron Failure: {worker_name}", "\n".join(lines))
