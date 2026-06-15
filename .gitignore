@@ -43,3 +43,5 @@ iws-portal-frontend/docs/work-log-*.md
 CLAUDE.md
 PRODUCT.md
 MIS-REPORT.xlsxgmail_token_central.json.bak-*
+1.png
+mis-portal/workers/manual_cas_retrigger.py
