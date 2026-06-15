@@ -1380,6 +1380,79 @@ def get_equity_summary(
 # Portfolio overview — aggregate MF + equity across all entities
 # ---------------------------------------------------------------------------
 
+# Maps each manual_input category to the broad asset_class used by the
+# dashboard donut / per-entity bars. Keys mirror security_master.asset_class
+# (EQUITY / FIXED_INCOME / ALTERNATES / DIRECT_EQUITY) so manual entries fold
+# into the same buckets as automated holdings. CASH covers below-the-line
+# cash-like balances (mirrors the report's E/F/G sections).
+MANUAL_ASSET_CLASS = {
+    "ppf":            "FIXED_INCOME",
+    "liquid_fund":    "FIXED_INCOME",
+    "debt_fund":      "FIXED_INCOME",
+    "arbitrage_fund": "FIXED_INCOME",
+    "pms":            "EQUITY",
+    "aif":            "EQUITY",
+    "direct_equity":  "DIRECT_EQUITY",
+    "overseas_fund":   "ALTERNATES",
+    "overseas_equity": "ALTERNATES",
+    "forex":           "ALTERNATES",
+    "gold_etf":        "ALTERNATES",
+    "unlisted":        "ALTERNATES",
+    "startup":         "ALTERNATES",
+    "funds_transit":   "CASH",
+    "broker_balance":  "CASH",
+    "bank":            "CASH",
+}
+
+
+def _fetch_manual_overview_rows(conn, entity_id: Optional[int] = None):
+    """
+    Latest manual_input per (entity, category, label), shaped to match the
+    row dicts the /overview aggregator consumes from holding / equity_holding.
+    cost / current_value / prev_week_value are already stored in INR by the
+    manual-data form, so no FX conversion is needed here. Manual entries have
+    no transaction ledger, so cagr/xirr are left as None and pnl is the simple
+    current_value - cost difference.
+    """
+    cur   = conn.cursor()
+    where = "WHERE m.entity_id = %s" if entity_id else ""
+    params = [entity_id] if entity_id else []
+    cur.execute(f"""
+        SELECT DISTINCT ON (m.entity_id, m.category, m.label)
+            m.entity_id, e.entity_name, m.category,
+            m.cost, m.current_value, m.prev_week_value, m.updated_at
+        FROM manual_input m
+        JOIN entity e ON e.id = m.entity_id
+        {where}
+        ORDER BY m.entity_id, m.category, m.label, m.updated_at DESC
+    """, params)
+    rows = cur.fetchall()
+    cur.close()
+
+    out = []
+    for r in rows:
+        cost     = float(r["cost"])            if r["cost"]            is not None else None
+        mkt      = float(r["current_value"])   if r["current_value"]   is not None else 0.0
+        prev     = float(r["prev_week_value"]) if r["prev_week_value"] is not None else None
+        invested = cost if cost is not None else 0.0
+        pnl      = (mkt - cost) if cost is not None else 0.0
+        weekly   = (mkt - prev) if prev is not None else 0.0
+        out.append({
+            "entity_id":          r["entity_id"],
+            "entity_name":        r["entity_name"],
+            "asset_class":        MANUAL_ASSET_CLASS.get(r["category"], "ALTERNATES"),
+            "security_type":      "MANUAL",
+            "invested":           invested,
+            "mkt_value":          mkt,
+            "pnl_inception":      pnl,
+            "pnl_ytd":            0.0,
+            "weekly_change":      weekly,
+            "cagr_inception_pct": None,
+            "weight":             mkt,
+        })
+    return out
+
+
 @app.get("/api/v1/overview")
 def get_overview(
     request: Request,
@@ -1438,7 +1511,12 @@ def get_overview(
         eq_rows = cursor.fetchall()
         cursor.close()
 
-        all_rows = list(mf_rows) + list(eq_rows)
+        # Manual inputs (PPF, PMS/AIF, unlisted equity, startups, overseas,
+        # cash balances, …) folded into the same asset-class buckets so the
+        # dashboard portfolio matches the generated reports.
+        manual_rows = _fetch_manual_overview_rows(conn)
+
+        all_rows = list(mf_rows) + list(eq_rows) + manual_rows
 
         def row_val(r, key):
             v = r[key]
@@ -1500,7 +1578,11 @@ def get_overview(
             em["total_pnl_ytd"]  += row_val(r, "pnl_ytd")
             em["total_weekly"]   += row_val(r, "weekly_change")
 
-            broad = "DIRECT_EQUITY" if cls == "DIRECT_EQUITY" else "MF"
+            # Keep each real asset_class distinct (EQUITY / FIXED_INCOME /
+            # ALTERNATES / DIRECT_EQUITY / HYBRID / ARBITRAGE / CASH) so manual
+            # entries surface in the per-entity bars instead of collapsing into
+            # a single "MF" bucket — consistent with the top-level donut.
+            broad = cls
             em["asset_classes"].setdefault(broad, {"invested": 0.0, "value": 0.0, "pnl": 0.0})
             em["asset_classes"][broad]["invested"] += row_val(r, "invested")
             em["asset_classes"][broad]["value"]    += row_val(r, "mkt_value")

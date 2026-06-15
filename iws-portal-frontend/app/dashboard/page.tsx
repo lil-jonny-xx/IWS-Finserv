@@ -77,6 +77,9 @@ const CLASS_COLORS: Record<string, string> = {
   DIRECT_EQUITY: '#6366f1',   // indigo for direct stocks
   FIXED_INCOME:  'var(--chart-fixed)',
   ALTERNATES:    'var(--chart-alt)',
+  HYBRID:        '#8b5cf6',   // violet for hybrid MF
+  ARBITRAGE:     '#14b8a6',   // teal for arbitrage
+  CASH:          '#94a3b8',   // slate for cash / transit balances
   MF:            'var(--chart-equity)',
 };
 
@@ -85,6 +88,9 @@ const CLASS_LABELS: Record<string, string> = {
   DIRECT_EQUITY: 'Direct Equity',
   FIXED_INCOME:  'Fixed Income',
   ALTERNATES:    'Alternates',
+  HYBRID:        'Hybrid MF',
+  ARBITRAGE:     'Arbitrage',
+  CASH:          'Cash & Transit',
   MF:            'Mutual Funds',
 };
 
