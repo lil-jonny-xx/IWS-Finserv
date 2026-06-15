@@ -1085,8 +1085,8 @@ def _resolve_entity(cursor, payload: dict, entity_id_param: Optional[int]) -> Op
     Uses live DB role to prevent stale JWT role from persisting after revocation.
     """
     role = _live_role(cursor, payload["email"])
-    if entity_id_param is not None and role == "admin":
-        return entity_id_param
+    if role == "admin":
+        return entity_id_param  # None → all entities, int → filtered
     cursor.execute(
         "SELECT entity_id FROM users WHERE email = %s AND is_active = TRUE",
         (payload["email"],),
@@ -1094,8 +1094,6 @@ def _resolve_entity(cursor, payload: dict, entity_id_param: Optional[int]) -> Op
     row = cursor.fetchone()
     if row and row["entity_id"]:
         return row["entity_id"]
-    if role == "admin":
-        return None  # all-entities view
     raise HTTPException(status_code=404, detail="No entity linked to this user")
 
 
