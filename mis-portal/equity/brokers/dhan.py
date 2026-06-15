@@ -83,26 +83,55 @@ def _renew_token(entity_code: str) -> str:
     return new_token
 
 
-def _generate_token(entity_code: str) -> str:
-    """Generate a fresh token via PIN + TOTP (headless). Returns new token."""
+def _generate_token(entity_code: str, max_attempts: int = 3) -> str:
+    """Generate a fresh token via PIN + TOTP (headless). Returns new token.
+
+    Dhan intermittently rejects a TOTP that was generated near the end of its
+    30-second window (the code expires in transit / on a small clock skew). A
+    single rejection here used to freeze the entity's holdings for the whole
+    day, so retry with a brand-new code taken just after the next window
+    boundary. Attempt 1 uses the current code (fast path); retries wait for a
+    fresh window so the resubmitted code has its full lifetime.
+    """
+    import time
+
     client_id  = _env(entity_code, "CLIENT_ID")
     api_key    = _env(entity_code, "API_KEY")
     api_secret = _env(entity_code, "API_SECRET")
     pin        = _env(entity_code, "PIN")
-    totp       = pyotp.TOTP(_env(entity_code, "TOTP_SECRET")).now()
-    # SDK's generate_token() omits app_id/app_secret headers — call directly.
-    resp = requests.post(
-        "https://auth.dhan.co/app/generateAccessToken",
-        params={"dhanClientId": client_id, "pin": pin, "totp": totp},
-        headers={"app_id": api_key, "app_secret": api_secret},
+    totp_gen   = pyotp.TOTP(_env(entity_code, "TOTP_SECRET"))
+
+    last_data = None
+    for attempt in range(1, max_attempts + 1):
+        # On a retry, roll into the next window so we send a fresh, full-life code.
+        secs_into_window = time.time() % 30
+        if attempt > 1 and secs_into_window > 5:
+            time.sleep(30 - secs_into_window + 0.5)
+
+        totp = totp_gen.now()
+        # SDK's generate_token() omits app_id/app_secret headers — call directly.
+        resp = requests.post(
+            "https://auth.dhan.co/app/generateAccessToken",
+            params={"dhanClientId": client_id, "pin": pin, "totp": totp},
+            headers={"app_id": api_key, "app_secret": api_secret},
+            timeout=20,
+        )
+        data = resp.json()
+        last_data = data
+        new_token = data.get("accessToken") or data.get("access_token") or data.get("token")
+        if new_token:
+            _save_token_to_env(entity_code, new_token)
+            logger.info(f"[{entity_code}] Dhan token generated via PIN+TOTP (attempt {attempt})")
+            return new_token
+
+        logger.warning(
+            f"[{entity_code}] Dhan generateAccessToken attempt "
+            f"{attempt}/{max_attempts} rejected: {data}"
+        )
+
+    raise RuntimeError(
+        f"generateAccessToken failed after {max_attempts} attempts: {last_data}"
     )
-    data = resp.json()
-    new_token = data.get("accessToken") or data.get("access_token") or data.get("token")
-    if not new_token:
-        raise RuntimeError(f"generateAccessToken response missing token: {data}")
-    _save_token_to_env(entity_code, new_token)
-    logger.info(f"[{entity_code}] Dhan token generated via PIN+TOTP")
-    return new_token
 
 
 def refresh_access_token(entity_code: str) -> str:
