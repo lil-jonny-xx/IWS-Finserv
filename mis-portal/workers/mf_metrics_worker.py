@@ -191,6 +191,38 @@ def load_transactions(conn) -> dict:
     return result
 
 
+def load_unit_balances(conn) -> dict:
+    """
+    Signed net units per (entity_id, security_id, folio_number) from the ledger.
+    Used to detect a holding whose transaction history does not reconcile with
+    its stored quantity (e.g. a corrupted/incomplete CAS parse). Such a ledger
+    yields garbage cost/P&L/XIRR, so the worker suppresses those metrics rather
+    than publishing nonsense (see DHR ICICI Liquid, folio 42429283/13).
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT entity_id, security_id, folio_number, COALESCE(SUM(units), 0) AS net_units
+        FROM   mf_transaction
+        GROUP  BY entity_id, security_id, folio_number
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    return {(r["entity_id"], r["security_id"], r["folio_number"]): Decimal(str(r["net_units"]))
+            for r in rows}
+
+
+def ledger_reconciles(quantity: Decimal, net_units: Decimal | None) -> bool:
+    """True if the ledger's signed unit sum matches the holding quantity.
+
+    Tolerance: 1 unit or 0.5% of quantity, whichever is larger, to absorb
+    rounding across many transactions without masking real corruption.
+    """
+    if net_units is None:
+        return False
+    tol = max(Decimal("1"), abs(quantity) * Decimal("0.005"))
+    return abs(quantity - net_units) <= tol
+
+
 def load_holdings(conn) -> list[dict]:
     """
     All holding rows that have a NAV and positive quantity.
@@ -235,6 +267,7 @@ def compute(
     as_of_date: date | None,
     today: date,
     cash_flows: list | None = None,
+    ledger_ok: bool = True,
 ) -> dict:
     qty       = Decimal(str(h["quantity"]))
     cost      = Decimal(str(h["cost_basis"])) if h["cost_basis"] else None
@@ -269,7 +302,9 @@ def compute(
         out["prev_week_value"] = float(pw)
         out["weekly_change"]   = float((cur_val - pw).quantize(TWO))
 
-    # P&L inception
+    # P&L & returns come from cost_basis — the registrar/CAMS per-folio figure,
+    # which is reliable even when the transaction ledger is incomplete. So these
+    # are always computed when a cost basis is present.
     if cost and cost > 0:
         pnl_inc = (cur_val - cost).quantize(TWO)
         out["pnl_inception"] = float(pnl_inc)
@@ -284,21 +319,26 @@ def compute(
             prev_pnl = (pw - cost).quantize(TWO)
             out["pnl_weekly_change"] = float((pnl_inc - prev_pnl).quantize(TWO))
 
-        # CAGR inception
-        fid = h.get("first_invested_date")
-        if fid:
-            years = (today - fid).days / 365.25
-            if years >= 0.08 and float(cost) > 0:
-                ratio = float(cur_val / cost)
-                if ratio > 0:
-                    out["cagr_inception_pct"] = round(
-                        (ratio ** (1.0 / years) - 1.0) * 100, 4
-                    )
+        # Time-weighted metrics (CAGR, XIRR) need the full dated cash-flow
+        # history. Suppress them when the ledger doesn't reconcile, since a
+        # partial flow series yields nonsense (e.g. a liquid fund showing 49%
+        # XIRR). Absolute P&L/return above stays, as it only needs cost + value.
+        if ledger_ok:
+            # CAGR inception
+            fid = h.get("first_invested_date")
+            if fid:
+                years = (today - fid).days / 365.25
+                if years >= 0.08 and float(cost) > 0:
+                    ratio = float(cur_val / cost)
+                    if ratio > 0:
+                        out["cagr_inception_pct"] = round(
+                            (ratio ** (1.0 / years) - 1.0) * 100, 4
+                        )
 
-        # XIRR inception — uses actual per-transaction cash flows
-        if cash_flows:
-            flows = list(cash_flows) + [(today, float(cur_val))]
-            out["xirr_inception_pct"] = xirr(flows)
+            # XIRR inception — uses actual per-transaction cash flows
+            if cash_flows:
+                flows = list(cash_flows) + [(today, float(cur_val))]
+                out["xirr_inception_pct"] = xirr(flows)
 
     # P&L YTD
     if fy_start_nav is not None:
@@ -379,6 +419,7 @@ def run():
         conn         = get_db()
         holdings     = load_holdings(conn)
         all_txn_flows = load_transactions(conn)
+        unit_balances = load_unit_balances(conn)
 
         if not holdings:
             logger.info("No holdings to process.")
@@ -423,7 +464,18 @@ def run():
 
                 txn_key = (h["entity_id"], h["security_id"], h["folio_number"])
                 flows   = all_txn_flows.get(txn_key)
-                m = compute(h, e_total, pw_nav, fy_start_nav, aod, today, flows)
+
+                ledger_ok = ledger_reconciles(
+                    Decimal(str(h["quantity"])), unit_balances.get(txn_key)
+                )
+                if not ledger_ok:
+                    logger.warning(
+                        f"Ledger mismatch for holding id={h['id']} ({h['security_name']}): "
+                        f"qty={h['quantity']} vs net_units={unit_balances.get(txn_key)} "
+                        f"— suppressing time-weighted metrics (CAGR/XIRR); P&L kept from cost basis"
+                    )
+
+                m = compute(h, e_total, pw_nav, fy_start_nav, aod, today, flows, ledger_ok)
                 metrics_batch.append(m)
                 processed += 1
             except Exception as e:
