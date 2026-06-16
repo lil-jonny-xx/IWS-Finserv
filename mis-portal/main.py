@@ -1253,6 +1253,98 @@ def get_equity_holdings(
         release_db_connection(conn)
 
 
+# ---------------------------------------------------------------------------
+# Nuvama PMS holdings — broken-out holdings with equity / cash / combined totals
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/pms/holdings")
+def get_pms_holdings(
+    request: Request,
+    entity_id: Optional[int] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Nuvama PMS holdings parsed from the WealthSpectrum report, with an equity
+    total, a cash total, and a combined total.
+    Admin: optional ?entity_id=N to filter. Member: own entity only.
+    """
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        eid  = _resolve_entity(cur, payload, entity_id)
+
+        conditions = []
+        params     = []
+        if eid is not None:
+            conditions.append("p.entity_id = %s")
+            params.append(eid)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        cur.execute(
+            f"""
+            SELECT p.entity_id, e.entity_name, p.holding_type, p.security_name,
+                   p.isin, p.quantity, p.avg_cost, p.cost, p.current_price,
+                   p.market_value, p.weight_pct, p.as_on_date
+            FROM   pms_holding p
+            JOIN   entity e ON e.id = p.entity_id
+            {where}
+            ORDER BY e.entity_name, p.holding_type, p.market_value DESC
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+        cur.close()
+
+        def _f(v):
+            return float(v) if v is not None else None
+
+        holdings = [{
+            "entity_id":     r["entity_id"],
+            "entity_name":   r["entity_name"],
+            "holding_type":  r["holding_type"],
+            "security_name": r["security_name"],
+            "isin":          r["isin"],
+            "quantity":      _f(r["quantity"]),
+            "avg_cost":      _f(r["avg_cost"]),
+            "cost":          _f(r["cost"]),
+            "current_price": _f(r["current_price"]),
+            "market_value":  _f(r["market_value"]) or 0.0,
+            "weight_pct":    _f(r["weight_pct"]),
+        } for r in rows]
+
+        equity_total = sum(h["market_value"] for h in holdings if h["holding_type"] == "equity")
+        cash_total   = sum(h["market_value"] for h in holdings if h["holding_type"] == "cash")
+        equity_cost  = sum((h["cost"] or 0.0) for h in holdings if h["holding_type"] == "equity")
+
+        entity_name = "All Entities" if eid is None else (rows[0]["entity_name"] if rows else "")
+        as_on = rows[0]["as_on_date"].isoformat() if rows and rows[0]["as_on_date"] else None
+
+        return {
+            "entity_id":   eid or 0,
+            "entity_name": entity_name,
+            "as_on_date":  as_on,
+            "totals": {
+                "equity_total": round(equity_total, 2),
+                "cash_total":   round(cash_total, 2),
+                "total":        round(equity_total + cash_total, 2),
+                "equity_cost":  round(equity_cost, 2),
+                "equity_pnl":   round(equity_total - equity_cost, 2),
+                "equity_count": sum(1 for h in holdings if h["holding_type"] == "equity"),
+                "cash_count":   sum(1 for h in holdings if h["holding_type"] == "cash"),
+            },
+            "holdings": holdings,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/v1/pms/holdings: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
 
 
 # ---------------------------------------------------------------------------
