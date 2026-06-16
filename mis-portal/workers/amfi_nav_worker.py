@@ -253,6 +253,26 @@ def run():
         if conn:
             conn.close()
 
+    # Chain the MF metrics worker so market_value_as_on stays in lockstep with
+    # the NAVs we just wrote. Running it here means EVERY NAV refresh — scheduled
+    # OR manual — is immediately followed by a metrics recompute, instead of
+    # relying on a separately-timed cron that only fires for the two daily runs
+    # (which left market_value_as_on stale whenever NAV ran at any other time).
+    # Runs on its own DB connection; isolated so a metrics failure never undoes
+    # the NAV save.
+    try:
+        from mf_metrics_worker import run as run_mf_metrics
+        logger.info("Chaining MF metrics worker after NAV update…")
+        run_mf_metrics()
+        logger.info("MF metrics worker finished.")
+    except SystemExit as e:
+        # mf_metrics_worker calls sys.exit(1) on its own failure — don't let that
+        # propagate as an AMFI failure; the NAVs were already saved & committed.
+        if e.code:
+            logger.error(f"MF metrics chain exited with code {e.code} (NAV still saved).")
+    except Exception as e:
+        logger.error(f"MF metrics chain failed (NAV still saved): {e}")
+
 
 if __name__ == "__main__":
     run()
