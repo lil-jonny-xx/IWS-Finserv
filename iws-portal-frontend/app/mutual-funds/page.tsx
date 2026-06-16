@@ -231,6 +231,7 @@ export default function MutualFundsPage() {
               { href: '/dashboard',    label: 'Overview'                },
               { href: '/mutual-funds', label: 'Mutual Funds', active: true },
               { href: '/equity',       label: 'Equity'                  },
+              { href: '/pms', label: 'PMS' },
               { href: '/manual-data',  label: 'Manual Data'             },
               { href: '/reports',      label: 'Reports'                 },
               { href: '/benchmarks',   label: 'Benchmarks'              },

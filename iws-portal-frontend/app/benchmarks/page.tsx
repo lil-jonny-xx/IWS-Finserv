@@ -19,6 +19,7 @@ const NAV = [
   { href: '/dashboard',      label: 'Dashboard' },
   { href: '/mutual-funds',   label: 'Mutual Funds' },
   { href: '/equity',         label: 'Equity' },
+  { href: '/pms', label: 'PMS' },
   { href: '/manual-data',    label: 'Manual Data' },
   { href: '/reports',        label: 'Reports' },
   { href: '/benchmarks',     label: 'Benchmarks', active: true },

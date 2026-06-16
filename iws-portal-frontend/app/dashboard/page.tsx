@@ -383,6 +383,7 @@ export default function DashboardPage() {
                 { href: '/dashboard', label: 'Overview', active: true },
                 { href: '/mutual-funds', label: 'Mutual Funds' },
                 { href: '/equity', label: 'Equity' },
+                { href: '/pms', label: 'PMS' },
                 { href: '/manual-data', label: 'Manual Data' },
                 { href: '/reports', label: 'Reports' },
                 { href: '/benchmarks', label: 'Benchmarks' },
