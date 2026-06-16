@@ -1,0 +1,104 @@
+# Python dependencies for the IWS / MIS Portal (API + workers).
+# Fully pinned from the deployment venv (/var/www/mis-portal/venv) for
+# reproducible installs. Regenerate after dependency changes with:
+#   /var/www/mis-portal/venv/bin/pip freeze > /var/www/requirements.txt
+#
+# Install:
+#   /var/www/mis-portal/venv/bin/pip install -r requirements.txt
+#
+# NOTE: keep dhanhq pinned — the equity price worker reads LTP from the Dhan
+# holdings feed (dhanhq 2.x API); an unpinned upgrade previously broke it
+# silently. See workers/equity_price_worker.py:DhanAdapter.
+
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.13.0
+attrs==26.1.0
+autobahn==19.11.2
+Automat==25.4.16
+bcrypt==5.0.0
+casparser==0.9.1
+casparser_isin==2026.5.1
+certifi==2026.5.20
+cffi==2.0.0
+charset-normalizer==3.4.7
+click==8.4.1
+colorama==0.4.6
+constantly==23.10.4
+cryptography==48.0.0
+Deprecated==1.3.1
+dhanhq==2.2.0
+dnspython==2.8.0
+email-validator==2.3.0
+et_xmlfile==2.0.0
+fastapi==0.136.3
+google-api-core==2.31.0
+google-api-python-client==2.197.0
+google-auth==2.53.0
+google-auth-httplib2==0.4.0
+google-auth-oauthlib==1.4.0
+googleapis-common-protos==1.75.0
+greenlet==3.5.1
+gunicorn==26.0.0
+h11==0.16.0
+httplib2==0.31.2
+httptools==0.8.0
+hyperlink==21.0.0
+idna==3.18
+Incremental==24.11.0
+kiteconnect==5.2.0
+limits==5.8.0
+logzero==1.7.0
+markdown-it-py==4.2.0
+mdurl==0.1.2
+numpy==2.4.6
+oauthlib==3.3.1
+openpyxl==3.1.5
+packaging==26.2
+pandas==3.0.3
+pdfminer.six==20260107
+playwright==1.60.0
+playwright-stealth==2.0.3
+proto-plus==1.28.0
+protobuf==7.35.0
+psycopg2-binary==2.9.12
+pyasn1==0.6.3
+pyasn1_modules==0.4.2
+pycparser==3.0
+pydantic==2.13.4
+pydantic_core==2.46.4
+pyee==13.0.1
+Pygments==2.20.0
+PyJWT==2.13.0
+PyMuPDF==1.27.2.3
+pyOpenSSL==26.2.0
+pyotp==2.9.0
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.2
+PyVirtualDisplay==3.0
+pyxirr==0.10.8
+PyYAML==6.0.3
+RapidFuzz==3.14.5
+redis==8.0.0
+requests==2.34.2
+requests-oauthlib==2.0.0
+rich==15.0.0
+service-identity==26.1.0
+six==1.17.0
+slowapi==0.1.9
+smartapi-python==1.5.5
+starlette==1.2.1
+Twisted==26.4.0
+txaio==25.12.2
+typing-inspection==0.4.2
+typing_extensions==4.15.0
+uritemplate==4.2.0
+urllib3==2.7.0
+uvicorn==0.49.0
+uvloop==0.22.1
+watchfiles==1.2.0
+websocket-client==1.9.0
+websockets==16.0
+wrapt==2.2.1
+zope.interface==8.5
