@@ -194,28 +194,51 @@ class AngelOneAdapter:
 
 
 class DhanAdapter:
-    """Dhan HQ — needs access_token and client_id."""
+    """Dhan HQ — live LTP read from the holdings feed.
 
-    def __init__(self, cred: dict):
-        from dhanhq import dhanhq
-        from dhanhq.dhan_context import DhanContext
-        c = cred["credentials"]
-        access_token = cred.get("access_token") or c.get("access_token", "")
-        client_id    = c.get("client_id", "")
-        if not access_token or not client_id:
-            raise ValueError("Dhan: access_token and client_id required")
-        self.dhan = dhanhq(DhanContext(client_id, access_token))
+    Dhan's ``get_holdings()`` already returns ``lastTradedPrice`` for every held
+    security, so LTP is read straight from there. (The old per-symbol
+    ``get_market_feed_ltp`` call was removed in dhanhq 2.x.) Tokens are managed
+    per entity in .env by ``equity.brokers.dhan`` and auto-refreshed via TOTP on
+    auth failure, so an expired token self-heals instead of silently freezing
+    prices. Refresh happens lazily (only when a fetch fails), not every cycle.
+
+    The DB ``cred`` row is unused — Dhan tokens/entities live in .env.
+    """
+
+    def __init__(self, cred: dict | None = None):
+        from equity.brokers import dhan as dhan_broker
+        self._dhan = dhan_broker
+
+    def _fetch_holdings(self, entity_code: str) -> list[dict]:
+        """Fetch holdings; on failure refresh the token once and retry."""
+        try:
+            return self._dhan.fetch_holdings(entity_code)
+        except Exception as e:
+            logger.warning(
+                f"Dhan[{entity_code}]: holdings fetch failed ({e}); "
+                f"refreshing token and retrying once"
+            )
+            self._dhan.refresh_access_token(entity_code)
+            return self._dhan.fetch_holdings(entity_code)
 
     def get_ltp(self, holdings: list[dict]) -> dict[str, float]:
-        prices = {}
-        for h in holdings:
+        prices: dict[str, float] = {}
+        for entity_code in self._dhan.SUPPORTED_ENTITIES:
             try:
-                exchange = (h.get("exchange") or "NSE").upper()
-                resp = self.dhan.get_market_feed_ltp(exchange, h["symbol"])
-                if resp and resp.get("status") == "success":
-                    prices[h["symbol"]] = float(resp["data"]["last_price"])
+                raw = self._fetch_holdings(entity_code)
             except Exception as e:
-                logger.warning(f"Dhan LTP error for {h['symbol']}: {e}")
+                logger.error(f"Dhan[{entity_code}]: LTP unavailable — {e}")
+                continue
+            for h in raw:
+                sym = h.get("tradingSymbol")
+                ltp = h.get("lastTradedPrice") or h.get("closingPrice")
+                if not sym or not ltp:
+                    continue
+                try:
+                    prices[sym] = float(ltp)
+                except (TypeError, ValueError):
+                    continue
         return prices
 
 
@@ -421,16 +444,29 @@ def run():
                 logger.error(f"{broker}: adapter error — {e}")
                 continue
 
+            if not ltp_map:
+                logger.error(
+                    f"{broker}: zero prices returned for {len(broker_holdings)} "
+                    f"holding(s) — NOT marking synced (stale token / API failure?)"
+                )
+                continue
+
             all_ltp.update(ltp_map)
 
+            missing = 0
             for h in broker_holdings:
                 ltp = ltp_map.get(h["symbol"])
                 if ltp is None:
-                    logger.debug(f"No price for {h['symbol']} ({broker})")
+                    missing += 1
+                    logger.warning(f"No price for {h['symbol']} ({broker})")
                     continue
                 metrics = compute_metrics(h, ltp)
                 metrics["id"] = h["id"]
                 updates.append(metrics)
+            if missing:
+                logger.warning(
+                    f"{broker}: {missing}/{len(broker_holdings)} holding(s) had no price"
+                )
 
             mark_broker_synced(conn, broker)
 
