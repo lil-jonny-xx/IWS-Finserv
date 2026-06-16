@@ -1545,6 +1545,50 @@ def _fetch_manual_overview_rows(conn, entity_id: Optional[int] = None):
     return out
 
 
+def _fetch_pms_overview_rows(conn, entity_id: Optional[int] = None):
+    """
+    Nuvama PMS holdings (pms_holding) shaped to match the row dicts the
+    /overview aggregator consumes from holding / equity_holding. PMS equity
+    folds into the EQUITY bucket and PMS cash into CASH — consistent with how
+    manual 'pms'/'bank' entries map — so the dashboard totals include PMS.
+    There is no transaction ledger, so cagr/xirr and ytd/weekly are left empty;
+    pnl is the simple market_value - cost.
+    """
+    cur    = conn.cursor()
+    where  = "WHERE p.entity_id = %s" if entity_id else ""
+    params = [entity_id] if entity_id else []
+    cur.execute(f"""
+        SELECT p.entity_id, e.entity_name, p.holding_type,
+               p.cost, p.market_value
+        FROM pms_holding p
+        JOIN entity e ON e.id = p.entity_id
+        {where}
+    """, params)
+    rows = cur.fetchall()
+    cur.close()
+
+    out = []
+    for r in rows:
+        cost     = float(r["cost"])         if r["cost"]         is not None else None
+        mkt      = float(r["market_value"]) if r["market_value"] is not None else 0.0
+        invested = cost if cost is not None else 0.0
+        pnl      = (mkt - cost) if cost is not None else 0.0
+        out.append({
+            "entity_id":          r["entity_id"],
+            "entity_name":        r["entity_name"],
+            "asset_class":        "CASH" if r["holding_type"] == "cash" else "EQUITY",
+            "security_type":      "PMS",
+            "invested":           invested,
+            "mkt_value":          mkt,
+            "pnl_inception":      pnl,
+            "pnl_ytd":            0.0,
+            "weekly_change":      0.0,
+            "cagr_inception_pct": None,
+            "weight":             mkt,
+        })
+    return out
+
+
 @app.get("/api/v1/overview")
 def get_overview(
     request: Request,
@@ -1608,7 +1652,11 @@ def get_overview(
         # dashboard portfolio matches the generated reports.
         manual_rows = _fetch_manual_overview_rows(conn)
 
-        all_rows = list(mf_rows) + list(eq_rows) + manual_rows
+        # Nuvama PMS holdings (equity → EQUITY bucket, cash → CASH) so the
+        # dashboard totals and allocation include the PMS portfolio.
+        pms_rows = _fetch_pms_overview_rows(conn)
+
+        all_rows = list(mf_rows) + list(eq_rows) + manual_rows + pms_rows
 
         def row_val(r, key):
             v = r[key]
