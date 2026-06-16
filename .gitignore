@@ -42,6 +42,15 @@ mis-portal/reports/
 iws-portal-frontend/docs/work-log-*.md
 CLAUDE.md
 PRODUCT.md
-MIS-REPORT.xlsxgmail_token_central.json.bak-*
+MIS-REPORT.xlsx
+gmail_token_central.json.bak-*
 1.png
+2.png
 mis-portal/workers/manual_cas_retrigger.py
+
+# Nuvama PMS worker — local runtime artifacts. NEVER commit: the browser
+# profile and saved sessions hold live auth cookies (secrets), and downloads
+# hold client financial statements.
+mis-portal/.nuvama_browser_profile/
+mis-portal/.nuvama_sessions/
+mis-portal/.pms_downloads/
