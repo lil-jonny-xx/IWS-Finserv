@@ -1,10 +1,10 @@
 # Python dependencies for the IWS / MIS Portal (API + workers).
-# Fully pinned from the deployment venv (/var/www/mis-portal/venv) for
-# reproducible installs. Regenerate after dependency changes with:
-#   /var/www/mis-portal/venv/bin/pip freeze > /var/www/requirements.txt
+# Fully pinned from the deployment venv (/var/www/.venv) for reproducible
+# installs. Regenerate after dependency changes with:
+#   /var/www/.venv/bin/pip freeze > /var/www/requirements.txt
 #
 # Install:
-#   /var/www/mis-portal/venv/bin/pip install -r requirements.txt
+#   /var/www/.venv/bin/pip install -r requirements.txt
 #
 # NOTE: keep dhanhq pinned — the equity price worker reads LTP from the Dhan
 # holdings feed (dhanhq 2.x API); an unpinned upgrade previously broke it
