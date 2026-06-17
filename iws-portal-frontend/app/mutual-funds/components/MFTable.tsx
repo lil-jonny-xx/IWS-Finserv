@@ -1,5 +1,5 @@
 'use client';
-import { useState, Fragment, useMemo } from 'react';
+import { useState, Fragment, useMemo, useEffect, useRef } from 'react';
 
 export interface MFHoldingRow {
   id: number;
@@ -95,6 +95,7 @@ interface Props {
   onToggleCombined: () => void;
   combinedHoldings?: CombinedHolding[];
   combinedTotals?: { total_combined: number; total_invested: number };
+  filterResetKey?: string | number | null;
 }
 
 // ── formatters ───────────────────────────────────────────────────────────────
@@ -710,7 +711,7 @@ function CombinedSubRowEl({ sub }: { sub: CombinedSubRow }) {
 
 // ── main component ────────────────────────────────────────────────────────────
 
-export default function MFTable({ holdings, totals, showEntityCol, viewMode, onToggleCombined, combinedHoldings, combinedTotals }: Props) {
+export default function MFTable({ holdings, totals, showEntityCol, viewMode, onToggleCombined, combinedHoldings, combinedTotals, filterResetKey }: Props) {
   const [sortKey, setSortKey]       = useState<SortKey>('market_value_as_on');
   const [sortDir, setSortDir]       = useState<SortDir>('desc');
   const [search, setSearch]         = useState('');
@@ -719,6 +720,20 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
   const [filterType, setFilterType]     = useState<string | null>(null);
   const [filterEntity, setFilterEntity] = useState<string | null>(null);
   const [expandedRows, setExpandedRows] = useState<Set<number>>(new Set());
+
+  // Reset all filters when the entity tab changes so stale filters from one
+  // entity view don't bleed into another (e.g. filterEntity='IWS' hiding all
+  // rows when switching back to the All tab, or to a different entity).
+  const prevResetKey = useRef(filterResetKey);
+  useEffect(() => {
+    if (filterResetKey !== prevResetKey.current) {
+      prevResetKey.current = filterResetKey;
+      setSearch('');
+      setFilterClass(null);
+      setFilterType(null);
+      setFilterEntity(null);
+    }
+  }, [filterResetKey]);
 
   function toggleExpand(secId: number) {
     setExpandedRows(prev => {
@@ -785,8 +800,8 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
   const colCount    = 3                          // sr + fund + folio
     + (showEntityCol && groupMode === 'entity' ? 1 : 0)
     + (showPanCol ? 1 : 0)
-    + 11                                         // units nav cost since exp mktval prevwk wklychg
-    + 7                                          // pnl×3 returns×3 xirr
+    + 8                                          // units nav cost since exp% mktval prevwk wklychg
+    + 7                                          // pnl×3 returns×4
     + 2;                                         // realized remarks
 
   // group rows
@@ -966,7 +981,7 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
             selected={filterType}
             onChange={setFilterType}
           />
-          {showEntityCol && (
+          {showEntityCol && viewMode === 'normal' && (
             <FilterPills
               label="Entity"
               options={entityNames}
@@ -978,7 +993,7 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
       </div>
 
       {/* Table */}
-      <div className="overflow-auto max-h-[75vh]" role="region" aria-label="MF holdings table" tabIndex={0}>
+      <div className="overflow-x-auto" role="region" aria-label="MF holdings table" tabIndex={0}>
 
         {/* ── Combined mode ── */}
         {viewMode === 'combined' && (
@@ -1007,6 +1022,12 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
                   if (q && !h.security_name.toLowerCase().includes(q) &&
                            !h.entities.join(' ').toLowerCase().includes(q)) return false;
                   return true;
+                }).sort((a, b) => {
+                  const va = (a[sortKey as keyof CombinedHolding] as number | string) ?? (typeof a[sortKey as keyof CombinedHolding] === 'number' ? -Infinity : '');
+                  const vb = (b[sortKey as keyof CombinedHolding] as number | string) ?? (typeof b[sortKey as keyof CombinedHolding] === 'number' ? -Infinity : '');
+                  if (va < vb) return sortDir === 'asc' ? -1 : 1;
+                  if (va > vb) return sortDir === 'asc' ? 1 : -1;
+                  return 0;
                 });
                 // group by asset class
                 const byClass = new Map<string, CombinedHolding[]>();

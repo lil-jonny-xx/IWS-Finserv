@@ -298,6 +298,7 @@ export default function MutualFundsPage() {
               onToggleCombined={handleToggleCombined}
               combinedHoldings={combinedData?.holdings}
               combinedTotals={combinedData ? { total_combined: combinedData.total_combined, total_invested: combinedData.total_invested } : undefined}
+              filterResetKey={selectedId}
             />
           </>
         )}
