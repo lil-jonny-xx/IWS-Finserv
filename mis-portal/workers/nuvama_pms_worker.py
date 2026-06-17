@@ -39,8 +39,9 @@ import logging
 import os
 import random
 import sys
+import time
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -101,6 +102,35 @@ NAV_TIMEOUT      = 60_000
 ACTION_TIMEOUT   = 15_000
 EXECUTE_TIMEOUT  = 180_000   # report generation can take a while
 
+# --- Partial-scrape guard ---------------------------------------------------
+# A re-scrape full-replaces the entity's holdings (delete-then-insert), so a
+# truncated Portfolio page — e.g. equities loaded but the Cash & Equivalent
+# section slow/missing — would silently wipe real rows. Before committing we
+# sanity-check the freshly parsed set and reject it (keeping the previous
+# snapshot) when it looks partial.
+PMS_REQUIRE_CASH = os.environ.get(
+    "NUVAMA_PMS_REQUIRE_CASH", "1").strip().lower() in ("1", "true", "yes")
+# Reject when the new total market value has collapsed against the last stored
+# snapshot by more than this fraction. Legit withdrawals rarely breach it; a
+# dropped section usually halves the total or worse. Set 0 to disable.
+PMS_MAX_VALUE_DROP = Decimal(os.environ.get("NUVAMA_PMS_MAX_VALUE_DROP", "0.40"))
+
+# --- Anti-fingerprint pacing (mirrors the CAMS CAS request cadence) ---------
+# Each entity is a separate WealthSpectrum login, so hitting them in a fixed
+# order at the same clock minute every night is a recognisably bot-like pattern.
+# Same shape as cas_automation_worker: randomise the ORDER, jitter the start
+# TIME, and wait a randomised DELAY between entities (the ceiling itself drawn
+# 45–75 min, the delay drawn 30 min..ceiling). All knobs tunable in .env; set
+# NUVAMA_PMS_RANDOMIZE=0 to run back-to-back with no waits (e.g. manual testing).
+PMS_RANDOMIZE        = os.environ.get(
+    "NUVAMA_PMS_RANDOMIZE", "1").strip().lower() in ("1", "true", "yes")
+PMS_START_JITTER_S   = int(os.getenv("NUVAMA_PMS_START_JITTER_S",   str(20 * 60)))  # 0..20 min
+PMS_DELAY_FLOOR_S    = int(os.getenv("NUVAMA_PMS_DELAY_FLOOR_S",    str(30 * 60)))  # 30 min
+PMS_DELAY_CEIL_MIN_S = int(os.getenv("NUVAMA_PMS_DELAY_CEIL_MIN_S", str(45 * 60)))  # 45 min
+PMS_DELAY_CEIL_MAX_S = int(os.getenv("NUVAMA_PMS_DELAY_CEIL_MAX_S", str(75 * 60)))  # 75 min
+
+IST = timezone(timedelta(hours=5, minutes=30))   # for human-readable fire times
+
 _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -126,6 +156,11 @@ class PmsConfig:
 class PmsSchemaUnknown(Exception):
     """Raised when the downloaded report's column layout has not yet been mapped.
     The real schema is logged so the mapping can be implemented against it."""
+
+
+class PmsPartialScrape(Exception):
+    """Raised when a freshly parsed holdings set looks truncated/partial, so the
+    previous snapshot is kept instead of being overwritten with bad data."""
 
 
 # ---------------------------------------------------------------------------
@@ -885,6 +920,63 @@ def _dump_pdf_schema(path: Path) -> str:
     return f"  PDF page 1 text (first 1500 chars):\n{text}"
 
 
+def _prev_snapshot_total(conn, entity_id: int) -> Decimal | None:
+    """Total market value of this entity's most recent stored PMS snapshot, or
+    None when there is no prior snapshot to compare a new scrape against."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT COALESCE(SUM(market_value), 0)
+          FROM pms_holding
+         WHERE entity_id = %s
+           AND as_on_date = (
+               SELECT MAX(as_on_date) FROM pms_holding WHERE entity_id = %s
+           )
+        """,
+        (entity_id, entity_id),
+    )
+    row = cur.fetchone()
+    cur.close()
+    if not row or row[0] is None:
+        return None
+    total = Decimal(row[0])
+    return total if total > 0 else None
+
+
+def _validate_scrape(conn, entity_id: int, rows: list[dict], cfg: PmsConfig) -> None:
+    """Reject a partial/truncated Portfolio scrape before it overwrites good data.
+
+    Raises PmsPartialScrape when the parsed set is missing a structural section
+    or its total value has collapsed against the last stored snapshot; the caller
+    then keeps the previous holdings. Run this BEFORE upsert (delete-then-insert)
+    so the comparison still sees the prior snapshot."""
+    n_cash   = sum(1 for r in rows if r["holding_type"] == "cash")
+    n_equity = sum(1 for r in rows if r["holding_type"] == "equity")
+
+    # Structural: the Portfolio page always carries a Cash & Equivalent line
+    # (even at ~0), so its absence means that section did not render this run.
+    if PMS_REQUIRE_CASH and n_cash == 0:
+        raise PmsPartialScrape(
+            f"no cash row parsed (equity rows={n_equity}) — Cash & Equivalent "
+            f"section likely did not load; keeping previous snapshot"
+        )
+
+    # Value collapse vs the last good snapshot catches a missing equity section
+    # (cash present, securities dropped) that the structural check cannot see.
+    if PMS_MAX_VALUE_DROP > 0:
+        prev = _prev_snapshot_total(conn, entity_id)
+        if prev is not None:
+            new_total = sum((r.get("market_value") or Decimal(0)) for r in rows)
+            floor = prev * (Decimal(1) - PMS_MAX_VALUE_DROP)
+            if new_total < floor:
+                drop = (Decimal(1) - new_total / prev) * 100
+                raise PmsPartialScrape(
+                    f"total value {new_total:,.0f} is {drop:.0f}% below the last "
+                    f"snapshot {prev:,.0f} (limit {PMS_MAX_VALUE_DROP * 100:.0f}%) "
+                    f"— likely a partial scrape; keeping previous snapshot"
+                )
+
+
 def upsert(conn, entity_id: int, rows: list[dict], cfg: PmsConfig,
            as_on: date | None = None) -> int:
     """Full-replace this entity's PMS holdings with the freshly parsed set.
@@ -1181,8 +1273,33 @@ def run():
     conn = get_db()
     processed = failed = 0
     errors = []
+
+    # Anti-fingerprint pacing: randomise the order, jitter the start, and (below)
+    # space the entities out by a randomised delay — the same cadence the CAMS
+    # CAS pipeline uses so the portal never sees a fixed order/time pattern.
+    if PMS_RANDOMIZE and len(configs) > 1:
+        random.shuffle(configs)
+    logger.info(f"PMS sync order: {' → '.join(c.code for c in configs)}")
+    if PMS_RANDOMIZE and PMS_START_JITTER_S > 0:
+        jitter = random.uniform(0, PMS_START_JITTER_S)
+        fires = datetime.now(IST) + timedelta(seconds=jitter)
+        logger.info(f"Start jitter: waiting {jitter / 60:.0f}m "
+                    f"(first entity ~{fires:%H:%M IST})")
+        time.sleep(jitter)
+
     try:
-        for cfg in configs:
+        for idx, cfg in enumerate(configs):
+            if idx > 0 and PMS_RANDOMIZE:
+                # Ceiling drawn 45–75 min, then the delay drawn 30 min..ceiling.
+                ceil_s  = random.uniform(PMS_DELAY_CEIL_MIN_S, PMS_DELAY_CEIL_MAX_S)
+                delay_s = random.uniform(PMS_DELAY_FLOOR_S, ceil_s)
+                fires   = datetime.now(IST) + timedelta(seconds=delay_s)
+                logger.info(
+                    f"Next sync [{cfg.code}] in {delay_s / 60:.0f}m "
+                    f"(ceil {ceil_s / 60:.0f}m, fires ~{fires:%H:%M IST})"
+                )
+                time.sleep(delay_s)
+
             logger.info(f"=== [{cfg.code}] Nuvama PMS sync ===")
             path = None
             try:
@@ -1192,6 +1309,7 @@ def run():
                 path, rows = download_report(cfg, as_on)
                 if not rows:
                     raise RuntimeError("no holdings parsed from Portfolio page")
+                _validate_scrape(conn, entity_id, rows, cfg)
                 n = upsert(conn, entity_id, rows, cfg, as_on)
                 conn.commit()
                 processed += n
