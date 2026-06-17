@@ -839,7 +839,7 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
   let srCounter = 0;
 
   return (
-    <div className="bg-card rounded-lg border border-rule overflow-hidden">
+    <div className="bg-card rounded-lg border border-rule [overflow:clip]">
 
       {/* Summary strip */}
       <div className="px-5 sm:px-6 pt-5 pb-4 border-b border-rule">
@@ -1036,7 +1036,12 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
                   byClass.get(h.asset_class)!.push(h);
                 }
                 let srC = 0;
-                return ASSET_CLASS_ORDER.filter(cls => byClass.has(cls)).map(cls => {
+                const orderedClasses = [
+                  ...ASSET_CLASS_ORDER,
+                  ...[...byClass.keys()]
+                    .filter(c => !ASSET_CLASS_ORDER.includes(c as typeof ASSET_CLASS_ORDER[number])),
+                ];
+                return orderedClasses.filter(cls => byClass.has(cls)).map(cls => {
                   const clsRows = byClass.get(cls)!;
                   return (
                     <Fragment key={cls}>
@@ -1087,13 +1092,21 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
               ) : groups.map(group => {
                 const showGroupHeader = showEntityCol || groupMode === 'pan';
 
+                // Known classes first, then any class outside ASSET_CLASS_ORDER so a
+                // holding with an unexpected asset_class is still shown under its own
+                // header rather than silently dropped.
+                const orderedClasses = [
+                  ...ASSET_CLASS_ORDER,
+                  ...[...new Set(group.rows.map(h => h.asset_class))]
+                    .filter(c => !ASSET_CLASS_ORDER.includes(c as typeof ASSET_CLASS_ORDER[number])),
+                ];
                 const byClass: Record<string, MFHoldingRow[]> = Object.fromEntries(
-                  ASSET_CLASS_ORDER.map(cls => [
+                  orderedClasses.map(cls => [
                     cls,
                     sortRows(group.rows.filter(h => h.asset_class === cls), sortKey, sortDir),
                   ])
                 );
-                const activeClasses = ASSET_CLASS_ORDER.filter(cls => (byClass[cls]?.length ?? 0) > 0);
+                const activeClasses = orderedClasses.filter(cls => (byClass[cls]?.length ?? 0) > 0);
 
                 return (
                   <Fragment key={group.key}>
