@@ -262,7 +262,7 @@ export default function AssistantPage() {
         <section className="flex min-h-0 flex-1 flex-col">
           {activeId == null ? (
             <div className="flex flex-1 items-center justify-center px-6 text-center">
-              <div>
+              <div className="rise-in">
                 <h2 className="text-lg font-semibold text-ink">Welcome to Jarvis</h2>
                 <p className="mx-auto mt-2 max-w-md text-sm text-ghost">
                   Your read-only financial copilot. Start a new conversation to analyse

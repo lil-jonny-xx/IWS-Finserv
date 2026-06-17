@@ -35,6 +35,11 @@
   /* Gain / loss */
   --gain:              oklch(42%  0.140 145);
 
+  /* Motion — global ease-out-quint for every Tailwind transition-* utility that
+     doesn't set its own ease-* class. Replaces the default symmetrical ease so UI
+     state changes arrive fast and settle gently. */
+  --default-transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+
   /* Chart palette */
   --chart-equity:      oklch(58%  0.160  40);
   --chart-fixed:       oklch(44%  0.115 258);
@@ -118,6 +123,46 @@ body {
   background: var(--page);
   color: var(--ink);
   font-family: var(--font-geist-sans, Arial, Helvetica, sans-serif);
+}
+
+/* ── Press feedback ──────────────────────────────────────────
+   Tactile scale on any enabled button press. Instantaneous by design —
+   OS input latency masks the lack of a down-transition. */
+button:not(:disabled):active {
+  transform: scale(0.97);
+}
+
+/* ── Entrance animations ─────────────────────────────────────
+   fill-mode: both prevents a pre-animation flash on first paint. */
+@keyframes error-enter {
+  from { opacity: 0; transform: translateY(6px); filter: blur(3px); }
+  to   { opacity: 1; transform: translateY(0);   filter: blur(0);   }
+}
+.error-enter { animation: error-enter 240ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+
+@keyframes chat-enter {
+  from { opacity: 0; transform: translateY(8px); filter: blur(4px); }
+  to   { opacity: 1; transform: translateY(0);   filter: blur(0);   }
+}
+.chat-enter { animation: chat-enter 180ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.fade-in { animation: fade-in 220ms ease-out both; }
+
+@keyframes rise-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0);   }
+}
+.rise-in { animation: rise-in 340ms cubic-bezier(0.22, 1, 0.36, 1) both; }
+
+/* Gentle opacity stagger for the assistant "thinking" dots — calmer and more
+   interruptible than the heavy translate bounce. */
+@keyframes thinking-dot {
+  0%, 80%, 100% { opacity: 0.25; }
+  40%           { opacity: 1; }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -104,7 +104,7 @@ export default function LoginPage() {
             />
           </div>
           {error && (
-            <p id="login-error" role="alert" className="text-peril text-sm">
+            <p id="login-error" role="alert" className="error-enter text-peril text-sm">
               {error}
             </p>
           )}

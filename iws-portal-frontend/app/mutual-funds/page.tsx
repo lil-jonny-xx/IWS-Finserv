@@ -277,7 +277,7 @@ export default function MutualFundsPage() {
         {loading && !data && <Skeleton />}
 
         {data && (
-          <>
+          <div className="fade-in">
             {/* Background-refresh failure: keep the last-loaded table, show a quiet notice. */}
             {error && (
               <div role="status" className="mb-3 flex items-center justify-between gap-3 bg-card rounded-lg border border-rule px-4 py-2">
@@ -300,7 +300,7 @@ export default function MutualFundsPage() {
               combinedTotals={combinedData ? { total_combined: combinedData.total_combined, total_invested: combinedData.total_invested } : undefined}
               filterResetKey={selectedId}
             />
-          </>
+          </div>
         )}
 
         {/* Transactions */}

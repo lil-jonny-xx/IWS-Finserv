@@ -90,11 +90,14 @@ export default function ChatThread({
 
         {/* Live streaming assistant turn */}
         {streaming.active && (
-          <div>
+          <div className="chat-enter" key="streaming-turn">
             <Bubble role="assistant">
               {streaming.tool && !streaming.text && (
                 <span className="inline-flex items-center gap-2 rounded-full border border-rule bg-card px-3 py-1.5 text-xs text-dim">
-                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-prime" />
+                  <svg className="h-3.5 w-3.5 animate-spin text-prime" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeOpacity="0.2" />
+                    <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+                  </svg>
                   {toolLabel(streaming.tool)}…
                 </span>
               )}
@@ -106,9 +109,9 @@ export default function ChatThread({
               )}
               {!streaming.tool && !streaming.text && (
                 <span className="inline-flex items-center gap-1.5 text-sm text-ghost">
-                  <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-ghost [animation-delay:-0.3s]" />
-                  <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-ghost [animation-delay:-0.15s]" />
-                  <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-ghost" />
+                  <span className="h-1.5 w-1.5 rounded-full bg-ghost [animation:thinking-dot_1.4s_ease-in-out_infinite] [animation-delay:-0.32s]" />
+                  <span className="h-1.5 w-1.5 rounded-full bg-ghost [animation:thinking-dot_1.4s_ease-in-out_infinite] [animation-delay:-0.16s]" />
+                  <span className="h-1.5 w-1.5 rounded-full bg-ghost [animation:thinking-dot_1.4s_ease-in-out_infinite]" />
                 </span>
               )}
             </Bubble>

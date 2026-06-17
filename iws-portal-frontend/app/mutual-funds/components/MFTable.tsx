@@ -672,7 +672,7 @@ function CombinedDataRow({
 function CombinedSubRowEl({ sub }: { sub: CombinedSubRow }) {
   const mktVal = sub.market_value_as_on ?? sub.current_value;
   return (
-    <tr className="border-t border-rule/40 bg-page/50">
+    <tr className="fade-in border-t border-rule/40 bg-page/50">
       <td className="pl-3 pr-1 py-2" />
       <td className="px-2 py-2" />
       <td className="px-3 pl-8 py-2 align-top" colSpan={1}>

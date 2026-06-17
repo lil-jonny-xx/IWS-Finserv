@@ -221,7 +221,7 @@ export default function EquityPage() {
         )}
 
         {data && (
-          <>
+          <div className="fade-in">
             {/* Background-refresh failure: keep the last-loaded table, show a quiet notice. */}
             {error && (
               <div role="status" className="mb-3 flex items-center justify-between gap-3 bg-card rounded-lg border border-rule px-4 py-2">
@@ -239,7 +239,7 @@ export default function EquityPage() {
               totals={data.totals}
               showEntityCol={showEntityCol}
             />
-          </>
+          </div>
         )}
 
         <p className="text-center text-xs text-ghost mt-8">

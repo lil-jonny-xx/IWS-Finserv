@@ -289,7 +289,7 @@ function OverviewSection({ data }: { data: OverviewData }) {
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="h-1.5 rounded-full overflow-hidden bg-wire">
-                      <div className="h-full rounded-full transition-all" style={{ width: `${c.pct}%`, background: CLASS_COLORS[c.asset_class] ?? 'var(--muted)' }} />
+                      <div className="h-full w-full rounded-full" style={{ transform: `scaleX(${Math.max(0, Math.min(c.pct, 100)) / 100})`, transformOrigin: 'left center', background: CLASS_COLORS[c.asset_class] ?? 'var(--muted)', transition: 'transform 400ms cubic-bezier(0.22, 1, 0.36, 1)' }} />
                     </div>
                   </div>
                   <span className="text-[11px] text-ghost w-8 text-right tabular-nums shrink-0">{c.pct.toFixed(0)}%</span>
