@@ -638,8 +638,11 @@ def get_holdings(
         user_role = _live_role(cursor, payload["email"])
 
         # Resolve the entity_id to query
-        if entity_id is not None and user_role == "admin":
-            eid = entity_id
+        if user_role == "admin":
+            # Admin with explicit entity_id param → single entity; no param → all entities.
+            # Do NOT fall back to the admin's own users.entity_id — that would hide other
+            # entities when the admin account happens to be linked to one.
+            eid = entity_id  # None when no param was given
         else:
             cursor.execute(
                 "SELECT entity_id FROM users WHERE email = %s AND is_active = TRUE",
@@ -647,11 +650,8 @@ def get_holdings(
             )
             row = cursor.fetchone()
             if not row or not row["entity_id"]:
-                if user_role != "admin":
-                    raise HTTPException(status_code=404, detail="No entity linked to this user")
-                eid = None  # admin all-entities view
-            else:
-                eid = row["entity_id"]
+                raise HTTPException(status_code=404, detail="No entity linked to this user")
+            eid = row["entity_id"]
 
         # Admin with no entity filter → return all holdings across all entities
         if eid is None and user_role == "admin":
