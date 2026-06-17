@@ -44,8 +44,7 @@ CLAUDE.md
 PRODUCT.md
 MIS-REPORT.xlsx
 gmail_token_central.json.bak-*
-1.png
-2.png
+*.png
 mis-portal/workers/manual_cas_retrigger.py
 
 # Nuvama PMS worker — local runtime artifacts. NEVER commit: the browser

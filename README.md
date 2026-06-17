@@ -233,6 +233,7 @@ ENRICHMENT WORKERS
 | every 1 min | — | `equity_price_worker.py` (systemd timer, market-hours guarded) | `/var/log/mis-portal-equity-price.log` |
 | every 1 min | — | `benchmark_worker.py` | `/var/log/mis-portal-benchmark.log` |
 | 00:30 | 06:00 | `fx_rates_worker.py` | `/var/log/mis-portal-fx-worker.log` |
+| 00:30 (Mon/Wed/Fri) | 06:00 | `nuvama_pms_worker.py` (randomised order + delays) | `/var/log/mis-portal-pms.log` |
 | 01:00 | 06:30 | `equity/token_refresh_worker.py` | `/var/log/mis-portal-equity-token.log` |
 | 01:30 | 07:00 | `equity/equity_sync_worker.py` | `/var/log/mis-portal-equity-sync.log` |
 | 16:30 (Mon–Fri) | 22:00 | `stock_transaction_worker.py` | `/var/log/mis-portal-stock-txn.log` |
