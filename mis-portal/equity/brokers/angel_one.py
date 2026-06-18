@@ -117,6 +117,30 @@ def fetch_holdings(entity_code: str) -> list[dict]:
     return holdings
 
 
+def fetch_cash_balance(entity_code: str) -> Decimal:
+    """
+    Available cash for the Angel One account via SmartAPI RMS limits.
+    Uses `availablecash` (the free cash), falling back to `net`, then 0.
+    """
+    obj  = _smart_client(entity_code)
+    resp = obj.rmsLimit() or {}
+    if not resp.get("status"):
+        # e.g. Invalid Token — raise so the caller keeps the last known balance
+        # instead of overwriting it with a misleading 0.
+        raise RuntimeError(f"[{entity_code}] Angel One RMS failed: {resp.get('message')}")
+    data = resp.get("data") or {}
+
+    raw = data.get("availablecash")
+    if raw in (None, ""):
+        raw = data.get("net")
+    try:
+        bal = Decimal(str(raw)) if raw not in (None, "") else Decimal("0")
+    except Exception:
+        bal = Decimal("0")
+    logger.info(f"[{entity_code}] Angel One: cash balance ₹{bal}")
+    return bal
+
+
 # ---------------------------------------------------------------------------
 # Normalise to EquityHolding dataclass
 # ---------------------------------------------------------------------------

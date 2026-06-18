@@ -43,8 +43,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-IST = zoneinfo.ZoneInfo("Asia/Kolkata")
-TWO = Decimal("0.01")
+IST  = zoneinfo.ZoneInfo("Asia/Kolkata")
+TWO  = Decimal("0.01")
+FOUR = Decimal("0.0001")
 
 DB_CONFIG = {
     "host":     os.getenv("DB_HOST", "localhost"),
@@ -406,6 +407,191 @@ def update_exposure_pct(conn):
 
 
 # ---------------------------------------------------------------------------
+# PMS price refresh — pms_holding rows sourced from a broker (e.g. Rajani Corp's
+# Zerodha PMS). Equity prices and cash come live from the broker module (same
+# source as the daily sync), so quantities/ISINs stay as last synced and only
+# price/value/weight move intraday.
+# ---------------------------------------------------------------------------
+def update_pms_prices(conn):
+    try:
+        from equity.equity_sync_worker import PMS_BROKER_MAP
+    except Exception as e:
+        logger.warning(f"PMS: could not load PMS_BROKER_MAP — skipping ({e})")
+        return
+
+    if not PMS_BROKER_MAP:
+        return
+
+    cur = conn.cursor()
+    cur.execute("SELECT id, entity_name FROM entity")
+    emap = {r["entity_name"]: r["id"] for r in cur.fetchall()}
+
+    total_updated = 0
+    for entity_code, broker_module, broker_label, pms_source in PMS_BROKER_MAP:
+        eid = emap.get(entity_code)
+        if eid is None:
+            continue
+
+        cur.execute(
+            "SELECT id, security_name, quantity FROM pms_holding "
+            "WHERE entity_id = %s AND source = %s AND holding_type = 'equity'",
+            (eid, pms_source),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            continue
+
+        try:
+            raw = broker_module.fetch_holdings(entity_code)
+        except Exception as e:
+            logger.error(f"PMS[{entity_code}/{broker_label}]: holdings fetch failed — {e}")
+            continue
+
+        ltp = {}
+        for h in raw:
+            sym, price = h.get("tradingsymbol"), h.get("last_price")
+            if sym and price:
+                ltp[sym] = Decimal(str(price))
+
+        cash = Decimal("0")
+        if hasattr(broker_module, "fetch_cash_balance"):
+            try:
+                cash = broker_module.fetch_cash_balance(entity_code) or Decimal("0")
+            except Exception as e:
+                logger.warning(f"PMS[{entity_code}/{broker_label}]: cash fetch failed — {e}")
+
+        new_vals = {}          # row_id -> (price, market_value)
+        equity_total = Decimal("0")
+        for r in rows:
+            price = ltp.get(r["security_name"])
+            if price is None:
+                continue
+            mv = (_d(r["quantity"]) * price).quantize(TWO, ROUND_HALF_UP)
+            new_vals[r["id"]] = (price, mv)
+            equity_total += mv
+
+        if not new_vals:
+            logger.warning(f"PMS[{entity_code}/{broker_label}]: no matching prices")
+            continue
+
+        total_value = equity_total + cash
+
+        def _wt(mv):
+            return float((mv / total_value * 100).quantize(FOUR, ROUND_HALF_UP)) if total_value > 0 else None
+
+        for rid, (price, mv) in new_vals.items():
+            cur.execute(
+                "UPDATE pms_holding SET current_price = %s, market_value = %s, "
+                "weight_pct = %s, updated_at = NOW() WHERE id = %s",
+                (float(price), float(mv), _wt(mv), rid),
+            )
+            total_updated += 1
+
+        if cash > 0:
+            cur.execute(
+                "UPDATE pms_holding SET market_value = %s, cost = %s, weight_pct = %s, "
+                "updated_at = NOW() WHERE entity_id = %s AND source = %s AND holding_type = 'cash'",
+                (float(cash), float(cash), _wt(cash), eid, pms_source),
+            )
+
+    conn.commit()
+    cur.close()
+    if total_updated:
+        logger.info(f"PMS: updated {total_updated} holding price(s)")
+
+
+# ---------------------------------------------------------------------------
+# Nuvama PMS price refresh — these positions are scraped (no broker account),
+# so we price them by ISIN: ISIN → NSE/BSE symbol (Dhan master) → Zerodha LTP.
+# Quantities and cash stay as last scraped (no broker access to the Nuvama
+# account); only equity price/value/weight move intraday. Dormant until the
+# scrape populates ISINs (pms_holding.isin is NULL until then).
+# ---------------------------------------------------------------------------
+def update_nuvama_pms_prices(conn, creds: dict, source: str = "nuvama_pms"):
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, entity_id, security_name, isin, quantity FROM pms_holding "
+        "WHERE source = %s AND holding_type = 'equity' AND isin IS NOT NULL",
+        (source,),
+    )
+    rows = cur.fetchall()
+    if not rows:
+        cur.close()
+        return   # no ISINs captured yet — nothing to price
+
+    zcred = creds.get("zerodha")
+    if not zcred:
+        logger.warning(f"{source}: no Zerodha credentials for LTP — skipping")
+        cur.close()
+        return
+
+    try:
+        from equity import isin_lookup
+        adapter = build_adapter("zerodha", zcred)
+    except Exception as e:
+        logger.error(f"{source}: LTP setup failed — {e}")
+        cur.close()
+        return
+
+    # Resolve each row's ISIN → EXCHANGE:SYMBOL.
+    row_sym, instruments = {}, []
+    for r in rows:
+        mapped = isin_lookup.symbol_for_isin(r["isin"])
+        if not mapped:
+            logger.warning(f"{source}: no symbol for ISIN {r['isin']} ({r['security_name']})")
+            continue
+        exch, sym = mapped.split(":", 1)
+        row_sym[r["id"]] = sym
+        instruments.append({"symbol": sym, "exchange": exch})
+
+    if not instruments:
+        cur.close()
+        return
+
+    try:
+        ltp = adapter.get_ltp(instruments)   # {symbol: price}
+    except Exception as e:
+        logger.error(f"{source}: LTP fetch failed — {e}")
+        cur.close()
+        return
+
+    # Existing scraped cash per entity (kept as-is; broker can't see Nuvama cash).
+    cur.execute(
+        "SELECT entity_id, COALESCE(SUM(market_value),0) AS cash FROM pms_holding "
+        "WHERE source = %s AND holding_type = 'cash' GROUP BY entity_id",
+        (source,),
+    )
+    cash_by_entity = {r["entity_id"]: _d(r["cash"]) for r in cur.fetchall()}
+
+    # New equity market values, then recompute weights per entity (equity + cash).
+    new_vals, equity_total_by_entity = {}, {}
+    for r in rows:
+        sym = row_sym.get(r["id"])
+        price = ltp.get(sym) if sym else None
+        if price is None:
+            continue
+        mv = (_d(r["quantity"]) * Decimal(str(price))).quantize(TWO, ROUND_HALF_UP)
+        new_vals[r["id"]] = (r["entity_id"], Decimal(str(price)), mv)
+        equity_total_by_entity[r["entity_id"]] = equity_total_by_entity.get(r["entity_id"], Decimal("0")) + mv
+
+    updated = 0
+    for rid, (eid, price, mv) in new_vals.items():
+        total = equity_total_by_entity.get(eid, Decimal("0")) + cash_by_entity.get(eid, Decimal("0"))
+        wt = float((mv / total * 100).quantize(FOUR, ROUND_HALF_UP)) if total > 0 else None
+        cur.execute(
+            "UPDATE pms_holding SET current_price = %s, market_value = %s, "
+            "weight_pct = %s, updated_at = NOW() WHERE id = %s",
+            (float(price), float(mv), wt, rid),
+        )
+        updated += 1
+
+    conn.commit()
+    cur.close()
+    if updated:
+        logger.info(f"{source}: updated {updated}/{len(rows)} holding price(s) via ISIN→LTP")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def run():
@@ -474,6 +660,21 @@ def run():
             update_holdings_batch(conn, updates)
             update_exposure_pct(conn)
             logger.info(f"Updated {len(updates)} holdings.")
+
+        # PMS holdings (e.g. Rajani Corp's Zerodha PMS) live in pms_holding and
+        # aren't part of the equity_holding batch above — refresh them too.
+        update_pms_prices(conn)
+
+        # Scraped PMS (Nuvama) — priced by ISIN→symbol→LTP; dormant until the
+        # scrape populates ISINs.
+        update_nuvama_pms_prices(conn, creds)
+
+        # Refresh per-broker cash balances (shown on the Equity page).
+        try:
+            from equity.equity_sync_worker import refresh_broker_cash
+            refresh_broker_cash(conn)
+        except Exception as e:
+            logger.warning(f"broker cash refresh failed — {e}")
 
         if is_eod_window():
             write_eod_snapshot(conn, holdings, all_ltp)

@@ -346,6 +346,173 @@ def snapshot_history(cur, h: EquityHolding, today: date):
 
 
 # ---------------------------------------------------------------------------
+# PMS write (broker holdings that represent a PMS account)
+# ---------------------------------------------------------------------------
+
+def sync_pms_broker(
+    conn,
+    entity_id: int,
+    entity_code: str,
+    broker_module,
+    broker_label: str,
+    pms_source: str,
+    today: date,
+) -> int:
+    """
+    Fetch a broker's holdings for an entity and store them in pms_holding as a
+    PMS portfolio (instead of equity_holding). Full-replace per (entity, source),
+    mirroring nuvama_pms_worker, so sold positions disappear.
+
+    The equity-grade metrics (XIRR/CAGR/PnL-inception/weekly) are not computed —
+    the PMS view shows holdings, cost, market value and weight only.
+
+    If the broker exposes fetch_cash_balance(), the available cash is stored as a
+    'cash' row so the PMS view shows an equity total, a cash total and a combined
+    total (like the Nuvama PMS). weight_pct is over the combined (equity + cash).
+    """
+    raw      = broker_module.fetch_holdings(entity_code)
+    holdings = broker_module.normalise(entity_id, entity_code, raw)
+
+    cash_balance = Decimal("0")
+    if hasattr(broker_module, "fetch_cash_balance"):
+        try:
+            cash_balance = broker_module.fetch_cash_balance(entity_code) or Decimal("0")
+        except Exception as e:
+            logger.warning(f"  [{entity_code}/{broker_label}→PMS] cash balance fetch failed: {e}")
+
+    equity_value = sum((h.current_market_value for h in holdings), Decimal("0"))
+    total_value  = equity_value + cash_balance
+
+    cur = conn.cursor()
+
+    # One-time/idempotent migration: drop any rows this entity+broker previously
+    # wrote to equity_holding so they no longer show on the Equity page.
+    cur.execute(
+        "DELETE FROM equity_holding WHERE entity_id = %s AND broker = %s",
+        (entity_id, _broker_name(broker_module)),
+    )
+
+    # Full-replace this PMS source for the entity.
+    cur.execute(
+        "DELETE FROM pms_holding WHERE entity_id = %s AND source = %s",
+        (entity_id, pms_source),
+    )
+
+    def _weight(mv: Decimal) -> Optional[float]:
+        if total_value <= 0:
+            return None
+        return float((mv / total_value * 100).quantize(FOUR, ROUND_HALF_UP))
+
+    def _insert(holding_type, security_name, isin, quantity, avg_cost, cost,
+                current_price, market_value, weight_pct):
+        cur.execute(
+            """
+            INSERT INTO pms_holding (
+                entity_id, as_on_date, holding_type, security_name, isin,
+                quantity, avg_cost, cost, current_price, market_value,
+                weight_pct, source, updated_at
+            ) VALUES (
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, NOW()
+            )
+            ON CONFLICT (entity_id, holding_type, security_name) DO UPDATE SET
+                as_on_date    = EXCLUDED.as_on_date,
+                isin          = EXCLUDED.isin,
+                quantity      = EXCLUDED.quantity,
+                avg_cost      = EXCLUDED.avg_cost,
+                cost          = EXCLUDED.cost,
+                current_price = EXCLUDED.current_price,
+                market_value  = EXCLUDED.market_value,
+                weight_pct    = EXCLUDED.weight_pct,
+                source        = EXCLUDED.source,
+                updated_at    = NOW()
+            """,
+            (
+                entity_id, today, holding_type, security_name, isin,
+                quantity, avg_cost, cost, current_price, market_value,
+                weight_pct, pms_source,
+            ),
+        )
+
+    count = 0
+    for h in holdings:
+        _insert(
+            "equity", h.symbol, h.isin or None,
+            float(h.quantity), float(h.avg_cost), float(h.cost),
+            float(h.current_price), float(h.current_market_value),
+            _weight(h.current_market_value),
+        )
+        count += 1
+
+    # Cash balance as a 'cash' row (cost == value, so no P&L).
+    if cash_balance > 0:
+        _insert(
+            "cash", "Cash Balance", None,
+            None, None, float(cash_balance),
+            None, float(cash_balance),
+            _weight(cash_balance),
+        )
+        count += 1
+
+    conn.commit()
+    cur.close()
+    logger.info(
+        f"  [{entity_code}/{broker_label}→PMS] Upserted {count} rows into pms_holding "
+        f"(equity ₹{equity_value} + cash ₹{cash_balance})"
+    )
+    return count
+
+
+def _broker_name(broker_module) -> str:
+    """Map a broker module to its equity_holding.broker label (e.g. 'zerodha')."""
+    return broker_module.__name__.rsplit(".", 1)[-1]
+
+
+def refresh_broker_cash(conn, emap: Optional[dict] = None) -> int:
+    """
+    Fetch available cash for every (entity, broker) in BROKER_ENTITY_MAP and
+    upsert into broker_cash. One API call per account; failures are isolated so
+    one bad token doesn't drop the others. Returns count of accounts updated.
+
+    Rajani Corp's Zerodha cash is intentionally NOT here — that account is a PMS
+    (PMS_BROKER_MAP), so its cash is stored in pms_holding instead.
+    """
+    if emap is None:
+        emap = load_entity_map(conn)
+
+    today   = date.today()
+    cur     = conn.cursor()
+    updated = 0
+    for entity_code, broker_module, broker_label in BROKER_ENTITY_MAP:
+        entity_id = emap.get(entity_code)
+        if entity_id is None or not hasattr(broker_module, "fetch_cash_balance"):
+            continue
+        try:
+            bal = broker_module.fetch_cash_balance(entity_code) or Decimal("0")
+        except Exception as e:
+            logger.warning(f"  [{entity_code}/{broker_label}] cash fetch failed: {e}")
+            continue
+        cur.execute(
+            """
+            INSERT INTO broker_cash (entity_id, broker, balance, as_of_date, updated_at)
+            VALUES (%s, %s, %s, %s, NOW())
+            ON CONFLICT (entity_id, broker) DO UPDATE SET
+                balance    = EXCLUDED.balance,
+                as_of_date = EXCLUDED.as_of_date,
+                updated_at = NOW()
+            """,
+            (entity_id, broker_label, float(bal), today),
+        )
+        updated += 1
+
+    conn.commit()
+    cur.close()
+    logger.info(f"Broker cash refreshed for {updated} account(s)")
+    return updated
+
+
+# ---------------------------------------------------------------------------
 # Per-entity sync
 # ---------------------------------------------------------------------------
 
@@ -357,8 +524,16 @@ BROKER_ENTITY_MAP = [
     ("HHR",         angel_one, "angel_one"),
     ("HHR",         dhan,      "dhan"),
     ("SDR",         zerodha,   "zerodha"),
-    ("Rajani Corp", zerodha,   "zerodha"),
     ("Rajani Corp", dhan,      "dhan"),
+]
+
+# Entities whose holdings at a given broker are actually a PMS account and should
+# land in pms_holding (shown on the PMS page) instead of equity_holding.
+# Rajani Corp's Zerodha account is a discretionary PMS, so its Zerodha holdings
+# are routed here. Its Dhan holdings stay in the regular equity flow above.
+# (entity_code, broker_module, broker_label, pms_source)
+PMS_BROKER_MAP = [
+    ("Rajani Corp", zerodha, "zerodha", "zerodha_pms"),
 ]
 
 
@@ -437,6 +612,33 @@ def main():
             logger.error(f"[{entity_code}/{broker_label}] Failed: {e}")
             conn.rollback()
             errors.append(f"{entity_code}:{broker_label}")
+
+    # PMS-routed brokers — holdings stored in pms_holding (shown on the PMS page)
+    # rather than equity_holding. e.g. Rajani Corp's Zerodha discretionary PMS.
+    for entity_code, broker_module, broker_label, pms_source in PMS_BROKER_MAP:
+        entity_id = emap.get(entity_code)
+        if entity_id is None:
+            logger.error(f"Entity '{entity_code}' not found in DB — skipping")
+            errors.append(f"{entity_code}:{broker_label}(pms)")
+            continue
+
+        logger.info(f"[{entity_code}/{broker_label}→PMS] Starting sync")
+        try:
+            n = sync_pms_broker(conn, entity_id, entity_code, broker_module, broker_label, pms_source, today)
+            total += n
+        except NotImplementedError:
+            logger.warning(f"[{entity_code}/{broker_label}→PMS] Broker not yet implemented — skipping")
+        except Exception as e:
+            logger.error(f"[{entity_code}/{broker_label}→PMS] Failed: {e}")
+            conn.rollback()
+            errors.append(f"{entity_code}:{broker_label}(pms)")
+
+    # Cash balances per (entity, broker) for the Equity page.
+    try:
+        refresh_broker_cash(conn, emap)
+    except Exception as e:
+        logger.error(f"Broker cash refresh failed: {e}")
+        conn.rollback()
 
     # Recalculate exposure_pct across all brokers per entity now that all syncs are done.
     # Per-broker sync uses only that broker's total — this corrects it to entity-wide total.

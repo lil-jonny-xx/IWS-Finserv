@@ -190,6 +190,29 @@ def fetch_holdings(entity_code: str) -> list[dict]:
     return holdings
 
 
+def fetch_cash_balance(entity_code: str) -> Decimal:
+    """
+    Available cash for the Dhan account via the fund-limit endpoint.
+    Uses `availabelBalance` (Dhan's spelling), falling back to
+    `withdrawableBalance`, then 0.
+    """
+    dhan = _dhan_client(entity_code)
+    resp = dhan.get_fund_limits() or {}
+    if resp.get("status") == "failure":
+        raise RuntimeError(f"[{entity_code}] Dhan fund limits failed: {resp.get('remarks')}")
+    data = resp.get("data") or {}
+
+    raw = data.get("availabelBalance")
+    if raw in (None, ""):
+        raw = data.get("withdrawableBalance")
+    try:
+        bal = Decimal(str(raw)) if raw not in (None, "") else Decimal("0")
+    except Exception:
+        bal = Decimal("0")
+    logger.info(f"[{entity_code}] Dhan: cash balance ₹{bal}")
+    return bal
+
+
 # ---------------------------------------------------------------------------
 # Normalise to EquityHolding dataclass
 # ---------------------------------------------------------------------------

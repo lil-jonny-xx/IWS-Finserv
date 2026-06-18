@@ -167,6 +167,25 @@ def fetch_holdings(entity_code: str) -> list[dict]:
     return holdings
 
 
+def fetch_cash_balance(entity_code: str) -> Decimal:
+    """
+    Available cash in the Zerodha equity segment, from Kite Connect margins.
+
+    Uses the segment `net` (the free/available balance Kite shows on the funds
+    screen). Falls back to available.live_balance, then 0. For a Zerodha-run PMS
+    this is the un-invested cash sitting in the account.
+    """
+    kite = _kite_client(entity_code)
+    m    = kite.margins("equity") or {}
+
+    net = m.get("net")
+    if net is None:
+        net = (m.get("available") or {}).get("live_balance")
+    bal = Decimal(str(net or 0))
+    logger.info(f"[{entity_code}] Zerodha: equity cash balance ₹{bal}")
+    return bal
+
+
 # ---------------------------------------------------------------------------
 # Normalise to EquityHolding dataclass
 # ---------------------------------------------------------------------------

@@ -1226,10 +1226,37 @@ def get_equity_holdings(
             params,
         )
         rows = cur.fetchall()
+
+        # Per-broker cash balances for the same scope (entity + optional broker).
+        cash_conditions, cash_params = [], []
+        if eid is not None:
+            cash_conditions.append("bc.entity_id = %s")
+            cash_params.append(eid)
+        if broker:
+            cash_conditions.append("bc.broker = %s")
+            cash_params.append(broker)
+        cash_where = ("WHERE " + " AND ".join(cash_conditions)) if cash_conditions else ""
+        cur.execute(
+            f"""
+            SELECT bc.entity_id, e.entity_name, bc.broker, bc.balance, bc.updated_at
+            FROM   broker_cash bc
+            JOIN   entity e ON e.id = bc.entity_id
+            {cash_where}
+            ORDER BY e.entity_name, bc.broker
+            """,
+            cash_params,
+        )
+        cash_rows = cur.fetchall()
         cur.close()
 
         holdings = [_row_to_holding(r) for r in rows]
         totals   = _equity_totals(rows)
+
+        cash_total = round(sum(float(c["balance"] or 0) for c in cash_rows), 2)
+        totals["cash_balance"] = cash_total
+        totals["value_plus_cash"] = round(
+            float(totals.get("total_current_market_value") or 0) + cash_total, 2
+        )
 
         entity_name = "All Entities" if eid is None else (
             rows[0]["entity_name"] if rows else ""
@@ -1242,6 +1269,17 @@ def get_equity_holdings(
             "total_holdings": len(holdings),
             "totals":         totals,
             "holdings":       holdings,
+            "cash_balance":   cash_total,
+            "cash_by_broker": [
+                {
+                    "entity_id":   c["entity_id"],
+                    "entity_name": c["entity_name"],
+                    "broker":      c["broker"],
+                    "balance":     float(c["balance"] or 0),
+                    "updated_at":  c["updated_at"].isoformat() if c["updated_at"] else None,
+                }
+                for c in cash_rows
+            ],
         }
 
     except HTTPException:
@@ -1424,7 +1462,21 @@ def get_equity_summary(
             params,
         )
         grand = cur.fetchone()
+
+        # Per-(entity, broker) cash balances for the same scope.
+        cur.execute(
+            f"""
+            SELECT bc.entity_id, bc.broker, bc.balance
+            FROM   broker_cash bc
+            {("WHERE bc.entity_id = %s" if eid is not None else "")}
+            """,
+            ([eid] if eid is not None else []),
+        )
+        cash_map   = {(c["entity_id"], c["broker"]): float(c["balance"] or 0) for c in cur.fetchall()}
+        cash_total = round(sum(cash_map.values()), 2)
         cur.close()
+
+        grand_value = float(grand["total_current_value"] or 0)
 
         return {
             "entity_id":   eid or 0,
@@ -1436,6 +1488,8 @@ def get_equity_summary(
                 "total_weekly_change":   _fmt(grand["total_weekly_change"]),
                 "total_pnl_inception":   _fmt(grand["total_pnl_inception"]),
                 "total_pnl_ytd":         _fmt(grand["total_pnl_ytd"]),
+                "cash_balance":          cash_total,
+                "value_plus_cash":       round(grand_value + cash_total, 2),
             },
             "by_broker": [
                 {
@@ -1452,6 +1506,7 @@ def get_equity_summary(
                     "total_pnl_weekly_change":_fmt(r["total_pnl_weekly_change"]),
                     "returns_inception_pct": _fmt(r["returns_inception_pct"]),
                     "returns_ytd_pct":       _fmt(r["returns_ytd_pct"]),
+                    "cash_balance":          cash_map.get((r["entity_id"], r["broker"]), 0.0),
                     "as_of_date":            str(r["as_of_date"]) if r["as_of_date"] else None,
                     "last_updated":          r["last_updated"].isoformat() if r["last_updated"] else None,
                 }
@@ -1589,6 +1644,45 @@ def _fetch_pms_overview_rows(conn, entity_id: Optional[int] = None):
     return out
 
 
+def _fetch_broker_cash_overview_rows(conn, entity_id: Optional[int] = None):
+    """
+    Broker-account cash (broker_cash) shaped for the /overview aggregator. The
+    free cash in the Zerodha / Angel One / Dhan equity accounts folds into the
+    CASH bucket so the dashboard total and allocation include it. Cash has no
+    cost basis, so pnl/ytd/weekly are 0. Rajani Corp's Zerodha PMS cash lives in
+    pms_holding (handled by _fetch_pms_overview_rows), not here — no double count.
+    """
+    cur    = conn.cursor()
+    where  = "WHERE bc.entity_id = %s" if entity_id else ""
+    params = [entity_id] if entity_id else []
+    cur.execute(f"""
+        SELECT bc.entity_id, e.entity_name, bc.broker, bc.balance
+        FROM broker_cash bc
+        JOIN entity e ON e.id = bc.entity_id
+        {where}
+    """, params)
+    rows = cur.fetchall()
+    cur.close()
+
+    out = []
+    for r in rows:
+        bal = float(r["balance"]) if r["balance"] is not None else 0.0
+        out.append({
+            "entity_id":          r["entity_id"],
+            "entity_name":        r["entity_name"],
+            "asset_class":        "CASH",
+            "security_type":      "BROKER_CASH",
+            "invested":           bal,
+            "mkt_value":          bal,
+            "pnl_inception":      0.0,
+            "pnl_ytd":            0.0,
+            "weekly_change":      0.0,
+            "cagr_inception_pct": None,
+            "weight":             bal,
+        })
+    return out
+
+
 @app.get("/api/v1/overview")
 def get_overview(
     request: Request,
@@ -1656,7 +1750,10 @@ def get_overview(
         # dashboard totals and allocation include the PMS portfolio.
         pms_rows = _fetch_pms_overview_rows(conn)
 
-        all_rows = list(mf_rows) + list(eq_rows) + manual_rows + pms_rows
+        # Broker-account cash (Zerodha / Angel One / Dhan) → CASH bucket.
+        broker_cash_rows = _fetch_broker_cash_overview_rows(conn)
+
+        all_rows = list(mf_rows) + list(eq_rows) + manual_rows + pms_rows + broker_cash_rows
 
         def row_val(r, key):
             v = r[key]

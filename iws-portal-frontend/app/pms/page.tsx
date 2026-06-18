@@ -91,7 +91,7 @@ function HoldingsTable({ rows, showEntityCol }: { rows: PmsHolding[]; showEntity
     items.length > 0 && (
       <>
         <tr className="bg-page">
-          <td colSpan={showEntityCol ? 8 : 7} className="px-5 py-2 text-xs font-semibold text-dim uppercase tracking-wide">
+          <td colSpan={showEntityCol ? 7 : 6} className="px-5 py-2 text-xs font-semibold text-dim uppercase tracking-wide">
             {title}
           </td>
         </tr>
@@ -191,7 +191,7 @@ export default function PmsPage() {
           <div>
             <h1 className="text-2xl sm:text-3xl font-bold text-ink">PMS Portfolio</h1>
             <p className="text-sm text-ghost mt-0.5">
-              Nuvama PMS holdings{data?.as_on_date ? ` · as on ${data.as_on_date}` : ''}
+              PMS holdings{data?.as_on_date ? ` · as on ${data.as_on_date}` : ''}
             </p>
           </div>
           <nav className="flex gap-1.5" aria-label="Sections">

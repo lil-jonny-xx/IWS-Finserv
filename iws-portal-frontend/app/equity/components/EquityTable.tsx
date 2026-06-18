@@ -38,6 +38,8 @@ export interface EquityTotals {
   total_pnl_ytd?: number;
   total_weekly_change?: number;
   grand_total?: number;
+  cash_balance?: number;
+  value_plus_cash?: number;
 }
 
 interface Props {
@@ -402,15 +404,6 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
   const [filterSector, setFilterSector]   = useState<string | null>(null);
   const [filterEntity, setFilterEntity]   = useState<string | null>(null);
 
-  if (holdings.length === 0) {
-    return (
-      <div className="bg-card rounded-lg border border-rule px-6 py-12 text-center">
-        <p className="text-sm font-medium text-ink mb-1">No equity holdings on record</p>
-        <p className="text-xs text-ghost">Holdings will appear after the first broker sync.</p>
-      </div>
-    );
-  }
-
   function handleSort(key: SortKey) {
     if (key === sortKey) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
     else { setSortKey(key); setSortDir('desc'); }
@@ -447,6 +440,18 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
 
     return rows;
   }, [holdings, search, filterBroker, filterSector, filterEntity]);
+
+  // Empty state — placed AFTER all hooks (useState×6 + useMemo) so the hook
+  // call order is identical whether holdings are empty or populated, satisfying
+  // React's Rules of Hooks (an early return above useMemo crashes on transition).
+  if (holdings.length === 0) {
+    return (
+      <div className="bg-card rounded-lg border border-rule px-6 py-12 text-center">
+        <p className="text-sm font-medium text-ink mb-1">No equity holdings on record</p>
+        <p className="text-xs text-ghost">Holdings will appear after the first broker sync.</p>
+      </div>
+    );
+  }
 
   const rows = sortRows(filtered, sortKey, sortDir);
 
@@ -486,6 +491,18 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
             <p className="text-xs text-ghost mb-0.5">Current Value</p>
             <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(totals.total_current_market_value)}</p>
           </div>
+          {totals.cash_balance != null && totals.cash_balance > 0 && (
+            <>
+              <div>
+                <p className="text-xs text-ghost mb-0.5">Cash Balance</p>
+                <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(totals.cash_balance)}</p>
+              </div>
+              <div>
+                <p className="text-xs text-ghost mb-0.5">Value + Cash</p>
+                <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(totals.value_plus_cash)}</p>
+              </div>
+            </>
+          )}
           {hasPnl && (
             <div>
               <p className="text-xs text-ghost mb-0.5">P&amp;L (Inception)</p>

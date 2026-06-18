@@ -926,7 +926,7 @@ def _prev_snapshot_total(conn, entity_id: int) -> Decimal | None:
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT COALESCE(SUM(market_value), 0)
+        SELECT COALESCE(SUM(market_value), 0) AS total
           FROM pms_holding
          WHERE entity_id = %s
            AND as_on_date = (
@@ -937,9 +937,11 @@ def _prev_snapshot_total(conn, entity_id: int) -> Decimal | None:
     )
     row = cur.fetchone()
     cur.close()
-    if not row or row[0] is None:
+    # Connection uses RealDictCursor, so rows are dicts — read by column name.
+    total_raw = row["total"] if row else None
+    if total_raw is None:
         return None
-    total = Decimal(row[0])
+    total = Decimal(total_raw)
     return total if total > 0 else None
 
 
