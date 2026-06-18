@@ -53,3 +53,5 @@ mis-portal/workers/manual_cas_retrigger.py
 mis-portal/.nuvama_browser_profile/
 mis-portal/.nuvama_sessions/
 mis-portal/.pms_downloads/
+motion-audits/
+mis-portal/.isin_symbol_map.json
