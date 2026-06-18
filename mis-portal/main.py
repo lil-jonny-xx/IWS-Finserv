@@ -1537,7 +1537,7 @@ MANUAL_ASSET_CLASS = {
     "liquid_fund":    "FIXED_INCOME",
     "debt_fund":      "FIXED_INCOME",
     "arbitrage_fund": "FIXED_INCOME",
-    "pms":            "EQUITY",
+    "pms":            "PMS",
     "aif":            "EQUITY",
     "direct_equity":  "DIRECT_EQUITY",
     "overseas_fund":   "ALTERNATES",
@@ -1546,6 +1546,7 @@ MANUAL_ASSET_CLASS = {
     "gold_etf":        "ALTERNATES",
     "unlisted":        "ALTERNATES",
     "startup":         "ALTERNATES",
+    "properties":      "REAL_ESTATE",
     "funds_transit":   "CASH",
     "broker_balance":  "CASH",
     "bank":            "CASH",
@@ -1602,12 +1603,12 @@ def _fetch_manual_overview_rows(conn, entity_id: Optional[int] = None):
 
 def _fetch_pms_overview_rows(conn, entity_id: Optional[int] = None):
     """
-    Nuvama PMS holdings (pms_holding) shaped to match the row dicts the
-    /overview aggregator consumes from holding / equity_holding. PMS equity
-    folds into the EQUITY bucket and PMS cash into CASH — consistent with how
-    manual 'pms'/'bank' entries map — so the dashboard totals include PMS.
-    There is no transaction ledger, so cagr/xirr and ytd/weekly are left empty;
-    pnl is the simple market_value - cost.
+    PMS holdings (pms_holding) shaped to match the row dicts the /overview
+    aggregator consumes from holding / equity_holding. PMS equity is reported
+    in its own PMS asset class (kept OUT of the EQUITY bucket so the dashboard
+    shows PMS as a distinct slice); PMS cash folds into CASH. There is no
+    transaction ledger, so cagr/xirr and ytd/weekly are left empty; pnl is the
+    simple market_value - cost.
     """
     cur    = conn.cursor()
     where  = "WHERE p.entity_id = %s" if entity_id else ""
@@ -1631,7 +1632,7 @@ def _fetch_pms_overview_rows(conn, entity_id: Optional[int] = None):
         out.append({
             "entity_id":          r["entity_id"],
             "entity_name":        r["entity_name"],
-            "asset_class":        "CASH" if r["holding_type"] == "cash" else "EQUITY",
+            "asset_class":        "CASH" if r["holding_type"] == "cash" else "PMS",
             "security_type":      "PMS",
             "invested":           invested,
             "mkt_value":          mkt,
@@ -2029,7 +2030,7 @@ VALID_CATEGORIES = {
     "liquid_fund", "debt_fund", "arbitrage_fund", "ppf",
     "pms", "direct_equity", "aif",
     "overseas_fund", "overseas_equity", "forex", "gold_etf",
-    "unlisted", "startup",
+    "unlisted", "startup", "properties",
     "funds_transit", "broker_balance", "bank",
 }
 

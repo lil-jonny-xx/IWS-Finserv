@@ -75,8 +75,10 @@ function gainColor(n: number): string {
 const CLASS_COLORS: Record<string, string> = {
   EQUITY:        'var(--chart-equity)',
   DIRECT_EQUITY: '#6366f1',   // indigo for direct stocks
+  PMS:           '#f59e0b',   // amber for PMS portfolios
   FIXED_INCOME:  'var(--chart-fixed)',
   ALTERNATES:    'var(--chart-alt)',
+  REAL_ESTATE:   '#0ea5e9',   // sky for real estate / property
   HYBRID:        '#8b5cf6',   // violet for hybrid MF
   ARBITRAGE:     '#14b8a6',   // teal for arbitrage
   CASH:          '#94a3b8',   // slate for cash / transit balances
@@ -86,8 +88,10 @@ const CLASS_COLORS: Record<string, string> = {
 const CLASS_LABELS: Record<string, string> = {
   EQUITY:        'Equity MF',
   DIRECT_EQUITY: 'Direct Equity',
+  PMS:           'PMS',
   FIXED_INCOME:  'Fixed Income',
   ALTERNATES:    'Alternates',
+  REAL_ESTATE:   'Real Estate',
   HYBRID:        'Hybrid MF',
   ARBITRAGE:     'Arbitrage',
   CASH:          'Cash & Transit',

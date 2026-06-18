@@ -57,6 +57,7 @@ const CATEGORIES: { value: string; label: string; group: string }[] = [
   { value: 'gold_etf',       label: 'Gold / Silver ETF',          group: 'Alternates' },
   { value: 'unlisted',       label: 'Unlisted Equity',            group: 'Alternates' },
   { value: 'startup',        label: 'Startup',                    group: 'Alternates' },
+  { value: 'properties',     label: 'Real Estate / Property',     group: 'Real Estate' },
   { value: 'funds_transit',  label: 'Funds in Transit',           group: 'Other' },
   { value: 'broker_balance', label: 'Broker Balance',             group: 'Other' },
   { value: 'bank',           label: 'Bank Balance',               group: 'Other' },
