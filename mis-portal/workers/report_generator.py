@@ -302,6 +302,139 @@ def _merge_equity_by_symbol(eq_rows: list) -> list:
     return sorted(merged, key=lambda h: h["symbol"])
 
 
+_BROKER_DISPLAY = {"zerodha": "Zerodha", "angel_one": "Angel One", "dhan": "Dhan"}
+_PMS_SOURCE_DISPLAY = {"nuvama_pms": "Nuvama", "zerodha_pms": "Zerodha PMS"}
+
+
+def _rollup_equity_by_broker(raw_rows: list) -> list:
+    """
+    Collapse direct-equity holdings into ONE row per broker (for the All Assets
+    report). Value columns are summed; returns are BLENDED — recomputed from the
+    summed cost/value, not averaged across stocks — and CAGR is value-weighted.
+    `raw_rows` are the per-(broker, symbol) equity_holding rows (NOT merged).
+    """
+    groups: dict = defaultdict(list)
+    for h in raw_rows:
+        groups[h["broker"]].append(h)
+
+    def _sum(rows, key):
+        vals = [float(r[key]) for r in rows if r.get(key) is not None]
+        return sum(vals) if vals else None
+
+    out = []
+    for broker, rows in groups.items():
+        cost    = _sum(rows, "cost")
+        cur_val = _sum(rows, "current_value")
+        pnl_inc = _sum(rows, "pnl_inception")
+        pnl_ytd = _sum(rows, "pnl_ytd")
+
+        returns_inc = (pnl_inc / cost * 100) if cost and pnl_inc is not None else None
+        returns_ytd = (pnl_ytd / cost * 100) if cost and pnl_ytd is not None else None
+
+        # value-weighted CAGR (weight by current value)
+        wsum = wcagr = 0.0
+        for r in rows:
+            c, w = r.get("cagr_inception_pct"), r.get("current_value")
+            if c is not None and w:
+                wcagr += float(c) * float(w); wsum += float(w)
+        cagr = (wcagr / wsum) if wsum else None
+
+        out.append({
+            "label":                 _BROKER_DISPLAY.get(broker, broker.title()),
+            "broker":                broker,
+            "cost":                  cost,
+            "current_value":         cur_val,
+            "market_value_as_on":    _sum(rows, "market_value_as_on"),
+            "prev_week_value":       _sum(rows, "prev_week_value"),
+            "weekly_change":         _sum(rows, "weekly_change"),
+            "pnl_inception":         pnl_inc,
+            "pnl_ytd":               pnl_ytd,
+            "returns_inception_pct": returns_inc,
+            "returns_ytd_pct":       returns_ytd,
+            "cagr_inception_pct":    cagr,
+        })
+    return sorted(out, key=lambda h: h["label"])
+
+
+def _fetch_pms_holdings(conn, entity_id: Optional[int] = None):
+    """PMS positions (pms_holding) — Nuvama + Zerodha-PMS, equity and cash."""
+    cur = conn.cursor()
+    q = """
+        SELECT entity_id, source, holding_type,
+               COALESCE(cost, 0) AS cost, COALESCE(market_value, 0) AS market_value
+        FROM pms_holding
+        {where}
+    """
+    if entity_id:
+        cur.execute(q.format(where="WHERE entity_id = %s"), (entity_id,))
+    else:
+        cur.execute(q.format(where=""))
+    rows = cur.fetchall()
+    cur.close()
+    return rows
+
+
+def _pms_report_rows(pms_rows: list) -> list:
+    """
+    Shape pms_holding into report rows: per source, one summed Equity row
+    (blended return) and one Cash row. Not per-stock — matching the summary
+    style of the All Assets equity rollup.
+    """
+    agg: dict = defaultdict(lambda: {"eq_cost": 0.0, "eq_mv": 0.0, "cash": 0.0})
+    for r in pms_rows:
+        a = agg[r["source"]]
+        if r["holding_type"] == "cash":
+            a["cash"] += float(r["market_value"])
+        else:
+            a["eq_cost"] += float(r["cost"]); a["eq_mv"] += float(r["market_value"])
+
+    out = []
+    for source in sorted(agg):
+        disp, a = _PMS_SOURCE_DISPLAY.get(source, source), agg[source]
+        if a["eq_mv"] or a["eq_cost"]:
+            ret = ((a["eq_mv"] - a["eq_cost"]) / a["eq_cost"] * 100) if a["eq_cost"] else None
+            out.append({
+                "label": f"PMS — {disp} (Equity)",
+                "cost": a["eq_cost"], "current_value": a["eq_mv"],
+                "returns_inception_pct": ret,
+            })
+        if a["cash"]:
+            out.append({
+                "label": f"PMS — {disp} (Cash)",
+                "cost": a["cash"], "current_value": a["cash"],
+            })
+    return out
+
+
+def _fetch_broker_cash(conn, entity_id: Optional[int] = None):
+    """Available cash per (entity, broker) from broker_cash."""
+    cur = conn.cursor()
+    q = """
+        SELECT entity_id, broker, COALESCE(balance, 0) AS balance
+        FROM broker_cash
+        {where}
+    """
+    if entity_id:
+        cur.execute(q.format(where="WHERE entity_id = %s"), (entity_id,))
+    else:
+        cur.execute(q.format(where=""))
+    rows = cur.fetchall()
+    cur.close()
+    return rows
+
+
+def _broker_cash_report_rows(cash_rows: list) -> list:
+    """One report row per broker cash balance (cost == value, no P&L)."""
+    out = []
+    for r in sorted(cash_rows, key=lambda x: x["broker"]):
+        bal = float(r["balance"])
+        out.append({
+            "label": f"{_BROKER_DISPLAY.get(r['broker'], r['broker'].title())} (Cash)",
+            "cost": bal, "current_value": bal,
+        })
+    return out
+
+
 # ── shared cell helpers ───────────────────────────────────────────────────────
 
 def _v(holding, key):
@@ -587,6 +720,8 @@ def build_individual_report(conn, entity_id: int, entity_name: str, as_of: date)
     mf_rows  = _fetch_mf_holdings(conn, entity_id)
     # Merge same stock held across multiple brokers (Combined view logic)
     eq_rows  = _merge_equity_by_symbol(_fetch_equity_holdings(conn, entity_id))
+    pms_items  = _pms_report_rows(_fetch_pms_holdings(conn, entity_id))
+    cash_items = _broker_cash_report_rows(_fetch_broker_cash(conn, entity_id))
     man_rows = _fetch_manual_inputs(conn, entity_id)
 
     man_by_cat: dict = {}
@@ -642,7 +777,14 @@ def build_individual_report(conn, entity_id: int, entity_name: str, as_of: date)
             _write_data_row(ws, row, h, alt); row += 1; alt = not alt
         _write_total_row(ws, row, "Total Direct Equities", (data_start, row - 1)); row += 1
 
-    for cat, label in [("pms", "PMS"), ("aif", "AIF")]:
+    if pms_items:
+        row = _write_section(ws, row, "PMS (Managed Accounts)")
+        data_start = row
+        for i, h in enumerate(pms_items):
+            _write_data_row(ws, row, h, i % 2 == 1); row += 1
+        _write_total_row(ws, row, "Total PMS (Managed)", (data_start, row - 1)); row += 1
+
+    for cat, label in [("pms", "PMS (Manual Entry)"), ("aif", "AIF")]:
         items = man_by_cat.get(cat, [])
         if not items:
             continue
@@ -653,6 +795,16 @@ def build_individual_report(conn, entity_id: int, entity_name: str, as_of: date)
         _write_total_row(ws, row, f"Total {label}", (data_start, row - 1)); row += 1
 
     _write_total_row(ws, row, "B. TOTAL EQUITY", None); row += 2
+
+    # ── Real Estate ─────────────────────────────────────────────────────────────
+    props = man_by_cat.get("properties", [])
+    if props:
+        row = _write_section(ws, row, "REAL ESTATE")
+        data_start = row
+        for i, m in enumerate(props):
+            _write_data_row(ws, row, m, i % 2 == 1); row += 1
+        _write_total_row(ws, row, "Total Real Estate", (data_start, row - 1)); row += 1
+        _write_total_row(ws, row, "C. TOTAL REAL ESTATE", None); row += 2
 
     # ── Alternates ────────────────────────────────────────────────────────────
     row = _write_section(ws, row, "ALTERNATES")
@@ -683,6 +835,9 @@ def build_individual_report(conn, entity_id: int, entity_name: str, as_of: date)
         ("bank",           "G. Funds in Bank"),
     ]:
         items = man_by_cat.get(cat, [])
+        # Fold automated broker cash (broker_cash) into the Broker Balance line.
+        if cat == "broker_balance":
+            items = cash_items + items
         row = _write_section(ws, row, label)
         data_start = row
         for i, m in enumerate(items):
@@ -693,7 +848,7 @@ def build_individual_report(conn, entity_id: int, entity_name: str, as_of: date)
         else:
             row += 1
 
-    _write_total_row(ws, row, "H. GRAND TOTAL (A+B+D+E+F+G)", None); row += 1
+    _write_total_row(ws, row, "H. GRAND TOTAL (A+B+C+D+E+F+G)", None); row += 1
 
     row += 1
     note = ws.cell(row=row, column=1,
@@ -833,14 +988,16 @@ def build_combined_report(conn, as_of: date, ws=None):
     for entity in entities:
         eid, ename = entity["id"], entity["entity_name"]
 
-        mf_rows  = _fetch_mf_holdings(conn, eid)
-        eq_rows  = _merge_equity_by_symbol(_fetch_equity_holdings(conn, eid))
-        man_rows = _fetch_manual_inputs(conn, eid)
+        mf_rows    = _fetch_mf_holdings(conn, eid)
+        eq_broker  = _rollup_equity_by_broker(_fetch_equity_holdings(conn, eid))
+        pms_items  = _pms_report_rows(_fetch_pms_holdings(conn, eid))
+        cash_items = _broker_cash_report_rows(_fetch_broker_cash(conn, eid))
+        man_rows   = _fetch_manual_inputs(conn, eid)
         man_by_cat: dict = {}
         for m in man_rows:
             man_by_cat.setdefault(m["category"], []).append(m)
 
-        if not mf_rows and not eq_rows and not man_rows:
+        if not (mf_rows or eq_broker or pms_items or cash_items or man_rows):
             continue
 
         # Entity header row
@@ -880,7 +1037,7 @@ def build_combined_report(conn, as_of: date, ws=None):
         pms    = man_by_cat.get("pms", [])
         aif    = man_by_cat.get("aif", [])
 
-        if eq_mf or hyb_mf or eq_rows or pms or aif:
+        if eq_mf or hyb_mf or eq_broker or pms_items or pms or aif:
             row = _comb_section(ws, row, "EQUITY")
 
             if eq_mf or hyb_mf:
@@ -893,21 +1050,29 @@ def build_combined_report(conn, as_of: date, ws=None):
                     _comb_data_row(ws, row, h, "CAS", alt);  row += 1; alt = not alt
                 _comb_total(ws, row, "Total MF Equity / Hybrid", sub_start, row - 1); row += 1
 
-            if eq_rows:
-                row = _comb_section(ws, row, "Direct Equities")
+            if eq_broker:
+                row = _comb_section(ws, row, "Direct Equities (by broker)")
                 sub_start = row
                 alt = False
-                for h in eq_rows:
-                    _comb_data_row(ws, row, h, h.get("broker", "Broker"), alt); row += 1; alt = not alt
+                for h in eq_broker:
+                    _comb_data_row(ws, row, h, "Equity", alt); row += 1; alt = not alt
                 _comb_total(ws, row, "Total Direct Equities", sub_start, row - 1); row += 1
 
+            if pms_items:
+                row = _comb_section(ws, row, "PMS (Managed Accounts)")
+                sub_start = row
+                alt = False
+                for h in pms_items:
+                    _comb_data_row(ws, row, h, "PMS", alt); row += 1; alt = not alt
+                _comb_total(ws, row, "Total PMS (Managed)", sub_start, row - 1); row += 1
+
             if pms:
-                row = _comb_section(ws, row, "PMS")
+                row = _comb_section(ws, row, "PMS (Manual Entry)")
                 sub_start = row
                 alt = False
                 for m in pms:
-                    _comb_data_row(ws, row, m, "PMS", alt);  row += 1; alt = not alt
-                _comb_total(ws, row, "Total PMS", sub_start, row - 1); row += 1
+                    _comb_data_row(ws, row, m, "Manual", alt);  row += 1; alt = not alt
+                _comb_total(ws, row, "Total PMS (Manual)", sub_start, row - 1); row += 1
 
             if aif:
                 row = _comb_section(ws, row, "AIF")
@@ -940,15 +1105,28 @@ def build_combined_report(conn, as_of: date, ws=None):
                 _comb_total(ws, row, f"Total {label}", sub_start, row - 1); row += 1
             _comb_total(ws, row, "Total Alternates"); row += 1
 
+        # ── Real Estate ────────────────────────────────────────────────────────
+        props = man_by_cat.get("properties", [])
+        if props:
+            row = _comb_section(ws, row, "REAL ESTATE")
+            data_start = row
+            alt = False
+            for m in props:
+                _comb_data_row(ws, row, m, "Manual", alt); row += 1; alt = not alt
+            _comb_total(ws, row, "Total Real Estate", data_start, row - 1); row += 1
+
         # ── Below-the-line ────────────────────────────────────────────────────
         btl = []
         for cat in ("funds_transit", "broker_balance", "bank"):
             btl.extend(man_by_cat.get(cat, []))
-        if btl:
+        if btl or cash_items:
             row = _comb_section(ws, row, "Funds in Transit / Bank / Broker")
             data_start = row
-            for i, m in enumerate(btl):
-                _comb_data_row(ws, row, m, "Bank/Broker", i % 2 == 1); row += 1
+            alt = False
+            for h in cash_items:
+                _comb_data_row(ws, row, h, "Broker Cash", alt); row += 1; alt = not alt
+            for m in btl:
+                _comb_data_row(ws, row, m, "Bank/Broker", alt); row += 1; alt = not alt
             _comb_total(ws, row, "Total Liquidity", data_start, row - 1); row += 1
 
         # Entity grand total
