@@ -53,5 +53,17 @@ mis-portal/workers/manual_cas_retrigger.py
 mis-portal/.nuvama_browser_profile/
 mis-portal/.nuvama_sessions/
 mis-portal/.pms_downloads/
+
+# Vested / DBS portal scrapers — same rule: browser profiles + saved sessions
+# hold live auth cookies, downloads hold client statements, and the feed cache
+# holds scraped client holdings/cash. All are local runtime artifacts.
+mis-portal/.vested_browser_profile/
+mis-portal/.vested_sessions/
+mis-portal/.vested_downloads/
+mis-portal/.dbs_browser_profile/
+mis-portal/.dbs_sessions/
+mis-portal/.dbs_downloads/
+mis-portal/equity/feeds/
+
 motion-audits/
 mis-portal/.isin_symbol_map.json
