@@ -22,7 +22,14 @@ ZERODHA   = "zerodha"
 ANGEL_ONE = "angel_one"
 DHAN      = "dhan"
 
-BROKERS = [ZERODHA, ANGEL_ONE, DHAN]
+# International brokers — holdings denominated in a foreign currency, converted
+# to INR at sync time via the fx_rate table (see equity/fx.py).
+IBKR      = "ibkr"      # Interactive Brokers (USD)   — automated Flex Web Service
+VESTED    = "vested"    # Vested  (USD)               — .env/JSON feed (no public API)
+DBS       = "dbs"       # DBS Wealth Singapore (SGD)  — .env/JSON feed (no public API)
+
+BROKERS               = [ZERODHA, ANGEL_ONE, DHAN, IBKR, VESTED, DBS]
+INTERNATIONAL_BROKERS = [IBKR, VESTED, DBS]
 
 
 # ---------------------------------------------------------------------------
@@ -44,7 +51,19 @@ class EquityHolding:
     current_price:       Decimal
     current_market_value: Decimal   # quantity × current_price
 
-    prev_week_value:     Optional[Decimal] = None   # value as of last Friday close
+    # Currency — adapters populate the money fields above in NATIVE units and set
+    # this; equity_sync_worker.apply_fx() then converts the money fields to INR
+    # in-place (so all INR consumers are unchanged) and stashes the originals in
+    # the *_native fields below. INR brokers keep currency='INR', fx_rate=1.
+    currency:    str               = "INR"
+    fx_rate:     Optional[Decimal] = None    # INR per 1 unit of `currency`
+
+    avg_cost_native:             Optional[Decimal] = None
+    cost_native:                 Optional[Decimal] = None
+    current_price_native:        Optional[Decimal] = None
+    current_market_value_native: Optional[Decimal] = None
+
+    prev_week_value:     Optional[Decimal] = None   # value as of last Friday close (INR)
     market_value_as_on:  Optional[Decimal] = None   # same as current_market_value; date stored separately
 
     # Computed fields — populated by metrics layer, not broker API
@@ -58,6 +77,14 @@ class EquityHolding:
     returns_ytd_pct:     Optional[Decimal] = None
     returns_inception_pct: Optional[Decimal] = None
     cagr_inception_pct:  Optional[Decimal] = None
+
+    # When an adapter knows the holding's transaction history (the Vested / DBS
+    # scrapers), it sets first_invested_date (date of first buy → CAGR anchor)
+    # and the money-weighted return xirr_inception_pct (native currency %). Left
+    # None by snapshot-only brokers, in which case the sync preserves whatever
+    # first_invested_date is already stored and leaves XIRR NULL.
+    first_invested_date: Optional[date]    = None
+    xirr_inception_pct:  Optional[Decimal] = None
 
     remarks:             Optional[str] = None
 
