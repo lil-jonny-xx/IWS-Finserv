@@ -15,6 +15,12 @@ export interface EquityHoldingRow {
   cost: number;
   current_price?: number;
   current_market_value?: number;
+  currency?: string;
+  fx_rate?: number;
+  avg_cost_native?: number;
+  cost_native?: number;
+  current_price_native?: number;
+  current_market_value_native?: number;
   prev_week_value?: number;
   market_value_as_on?: number;
   as_of_date?: string;
@@ -100,6 +106,9 @@ const BROKER_LABELS: Record<string, string> = {
   zerodha:   'Zerodha',
   angel_one: 'Angel One',
   dhan:      'Dhan',
+  ibkr:      'Interactive Brokers',
+  vested:    'Vested',
+  dbs:       'DBS Wealth',
   combined:  'Combined',
 };
 
@@ -107,7 +116,20 @@ const BROKER_COLORS: Record<string, string> = {
   zerodha:   '#3772ff',
   angel_one: '#e05c00',
   dhan:      '#059669',
+  ibkr:      '#d2122e',
+  vested:    '#7c3aed',
+  dbs:       '#b8860b',
 };
+
+// Native-currency symbols for international holdings (display only — all totals
+// and aggregation use the INR-converted values).
+const CCY_SYMBOL: Record<string, string> = { USD: '$', SGD: 'S$', GBP: '£', AED: 'AED ', HKD: 'HK$' };
+
+function fmtNative(n: number | null | undefined, ccy: string | undefined): string {
+  if (n == null || !ccy || ccy === 'INR') return '';
+  const sym = CCY_SYMBOL[ccy] ?? (ccy + ' ');
+  return sym + Math.abs(n).toLocaleString('en-US', { maximumFractionDigits: 2 });
+}
 
 // Sector display name, sort order, accent color
 const SECTOR_META: Record<string, { label: string; order: number; accent: string }> = {
@@ -599,13 +621,23 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
                         )}
                         <td className="px-3 py-3 text-xs text-ghost whitespace-nowrap align-top">{h.exchange ?? '—'}</td>
                         <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{h.quantity.toFixed(0)}</td>
-                        <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">{fmtINR(h.avg_cost)}</td>
+                        <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">
+                          {fmtINR(h.avg_cost)}
+                          {h.currency && h.currency !== 'INR' && h.avg_cost_native != null && (
+                            <p className="text-[10px] text-ghost mt-0.5">{fmtNative(h.avg_cost_native, h.currency)}</p>
+                          )}
+                        </td>
                         <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{fmtINR(h.cost)}</td>
                         <td className="px-3 py-3 text-right tabular-nums text-xs align-top whitespace-nowrap">
                           <span className="text-ink">{fmtDate(h.first_invested_date)}</span>
                           {h.first_invested_date && <p className="text-[10px] text-ghost mt-0.5">{fmtDuration(h.first_invested_date)}</p>}
                         </td>
-                        <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{fmtINR(h.current_market_value)}</td>
+                        <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">
+                          {fmtINR(h.current_market_value)}
+                          {h.currency && h.currency !== 'INR' && h.current_market_value_native != null && (
+                            <p className="text-[10px] text-ghost mt-0.5">{fmtNative(h.current_market_value_native, h.currency)}</p>
+                          )}
+                        </td>
                         <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">{fmtINR(h.prev_week_value)}</td>
                         <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top"><ColorNum n={h.weekly_change} fmt={fmtINR} /></td>
                         <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">
