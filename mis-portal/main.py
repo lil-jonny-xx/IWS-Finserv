@@ -1119,6 +1119,12 @@ _EQUITY_HOLDING_COLS = """
     eh.cost,
     eh.current_price,
     eh.current_market_value,
+    eh.currency,
+    eh.fx_rate,
+    eh.avg_cost_native,
+    eh.cost_native,
+    eh.current_price_native,
+    eh.current_market_value_native,
     eh.market_value_as_on,
     eh.as_of_date,
     eh.prev_week_value,
@@ -1130,6 +1136,7 @@ _EQUITY_HOLDING_COLS = """
     eh.returns_ytd_pct,
     eh.returns_inception_pct,
     eh.cagr_inception_pct,
+    eh.xirr_inception_pct,
     eh.first_invested_date,
     eh.sector,
     eh.remarks,
@@ -1151,6 +1158,12 @@ def _row_to_holding(r: dict) -> dict:
         "cost":                  _fmt(r["cost"]),
         "current_price":         _fmt(r["current_price"]),
         "current_market_value":  _fmt(r["current_market_value"]),
+        "currency":              r.get("currency") or "INR",
+        "fx_rate":               _fmt(r.get("fx_rate")),
+        "avg_cost_native":             _fmt(r.get("avg_cost_native")),
+        "cost_native":                 _fmt(r.get("cost_native")),
+        "current_price_native":        _fmt(r.get("current_price_native")),
+        "current_market_value_native": _fmt(r.get("current_market_value_native")),
         "market_value_as_on":    _fmt(r["market_value_as_on"]),
         "as_of_date":            str(r["as_of_date"]) if r["as_of_date"] else None,
         "prev_week_value":       _fmt(r["prev_week_value"]),
@@ -1162,6 +1175,7 @@ def _row_to_holding(r: dict) -> dict:
         "returns_ytd_pct":       _fmt(r["returns_ytd_pct"]),
         "returns_inception_pct": _fmt(r["returns_inception_pct"]),
         "cagr_inception_pct":    _fmt(r["cagr_inception_pct"]),
+        "xirr_inception_pct":    _fmt(r.get("xirr_inception_pct")),
         "first_invested_date":   str(r["first_invested_date"]) if r["first_invested_date"] else None,
         "sector":                r["sector"],
         "remarks":               r["remarks"],
@@ -1238,7 +1252,8 @@ def get_equity_holdings(
         cash_where = ("WHERE " + " AND ".join(cash_conditions)) if cash_conditions else ""
         cur.execute(
             f"""
-            SELECT bc.entity_id, e.entity_name, bc.broker, bc.balance, bc.updated_at
+            SELECT bc.entity_id, e.entity_name, bc.broker, bc.balance,
+                   bc.currency, bc.balance_native, bc.updated_at
             FROM   broker_cash bc
             JOIN   entity e ON e.id = bc.entity_id
             {cash_where}
@@ -1276,6 +1291,8 @@ def get_equity_holdings(
                     "entity_name": c["entity_name"],
                     "broker":      c["broker"],
                     "balance":     float(c["balance"] or 0),
+                    "currency":    c.get("currency") or "INR",
+                    "balance_native": float(c["balance_native"]) if c.get("balance_native") is not None else None,
                     "updated_at":  c["updated_at"].isoformat() if c["updated_at"] else None,
                 }
                 for c in cash_rows
