@@ -33,7 +33,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 load_dotenv("/var/www/mis-portal/.env", override=True)
 
-from equity.brokers import zerodha, angel_one, dhan
+from equity import fx, finmath
+from equity.brokers import zerodha, angel_one, dhan, ibkr, vested, dbs
 from equity.models import EquityHolding
 
 logging.basicConfig(
@@ -174,6 +175,86 @@ def fetch_first_invested_date(conn, entity_id: int, broker: str, symbol: str) ->
     return row["first_invested_date"] if row else None
 
 
+def ledger_metrics(conn, entity_id: int, broker: str, symbol: str,
+                   current_mv_native: Optional[Decimal], today: date):
+    """
+    (xirr_inception_pct, first_buy_date) from the equity_trade_ledger, or
+    (None, None) if the holding has no ledger (e.g. snapshot-only brokers, or
+    before the one-time backfill has run).
+
+    XIRR is money-weighted in the security's NATIVE currency: the ledger's dated
+    cash flows plus the current market value (native) as the final inflow. This
+    is recomputed every sync so it tracks the live market value, without
+    re-pulling broker transaction history.
+    """
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT trade_date, side, cash_flow_native
+            FROM   equity_trade_ledger
+            WHERE  entity_id = %s AND broker = %s AND symbol = %s
+            ORDER  BY trade_date
+            """,
+            (entity_id, broker, symbol),
+        )
+        rows = cur.fetchall()
+    except psycopg2.errors.UndefinedTable:
+        conn.rollback()   # ledger table not migrated yet — silently no-op
+        return None, None
+    finally:
+        cur.close()
+
+    if not rows:
+        return None, None
+
+    buys      = [r["trade_date"] for r in rows if r["side"] == "BUY"]
+    first_buy = min(buys) if buys else min(r["trade_date"] for r in rows)
+
+    xirr_pct = None
+    if current_mv_native is not None:
+        flows = [(r["trade_date"], float(r["cash_flow_native"])) for r in rows]
+        flows.append((today, float(current_mv_native)))
+        rate = finmath.xirr(flows)
+        if rate is not None:
+            xirr_pct = Decimal(str(round(rate * 100, 4)))
+    return xirr_pct, first_buy
+
+
+# ---------------------------------------------------------------------------
+# Currency conversion (international brokers → INR)
+# ---------------------------------------------------------------------------
+
+def apply_fx(conn, h: EquityHolding, today: date) -> EquityHolding:
+    """
+    Convert a holding's money fields to INR in-place, preserving the originals
+    in the *_native fields. INR holdings are returned untouched (fx_rate=1).
+
+    Raises if no FX rate is available for a foreign currency, so the caller can
+    skip the holding rather than store a bogus 0/native-as-INR value.
+    """
+    ccy = (h.currency or "INR").upper()
+    if ccy == "INR":
+        h.fx_rate = Decimal("1")
+        return h
+
+    rate = fx.get_rate(conn, ccy, today)
+    if rate is None:
+        raise RuntimeError(f"no FX rate for {ccy}→INR on/before {today}")
+
+    h.fx_rate = rate
+    h.avg_cost_native             = h.avg_cost
+    h.cost_native                 = h.cost
+    h.current_price_native        = h.current_price
+    h.current_market_value_native = h.current_market_value
+
+    h.avg_cost             = (h.avg_cost * rate).quantize(FOUR, ROUND_HALF_UP)
+    h.cost                 = (h.cost * rate).quantize(TWO, ROUND_HALF_UP)
+    h.current_price        = (h.current_price * rate).quantize(FOUR, ROUND_HALF_UP)
+    h.current_market_value = (h.current_market_value * rate).quantize(TWO, ROUND_HALF_UP)
+    return h
+
+
 # ---------------------------------------------------------------------------
 # Metrics computation
 # ---------------------------------------------------------------------------
@@ -187,7 +268,10 @@ def compute_metrics(
     first_invested_date: Optional[date],
 ) -> EquityHolding:
 
-    h.as_of_date         = today
+    # Keep an adapter-supplied snapshot date (intl scrapers run only a few times a
+    # week → show the real last-snapshot date, not every daily sync's date).
+    if h.as_of_date is None:
+        h.as_of_date = today
     h.market_value_as_on = h.current_market_value
     h.prev_week_value    = prev_week_value
 
@@ -257,18 +341,24 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
         INSERT INTO equity_holding (
             entity_id, broker, symbol, isin, exchange, sector,
             quantity, avg_cost, cost, current_price, current_market_value,
+            currency, fx_rate,
+            avg_cost_native, cost_native, current_price_native, current_market_value_native,
             prev_week_value, market_value_as_on, as_of_date,
             exposure_pct, weekly_change,
             pnl_ytd, pnl_inception, pnl_weekly_change,
             returns_ytd_pct, returns_inception_pct, cagr_inception_pct,
+            xirr_inception_pct,
             first_invested_date, remarks, angel_one_token, updated_at
         ) VALUES (
             %(entity_id)s, %(broker)s, %(symbol)s, %(isin)s, %(exchange)s, %(sector)s,
             %(quantity)s, %(avg_cost)s, %(cost)s, %(current_price)s, %(current_market_value)s,
+            %(currency)s, %(fx_rate)s,
+            %(avg_cost_native)s, %(cost_native)s, %(current_price_native)s, %(current_market_value_native)s,
             %(prev_week_value)s, %(market_value_as_on)s, %(as_of_date)s,
             %(exposure_pct)s, %(weekly_change)s,
             %(pnl_ytd)s, %(pnl_inception)s, %(pnl_weekly_change)s,
             %(returns_ytd_pct)s, %(returns_inception_pct)s, %(cagr_inception_pct)s,
+            %(xirr_inception_pct)s,
             %(first_invested_date)s, %(remarks)s, %(angel_one_token)s, NOW()
         )
         ON CONFLICT (entity_id, broker, symbol) DO UPDATE SET
@@ -280,6 +370,12 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
             cost                  = EXCLUDED.cost,
             current_price         = EXCLUDED.current_price,
             current_market_value  = EXCLUDED.current_market_value,
+            currency              = EXCLUDED.currency,
+            fx_rate               = EXCLUDED.fx_rate,
+            avg_cost_native             = EXCLUDED.avg_cost_native,
+            cost_native                 = EXCLUDED.cost_native,
+            current_price_native        = EXCLUDED.current_price_native,
+            current_market_value_native = EXCLUDED.current_market_value_native,
             prev_week_value       = EXCLUDED.prev_week_value,
             market_value_as_on    = EXCLUDED.market_value_as_on,
             as_of_date            = EXCLUDED.as_of_date,
@@ -291,6 +387,8 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
             returns_ytd_pct       = EXCLUDED.returns_ytd_pct,
             returns_inception_pct = EXCLUDED.returns_inception_pct,
             cagr_inception_pct    = EXCLUDED.cagr_inception_pct,
+            xirr_inception_pct    = EXCLUDED.xirr_inception_pct,
+            first_invested_date   = EXCLUDED.first_invested_date,
             remarks               = EXCLUDED.remarks,
             angel_one_token       = COALESCE(EXCLUDED.angel_one_token, equity_holding.angel_one_token),
             updated_at            = NOW()
@@ -307,6 +405,12 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
             "cost":                  float(h.cost),
             "current_price":         float(h.current_price),
             "current_market_value":  float(h.current_market_value),
+            "currency":              h.currency or "INR",
+            "fx_rate":               float(h.fx_rate) if h.fx_rate is not None else 1,
+            "avg_cost_native":             float(h.avg_cost_native)             if h.avg_cost_native             is not None else None,
+            "cost_native":                 float(h.cost_native)                 if h.cost_native                 is not None else None,
+            "current_price_native":        float(h.current_price_native)        if h.current_price_native        is not None else None,
+            "current_market_value_native": float(h.current_market_value_native) if h.current_market_value_native is not None else None,
             "prev_week_value":       float(h.prev_week_value)    if h.prev_week_value    else None,
             "market_value_as_on":    float(h.market_value_as_on) if h.market_value_as_on else None,
             "as_of_date":            h.as_of_date,
@@ -318,6 +422,7 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
             "returns_ytd_pct":       float(h.returns_ytd_pct)       if h.returns_ytd_pct       else None,
             "returns_inception_pct": float(h.returns_inception_pct) if h.returns_inception_pct else None,
             "cagr_inception_pct":    float(h.cagr_inception_pct)    if h.cagr_inception_pct    else None,
+            "xirr_inception_pct":    float(h.xirr_inception_pct)    if h.xirr_inception_pct is not None else None,
             "first_invested_date":   first_invested_date,
             "remarks":               h.remarks,
             "angel_one_token":       h.angel_one_token or None,
@@ -330,8 +435,9 @@ def snapshot_history(cur, h: EquityHolding, today: date):
     cur.execute(
         """
         INSERT INTO equity_holding_history
-            (entity_id, broker, symbol, isin, snapshot_date, quantity, close_price, market_value, cost, pnl)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (entity_id, broker, symbol, isin, snapshot_date, quantity, close_price, market_value, cost, pnl,
+             currency, fx_rate, close_price_native, market_value_native)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (entity_id, broker, symbol, snapshot_date) DO NOTHING
         """,
         (
@@ -341,6 +447,10 @@ def snapshot_history(cur, h: EquityHolding, today: date):
             float(h.current_market_value),
             float(h.cost),
             float(h.pnl_inception) if h.pnl_inception else None,
+            h.currency or "INR",
+            float(h.fx_rate) if h.fx_rate is not None else 1,
+            float(h.current_price_native)        if h.current_price_native        is not None else None,
+            float(h.current_market_value_native) if h.current_market_value_native is not None else None,
         ),
     )
 
@@ -484,7 +594,7 @@ def refresh_broker_cash(conn, emap: Optional[dict] = None) -> int:
     today   = date.today()
     cur     = conn.cursor()
     updated = 0
-    for entity_code, broker_module, broker_label in BROKER_ENTITY_MAP:
+    for entity_code, broker_module, broker_label in active_broker_map(emap):
         entity_id = emap.get(entity_code)
         if entity_id is None or not hasattr(broker_module, "fetch_cash_balance"):
             continue
@@ -493,16 +603,40 @@ def refresh_broker_cash(conn, emap: Optional[dict] = None) -> int:
         except Exception as e:
             logger.warning(f"  [{entity_code}/{broker_label}] cash fetch failed: {e}")
             continue
+
+        # Convert foreign-currency cash to INR (stored in `balance`); keep the
+        # original in `balance_native`. The cash currency for IBKR is the account
+        # base currency; Vested→USD, DBS→SGD via the module's CURRENCY constant.
+        if hasattr(broker_module, "cash_currency"):
+            ccy = broker_module.cash_currency(entity_code)
+        else:
+            ccy = getattr(broker_module, "CURRENCY", "INR")
+        ccy = (ccy or "INR").upper()
+
+        if ccy == "INR":
+            inr_bal, native_bal, rate = bal, None, Decimal("1")
+        else:
+            rate = fx.get_rate(conn, ccy, today)
+            if rate is None:
+                logger.warning(f"  [{entity_code}/{broker_label}] cash FX skip — no {ccy} rate")
+                continue
+            inr_bal, native_bal = (bal * rate).quantize(TWO, ROUND_HALF_UP), bal
+
         cur.execute(
             """
-            INSERT INTO broker_cash (entity_id, broker, balance, as_of_date, updated_at)
-            VALUES (%s, %s, %s, %s, NOW())
+            INSERT INTO broker_cash
+                (entity_id, broker, balance, currency, fx_rate, balance_native, as_of_date, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
             ON CONFLICT (entity_id, broker) DO UPDATE SET
-                balance    = EXCLUDED.balance,
-                as_of_date = EXCLUDED.as_of_date,
-                updated_at = NOW()
+                balance        = EXCLUDED.balance,
+                currency       = EXCLUDED.currency,
+                fx_rate        = EXCLUDED.fx_rate,
+                balance_native = EXCLUDED.balance_native,
+                as_of_date     = EXCLUDED.as_of_date,
+                updated_at     = NOW()
             """,
-            (entity_id, broker_label, float(bal), today),
+            (entity_id, broker_label, float(inr_bal), ccy, float(rate),
+             float(native_bal) if native_bal is not None else None, today),
         )
         updated += 1
 
@@ -526,6 +660,53 @@ BROKER_ENTITY_MAP = [
     ("SDR",         zerodha,   "zerodha"),
     ("Rajani Corp", dhan,      "dhan"),
 ]
+
+# International (multi-currency) brokers. These are not hard-wired to entities —
+# an (entity, broker) pair becomes active as soon as its credentials/feed are
+# present in .env, so adding an account is a pure config change (no code edit):
+#   IBKR   → IBKR_{CODE}_FLEX_TOKEN + IBKR_{CODE}_QUERY_ID  (automated Flex pull)
+#   Vested → VESTED_{CODE}_HOLDINGS or VESTED_{CODE}_HOLDINGS_FILE
+#   DBS    → DBS_{CODE}_HOLDINGS    or DBS_{CODE}_HOLDINGS_FILE
+# Holdings land in equity_holding (Equity page), converted to INR via apply_fx.
+INTERNATIONAL_BROKERS = [
+    (ibkr,   "ibkr"),
+    (vested, "vested"),
+    (dbs,    "dbs"),
+]
+
+
+def _intl_configured(broker_module, broker_label: str, entity_code: str) -> bool:
+    """True if this entity has credentials/feed for an international broker."""
+    prefix = {"Rajani Corp": "RAJANIRCORP"}.get(entity_code, entity_code)
+    if broker_label == "ibkr":
+        return bool(os.environ.get(f"IBKR_{prefix}_FLEX_TOKEN")
+                    and os.environ.get(f"IBKR_{prefix}_QUERY_ID"))
+    # Vested / DBS — active when scraper credentials are set OR a data source
+    # (scraper cache file / manual feed) already exists. The adapter owns the
+    # data-source check; the credentials check lets an account light up from a
+    # fresh .env before the scraper's first successful run.
+    env_prefix = broker_label.upper()   # VESTED / DBS
+    if os.environ.get(f"{env_prefix}_{prefix}_USERNAME"):
+        return True
+    if hasattr(broker_module, "configured"):
+        return broker_module.configured(entity_code)
+    return bool(os.environ.get(f"{env_prefix}_{prefix}_HOLDINGS")
+                or os.environ.get(f"{env_prefix}_{prefix}_HOLDINGS_FILE"))
+
+
+def discover_international(emap: dict) -> list:
+    """(entity_code, broker_module, broker_label) for every configured intl account."""
+    found = []
+    for entity_code in emap:
+        for broker_module, broker_label in INTERNATIONAL_BROKERS:
+            if _intl_configured(broker_module, broker_label, entity_code):
+                found.append((entity_code, broker_module, broker_label))
+    return found
+
+
+def active_broker_map(emap: dict) -> list:
+    """Indian brokers (static) + any international accounts configured in .env."""
+    return list(BROKER_ENTITY_MAP) + discover_international(emap)
 
 # Entities whose holdings at a given broker are actually a PMS account and should
 # land in pms_holding (shown on the PMS page) instead of equity_holding.
@@ -553,7 +734,20 @@ def sync_entity_broker(
         logger.info(f"  [{entity_code}/{broker_label}] No holdings returned")
         return 0
 
-    # Total portfolio value for this entity+broker (needed for exposure_pct)
+    # Convert any foreign-currency holdings to INR in-place (originals kept in
+    # the *_native fields). Skip a holding only if its FX rate is unavailable.
+    converted = []
+    for h in holdings:
+        try:
+            converted.append(apply_fx(conn, h, today))
+        except Exception as e:
+            logger.warning(f"  [{entity_code}/{broker_label}] {h.symbol}: FX skip — {e}")
+    holdings = converted
+    if not holdings:
+        logger.info(f"  [{entity_code}/{broker_label}] No holdings after FX conversion")
+        return 0
+
+    # Total portfolio value for this entity+broker (needed for exposure_pct), in INR
     total_value = sum(h.current_market_value for h in holdings)
 
     prev_friday = last_friday(today - timedelta(days=1))  # last completed Friday
@@ -569,9 +763,20 @@ def sync_entity_broker(
         # tradebook — see zerodha_tradebook_import.py). Defaulting to today stamped a wrong
         # "Since" date and produced a bogus ~0-year CAGR. Both compute_metrics and the upsert
         # handle None: "Since" renders "—" and CAGR is skipped until a real date is set.
-        first_invest_date = fetch_first_invested_date(conn, entity_id, broker_label, h.symbol)
+        # Foreign brokers (Vested / DBS) derive it from the scraped transaction history and
+        # set it on the holding — prefer that over the preserved DB value. The trade ledger
+        # (IBKR inception backfill) supplies it too, ahead of the preserved DB value.
+        ledger_xirr, ledger_first_buy = ledger_metrics(
+            conn, entity_id, broker_label, h.symbol, h.current_market_value_native, today)
+        first_invest_date = h.first_invested_date or ledger_first_buy or \
+            fetch_first_invested_date(conn, entity_id, broker_label, h.symbol)
 
         h = compute_metrics(h, prev_week_val, ytd_val, total_value, today, first_invest_date)
+
+        # Recompute XIRR from the ledger each run so it tracks live market value.
+        # Adapter-supplied XIRR (if any) wins; otherwise use the ledger result.
+        if h.xirr_inception_pct is None and ledger_xirr is not None:
+            h.xirr_inception_pct = ledger_xirr
 
         upsert_equity_holding(cur, h, first_invest_date)
         snapshot_history(cur, h, today)
@@ -595,7 +800,7 @@ def main():
     errors  = []
     total   = 0
 
-    for entity_code, broker_module, broker_label in BROKER_ENTITY_MAP:
+    for entity_code, broker_module, broker_label in active_broker_map(emap):
         entity_id = emap.get(entity_code)
         if entity_id is None:
             logger.error(f"Entity '{entity_code}' not found in DB — skipping")
