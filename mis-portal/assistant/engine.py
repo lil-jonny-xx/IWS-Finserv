@@ -146,10 +146,15 @@ def run_stream(history: list[dict], user_text: str, eid: Optional[int],
     all_citations: list[dict] = []
     tool_names: list[str] = []
     all_charts: list[dict] = []
+    # Code-execution sandbox id. Once a turn spins up a code_execution container,
+    # every subsequent request in this loop must reference the SAME container so
+    # pending tool uses generated inside it (programmatic tool calling) can resume —
+    # the API 400s with "container_id is required" otherwise.
+    container_id: Optional[str] = None
 
     try:
         for _turn in range(MAX_TURNS):
-            with client.messages.stream(
+            stream_kwargs = dict(
                 model=model,
                 max_tokens=MAX_TOKENS,
                 system=SYSTEM_PROMPT,
@@ -157,7 +162,10 @@ def run_stream(history: list[dict], user_text: str, eid: Optional[int],
                 thinking={"type": "adaptive"},
                 output_config={"effort": effort},
                 messages=messages,
-            ) as stream:
+            )
+            if container_id:
+                stream_kwargs["container"] = container_id
+            with client.messages.stream(**stream_kwargs) as stream:
                 for event in stream:
                     if (event.type == "content_block_delta"
                             and getattr(event.delta, "type", None) == "text_delta"):
@@ -174,6 +182,11 @@ def run_stream(history: list[dict], user_text: str, eid: Optional[int],
                                 tool_names.append(nm)
                                 yield {"type": "tool", "name": nm}
                 final = stream.get_final_message()
+
+            # Carry the code-execution container forward across loop turns.
+            cid = getattr(getattr(final, "container", None), "id", None)
+            if cid:
+                container_id = cid
 
             messages.append({"role": "assistant", "content": final.content})
 

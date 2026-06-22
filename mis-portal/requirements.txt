@@ -4,6 +4,6 @@
 # Note: the API/worker runtime depends on more than this (fastapi, uvicorn, psycopg2,
 # redis, slowapi, pyjwt, bcrypt, python-dotenv, openpyxl, ...). This file pins the
 # packages the Jarvis assistant adds plus the numeric stack it relies on.
-anthropic>=0.69
+anthropic>=0.109  # engine.py uses web_search_20260209 / code_execution_20260120 / output_config / adaptive thinking — older SDKs lack these
 numpy>=1.26
 pandas>=2.0
