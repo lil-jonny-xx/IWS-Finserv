@@ -16,7 +16,6 @@ Register via CAMS GoGreen service or CAMServ chatbot before running automation.
 import logging
 import os
 import random
-import socket
 import time
 from datetime import date
 from pathlib import Path
@@ -40,7 +39,6 @@ _USER_AGENTS = [
 
 NAV_TIMEOUT    = 60_000
 ACTION_TIMEOUT = 10_000
-TOR_PROXY      = "socks5://127.0.0.1:9050"
 
 # Persistent Chromium profile — cookies/history accumulate across daily runs,
 # improving reCAPTCHA v3 trust score over time.
@@ -56,15 +54,6 @@ class CamsRateLimited(Exception):
     """Raised when CAMS rejects the submission with a transient rate-limit /
     bot-detection page (retryable), as opposed to a hard failure such as an
     unregistered email (not retryable)."""
-
-
-def _tor_available() -> bool:
-    try:
-        s = socket.create_connection(("127.0.0.1", 9050), timeout=2)
-        s.close()
-        return True
-    except OSError:
-        return False
 
 
 def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:

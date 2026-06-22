@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 load_dotenv("/var/www/mis-portal/.env", override=True)
 
-from workers.equity_price_worker import load_credentials, ADAPTER_MAP
+from workers.equity_price_worker import ADAPTER_MAP
 from workers.import_tradebook import _get_or_create_security, _parse_date
 
 logging.basicConfig(level=logging.INFO,

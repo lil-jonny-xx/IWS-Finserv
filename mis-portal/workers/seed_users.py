@@ -16,7 +16,6 @@ Default temporary passwords (change after first login):
   ***REMOVED***  → ***REMOVED***
 """
 import os
-import sys
 import bcrypt
 import psycopg2
 from psycopg2.extras import RealDictCursor

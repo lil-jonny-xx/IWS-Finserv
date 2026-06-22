@@ -18,7 +18,7 @@ Cron fallback:
 import os
 import sys
 import logging
-from datetime import datetime, date, timezone, timedelta
+from datetime import datetime, date, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 import zoneinfo

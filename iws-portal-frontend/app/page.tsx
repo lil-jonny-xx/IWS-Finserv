@@ -36,7 +36,7 @@ export default function LoginPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password }),
       });
-      const data = await res.json();
+      await res.json();
       if (!res.ok) {
         setError('Invalid credentials or account locked. Please try again.');
         return;

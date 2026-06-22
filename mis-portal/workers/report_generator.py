@@ -254,20 +254,6 @@ def _fetch_manual_inputs(conn, entity_id: Optional[int] = None):
     return rows
 
 
-def _fetch_fx_rates(conn):
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT DISTINCT ON (from_currency)
-            from_currency, rate
-        FROM fx_rate
-        WHERE to_currency = 'INR'
-        ORDER BY from_currency, rate_date DESC
-    """)
-    rows = cur.fetchall()
-    cur.close()
-    return {r["from_currency"]: float(r["rate"]) for r in rows}
-
-
 # ── equity merge (mirrors frontend Combined view) ─────────────────────────────
 
 def _merge_equity_by_symbol(eq_rows: list) -> list:
@@ -1592,7 +1578,6 @@ def _fetch_benchmarks(conn, as_of: date) -> list[dict]:
         return []
     cur.close()
 
-    from collections import OrderedDict
     series: dict = defaultdict(list)
     label_of, unit_of = {}, {}
     for r in rows:

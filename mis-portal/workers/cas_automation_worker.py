@@ -331,7 +331,6 @@ def _main():
 
     # Shuffle so no two consecutive triggers share a PAN
     ordered = _shuffled_no_consecutive_pan(configs)
-    order_str = " → ".join(f"{c.code}({c.pan[:4]}****)" for c in ordered)
     logger.info(f"Gmail collector active until {deadline_str}")
     logger.info(f"Trigger order: {' → '.join(c.code for c in ordered)}")
 

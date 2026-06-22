@@ -30,8 +30,6 @@ from equity.brokers import zerodha
 from equity.equity_sync_worker import (
     compute_metrics,
     fetch_history_value,
-    upsert_equity_holding,
-    snapshot_history,
     BROKER_ENTITY_MAP,
 )
 from equity.models import EquityHolding

@@ -95,11 +95,6 @@ function savedToRow(s: SavedInput): ManualInputRow {
   };
 }
 
-function fmtINR(n: number | null | undefined): string {
-  if (n == null) return '—';
-  return '₹' + Math.round(n).toLocaleString('en-IN');
-}
-
 export default function ManualDataPage() {
   const router = useRouter();
   const [entities, setEntities] = useState<Entity[]>([]);

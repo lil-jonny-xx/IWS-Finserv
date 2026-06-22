@@ -43,7 +43,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 

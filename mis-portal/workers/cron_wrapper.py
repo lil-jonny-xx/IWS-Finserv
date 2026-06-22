@@ -9,7 +9,6 @@ The script path is relative to the project root (/var/www/mis-portal).
 Stdout/stderr are passed through so the crontab log redirect still captures everything.
 """
 import logging
-import os
 import subprocess
 import sys
 from pathlib import Path

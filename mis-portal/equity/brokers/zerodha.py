@@ -26,9 +26,8 @@ from urllib.parse import urlparse, parse_qs
 
 import pyotp
 from kiteconnect import KiteConnect
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright.sync_api import sync_playwright
 
-sys_path_insert = None  # resolved by parent package import
 from equity import tokens
 from equity.models import EquityHolding
 

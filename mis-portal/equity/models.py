@@ -8,7 +8,7 @@ Table: equity_holding
 Table: equity_holding_history
   Daily snapshots for week-over-week / YTD / inception calculations.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from typing import Optional

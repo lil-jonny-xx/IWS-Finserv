@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, date
 import os
 from dotenv import load_dotenv
 import psycopg2
-from psycopg2 import pool
+import psycopg2.pool  # required: psycopg2.pool is a submodule, not exposed by `import psycopg2` alone
 from psycopg2.extras import RealDictCursor
 import redis
 from slowapi import Limiter
