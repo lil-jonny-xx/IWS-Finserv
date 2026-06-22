@@ -1523,6 +1523,41 @@ def get_pms_holdings(
         equity_total = sum(h["market_value"] for h in holdings if h["holding_type"] == "equity")
         cash_total   = sum(h["market_value"] for h in holdings if h["holding_type"] == "cash")
         equity_cost  = sum((h["cost"] or 0.0) for h in holdings if h["holding_type"] == "equity")
+        # Total capital put into PMS = cost of equity holdings + cash parked in
+        # the account. Cash is uninvested principal, so it counts toward invested.
+        invested_cost = equity_cost + cash_total
+
+        # Per-entity breakdown of invested cost, so the admin "All Entities" view
+        # can show each user individually alongside the combined grand total.
+        by_entity: dict[int, dict] = {}
+        for h in holdings:
+            e = by_entity.setdefault(h["entity_id"], {
+                "entity_id":    h["entity_id"],
+                "entity_name":  h["entity_name"],
+                "equity_cost":  0.0,
+                "cash_total":   0.0,
+                "equity_total": 0.0,
+            })
+            if h["holding_type"] == "equity":
+                e["equity_cost"]  += h["cost"] or 0.0
+                e["equity_total"] += h["market_value"] or 0.0
+            elif h["holding_type"] == "cash":
+                e["cash_total"]   += h["market_value"] or 0.0
+        by_entity_list = sorted(
+            (
+                {
+                    "entity_id":     e["entity_id"],
+                    "entity_name":   e["entity_name"],
+                    "equity_cost":   round(e["equity_cost"], 2),
+                    "cash_total":    round(e["cash_total"], 2),
+                    "equity_total":  round(e["equity_total"], 2),
+                    "invested_cost": round(e["equity_cost"] + e["cash_total"], 2),
+                    "total":         round(e["equity_total"] + e["cash_total"], 2),
+                }
+                for e in by_entity.values()
+            ),
+            key=lambda x: x["entity_name"],
+        )
 
         entity_name = "All Entities" if eid is None else (rows[0]["entity_name"] if rows else "")
         as_on = rows[0]["as_on_date"].isoformat() if rows and rows[0]["as_on_date"] else None
@@ -1532,15 +1567,17 @@ def get_pms_holdings(
             "entity_name": entity_name,
             "as_on_date":  as_on,
             "totals": {
-                "equity_total": round(equity_total, 2),
-                "cash_total":   round(cash_total, 2),
-                "total":        round(equity_total + cash_total, 2),
-                "equity_cost":  round(equity_cost, 2),
-                "equity_pnl":   round(equity_total - equity_cost, 2),
-                "equity_count": sum(1 for h in holdings if h["holding_type"] == "equity"),
-                "cash_count":   sum(1 for h in holdings if h["holding_type"] == "cash"),
+                "equity_total":  round(equity_total, 2),
+                "cash_total":    round(cash_total, 2),
+                "total":         round(equity_total + cash_total, 2),
+                "equity_cost":   round(equity_cost, 2),
+                "invested_cost": round(invested_cost, 2),
+                "equity_pnl":    round(equity_total - equity_cost, 2),
+                "equity_count":  sum(1 for h in holdings if h["holding_type"] == "equity"),
+                "cash_count":    sum(1 for h in holdings if h["holding_type"] == "cash"),
             },
-            "holdings": holdings,
+            "by_entity": by_entity_list,
+            "holdings":  holdings,
         }
 
     except HTTPException:

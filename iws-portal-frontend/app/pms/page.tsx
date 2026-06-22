@@ -25,15 +25,26 @@ interface PmsTotals {
   cash_total: number;
   total: number;
   equity_cost: number;
+  invested_cost: number;
   equity_pnl: number;
   equity_count: number;
   cash_count: number;
+}
+interface PmsByEntity {
+  entity_id: number;
+  entity_name: string;
+  equity_cost: number;
+  cash_total: number;
+  equity_total: number;
+  invested_cost: number;
+  total: number;
 }
 interface PmsResponse {
   entity_id: number;
   entity_name: string;
   as_on_date: string | null;
   totals: PmsTotals;
+  by_entity: PmsByEntity[];
   holdings: PmsHolding[];
 }
 
@@ -79,6 +90,42 @@ function TotalCard({ label, value, sub, accent }: {
       <p className="text-xs text-ghost">{label}</p>
       <p className={`text-xl font-bold mt-1 ${accent ? `text-${accent}` : 'text-ink'}`}>{value}</p>
       {sub && <p className="text-xs text-ghost mt-0.5">{sub}</p>}
+    </div>
+  );
+}
+
+function InvestedByEntity({ rows }: { rows: PmsByEntity[] }) {
+  const grand = rows.reduce((s, r) => s + r.invested_cost, 0);
+  return (
+    <div className="bg-card rounded-lg border border-rule overflow-x-auto mb-5">
+      <table className="w-full min-w-[480px]">
+        <thead>
+          <tr className="text-left text-xs text-ghost">
+            <th className="px-5 py-3 font-medium">Entity</th>
+            <th className="px-5 py-3 font-medium text-right">Cost Invested</th>
+            <th className="px-5 py-3 font-medium text-right">Cash</th>
+            <th className="px-5 py-3 font-medium text-right">Total Invested</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(r => (
+            <tr key={r.entity_id} className="border-t border-rule hover:bg-page">
+              <td className="px-5 py-2.5 text-sm text-ink">{r.entity_name}</td>
+              <td className="px-5 py-2.5 text-sm text-dim text-right tabular-nums">₹{inr(r.equity_cost)}</td>
+              <td className="px-5 py-2.5 text-sm text-dim text-right tabular-nums">₹{inr(r.cash_total)}</td>
+              <td className="px-5 py-2.5 text-sm text-ink font-medium text-right tabular-nums">₹{inr(r.invested_cost)}</td>
+            </tr>
+          ))}
+        </tbody>
+        <tfoot>
+          <tr className="border-t border-rule bg-card font-semibold">
+            <td className="px-5 py-2.5 text-xs text-dim uppercase tracking-wide">All entities</td>
+            <td className="px-5 py-2.5 text-sm text-dim text-right tabular-nums">₹{inr(rows.reduce((s, r) => s + r.equity_cost, 0))}</td>
+            <td className="px-5 py-2.5 text-sm text-dim text-right tabular-nums">₹{inr(rows.reduce((s, r) => s + r.cash_total, 0))}</td>
+            <td className="px-5 py-2.5 text-sm text-ink text-right tabular-nums">₹{inr(grand)}</td>
+          </tr>
+        </tfoot>
+      </table>
     </div>
   );
 }
@@ -247,7 +294,9 @@ export default function PmsPage() {
 
         {data && t && (
           <>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-5">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-5">
+              <TotalCard label="Total Invested (Cost + Cash)" value={`₹${inr(t.invested_cost)}`}
+                sub={`Cost ₹${inr(t.equity_cost)} + Cash ₹${inr(t.cash_total)}`} />
               <TotalCard label="Equity" value={`₹${inr(t.equity_total)}`}
                 sub={`${t.equity_count} holding${t.equity_count === 1 ? '' : 's'} · P&L ₹${inr(t.equity_pnl)}`}
                 accent={t.equity_pnl >= 0 ? 'gain' : 'loss'} />
@@ -255,6 +304,10 @@ export default function PmsPage() {
                 sub={`${t.cash_count} account${t.cash_count === 1 ? '' : 's'}`} />
               <TotalCard label="Total (Equity + Cash)" value={`₹${inr(t.total)}`} />
             </div>
+
+            {showEntityCol && data.by_entity.length > 1 && (
+              <InvestedByEntity rows={data.by_entity} />
+            )}
 
             {data.holdings.length === 0 ? (
               <div className="bg-card rounded-lg border border-rule px-5 py-10 text-center text-sm text-ghost">
