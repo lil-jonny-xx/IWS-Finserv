@@ -1467,6 +1467,32 @@ def _avg_cost_realised(seq: list, fy_start: date) -> list:
     return out
 
 
+def _fx_rate_on(conn, currency: str, on_date: date) -> Optional[float]:
+    """Currency→INR rate as of a date (nearest rate on/before; else earliest available).
+
+    Trade-date FX: each leg of a foreign trade is valued at the rate on its own date,
+    so realised P&L captures currency movement as well as price movement. Accuracy of
+    historical legs depends on fx_rate being backfilled (see fx_backfill_worker.py);
+    returns None when no rate exists at all (caller skips the leg).
+    """
+    if not currency or currency.upper() == "INR":
+        return 1.0
+    cur = conn.cursor()
+    try:
+        cur.execute("""SELECT rate FROM fx_rate
+                       WHERE from_currency = %s AND to_currency = 'INR' AND rate_date <= %s
+                       ORDER BY rate_date DESC LIMIT 1""", (currency, on_date))
+        row = cur.fetchone()
+        if not row:  # no rate on/before the date — fall back to the earliest we have
+            cur.execute("""SELECT rate FROM fx_rate
+                           WHERE from_currency = %s AND to_currency = 'INR'
+                           ORDER BY rate_date ASC LIMIT 1""", (currency,))
+            row = cur.fetchone()
+    finally:
+        cur.close()
+    return float(row["rate"]) if row else None
+
+
 def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
                           since_inception: bool = False,
                           include_switches: bool = True) -> list:
@@ -1535,6 +1561,39 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
                 continue
             seq.append({"date": r["d"], "kind": kind, "units": r["units"],
                         "amount": r["amount"], "name": r["security_name"], "group": "Equity"})
+        out += _avg_cost_realised(seq, fy)
+
+    # ---- Foreign equity (equity_trade_ledger; native cash flows → INR at trade-date FX) ----
+    # Switches do not exist for brokers, so include_switches is irrelevant here.
+    # cash_flow_native is signed (BUY negative / SELL positive); we avg-cost on |amount|
+    # converted to INR at each leg's own trade-date rate, so realised P&L embeds FX gain.
+    try:
+        cur.execute(f"""
+            SELECT symbol, isin, trade_date AS d, side,
+                   quantity AS units, currency, cash_flow_native
+            FROM equity_trade_ledger
+            WHERE entity_id IN ({ph})
+            ORDER BY symbol, trade_date
+        """, entity_ids)
+        frows = cur.fetchall()
+    except Exception:
+        conn.rollback(); frows = []
+    fe_by_sec: dict = defaultdict(list)
+    for r in frows:
+        fe_by_sec[(r["symbol"], r["isin"])].append(r)
+    for txns in fe_by_sec.values():
+        seq = []
+        for r in txns:
+            side = (r["side"] or "").upper()
+            kind = "buy" if side == "BUY" else ("sell" if side == "SELL" else None)
+            if not kind:
+                continue
+            fx = _fx_rate_on(conn, r["currency"], r["d"])
+            if fx is None:
+                continue  # no rate available — cannot express this leg in INR
+            amt_inr = abs(float(r["cash_flow_native"] or 0)) * fx
+            seq.append({"date": r["d"], "kind": kind, "units": r["units"],
+                        "amount": amt_inr, "name": r["symbol"], "group": "Foreign Equity"})
         out += _avg_cost_realised(seq, fy)
 
     cur.close()
