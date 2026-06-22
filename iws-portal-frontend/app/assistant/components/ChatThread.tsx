@@ -3,6 +3,7 @@ import { useEffect, useRef } from 'react';
 import type { Citation, ChartSpec, Message } from '../types';
 import Citations from './Citations';
 import { ChartList } from './charts/Chart';
+import MarkdownMessage from './MarkdownMessage';
 
 export interface StreamingState {
   active: boolean;          // a turn is in flight
@@ -71,7 +72,9 @@ export default function ChatThread({
         {messages.map(m => (
           <div key={m.id}>
             <Bubble role={m.role}>
-              <span className="whitespace-pre-wrap">{m.content}</span>
+              {m.role === 'assistant'
+                ? <MarkdownMessage>{m.content}</MarkdownMessage>
+                : <span className="whitespace-pre-wrap">{m.content}</span>}
             </Bubble>
             {m.role === 'assistant' && m.charts?.length ? (
               <div className="mt-1 flex justify-start">
@@ -102,10 +105,10 @@ export default function ChatThread({
                 </span>
               )}
               {streaming.text && (
-                <span className="whitespace-pre-wrap">
-                  {streaming.text}
+                <div>
+                  <MarkdownMessage>{streaming.text}</MarkdownMessage>
                   <span className="ml-0.5 inline-block h-4 w-[2px] -translate-y-px animate-pulse bg-prime align-middle" />
-                </span>
+                </div>
               )}
               {!streaming.tool && !streaming.text && (
                 <span className="inline-flex items-center gap-1.5 text-sm text-ghost">
