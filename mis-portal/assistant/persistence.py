@@ -117,6 +117,16 @@ def add_message(conn, conversation_id: int, role: str, content: Optional[str],
     return mid
 
 
+def update_title(conn, conversation_id: int, title: str) -> None:
+    """Set a conversation's title. Caller decides when (e.g. only when untitled)."""
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE assistant_conversation SET title = %s WHERE id = %s",
+        (title, conversation_id),
+    )
+    cur.close()
+
+
 def archive_conversation(conn, user_id: int, conversation_id: int) -> bool:
     """Archive iff owned by user_id. Returns True if a row was archived."""
     cur = conn.cursor()

@@ -58,6 +58,39 @@ def _api_tools() -> list:
     return tools_mod.TOOL_SCHEMAS + [WEB_SEARCH_TOOL, CODE_EXECUTION_TOOL]
 
 
+# Conversation titles are a cheap, latency-insensitive side task — use the small/fast
+# model, no tools, no thinking (effort/adaptive thinking error on Haiku).
+TITLE_MODEL = os.getenv("ASSISTANT_TITLE_MODEL", "claude-haiku-4-5")
+
+
+def generate_title(user_message: str) -> str:
+    """Short (~3-6 word) conversation title from the first user message.
+
+    Best-effort: returns "" on any failure so the caller simply leaves the
+    conversation untitled rather than breaking the chat.
+    """
+    msg = (user_message or "").strip()
+    if not msg:
+        return ""
+    try:
+        resp = get_client().messages.create(
+            model=TITLE_MODEL,
+            max_tokens=20,
+            system=(
+                "Generate a concise title for a conversation from the user's first "
+                "message. Reply with ONLY the title: 3-6 words, Title Case, no quotes, "
+                "no trailing punctuation, describing the topic. Do not answer the message."
+            ),
+            messages=[{"role": "user", "content": msg[:2000]}],
+        )
+        parts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
+        title = " ".join(parts).strip().strip('"').strip()
+        title = title.splitlines()[0].strip() if title else ""
+        return title[:80]
+    except Exception:
+        return ""
+
+
 def _build_messages(history: list[dict], user_text: str) -> list[dict]:
     """Replay prior turns as plain text (user/assistant), then append the new user message."""
     messages = []

@@ -2915,6 +2915,13 @@ def assistant_chat(
         history = assistant_persistence.get_messages(conn, conv["id"])
 
         assistant_persistence.add_message(conn, conv["id"], "user", body.message)
+        # Auto-title on the first message of an untitled conversation (like Claude/ChatGPT).
+        # Committed here, before streaming, so it's persisted by the time the client
+        # refetches the conversation list on the stream's "done" event. Best-effort.
+        if not history and not (conv.get("title") or "").strip():
+            title = assistant_engine.generate_title(body.message)
+            if title:
+                assistant_persistence.update_title(conn, conv["id"], title)
         write_audit_log(conn, user_id, "assistant_chat", "assistant_conversation",
                         conv["id"], body.message[:500])
         conn.commit()
