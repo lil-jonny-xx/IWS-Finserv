@@ -1596,6 +1596,27 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
                         "amount": amt_inr, "name": r["symbol"], "group": "Foreign Equity"})
         out += _avg_cost_realised(seq, fy)
 
+    # ---- PMS (pms_realised; broker-provided realised P&L, already computed) ----
+    # No avg-cost: the statement gives cost/proceeds/P&L per lot directly. INR only.
+    try:
+        cur.execute(f"""
+            SELECT security_name, sale_date AS d, purchase_amount, sale_amount, pnl
+            FROM pms_realised
+            WHERE entity_id IN ({ph}) AND sale_date >= %s
+            ORDER BY sale_date
+        """, entity_ids + [fy])
+        prows = cur.fetchall()
+    except Exception:
+        conn.rollback(); prows = []
+    for r in prows:
+        pnl = float(r["pnl"]) if r["pnl"] is not None else None
+        pa  = float(r["purchase_amount"]) if r["purchase_amount"] is not None else None
+        ret = (pnl / pa) if (pnl is not None and pa) else None
+        out.append({"group": "PMS", "security_name": r["security_name"],
+                    "purchase_amount": pa, "sale_date": r["d"],
+                    "sale_amount": float(r["sale_amount"]) if r["sale_amount"] is not None else None,
+                    "pnl": pnl, "return_pct": ret})
+
     cur.close()
     return out
 
