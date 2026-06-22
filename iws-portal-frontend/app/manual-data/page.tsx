@@ -248,6 +248,7 @@ export default function ManualDataPage() {
               { href: '/dashboard',   label: 'Dashboard' },
               { href: '/mutual-funds',label: 'Mutual Funds' },
               { href: '/equity',      label: 'Equity' },
+              { href: '/foreign-equity', label: 'Foreign Equity' },
               { href: '/pms', label: 'PMS' },
               { href: '/manual-data', label: 'Manual Data', active: true },
               { href: '/reports',     label: 'Reports' },

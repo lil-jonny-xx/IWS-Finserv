@@ -1,19 +1,22 @@
 'use client';
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import EquityTable, { type EquityHoldingRow, type EquityTotals } from './components/EquityTable';
+import ForeignEquityTable, { type EquityHoldingRow, type EquityTotals } from './components/ForeignEquityTable';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
 interface User { role: string; full_name: string; entity_id?: number; }
 interface Entity { id: number; name: string; }
 
-interface EquityResponse {
+interface ForeignEquityResponse {
   entity_id: number;
   entity_name: string;
   total_holdings: number;
   holdings: EquityHoldingRow[];
   totals: EquityTotals;
+  fx_rates: Record<string, number>;
+  as_of_date: string | null;
+  last_updated: string | null;
 }
 
 function EntitySwitcher({
@@ -59,7 +62,7 @@ function Skeleton() {
           ))}
         </div>
       </div>
-      {[...Array(6)].map((_, i) => (
+      {[...Array(5)].map((_, i) => (
         <div key={i} className="flex gap-4 px-5 sm:px-6 py-3.5 border-t border-rule">
           <div className="h-3 bg-rule rounded w-16 animate-pulse" />
           <div className="h-3 bg-rule rounded w-20 animate-pulse" />
@@ -70,19 +73,21 @@ function Skeleton() {
   );
 }
 
-export default function EquityPage() {
+function fmtAsOf(iso: string | null): string {
+  if (!iso) return '';
+  return new Date(iso).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+export default function ForeignEquityPage() {
   const router = useRouter();
-  const [user, setUser]                   = useState<User | null>(null);
-  const [entities, setEntities]           = useState<Entity[]>([]);
-  const [selectedId, setSelectedId]       = useState<number | null>(null);
-  const [data, setData]                   = useState<EquityResponse | null>(null);
-  const [loading, setLoading]             = useState(true);
-  const [error, setError]                 = useState<string | null>(null);
-  const [retryCount, setRetryCount]       = useState(0);
-  const [lastUpdated, setLastUpdated]     = useState<Date | null>(null);
-  const [liveActive, setLiveActive]       = useState(false);
-  const intervalRef                       = useRef<ReturnType<typeof setInterval> | null>(null);
-  const didInitialLoad                    = useRef(false);
+  const [user, setUser]             = useState<User | null>(null);
+  const [entities, setEntities]     = useState<Entity[]>([]);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [data, setData]             = useState<ForeignEquityResponse | null>(null);
+  const [loading, setLoading]       = useState(true);
+  const [error, setError]           = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
+  const didInitialLoad              = useRef(false);
 
   useEffect(() => {
     fetch(`${API_URL}/api/v1/me`, { credentials: 'include' })
@@ -102,46 +107,19 @@ export default function EquityPage() {
 
   useEffect(() => {
     const controller = new AbortController();
-    // Show the skeleton only on the very first load. Background refreshes (auto-refresh
-    // every minute) update values in place without unmounting the table, so the user's
-    // sort / filters / search are preserved.
     if (!didInitialLoad.current) setLoading(true);
     setError(null);
     const qs = selectedId !== null ? `?entity_id=${selectedId}` : '';
-    fetch(`${API_URL}/api/v1/equity/holdings${qs}`, { credentials: 'include', signal: controller.signal })
-      .then(r => { if (r.status === 401) { router.push('/'); return null; } if (!r.ok) throw new Error('Failed to load equity holdings.'); return r.json(); })
-      .then((d: EquityResponse | null) => {
-        if (d) { setData(d); setLastUpdated(new Date()); }
+    fetch(`${API_URL}/api/v1/foreign-equity/holdings${qs}`, { credentials: 'include', signal: controller.signal })
+      .then(r => { if (r.status === 401) { router.push('/'); return null; } if (!r.ok) throw new Error('Failed to load foreign equity holdings.'); return r.json(); })
+      .then((d: ForeignEquityResponse | null) => {
+        if (d) setData(d);
         setLoading(false);
         didInitialLoad.current = true;
       })
       .catch(err => { if (err.name !== 'AbortError') { setError(err.message); setLoading(false); } });
     return () => controller.abort();
   }, [router, selectedId, retryCount]);
-
-  // Auto-refresh every 60 s during market hours (09:15–15:30 IST Mon–Fri)
-  useEffect(() => {
-    function isMarketOpen() {
-      const now = new Date();
-      const ist = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
-      const day = ist.getDay();
-      if (day === 0 || day === 6) return false;
-      const mins = ist.getHours() * 60 + ist.getMinutes();
-      return mins >= 9 * 60 + 15 && mins < 15 * 60 + 30;
-    }
-
-    if (intervalRef.current) clearInterval(intervalRef.current);
-    const active = isMarketOpen();
-    setLiveActive(active);
-    if (!active) return;
-
-    intervalRef.current = setInterval(() => {
-      if (!isMarketOpen()) { clearInterval(intervalRef.current!); setLiveActive(false); return; }
-      setRetryCount(c => c + 1);
-    }, 60_000);
-
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
-  }, [selectedId]);
 
   const isAdmin       = user?.role === 'admin';
   const showEntityCol = isAdmin && selectedId === null;
@@ -153,20 +131,11 @@ export default function EquityPage() {
 
         <div className="flex flex-wrap justify-between items-start gap-3 mb-6">
           <div>
-            <h1 className="text-2xl sm:text-3xl font-bold text-ink">Equity Portfolio</h1>
+            <h1 className="text-2xl sm:text-3xl font-bold text-ink">Foreign Equity</h1>
             <div className="flex items-center gap-2 mt-0.5">
-              {liveActive ? (
-                <span className="flex items-center gap-1.5 text-xs text-gain font-medium">
-                  <span className="w-1.5 h-1.5 rounded-full bg-gain animate-pulse inline-block" />
-                  Live · updates every minute
-                </span>
-              ) : (
-                <span className="text-sm text-ghost">Direct stock holdings across all brokers</span>
-              )}
-              {lastUpdated && (
-                <span className="text-xs text-ghost">
-                  · updated {lastUpdated.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-                </span>
+              <span className="text-sm text-ghost">International holdings (IBKR, Vested, DBS) in native currency</span>
+              {data?.as_of_date && (
+                <span className="text-xs text-ghost">· as of {fmtAsOf(data.as_of_date)}</span>
               )}
             </div>
           </div>
@@ -174,8 +143,8 @@ export default function EquityPage() {
             {[
               { href: '/dashboard',    label: 'Overview'     },
               { href: '/mutual-funds', label: 'Mutual Funds' },
-              { href: '/equity',       label: 'Equity',       active: true },
-              { href: '/foreign-equity', label: 'Foreign Equity' },
+              { href: '/equity',       label: 'Equity'       },
+              { href: '/foreign-equity', label: 'Foreign Equity', active: true },
               { href: '/pms', label: 'PMS' },
               { href: '/manual-data',  label: 'Manual Data'  },
               { href: '/reports',      label: 'Reports'       },
@@ -205,11 +174,10 @@ export default function EquityPage() {
 
         {loading && !data && <Skeleton />}
 
-        {/* Initial-load failure: no data to show, so surface the full error + retry. */}
         {error && !data && (
           <div role="alert" className="bg-card rounded-lg border border-rule px-5 py-5 flex items-start justify-between gap-4">
             <div>
-              <p className="text-sm font-medium text-dim">Could not load equity holdings</p>
+              <p className="text-sm font-medium text-dim">Could not load foreign equity holdings</p>
               <p className="text-xs text-ghost mt-1">{error}</p>
             </div>
             <button
@@ -223,7 +191,6 @@ export default function EquityPage() {
 
         {data && (
           <div className="fade-in">
-            {/* Background-refresh failure: keep the last-loaded table, show a quiet notice. */}
             {error && (
               <div role="status" className="mb-3 flex items-center justify-between gap-3 bg-card rounded-lg border border-rule px-4 py-2">
                 <p className="text-xs text-ghost">Couldn’t refresh — showing last loaded values.</p>
@@ -235,16 +202,18 @@ export default function EquityPage() {
                 </button>
               </div>
             )}
-            <EquityTable
+            <ForeignEquityTable
               holdings={data.holdings}
               totals={data.totals}
+              fxRates={data.fx_rates}
               showEntityCol={showEntityCol}
+              lastUpdated={data.last_updated}
             />
           </div>
         )}
 
         <p className="text-center text-xs text-ghost mt-8">
-          IWS Finserv &copy; {new Date().getFullYear()} · Live prices during market hours (09:15–15:30 IST)
+          IWS Finserv &copy; {new Date().getFullYear()} · Foreign holdings update on each broker sync
         </p>
       </div>
     </main>

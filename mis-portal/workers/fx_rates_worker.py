@@ -4,7 +4,7 @@ FX Rates Worker — IWS MIS Portal
 Fetches daily exchange rates and stores in PostgreSQL.
 Primary: exchangerate-api.com
 Fallback: frankfurter.app (no API key needed)
-Currencies tracked: USD, GBP, SGD, AED, HKD → INR
+Currencies tracked: USD, GBP, SGD, AED, HKD, CHF → INR
 Schedule: Daily at 6:00 AM IST via cron
 """
 import os
@@ -36,7 +36,7 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD", ""),
 }
 
-TARGET_CURRENCIES = ["USD", "GBP", "SGD", "AED", "HKD"]
+TARGET_CURRENCIES = ["USD", "GBP", "SGD", "AED", "HKD", "CHF"]
 
 
 def get_db_connection():
@@ -134,18 +134,22 @@ def run():
     try:
         conn = get_db_connection()
 
-        # Check if rates already exist for today
+        # Skip only when every target currency already has a rate for today.
+        # (Checking per-currency lets a newly added currency — e.g. CHF — get
+        # filled in on the same day rather than waiting for a day with no rates.)
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT COUNT(*) as count FROM fx_rate WHERE rate_date = %s",
+            "SELECT from_currency FROM fx_rate WHERE rate_date = %s AND to_currency = 'INR'",
             (today,)
         )
-        existing = cursor.fetchone()["count"]
+        present = {r["from_currency"] for r in cursor.fetchall()}
         cursor.close()
 
-        if existing > 0:
-            logger.info(f"Rates for {today} already exist. Skipping.")
+        missing = [c for c in TARGET_CURRENCIES if c not in present]
+        if not missing:
+            logger.info(f"All target rates for {today} already exist. Skipping.")
             return
+        logger.info(f"Missing rates for {today}: {missing}")
 
         # Try primary source
         try:

@@ -37,6 +37,20 @@ from equity import fx, finmath
 from equity.brokers import zerodha, angel_one, dhan, ibkr, vested, dbs
 from equity.models import EquityHolding
 
+# Foreign (multi-currency) brokers are stored in their own tables so the Equity
+# page stays India-only and the Foreign Equity page can show native currency.
+# Keep this in sync with INTERNATIONAL_BROKERS below and the migration script
+# equity/db_migrate_foreign_equity.py.
+FOREIGN_BROKER_LABELS = {"ibkr", "vested", "dbs"}
+
+
+def _holding_table(foreign: bool) -> str:
+    return "foreign_equity_holding" if foreign else "equity_holding"
+
+
+def _history_table(foreign: bool) -> str:
+    return "foreign_equity_holding_history" if foreign else "equity_holding_history"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -93,9 +107,10 @@ def fetch_history_value(
     symbol: str,
     snapshot_date: date,
     isin: Optional[str] = None,
+    foreign: bool = False,
 ) -> Optional[Decimal]:
     """
-    Return the market_value from equity_holding_history at or before snapshot_date
+    Return the market_value from the holding-history table at or before snapshot_date
     (nearest earlier snapshot if the exact date is missing).
 
     Matches on ISIN first — the stable identifier — so a ticker rename (e.g.
@@ -103,12 +118,13 @@ def fetch_history_value(
     orphan the prior-week snapshots and zero out weekly_change. Falls back to a
     symbol match for legacy rows written before the isin column existed.
     """
+    hist = _history_table(foreign)
     cur = conn.cursor()
     if isin:
         cur.execute(
-            """
+            f"""
             SELECT market_value
-            FROM   equity_holding_history
+            FROM   {hist}
             WHERE  entity_id     = %s
               AND  broker        = %s
               AND  isin          = %s
@@ -124,9 +140,9 @@ def fetch_history_value(
             return Decimal(str(row["market_value"]))
 
     cur.execute(
-        """
+        f"""
         SELECT market_value
-        FROM   equity_holding_history
+        FROM   {hist}
         WHERE  entity_id     = %s
           AND  broker        = %s
           AND  symbol        = %s
@@ -159,13 +175,14 @@ def classify_sector(symbol: str, isin: str) -> str:
     return 'Equity'
 
 
-def fetch_first_invested_date(conn, entity_id: int, broker: str, symbol: str) -> Optional[date]:
+def fetch_first_invested_date(conn, entity_id: int, broker: str, symbol: str,
+                              foreign: bool = False) -> Optional[date]:
     """Preserve the existing first_invested_date so CAGR anchor doesn't drift."""
     cur = conn.cursor()
     cur.execute(
-        """
+        f"""
         SELECT first_invested_date
-        FROM   equity_holding
+        FROM   {_holding_table(foreign)}
         WHERE  entity_id = %s AND broker = %s AND symbol = %s
         """,
         (entity_id, broker, symbol),
@@ -325,20 +342,22 @@ def compute_metrics(
 # DB writes
 # ---------------------------------------------------------------------------
 
-def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[date]):
+def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[date],
+                          foreign: bool = False):
+    tbl = _holding_table(foreign)
     # If symbol was previously stored as empty string (before ISIN fallback was added),
     # remove the stale row so the new upsert doesn't create a duplicate.
     if h.isin:
         cur.execute(
-            """
-            DELETE FROM equity_holding
+            f"""
+            DELETE FROM {tbl}
             WHERE entity_id = %s AND broker = %s AND symbol = '' AND isin = %s
             """,
             (h.entity_id, h.broker, h.isin),
         )
     cur.execute(
-        """
-        INSERT INTO equity_holding (
+        f"""
+        INSERT INTO {tbl} (
             entity_id, broker, symbol, isin, exchange, sector,
             quantity, avg_cost, cost, current_price, current_market_value,
             currency, fx_rate,
@@ -390,7 +409,7 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
             xirr_inception_pct    = EXCLUDED.xirr_inception_pct,
             first_invested_date   = EXCLUDED.first_invested_date,
             remarks               = EXCLUDED.remarks,
-            angel_one_token       = COALESCE(EXCLUDED.angel_one_token, equity_holding.angel_one_token),
+            angel_one_token       = COALESCE(EXCLUDED.angel_one_token, {tbl}.angel_one_token),
             updated_at            = NOW()
         """,
         {
@@ -430,11 +449,11 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
     )
 
 
-def snapshot_history(cur, h: EquityHolding, today: date):
+def snapshot_history(cur, h: EquityHolding, today: date, foreign: bool = False):
     """Insert today's snapshot — skipped silently if already exists (ON CONFLICT DO NOTHING)."""
     cur.execute(
-        """
-        INSERT INTO equity_holding_history
+        f"""
+        INSERT INTO {_history_table(foreign)}
             (entity_id, broker, symbol, isin, snapshot_date, quantity, close_price, market_value, cost, pnl,
              currency, fx_rate, close_price_native, market_value_native)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -725,8 +744,14 @@ def sync_entity_broker(
     broker_module,
     broker_label: str,
     today: date,
+    foreign: bool = False,
 ) -> int:
-    """Sync one entity + broker pair. Returns count of holdings upserted."""
+    """Sync one entity + broker pair. Returns count of holdings upserted.
+
+    Foreign (multi-currency) brokers are written to foreign_equity_holding(+history)
+    so the Equity page stays India-only; INR-converted columns are still populated
+    so net-worth aggregators can union the foreign table.
+    """
     raw      = broker_module.fetch_holdings(entity_code)
     holdings = broker_module.normalise(entity_id, entity_code, raw)
 
@@ -757,8 +782,8 @@ def sync_entity_broker(
     count = 0
 
     for h in holdings:
-        prev_week_val     = fetch_history_value(conn, entity_id, broker_label, h.symbol, prev_friday, h.isin)
-        ytd_val           = fetch_history_value(conn, entity_id, broker_label, h.symbol, ytd_date, h.isin)
+        prev_week_val     = fetch_history_value(conn, entity_id, broker_label, h.symbol, prev_friday, h.isin, foreign)
+        ytd_val           = fetch_history_value(conn, entity_id, broker_label, h.symbol, ytd_date, h.isin, foreign)
         # Leave NULL until the real purchase date is known (backfilled from the broker
         # tradebook — see zerodha_tradebook_import.py). Defaulting to today stamped a wrong
         # "Since" date and produced a bogus ~0-year CAGR. Both compute_metrics and the upsert
@@ -769,7 +794,7 @@ def sync_entity_broker(
         ledger_xirr, ledger_first_buy = ledger_metrics(
             conn, entity_id, broker_label, h.symbol, h.current_market_value_native, today)
         first_invest_date = h.first_invested_date or ledger_first_buy or \
-            fetch_first_invested_date(conn, entity_id, broker_label, h.symbol)
+            fetch_first_invested_date(conn, entity_id, broker_label, h.symbol, foreign)
 
         h = compute_metrics(h, prev_week_val, ytd_val, total_value, today, first_invest_date)
 
@@ -778,8 +803,8 @@ def sync_entity_broker(
         if h.xirr_inception_pct is None and ledger_xirr is not None:
             h.xirr_inception_pct = ledger_xirr
 
-        upsert_equity_holding(cur, h, first_invest_date)
-        snapshot_history(cur, h, today)
+        upsert_equity_holding(cur, h, first_invest_date, foreign)
+        snapshot_history(cur, h, today, foreign)
         count += 1
 
     conn.commit()
@@ -807,9 +832,10 @@ def main():
             errors.append(f"{entity_code}:{broker_label}")
             continue
 
-        logger.info(f"[{entity_code}/{broker_label}] Starting sync")
+        foreign = broker_label in FOREIGN_BROKER_LABELS
+        logger.info(f"[{entity_code}/{broker_label}] Starting sync{' (foreign)' if foreign else ''}")
         try:
-            n = sync_entity_broker(conn, entity_id, entity_code, broker_module, broker_label, today)
+            n = sync_entity_broker(conn, entity_id, entity_code, broker_module, broker_label, today, foreign)
             total += n
         except NotImplementedError:
             logger.warning(f"[{entity_code}/{broker_label}] Broker not yet implemented — skipping")
@@ -847,22 +873,25 @@ def main():
 
     # Recalculate exposure_pct across all brokers per entity now that all syncs are done.
     # Per-broker sync uses only that broker's total — this corrects it to entity-wide total.
+    # Indian and foreign holdings are weighted within their own table (each page shows its
+    # own 100%).
     cur = conn.cursor()
-    cur.execute("""
-        UPDATE equity_holding eh
-        SET    exposure_pct = ROUND(
-                   eh.current_market_value
-                   / NULLIF(totals.total_cmv, 0) * 100, 2
-               )
-        FROM (
-            SELECT entity_id, SUM(current_market_value) AS total_cmv
-            FROM   equity_holding
-            WHERE  current_market_value IS NOT NULL
-            GROUP  BY entity_id
-        ) totals
-        WHERE eh.entity_id = totals.entity_id
-          AND eh.current_market_value IS NOT NULL
-    """)
+    for tbl in ("equity_holding", "foreign_equity_holding"):
+        cur.execute(f"""
+            UPDATE {tbl} eh
+            SET    exposure_pct = ROUND(
+                       eh.current_market_value
+                       / NULLIF(totals.total_cmv, 0) * 100, 2
+                   )
+            FROM (
+                SELECT entity_id, SUM(current_market_value) AS total_cmv
+                FROM   {tbl}
+                WHERE  current_market_value IS NOT NULL
+                GROUP  BY entity_id
+            ) totals
+            WHERE eh.entity_id = totals.entity_id
+              AND eh.current_market_value IS NOT NULL
+        """)
     conn.commit()
     cur.close()
     logger.info("Exposure % recalculated across all brokers per entity")

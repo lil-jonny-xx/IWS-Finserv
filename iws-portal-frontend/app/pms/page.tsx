@@ -199,6 +199,7 @@ export default function PmsPage() {
               { href: '/dashboard',     label: 'Overview'       },
               { href: '/mutual-funds',  label: 'Mutual Funds'   },
               { href: '/equity',        label: 'Equity'         },
+              { href: '/foreign-equity', label: 'Foreign Equity' },
               { href: '/pms',           label: 'PMS', active: true },
               { href: '/manual-data',   label: 'Manual Data'    },
               { href: '/reports',       label: 'Reports'        },

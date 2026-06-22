@@ -1309,6 +1309,156 @@ def get_equity_holdings(
 
 
 # ---------------------------------------------------------------------------
+# Foreign equity holdings — multi-currency (IBKR/Vested USD, DBS SGD), shown on
+# the Foreign Equity page in native currency with a currency switcher.
+# ---------------------------------------------------------------------------
+
+# Keep in sync with equity_sync_worker.FOREIGN_BROKER_LABELS and the migration.
+FOREIGN_BROKERS = ("ibkr", "vested", "dbs")
+
+
+def _latest_fx_rates(conn) -> dict:
+    """Latest INR-per-unit rate for every tracked currency (INR itself = 1).
+
+    Drives the Foreign Equity currency switcher: to show a value in currency T,
+    the frontend computes value_native * rate[native] / rate[T].
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT DISTINCT ON (from_currency) from_currency, rate, rate_date
+        FROM   fx_rate
+        WHERE  to_currency = 'INR'
+        ORDER  BY from_currency, rate_date DESC
+        """
+    )
+    rates = {"INR": 1.0}
+    for r in cur.fetchall():
+        rates[r["from_currency"]] = float(r["rate"])
+    cur.close()
+    return rates
+
+
+@app.get("/api/v1/foreign-equity/holdings")
+def get_foreign_equity_holdings(
+    request: Request,
+    entity_id: Optional[int] = None,
+    broker: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Foreign (multi-currency) equity holdings from foreign_equity_holding.
+    Each row carries both native (USD/SGD/…) and INR-converted figures plus
+    currency/fx_rate; the response also includes the latest fx_rates map so the
+    frontend can convert every row to a single chosen display currency.
+    """
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        eid  = _resolve_entity(cur, payload, entity_id)
+
+        conditions, params = [], []
+        if eid is not None:
+            conditions.append("eh.entity_id = %s")
+            params.append(eid)
+        if broker:
+            conditions.append("eh.broker = %s")
+            params.append(broker)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        cur.execute(
+            f"""
+            SELECT {_EQUITY_HOLDING_COLS}
+            FROM   foreign_equity_holding eh
+            JOIN   entity e ON e.id = eh.entity_id
+            {where}
+            ORDER BY e.entity_name, eh.broker, eh.symbol
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+
+        # Foreign broker cash for the same scope.
+        cash_conditions = ["bc.broker = ANY(%s)"]
+        cash_params: list = [list(FOREIGN_BROKERS)]
+        if eid is not None:
+            cash_conditions.append("bc.entity_id = %s")
+            cash_params.append(eid)
+        if broker:
+            cash_conditions.append("bc.broker = %s")
+            cash_params.append(broker)
+        cur.execute(
+            f"""
+            SELECT bc.entity_id, e.entity_name, bc.broker, bc.balance,
+                   bc.currency, bc.balance_native, bc.updated_at
+            FROM   broker_cash bc
+            JOIN   entity e ON e.id = bc.entity_id
+            WHERE  {" AND ".join(cash_conditions)}
+            ORDER BY e.entity_name, bc.broker
+            """,
+            cash_params,
+        )
+        cash_rows = cur.fetchall()
+        fx_rates  = _latest_fx_rates(conn)
+        cur.close()
+
+        holdings = [_row_to_holding(r) for r in rows]
+        totals   = _equity_totals(rows)
+
+        cash_total = round(sum(float(c["balance"] or 0) for c in cash_rows), 2)
+        totals["cash_balance"] = cash_total
+        totals["value_plus_cash"] = round(
+            float(totals.get("total_current_market_value") or 0) + cash_total, 2
+        )
+
+        # Most recent snapshot / refresh time across the returned holdings.
+        as_of_dates = [r["as_of_date"] for r in rows if r["as_of_date"]]
+        updated_ats = [r["updated_at"] for r in rows if r["updated_at"]]
+        as_of_date  = str(max(as_of_dates)) if as_of_dates else None
+        last_updated = max(updated_ats).isoformat() if updated_ats else None
+
+        entity_name = "All Entities" if eid is None else (
+            rows[0]["entity_name"] if rows else ""
+        )
+
+        return {
+            "entity_id":      eid or 0,
+            "entity_name":    entity_name,
+            "broker":         broker,
+            "total_holdings": len(holdings),
+            "totals":         totals,
+            "holdings":       holdings,
+            "fx_rates":       fx_rates,
+            "as_of_date":     as_of_date,
+            "last_updated":   last_updated,
+            "cash_balance":   cash_total,
+            "cash_by_broker": [
+                {
+                    "entity_id":   c["entity_id"],
+                    "entity_name": c["entity_name"],
+                    "broker":      c["broker"],
+                    "balance":     float(c["balance"] or 0),
+                    "currency":    c.get("currency") or "INR",
+                    "balance_native": float(c["balance_native"]) if c.get("balance_native") is not None else None,
+                    "updated_at":  c["updated_at"].isoformat() if c["updated_at"] else None,
+                }
+                for c in cash_rows
+            ],
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/v1/foreign-equity/holdings: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+# ---------------------------------------------------------------------------
 # Nuvama PMS holdings — broken-out holdings with equity / cash / combined totals
 # ---------------------------------------------------------------------------
 
@@ -1754,6 +1904,21 @@ def get_overview(
                 eh.cagr_inception_pct,
                 COALESCE(eh.current_market_value, 0)  AS weight
             FROM equity_holding eh
+            JOIN entity e ON e.id = eh.entity_id
+            UNION ALL
+            SELECT
+                eh.entity_id,
+                e.entity_name,
+                'DIRECT_EQUITY'                       AS asset_class,
+                'DIRECT_EQUITY'                       AS security_type,
+                COALESCE(eh.cost, 0)                  AS invested,
+                COALESCE(eh.current_market_value, 0)  AS mkt_value,
+                COALESCE(eh.pnl_inception, 0)         AS pnl_inception,
+                COALESCE(eh.pnl_ytd, 0)               AS pnl_ytd,
+                COALESCE(eh.weekly_change, 0)         AS weekly_change,
+                eh.cagr_inception_pct,
+                COALESCE(eh.current_market_value, 0)  AS weight
+            FROM foreign_equity_holding eh
             JOIN entity e ON e.id = eh.entity_id
         """)
         eq_rows = cursor.fetchall()

@@ -171,6 +171,9 @@ def _fetch_mf_holdings(conn, entity_id: Optional[int] = None):
 
 
 def _fetch_equity_holdings(conn, entity_id: Optional[int] = None):
+    """Domestic direct-equity holdings (equity_holding). Foreign brokers live in
+    foreign_equity_holding — see _fetch_foreign_equity_holdings — and are reported
+    in their own section so totals stay whole without mixing the two."""
     cur = conn.cursor()
     q = """
         SELECT
@@ -186,6 +189,39 @@ def _fetch_equity_holdings(conn, entity_id: Optional[int] = None):
         JOIN entity e ON e.id = eh.entity_id
         {where}
         ORDER BY eh.symbol
+    """
+    if entity_id:
+        cur.execute(q.format(where="WHERE eh.entity_id = %s"), (entity_id,))
+    else:
+        cur.execute(q.format(where=""))
+    rows = cur.fetchall()
+    cur.close()
+    return rows
+
+
+def _fetch_foreign_equity_holdings(conn, entity_id: Optional[int] = None):
+    """Foreign (multi-currency) direct-equity holdings (foreign_equity_holding).
+    Returns the INR-converted columns used by the by-broker rollup AND the native
+    currency columns used by the Foreign Equity Print detail sheet."""
+    cur = conn.cursor()
+    q = """
+        SELECT
+            eh.entity_id, e.entity_name,
+            eh.broker, COALESCE(eh.symbol_override, eh.symbol) AS symbol, eh.isin, eh.exchange,
+            eh.cost, eh.current_market_value AS current_value,
+            eh.prev_week_value, eh.market_value_as_on,
+            eh.pnl_ytd, eh.pnl_inception,
+            eh.returns_ytd_pct, eh.returns_inception_pct, eh.cagr_inception_pct,
+            eh.first_invested_date,
+            eh.weekly_change, eh.exposure_pct, eh.remarks,
+            eh.currency, eh.fx_rate, eh.quantity,
+            eh.avg_cost_native, eh.cost_native,
+            eh.current_price_native, eh.current_market_value_native,
+            eh.xirr_inception_pct
+        FROM foreign_equity_holding eh
+        JOIN entity e ON e.id = eh.entity_id
+        {where}
+        ORDER BY eh.broker, eh.symbol
     """
     if entity_id:
         cur.execute(q.format(where="WHERE eh.entity_id = %s"), (entity_id,))
@@ -302,7 +338,8 @@ def _merge_equity_by_symbol(eq_rows: list) -> list:
     return sorted(merged, key=lambda h: h["symbol"])
 
 
-_BROKER_DISPLAY = {"zerodha": "Zerodha", "angel_one": "Angel One", "dhan": "Dhan"}
+_BROKER_DISPLAY = {"zerodha": "Zerodha", "angel_one": "Angel One", "dhan": "Dhan",
+                   "ibkr": "Interactive Brokers", "vested": "Vested", "dbs": "DBS Wealth"}
 _PMS_SOURCE_DISPLAY = {"nuvama_pms": "Nuvama", "zerodha_pms": "Zerodha PMS"}
 
 
@@ -990,6 +1027,7 @@ def build_combined_report(conn, as_of: date, ws=None):
 
         mf_rows    = _fetch_mf_holdings(conn, eid)
         eq_broker  = _rollup_equity_by_broker(_fetch_equity_holdings(conn, eid))
+        fe_broker  = _rollup_equity_by_broker(_fetch_foreign_equity_holdings(conn, eid))
         pms_items  = _pms_report_rows(_fetch_pms_holdings(conn, eid))
         cash_items = _broker_cash_report_rows(_fetch_broker_cash(conn, eid))
         man_rows   = _fetch_manual_inputs(conn, eid)
@@ -1037,7 +1075,7 @@ def build_combined_report(conn, as_of: date, ws=None):
         pms    = man_by_cat.get("pms", [])
         aif    = man_by_cat.get("aif", [])
 
-        if eq_mf or hyb_mf or eq_broker or pms_items or pms or aif:
+        if eq_mf or hyb_mf or eq_broker or fe_broker or pms_items or pms or aif:
             row = _comb_section(ws, row, "EQUITY")
 
             if eq_mf or hyb_mf:
@@ -1057,6 +1095,17 @@ def build_combined_report(conn, as_of: date, ws=None):
                 for h in eq_broker:
                     _comb_data_row(ws, row, h, "Equity", alt); row += 1; alt = not alt
                 _comb_total(ws, row, "Total Direct Equities", sub_start, row - 1); row += 1
+
+            # Foreign equity: one summary row per broker (detail in the
+            # "Foreign Equity Print" sheet). INR-converted, so it folds into the
+            # entity / grand totals like every other section.
+            if fe_broker:
+                row = _comb_section(ws, row, "Foreign Equity (by broker)")
+                sub_start = row
+                alt = False
+                for h in fe_broker:
+                    _comb_data_row(ws, row, h, "Foreign", alt); row += 1; alt = not alt
+                _comb_total(ws, row, "Total Foreign Equity", sub_start, row - 1); row += 1
 
             if pms_items:
                 row = _comb_section(ws, row, "PMS (Managed Accounts)")
@@ -1258,6 +1307,152 @@ def build_equity_daily_print(conn, entity_codes: list, as_of: date, ws=None):
     return ws
 
 
+# ── foreign equity detail print ────────────────────────────────────────────────
+
+# Native money has no currency symbol (the Ccy column carries it; one sheet may mix
+# USD / SGD / …); INR columns reuse INR_FMT.
+FE_NATIVE_FMT = '#,##0.00'
+FE_COLS = [
+    ("Script Name",            24),
+    ("Broker",                 18),
+    ("Ccy",                     6),
+    ("Quantity",               11),
+    ("Avg Cost\n(native)",     13),
+    ("Total Cost\n(native)",   15),
+    ("Cur Price\n(native)",    13),
+    ("Cur Mkt Val\n(native)",  15),
+    ("Cur Mkt Val\n(₹)",       15),
+    ("P&L Inception\n(₹)",     15),
+    ("Inception\nReturns %",   11),
+    ("XIRR %\np.a.",           10),
+]
+NC_FE = len(FE_COLS)
+
+
+def build_foreign_equity_print(conn, as_of: date, ws=None):
+    """
+    Per-holding detail of foreign (multi-currency) equity, in NATIVE currency plus
+    the INR-converted value. One section per entity (subtotalled in ₹), so the
+    All Assets sheet can carry just the by-broker summary. Returns the ws, or None
+    if there are no foreign holdings.
+    """
+    rows = _fetch_foreign_equity_holdings(conn)
+    if not rows:
+        return None
+
+    if ws is None:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+    ws.title = "Foreign Equity Print"
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A3"
+
+    # Title
+    row = 1
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=NC_FE)
+    hdr = ws.cell(row=row, column=1,
+                  value=f"FOREIGN EQUITY — HOLDINGS DETAIL   |   As on {as_of.strftime('%d %b %Y')}")
+    hdr.font = HDR_FONT; hdr.fill = HDR_FILL
+    hdr.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[row].height = 22
+    row += 1
+
+    # Column headers
+    for c, (name, _) in enumerate(FE_COLS, 1):
+        cell = ws.cell(row=row, column=c, value=name)
+        cell.font = SUB_FONT; cell.fill = SUB_FILL; cell.border = THIN_BORDER
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[row].height = 30
+    row += 1
+
+    # Group by entity (preserve fetch order: entity_name, broker, symbol)
+    by_entity: dict = defaultdict(list)
+    for r in rows:
+        by_entity[r["entity_name"]].append(r)
+
+    def _data_row(r, alt):
+        nonlocal row
+        fill = ALT_FILL if alt else WHITE_FILL
+        ret_inc = _v(r, "returns_inception_pct")
+        xirr    = _v(r, "xirr_inception_pct")
+        vals = [
+            r.get("symbol") or r.get("isin") or "",
+            _BROKER_DISPLAY.get(r["broker"], r["broker"].title()),
+            r.get("currency") or "",
+            _v(r, "quantity"),
+            _v(r, "avg_cost_native"),
+            _v(r, "cost_native"),
+            _v(r, "current_price_native"),
+            _v(r, "current_market_value_native"),
+            _v(r, "current_value"),          # INR
+            _v(r, "pnl_inception"),          # INR
+            (ret_inc / 100) if ret_inc is not None else None,
+            (xirr / 100) if xirr is not None else None,
+        ]
+        for c, val in enumerate(vals, 1):
+            cell = ws.cell(row=row, column=c, value=val)
+            cell.fill = fill; cell.border = THIN_BORDER; cell.font = BODY_FONT
+            if c == 1:
+                cell.alignment = Alignment(horizontal="left", indent=1, wrap_text=True)
+            elif c in (2, 3):
+                cell.alignment = Alignment(horizontal="center" if c == 3 else "left")
+            elif c == 4:
+                cell.number_format = FE_NATIVE_FMT; cell.alignment = Alignment(horizontal="right")
+            elif c in (5, 6, 7, 8):
+                cell.number_format = FE_NATIVE_FMT; cell.alignment = Alignment(horizontal="right")
+            elif c in (9, 10):
+                cell.number_format = INR_FMT; cell.alignment = Alignment(horizontal="right")
+            else:
+                cell.number_format = PCT_FMT; cell.alignment = Alignment(horizontal="right")
+        row += 1
+
+    def _subtotal(label, ent_rows, data_start, data_end):
+        nonlocal row
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=8)
+        cell = ws.cell(row=row, column=1, value=label)
+        cell.font = TOT_FONT; cell.fill = TOT_FILL
+        cell.alignment = Alignment(horizontal="left", indent=1); cell.border = THIN_BORDER
+        for c in range(2, 9):
+            cc = ws.cell(row=row, column=c); cc.fill = TOT_FILL; cc.border = THIN_BORDER
+        # Only the INR columns (9, 10) are summable across mixed currencies.
+        for c in (9, 10):
+            col = get_column_letter(c)
+            tc = ws.cell(row=row, column=c, value=f"=SUM({col}{data_start}:{col}{data_end})")
+            tc.font = TOT_FONT; tc.fill = TOT_FILL; tc.border = THIN_BORDER
+            tc.number_format = INR_FMT; tc.alignment = Alignment(horizontal="right")
+        for c in (11, 12):
+            cc = ws.cell(row=row, column=c); cc.fill = TOT_FILL; cc.border = THIN_BORDER
+        row += 1
+
+    for ename, ent_rows in by_entity.items():
+        # Entity banner
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=NC_FE)
+        b = ws.cell(row=row, column=1, value=ename)
+        b.font = ENT_FONT; b.fill = ENT_FILL
+        b.alignment = Alignment(horizontal="left", indent=1)
+        ws.row_dimensions[row].height = 16
+        row += 1
+
+        data_start = row
+        for i, r in enumerate(ent_rows):
+            _data_row(r, i % 2 == 1)
+        _subtotal(f"Total Foreign Equity — {ename}", ent_rows, data_start, row - 1)
+        row += 1
+
+    note = ws.cell(row=row, column=1,
+                   value=f"Generated {datetime.utcnow().strftime('%d %b %Y %H:%M')} UTC  "
+                         f"|  Native amounts in each holding's own currency  "
+                         f"|  ₹ values converted at the snapshot FX rate")
+    note.font = LABEL_FONT
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=NC_FE)
+
+    for c, (_, width) in enumerate(FE_COLS, 1):
+        ws.column_dimensions[get_column_letter(c)].width = width
+
+    ws.print_title_rows = "1:2"
+    return ws
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Data-driven per-entity / per-group sheets (styled to match MIS-REPORT.xlsx)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1337,29 +1532,30 @@ def _bundle_for(conn, entity_ids: list) -> dict:
     via several brokers (or several entities in a group) collapses to one line, with
     every broker named.  Returns {mf, eq, manual_by_cat}.
     """
-    mf_rows, eq_raw, man_rows = [], [], []
+    mf_rows, eq_raw, fe_raw, man_rows = [], [], [], []
     for eid in entity_ids:
         mf_rows.extend(_fetch_mf_holdings(conn, eid))
         eq_raw.extend(_fetch_equity_holdings(conn, eid))
+        fe_raw.extend(_fetch_foreign_equity_holdings(conn, eid))
         man_rows.extend(_fetch_manual_inputs(conn, eid))
 
     # Collapse entity_id so _merge_equity_by_symbol merges across the whole bundle.
-    for r in eq_raw:
+    for r in eq_raw + fe_raw:
         r["entity_id"] = 0
     eq = _merge_equity_by_symbol(eq_raw)
+    fe = _merge_equity_by_symbol(fe_raw)   # foreign, merged by symbol across the bundle
 
     # Normalise broker labels (single-broker rows arrive raw e.g. "zerodha").
-    _BROKER_LABELS = {"zerodha": "Zerodha", "angel_one": "Angel One", "dhan": "Dhan"}
-    for r in eq:
+    for r in eq + fe:
         b = r.get("broker")
         if b:
             r["broker"] = ", ".join(
-                _BROKER_LABELS.get(p.strip(), p.strip().title()) for p in str(b).split(","))
+                _BROKER_DISPLAY.get(p.strip(), p.strip().title()) for p in str(b).split(","))
 
     man_by_cat: dict = defaultdict(list)
     for m in man_rows:
         man_by_cat[m["category"]].append(m)
-    return {"mf": mf_rows, "eq": eq, "manual_by_cat": man_by_cat}
+    return {"mf": mf_rows, "eq": eq, "fe": fe, "manual_by_cat": man_by_cat}
 
 
 def _wk_pct(h, key):
@@ -1630,11 +1826,12 @@ def build_weekly_sheet(wb, sheet_title: str, label: str, bundle: dict, as_of: da
 
     mf  = bundle["mf"]
     eq  = bundle["eq"]
+    fe  = bundle.get("fe", [])
     man = bundle["manual_by_cat"]
 
     def _cmv(rows):
         return sum(float(r["current_value"]) for r in rows if r.get("current_value")) or 0.0
-    total_cmv = _cmv(mf) + _cmv(eq) + sum(_cmv(v) for v in man.values())
+    total_cmv = _cmv(mf) + _cmv(eq) + _cmv(fe) + sum(_cmv(v) for v in man.values())
 
     # Title
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=NWK)
@@ -1739,8 +1936,9 @@ def build_weekly_sheet(wb, sheet_title: str, label: str, bundle: dict, as_of: da
             ("MF Hybrid Funds",        mf_by("MF_HYBRID")),
             ("PMS",                    man.get("pms", [])),
             ("Direct Equities",        eq),
+            ("Foreign Equity",         fe),
             ("AIF",                    man.get("aif", [])),
-            ("Foreign Equity & Funds", man.get("overseas_fund", []) + man.get("overseas_equity", [])),
+            ("Foreign Funds (Manual)", man.get("overseas_fund", []) + man.get("overseas_equity", [])),
         ]),
         ("C. ALTERNATES", [
             ("Unlisted Equity",        man.get("unlisted", [])),
@@ -1940,6 +2138,13 @@ def build_master_workbook(conn, as_of: date):
 
     # Shared sheet 2 — All Assets Daily MIS
     build_combined_report(conn, as_of, ws=wb.create_sheet("All Assets Daily MIS"))
+
+    # Shared sheet 3 — Foreign Equity Print (per-holding native detail).
+    # Created only when foreign holdings exist (else the helper returns None and
+    # leaves no empty sheet behind).
+    fe_ws = wb.create_sheet("Foreign Equity Print")
+    if build_foreign_equity_print(conn, as_of, ws=fe_ws) is None:
+        wb.remove(fe_ws)
 
     benchmarks = _fetch_benchmarks(conn, as_of)
 

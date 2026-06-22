@@ -320,17 +320,25 @@ def _mf_holdings(conn, eid: Optional[int]) -> list[dict]:
 
 def _equity_holdings(conn, eid: Optional[int]) -> list[dict]:
     where, params = _entity_clause(eid, "eh.entity_id")
-    cur = conn.cursor()
-    cur.execute(f"""
+    # Indian (equity_holding) + foreign (foreign_equity_holding), both in INR-
+    # converted columns, so the assistant sees the whole equity book.
+    select = """
         SELECT eh.entity_id, eh.broker, eh.symbol, eh.symbol_override, eh.isin,
                eh.sector, eh.quantity, eh.cost, eh.current_market_value,
                eh.market_value_as_on, eh.weekly_change, eh.exposure_pct,
                eh.pnl_inception, eh.pnl_ytd, eh.returns_inception_pct,
                eh.returns_ytd_pct, eh.cagr_inception_pct
-        FROM equity_holding eh
+        FROM {table} eh
         {where}
-        ORDER BY eh.current_market_value DESC NULLS LAST
-    """, params)
+    """
+    cur = conn.cursor()
+    cur.execute(
+        select.format(table="equity_holding", where=where)
+        + " UNION ALL "
+        + select.format(table="foreign_equity_holding", where=where)
+        + " ORDER BY current_market_value DESC NULLS LAST",
+        list(params) + list(params),
+    )
     rows = cur.fetchall()
     cur.close()
     out = []
