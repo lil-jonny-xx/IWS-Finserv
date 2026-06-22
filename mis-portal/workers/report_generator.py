@@ -1467,13 +1467,21 @@ def _avg_cost_realised(seq: list, fy_start: date) -> list:
     return out
 
 
-def _fetch_realised_gains(conn, entity_ids: list, as_of: date) -> list:
+def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
+                          since_inception: bool = False,
+                          include_switches: bool = True) -> list:
     """
-    FY-to-date realised gains for the given entity/entities.
+    Realised gains for the given entity/entities.
     MF — auto from mf_transaction (REDEMPTION/SWITCH_OUT vs avg cost).
     Equity — from stock_transaction (SELL vs avg cost) once trades are imported.
+
+    since_inception   — when True, count every sell on/after inception instead of
+                        only the current FY (defaults to FY-to-date).
+    include_switches  — when True (default), SWITCH_IN/SWITCH_OUT count as buys/sells;
+                        when False they are dropped entirely (only real
+                        PURCHASE/REDEMPTION flows feed cost basis and realisations).
     """
-    fy = _fy_start(as_of)
+    fy = date(1900, 1, 1) if since_inception else _fy_start(as_of)
     out: list = []
     cur = conn.cursor()
     ph = ",".join(["%s"] * len(entity_ids))
@@ -1486,8 +1494,8 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date) -> list:
         WHERE t.entity_id IN ({ph})
         ORDER BY t.security_id, t.transaction_date
     """, entity_ids)
-    BUY  = {"PURCHASE", "PURCHASE_SIP", "SWITCH_IN"}
-    SELL = {"REDEMPTION", "SWITCH_OUT"}
+    BUY  = {"PURCHASE", "PURCHASE_SIP"} | ({"SWITCH_IN"}  if include_switches else set())
+    SELL = {"REDEMPTION"}               | ({"SWITCH_OUT"} if include_switches else set())
     by_sec: dict = defaultdict(list)
     for r in cur.fetchall():
         by_sec[r["security_id"]].append(r)

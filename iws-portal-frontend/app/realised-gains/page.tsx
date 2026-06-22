@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
@@ -36,19 +36,63 @@ function pct(v: number | null): string {
   return `${(v * 100).toFixed(2)}%`;
 }
 
+function Toggle<T extends string>({ label, value, onChange, options }: {
+  label: string;
+  value: T;
+  onChange: (v: T) => void;
+  options: { v: T; label: string }[];
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-xs font-medium" style={{ color: 'var(--ghost)' }}>{label}</span>
+      <div className="inline-flex rounded-lg overflow-hidden" style={{ border: '1px solid var(--rule)' }}>
+        {options.map(o => {
+          const active = o.v === value;
+          return (
+            <button
+              key={o.v}
+              onClick={() => onChange(o.v)}
+              className="px-3 py-1 text-xs font-medium transition-colors"
+              style={{
+                background: active ? 'var(--prime)' : 'var(--card)',
+                color: active ? '#fff' : 'var(--dim)',
+              }}
+            >{o.label}</button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+type Period = 'fy' | 'inception';
+type Switches = 'include' | 'exclude';
+
 export default function RealisedGainsPage() {
   const router = useRouter();
   const [rows, setRows] = useState<RealisedRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const [period, setPeriod] = useState<Period>('fy');
+  const [switches, setSwitches] = useState<Switches>('include');
 
-  const fetchRows = useCallback(async () => {
-    const res = await fetch(`${API_URL}/api/v1/realised-gains`, { credentials: 'include' });
-    if (res.status === 401) { router.push('/'); return; }
-    if (res.ok) setRows(await res.json());
-    setLoading(false);
-  }, [router]);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const res = await fetch(
+        `${API_URL}/api/v1/realised-gains?period=${period}&switches=${switches}`,
+        { credentials: 'include' },
+      );
+      if (cancelled) return;
+      if (res.status === 401) { router.push('/'); return; }
+      if (res.ok) setRows(await res.json());
+      setLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [router, period, switches]);
 
-  useEffect(() => { fetchRows(); }, [fetchRows]);
+  // Show the loading state while a toggle change refetches.
+  const changePeriod = (p: Period) => { setLoading(true); setPeriod(p); };
+  const changeSwitches = (s: Switches) => { setLoading(true); setSwitches(s); };
 
   const totalPnl = rows.reduce((s, r) => s + (r.pnl ?? 0), 0);
 
@@ -68,11 +112,14 @@ export default function RealisedGainsPage() {
       </header>
 
       <main className="max-w-6xl mx-auto px-4 py-6">
-        <div className="mb-6 flex items-end justify-between">
+        <div className="mb-4 flex items-end justify-between">
           <div>
-            <h1 className="text-lg font-bold" style={{ color: 'var(--ink)' }}>Realised Gains (FY to date)</h1>
+            <h1 className="text-lg font-bold" style={{ color: 'var(--ink)' }}>
+              Realised Gains ({period === 'inception' ? 'since inception' : 'FY to date'})
+            </h1>
             <p className="text-xs mt-0.5" style={{ color: 'var(--ghost)' }}>
               MF realised auto-computed from CAS transactions. Equity appears once broker trades are imported.
+              {' '}Switches are {switches === 'exclude' ? 'excluded' : 'included'}.
             </p>
           </div>
           <div className="text-right">
@@ -81,6 +128,21 @@ export default function RealisedGainsPage() {
               ₹{inr(totalPnl)}
             </div>
           </div>
+        </div>
+
+        <div className="mb-6 flex flex-wrap items-center gap-x-6 gap-y-2">
+          <Toggle<Period>
+            label="Period"
+            value={period}
+            onChange={changePeriod}
+            options={[{ v: 'fy', label: 'FY to date' }, { v: 'inception', label: 'Since inception' }]}
+          />
+          <Toggle<Switches>
+            label="Switches"
+            value={switches}
+            onChange={changeSwitches}
+            options={[{ v: 'include', label: 'Include' }, { v: 'exclude', label: 'Exclude' }]}
+          />
         </div>
 
         {loading ? (

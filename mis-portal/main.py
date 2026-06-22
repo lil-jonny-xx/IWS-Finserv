@@ -2351,9 +2351,15 @@ def save_benchmarks(
 @app.get("/api/v1/realised-gains")
 def get_realised_gains(
     request: Request,
+    period: str = "fy",
+    switches: str = "include",
     authorization: Optional[str] = Header(None),
 ):
-    """FY-to-date realised gains across all entities (admin)."""
+    """Realised gains across all entities (admin).
+
+    period   — "fy" (default, FY-to-date) or "inception" (whole history).
+    switches — "include" (default) or "exclude" (drop SWITCH_IN/SWITCH_OUT).
+    """
     conn = None
     try:
         payload = _require_auth(request, authorization)
@@ -2367,9 +2373,15 @@ def get_realised_gains(
         entities = cur.fetchall()
         cur.close()
 
+        since_inception  = (period == "inception")
+        include_switches = (switches != "exclude")
         out = []
         for e in entities:
-            for r in _fetch_realised_gains(conn, [e["id"]], date.today()):
+            for r in _fetch_realised_gains(
+                conn, [e["id"]], date.today(),
+                since_inception=since_inception,
+                include_switches=include_switches,
+            ):
                 out.append({
                     "entity":          e["entity_name"],
                     "group":           r["group"],
