@@ -18,7 +18,7 @@ Cron fallback:
 import os
 import sys
 import logging
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 import zoneinfo
@@ -58,6 +58,7 @@ MARKET_OPEN  = (9, 15)   # 09:15 IST
 MARKET_CLOSE = (15, 30)  # 15:30 IST
 
 EOD_SNAPSHOT_WINDOW_MINUTES = 5   # write history in last 5 min before close
+BROKER_CASH_REFRESH_MIN = 30      # min minutes between broker-cash refreshes (cash moves slowly)
 
 
 # ---------------------------------------------------------------------------
@@ -669,10 +670,23 @@ def run():
         # scrape populates ISINs.
         update_nuvama_pms_prices(conn, creds)
 
-        # Refresh per-broker cash balances (shown on the Equity page).
+        # Refresh per-broker cash balances (shown on the Equity page). Cash barely
+        # moves intraday, so throttle to ~every 30 min instead of every loop — this
+        # avoids hammering broker funds endpoints (e.g. Angel One RMS, whose token
+        # can be invalidated intraday) with a per-minute failing call. The daily
+        # sync still refreshes unconditionally.
         try:
-            from equity.equity_sync_worker import refresh_broker_cash
-            refresh_broker_cash(conn)
+            cur = conn.cursor()
+            cur.execute("SELECT MAX(updated_at) AS last FROM broker_cash")
+            row = cur.fetchone()
+            cur.close()
+            last = row["last"] if row else None
+            stale = last is None or (
+                datetime.now(last.tzinfo) - last
+            ) >= timedelta(minutes=BROKER_CASH_REFRESH_MIN)
+            if stale:
+                from equity.equity_sync_worker import refresh_broker_cash
+                refresh_broker_cash(conn)
         except Exception as e:
             logger.warning(f"broker cash refresh failed — {e}")
 
