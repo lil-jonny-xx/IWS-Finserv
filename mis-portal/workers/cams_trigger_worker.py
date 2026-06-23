@@ -483,11 +483,19 @@ def _check_submit_result(page) -> bool:
             "password should contain atleast",
             "password may contain only",
         ]
-        if any(s in content for s in form_reset_signals):
+        matched = [s for s in form_reset_signals if s in content]
+        if matched:
+            # Report the ACTUAL validation message(s) the page showed. The password
+            # is generated CAMS-compliant (_random_pdf_password: ≥2 digits, alnum
+            # only), so a password-specific signal is rare — an email/required-field
+            # reset usually means a transient reCAPTCHA/session reset, which the
+            # retry wrapper backs off and re-attempts.
+            pw_related = any("password" in s for s in matched)
+            cause = ("invalid PDF password" if pw_related
+                     else "transient reCAPTCHA/session reset (fields cleared)")
             logger.error(
-                "CAMS form was reset after Submit — fields cleared with validation errors. "
-                "Likely cause: invalid PDF password (must contain ≥2 digits; "
-                "allowed special chars: @ # $ * _). Hard failure — will not wait for PDF."
+                f"CAMS form was reset after Submit — validation errors {matched}. "
+                f"Likely cause: {cause}. Hard failure — will not wait for PDF."
             )
             return False
 
