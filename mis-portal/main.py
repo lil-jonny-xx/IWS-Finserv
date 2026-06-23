@@ -17,6 +17,7 @@ from slowapi import Limiter
 from slowapi.middleware import SlowAPIMiddleware
 import logging
 import hashlib
+import hmac
 import atexit
 
 from assistant import engine as assistant_engine
@@ -116,6 +117,13 @@ if not SECRET_KEY:
 # Default to an 8-hour working session; override via env without a code change.
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "480"))
 ACCESS_TOKEN_EXPIRE_SECONDS = ACCESS_TOKEN_EXPIRE_MINUTES * 60
+
+# Optional shared secret for the Dhan order-update webhook. Dhan postbacks carry no
+# provider signature and the endpoint is necessarily unauthenticated (no JWT), so when
+# this is set we require the caller to present the same secret (header or ?token=) and
+# reject anything else — preventing forged order events once the handler does real work.
+# Left unset = backward-compatible (endpoint stays open, logs a warning).
+DHAN_POSTBACK_SECRET = os.getenv("DHAN_POSTBACK_SECRET")
 
 def get_db_connection():
     """Get connection from pool with query timeout."""
@@ -2729,18 +2737,47 @@ def download_report(
         release_db_connection(conn)
 
 
+def _verify_dhan_postback(request: Request) -> bool:
+    """
+    Constant-time check of the optional webhook shared secret. Accepts the secret in
+    the `X-Postback-Token` header (preferred) or a `token` query param (use only if the
+    caller can't set headers — query strings can leak into access logs). Returns True
+    when no secret is configured (open, backward-compatible).
+    """
+    if not DHAN_POSTBACK_SECRET:
+        return True
+    presented = request.headers.get("x-postback-token") or request.query_params.get("token") or ""
+    return hmac.compare_digest(presented, DHAN_POSTBACK_SECRET)
+
+
 @app.post("/api/v1/dhan/postback")
+@limiter.limit("120/minute")
 async def dhan_postback(request: Request):
     """
     Dhan order-update postback (webhook).
     Dhan POSTs JSON on every order/trade event.
     We log it and return 200 — downstream processing can be added here.
+
+    Unauthenticated by necessity (Dhan sends no JWT and no signature). Set
+    DHAN_POSTBACK_SECRET to require a shared secret before this is trusted for any
+    state-changing work; until then it only logs.
     """
+    if not _verify_dhan_postback(request):
+        logger.warning("Dhan postback rejected — bad/missing shared secret")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not DHAN_POSTBACK_SECRET:
+        logger.warning("Dhan postback is UNAUTHENTICATED — set DHAN_POSTBACK_SECRET before "
+                       "adding any state-changing processing here")
     try:
         body = await request.json()
     except Exception:
         body = {}
-    logger.info(f"Dhan postback received: {body}")
+    # Redacted log: only non-sensitive routing fields, never the full payload (which can
+    # carry account/order identifiers). Adjust the allow-list when real processing lands.
+    summary = {k: body.get(k) for k in ("orderId", "orderStatus", "transactionType",
+                                        "tradingSymbol", "exchangeSegment") if k in body} \
+        if isinstance(body, dict) else {}
+    logger.info(f"Dhan postback received (fields={sorted(body) if isinstance(body, dict) else 'n/a'}): {summary}")
     return {"status": "ok"}
 
 
