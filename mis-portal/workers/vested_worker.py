@@ -63,6 +63,9 @@ logger = logging.getLogger("vested_worker")
 # ---------------------------------------------------------------------------
 BASE_URL  = os.environ.get("VESTED_BASE_URL", "https://app.vestedfinance.com")
 LOGIN_URL = os.environ.get("VESTED_LOGIN_URL", f"{BASE_URL.rstrip('/')}/login")
+# App home after login — auto-fetches /account/portfolio-summary, which carries
+# the full positions list (the icon-only nav rail has no clickable holdings link).
+HOME_URL  = os.environ.get("VESTED_HOME_URL", f"{BASE_URL.rstrip('/')}/home")
 TXN_URL   = os.environ.get("VESTED_TXN_URL",
                            f"{BASE_URL.rstrip('/')}/en/global/transaction-history")
 # Backend API the transaction-history page calls (separate host → needs the
@@ -257,9 +260,26 @@ def _is_logged_in(page) -> bool:
             return False
     except Exception:
         pass
-    return ps.has_text(page, "global mutual funds", "private markets",
-                       "view portfolio performance", "buying power",
-                       "unrealized p", "us stocks")
+    # The first login screen is a method CHOOSER (buttons, not inputs), so the
+    # input guard above misses it. Detect the chooser explicitly — these controls
+    # never render on the authenticated app home.
+    try:
+        if page.locator(
+            'button:has-text("Continue with Google"), '
+            'button:has-text("Continue with Apple"), '
+            'button:has-text("Login with Email"), '
+            'button:has-text("Log in with Email"), '
+            'a:has-text("Sign up")'
+        ).count() > 0:
+            return False
+    except Exception:
+        pass
+    # Dashboard needles must be markers that do NOT also appear in the login
+    # page's "What's new at Vested" promo sidebar — that panel contains "Global
+    # Funds" and "Private Markets", which previously caused a false positive and
+    # made the worker skip login on an expired session (0 holdings).
+    return ps.has_text(page, "view portfolio performance", "buying power",
+                       "unrealized p", "us stocks and etfs")
 
 
 def _wait_for_pin_page(page, timeout_ms: int = 25000):
@@ -582,12 +602,16 @@ def scrape_holdings(page, cfg: VestedConfig) -> tuple[list[dict], Decimal | None
             pass
 
     page.on("response", _on_response)
-    ps.click(page, [
-        'a:has-text("US Stocks")', 'a:has-text("US Stocks and ETFs")',
-        'a:has-text("Stocks and ETFs")', 'button:has-text("US Stocks")',
-        'a:has-text("Portfolio")', 'a:has-text("Holdings")', '[href*="portfolio" i]',
-    ], "US Stocks and ETFs nav", optional=True)
-    page.wait_for_timeout(5000)
+    # The app home auto-fetches /account/portfolio-summary (and dashboard-v3),
+    # both of which carry the full positions list. The left-rail nav is icon-only
+    # (no text/anchors), so the old has-text() click never matched — and even when
+    # it did nothing, holdings only worked by luck of timing. Re-load /home with
+    # the listener already attached so that JSON fires while we're capturing it.
+    try:
+        page.goto(HOME_URL, timeout=ps.NAV_TIMEOUT, wait_until="domcontentloaded")
+    except Exception:
+        pass
+    page.wait_for_timeout(7000)
     ps.shot(page, CFG, f"vested_holdings_{cfg.prefix}.png")
 
     holdings: list[dict] = []
