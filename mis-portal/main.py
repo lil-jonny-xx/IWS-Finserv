@@ -211,9 +211,9 @@ class LoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=6, max_length=72)
 
-@app.get("/api/ping")
+@app.api_route("/api/ping", methods=["GET", "HEAD"])
 def ping():
-    """Public health check for uptime monitoring."""
+    """Public health check for uptime monitoring (GET + HEAD for UptimeRobot)."""
     return {"status": "ok"}
 
 @app.get("/api/v1/health")
