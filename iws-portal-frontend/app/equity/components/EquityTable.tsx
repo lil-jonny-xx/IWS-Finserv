@@ -46,6 +46,9 @@ export interface EquityTotals {
   grand_total?: number;
   cash_balance?: number;
   value_plus_cash?: number;
+  portfolio_xirr_pct?: number | null;   // money-weighted return from ledger cash flows (entity scope)
+  portfolio_income?: number | null;     // dividends + interest received (INR)
+  portfolio_coverage?: string | null;   // 'full' | 'partial'
 }
 
 interface Props {
@@ -559,6 +562,21 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
                 style={{ color: avgCagrAll >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
                 {fmtPct(avgCagrAll)} p.a.
               </p>
+            </div>
+          )}
+          {totals.portfolio_xirr_pct != null && (
+            <div title="Money-weighted return (XIRR) from actual deposits, withdrawals & dividends in the broker ledger">
+              <p className="text-xs text-ghost mb-0.5">Portfolio XIRR</p>
+              <p className="text-sm font-semibold tabular-nums"
+                style={{ color: totals.portfolio_xirr_pct >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
+                {fmtPct(totals.portfolio_xirr_pct)} p.a.
+              </p>
+            </div>
+          )}
+          {totals.portfolio_income != null && totals.portfolio_income > 0 && (
+            <div title="Dividends & interest received (from broker ledgers)">
+              <p className="text-xs text-ghost mb-0.5">Dividends/Int</p>
+              <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(totals.portfolio_income)}</p>
             </div>
           )}
           <div>

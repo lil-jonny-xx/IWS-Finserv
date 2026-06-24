@@ -1,6 +1,9 @@
 # Graphify knowledge graph — local only
 graphify-out/
 
+# Uploaded broker statements (tradebooks/ledgers) — financial PII, never commit
+mis-portal/data/
+
 # Python
 mis-portal/venv/
 mis-portal/__pycache__/

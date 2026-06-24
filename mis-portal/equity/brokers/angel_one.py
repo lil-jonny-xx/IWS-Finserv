@@ -117,6 +117,22 @@ def fetch_holdings(entity_code: str) -> list[dict]:
     return holdings
 
 
+def fetch_trades(entity_code: str) -> list[dict]:
+    """Today's executed trades from SmartAPI tradeBook (current day only).
+    Each item: tradingsymbol, transactiontype(BUY/SELL), fillsize, fillprice,
+    tradeid, exchange, filltime, symboltoken."""
+    obj  = _smart_client(entity_code)
+    resp = obj.tradeBook() or {}
+    if not resp.get("status"):
+        # No trades today returns status True + empty data; a real failure has a message.
+        msg = resp.get("message") or ""
+        if "no data" not in msg.lower() and resp.get("data") is None and msg:
+            raise RuntimeError(f"[{entity_code}] Angel One tradeBook failed: {msg}")
+    trades = resp.get("data") or []
+    logger.info(f"[{entity_code}] Angel One: fetched {len(trades)} trades")
+    return trades
+
+
 def fetch_cash_balance(entity_code: str) -> Decimal:
     """
     Available cash for the Angel One account via SmartAPI RMS limits.

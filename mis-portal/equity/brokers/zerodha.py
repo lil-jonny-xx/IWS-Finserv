@@ -166,6 +166,17 @@ def fetch_holdings(entity_code: str) -> list[dict]:
     return holdings
 
 
+def fetch_trades(entity_code: str) -> list[dict]:
+    """Today's executed trades from Kite. Kite only retains the CURRENT trading
+    day's trades, so this must run after market close each day to not miss fills.
+    Each item: tradingsymbol, transaction_type(BUY/SELL), quantity, average_price,
+    trade_id, exchange, fill_timestamp."""
+    kite   = _kite_client(entity_code)
+    trades = kite.trades() or []
+    logger.info(f"[{entity_code}] Zerodha: fetched {len(trades)} trades")
+    return trades
+
+
 def fetch_cash_balance(entity_code: str) -> Decimal:
     """
     Available cash in the Zerodha equity segment, from Kite Connect margins.

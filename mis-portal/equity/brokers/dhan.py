@@ -190,6 +190,36 @@ def fetch_holdings(entity_code: str) -> list[dict]:
     return holdings
 
 
+def fetch_trades(entity_code: str, from_date: str, to_date: str) -> list[dict]:
+    """Executed trades over a date range from Dhan trade history (paginated).
+    Unlike Zerodha/Angel, Dhan exposes a date-ranged history, so gaps self-heal.
+    Each item: tradingSymbol/customSymbol, securityId, isin, transactionType
+    (BUY/SELL), tradedQuantity, tradedPrice, exchangeSegment, exchangeTime."""
+    dhan = _dhan_client(entity_code)
+    out, page = [], 0
+    while True:
+        resp = dhan.get_trade_history(from_date=from_date, to_date=to_date, page_number=page)
+        data = (resp or {}).get("data") or []
+        if not data:
+            break
+        out.extend(data)
+        page += 1
+        if page > 50:                       # safety cap
+            break
+    logger.info(f"[{entity_code}] Dhan: fetched {len(out)} trades {from_date}→{to_date}")
+    return out
+
+
+def fetch_ledger(entity_code: str, from_date: str, to_date: str) -> list[dict]:
+    """Cash ledger over a date range from Dhan (deposits/withdrawals/charges).
+    Each item: date, voucherdate, narration/description, debit, credit, runbal."""
+    dhan = _dhan_client(entity_code)
+    resp = dhan.ledger_report(from_date=from_date, to_date=to_date)
+    data = (resp or {}).get("data") or []
+    logger.info(f"[{entity_code}] Dhan: fetched {len(data)} ledger rows {from_date}→{to_date}")
+    return data
+
+
 def fetch_cash_balance(entity_code: str) -> Decimal:
     """
     Available cash for the Dhan account via the fund-limit endpoint.
