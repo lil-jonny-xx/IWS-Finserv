@@ -23,9 +23,12 @@ Env vars (per entity, replace {CODE} with the entity code e.g. DHR):
 """
 import logging
 import os
+import random
 import time
 import xml.etree.ElementTree as ET
+from datetime import date
 from decimal import Decimal
+from pathlib import Path
 
 import requests
 
@@ -41,18 +44,143 @@ _SEND_URL = "https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStateme
 _GET_URL  = "https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService.GetStatement"
 _VERSION  = "3"
 
+# Flex Web Service rate limits (per IBKR docs): 1 request/second AND 10
+# requests/minute, PER TOKEN. Exceeding returns 1018 ("too many requests from
+# this token"); bursts can also trip a transient 1001 ("statement could not be
+# generated"), and 1009 means the server is busy / 1019 "in progress" — all
+# retryable. We pace EVERY Flex request (SendRequest + GetStatement polls) through
+# _flex_get(), which holds a randomized minimum gap between calls so we stay well
+# under the 10/min ceiling and never hit the service with a perfectly periodic
+# cadence (which can itself trip the server-side throttle). The gap is tunable via
+# .env for ad-hoc backfills.
+# 1025 ("too many failed attempts") is a hard cooldown LOCKOUT — never retry it;
+# retrying only deepens it. The transient/throttle codes below get a SMALL number
+# of retries with a LONG randomized wait: rapid sub-minute retries are precisely
+# what escalate a transient 1001 into a token-wide throttle and then a 1025
+# (learned the hard way — the cure for 1001 is silence, not more requests).
+_RETRYABLE_SEND_CODES = {"1001", "1009", "1018", "1019"}
+_SEND_RETRIES = int(os.environ.get("IBKR_FLEX_SEND_RETRIES", "2"))           # total attempts (1 retry)
+_SEND_BACKOFF = float(os.environ.get("IBKR_FLEX_THROTTLE_WAIT_SEC", "90"))   # base s between throttle retries (× attempt)
+
+# Randomized minimum gap between consecutive Flex requests. Defaults give a
+# 7–13s spacing (≈ 4.6–8.6 req/min, comfortably under the 10/min limit).
+_FLEX_MIN_GAP = float(os.environ.get("IBKR_FLEX_MIN_GAP_SEC", "7"))   # base seconds
+_FLEX_JITTER  = float(os.environ.get("IBKR_FLEX_JITTER_SEC", "6"))    # random 0..this, added
+_last_req_ts  = 0.0   # monotonic timestamp of the last Flex request (module-wide pacing)
+
+# In-process cache of generated statements. Holdings AND cash come from the SAME Flex
+# query (Open Positions + Cash Report), so fetch_holdings() + fetch_cash_balance() would
+# otherwise fire TWO SendRequests for one query back-to-back — exactly the rapid
+# same-query regeneration that escalates a transient 1001 into a token-wide throttle and
+# then a 1025 lockout. Caching the parsed statement briefly lets the second call reuse the
+# first's result with zero extra requests. A Flex statement is a point-in-time daily
+# snapshot, so reuse within the TTL is correct.
+_STMT_CACHE: dict = {}
+_STMT_CACHE_TTL = float(os.environ.get("IBKR_FLEX_STMT_CACHE_SEC", "600"))   # seconds
+
+# PERSISTENT (on-disk) fallback. A Flex statement is a daily snapshot, so when a live
+# fetch is throttled (1001/1025) the last statement we successfully pulled is still a far
+# better answer than nothing/very-stale DB values. Every successful daily fetch is saved
+# here; on a live failure we fall back to the most recent saved copy if it's within
+# _STMT_DISK_MAX_AGE. Only the daily query (no date range) is disk-cached — backfill date
+# windows are one-off and must not be reused.
+_STMT_DISK_DIR = Path(os.environ.get(
+    "IBKR_STMT_CACHE_DIR", "/var/www/mis-portal/.ibkr_statements"))
+_STMT_DISK_MAX_AGE = float(os.environ.get("IBKR_STMT_CACHE_MAX_AGE_DAYS", "7")) * 86400
+
+
+def _disk_cache_path(acct_prefix: str, query_id: str) -> "Path":
+    return _STMT_DISK_DIR / f"{acct_prefix}_{query_id}.xml"
+
+
+def _save_statement_disk(acct_prefix: str, query_id: str, stmt: ET.Element) -> None:
+    try:
+        _STMT_DISK_DIR.mkdir(parents=True, exist_ok=True)
+        _disk_cache_path(acct_prefix, query_id).write_bytes(ET.tostring(stmt))
+    except Exception as e:
+        logger.warning(f"[{acct_prefix}] could not save IBKR statement to disk: {e}")
+
+
+def _load_statement_disk(acct_prefix: str, query_id: str):
+    """Return (stmt, age_seconds) from the on-disk copy if it exists and is within
+    _STMT_DISK_MAX_AGE; else None."""
+    path = _disk_cache_path(acct_prefix, query_id)
+    try:
+        if not path.exists():
+            return None
+        age = time.time() - path.stat().st_mtime
+        if age > _STMT_DISK_MAX_AGE:
+            logger.warning(f"[{acct_prefix}] on-disk IBKR statement is {age/86400:.1f}d old "
+                           f"(> {_STMT_DISK_MAX_AGE/86400:.0f}d cap) — not using it")
+            return None
+        return ET.fromstring(path.read_bytes()), age
+    except Exception as e:
+        logger.warning(f"[{acct_prefix}] could not read cached IBKR statement: {e}")
+        return None
+
+
+def _flex_get(url: str, params: dict, timeout: int = 60) -> "requests.Response":
+    """Paced GET against the Flex Web Service.
+
+    Blocks until at least a randomized _FLEX_MIN_GAP .. (_FLEX_MIN_GAP+_FLEX_JITTER)
+    seconds have elapsed since the previous Flex request, keeping us under IBKR's
+    1/sec & 10/min per-token limit and avoiding a perfectly periodic request
+    pattern that can still trip the 1001/1018 throttle.
+    """
+    global _last_req_ts
+    gap  = _FLEX_MIN_GAP + random.uniform(0, _FLEX_JITTER)
+    wait = _last_req_ts + gap - time.monotonic()
+    if wait > 0:
+        logger.debug(f"IBKR Flex pacing: sleeping {wait:.1f}s before next request")
+        time.sleep(wait)
+    try:
+        return requests.get(url, params=params, timeout=timeout)
+    finally:
+        _last_req_ts = time.monotonic()
+
 # entity_name (DB) → env var prefix when they differ (matches the other adapters)
 _ENV_PREFIX = {
     "Rajani Corp": "RAJANIRCORP",
 }
 
 
-def _env(entity_code: str, key: str, required: bool = True, default: str = "") -> str:
-    prefix = _ENV_PREFIX.get(entity_code, entity_code)
-    val = os.environ.get(f"IBKR_{prefix}_{key}", default)
+def _resolve_prefix(entity_code: str) -> str:
+    return _ENV_PREFIX.get(entity_code, entity_code)
+
+
+def _get(acct_prefix: str, key: str, required: bool = True, default: str = "") -> str:
+    """Read IBKR_{acct_prefix}_{key} from the environment."""
+    val = os.environ.get(f"IBKR_{acct_prefix}_{key}", default)
     if required and not val:
-        raise KeyError(f"IBKR_{prefix}_{key} not set in .env")
+        raise KeyError(f"IBKR_{acct_prefix}_{key} not set in .env")
     return val
+
+
+def _env(entity_code: str, key: str, required: bool = True, default: str = "") -> str:
+    """Back-compat shim: read a key from the entity's PRIMARY login only."""
+    return _get(_resolve_prefix(entity_code), key, required, default)
+
+
+def _account_prefixes(entity_code: str) -> list[str]:
+    """Env-var prefixes for every IBKR login that feeds this entity.
+
+    A single portal entity (e.g. DHR) can aggregate more than one IBKR login: the
+    primary prefix (IBKR_DHR_*) plus numbered extras (IBKR_DHR_2_*, IBKR_DHR_3_*,
+    ...). Use the extras when one master login covers some accounts but another
+    account is logged in separately — each login needs its own token/query, yet
+    all their holdings/trades roll up under the one entity.
+    """
+    base = _resolve_prefix(entity_code)
+    prefixes: list[str] = []
+    if os.environ.get(f"IBKR_{base}_FLEX_TOKEN"):
+        prefixes.append(base)
+    n = 2
+    while os.environ.get(f"IBKR_{base}_{n}_FLEX_TOKEN"):
+        prefixes.append(f"{base}_{n}")
+        n += 1
+    if not prefixes:
+        raise KeyError(f"IBKR_{base}_FLEX_TOKEN not set in .env")
+    return prefixes
 
 
 def cash_currency(entity_code: str) -> str:
@@ -63,37 +191,102 @@ def cash_currency(entity_code: str) -> str:
 # Flex Web Service — two-step fetch
 # ---------------------------------------------------------------------------
 
-def _fetch_statement_xml(entity_code: str, query_id: str = "") -> ET.Element:
-    token    = _env(entity_code, "FLEX_TOKEN")
-    query_id = query_id or _env(entity_code, "QUERY_ID")
+def _fetch_statement_xml(
+    acct_prefix: str,
+    query_id: str = "",
+    from_date: "date | None" = None,
+    to_date: "date | None" = None,
+) -> ET.Element:
+    query_id = query_id or _get(acct_prefix, "QUERY_ID")
+    cache_key = (acct_prefix, query_id,
+                 from_date.isoformat() if from_date else None,
+                 to_date.isoformat() if to_date else None)
+    cached = _STMT_CACHE.get(cache_key)
+    if cached and (time.monotonic() - cached[0]) < _STMT_CACHE_TTL:
+        logger.info(f"[{acct_prefix}] IBKR Flex statement cache hit (q={query_id}) — "
+                    f"reusing, no new SendRequest")
+        return cached[1]
+
+    daily = from_date is None and to_date is None   # only the daily query is disk-cached
+    try:
+        stmt = _fetch_statement_xml_live(acct_prefix, query_id, from_date, to_date)
+    except Exception as e:
+        # Throttled (1001/1025) or otherwise unavailable: fall back to the last statement
+        # we successfully saved for this query, if it's still fresh enough. A day-old
+        # snapshot beats blanking out holdings/cash. Re-raise if there's nothing to use.
+        if daily:
+            fallback = _load_statement_disk(acct_prefix, query_id)
+            if fallback is not None:
+                stmt, age = fallback
+                logger.warning(f"[{acct_prefix}] live Flex fetch failed ({e}); USING CACHED "
+                               f"on-disk statement from {age/3600:.1f}h ago (q={query_id})")
+                _STMT_CACHE[cache_key] = (time.monotonic(), stmt)
+                return stmt
+        raise
+
+    _STMT_CACHE[cache_key] = (time.monotonic(), stmt)
+    if daily:
+        _save_statement_disk(acct_prefix, query_id, stmt)
+    return stmt
+
+
+def _fetch_statement_xml_live(
+    acct_prefix: str,
+    query_id: str,
+    from_date: "date | None" = None,
+    to_date: "date | None" = None,
+) -> ET.Element:
+    """Live two-step Flex fetch (SendRequest → poll GetStatement). Raises on failure."""
+    token = _get(acct_prefix, "FLEX_TOKEN")
 
     # Step 1 — request statement generation, get a reference code.
-    resp = requests.get(
-        _SEND_URL,
-        params={"t": token, "q": query_id, "v": _VERSION},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    root = ET.fromstring(resp.content)
+    # fd/td override the saved query's date period (yyyymmdd, max 365-day span).
+    params = {"t": token, "q": query_id, "v": _VERSION}
+    if from_date and to_date:
+        params["fd"] = from_date.strftime("%Y%m%d")
+        params["td"] = to_date.strftime("%Y%m%d")
 
-    status = (root.findtext("Status") or "").strip()
-    if status != "Success":
-        raise RuntimeError(
-            f"[{entity_code}] IBKR Flex SendRequest failed: "
-            f"{root.findtext('ErrorCode')} {root.findtext('ErrorMessage')}"
-        )
+    # IBKR paces statement generation: regenerating the same query in quick
+    # succession returns Status=Fail / ErrorCode 1001 ("could not be generated at
+    # this time, try again shortly"). That's transient — back off and retry.
+    root = None
+    for attempt in range(_SEND_RETRIES):
+        resp = _flex_get(_SEND_URL, params, timeout=30)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+        status = (root.findtext("Status") or "").strip()
+        if status == "Success":
+            break
+        code = (root.findtext("ErrorCode") or "").strip()
+        msg  = (root.findtext("ErrorMessage") or "").strip()
+        if code == "1025":
+            # Hard cooldown lockout — retrying extends it. Bail immediately.
+            raise RuntimeError(
+                f"[{acct_prefix}] IBKR Flex 1025 (too many failed attempts): token is in a "
+                f"cooldown LOCKOUT — stop all requests and let it rest (do NOT retry). {msg}")
+        retryable = code in _RETRYABLE_SEND_CODES or "try again" in msg.lower()
+        if retryable and attempt < _SEND_RETRIES - 1:
+            # Linear backoff with jitter, on top of the per-request pacing gap.
+            wait = _SEND_BACKOFF * (attempt + 1) + random.uniform(0, _FLEX_JITTER)
+            logger.info(f"[{acct_prefix}] IBKR Flex SendRequest pacing "
+                        f"({code} {msg}); retry {attempt + 1}/{_SEND_RETRIES - 1} in {wait:.0f}s")
+            time.sleep(wait)
+            continue
+        raise RuntimeError(f"[{acct_prefix}] IBKR Flex SendRequest failed: {code} {msg}")
+
     reference_code = (root.findtext("ReferenceCode") or "").strip()
     get_url        = (root.findtext("Url") or _GET_URL).strip()
     if not reference_code:
-        raise RuntimeError(f"[{entity_code}] IBKR Flex: no ReferenceCode returned")
+        raise RuntimeError(f"[{acct_prefix}] IBKR Flex: no ReferenceCode returned")
 
     # Step 2 — poll for the generated statement (IBKR may report "in progress").
     last_msg = ""
     for attempt in range(6):
-        time.sleep(2 if attempt == 0 else 5)
-        r = requests.get(
+        # _flex_get already enforces a randomized gap (≥7s), which doubles as the
+        # wait for the statement to finish generating — no extra fixed sleep needed.
+        r = _flex_get(
             get_url,
-            params={"t": token, "q": reference_code, "v": _VERSION},
+            {"t": token, "q": reference_code, "v": _VERSION},
             timeout=60,
         )
         r.raise_for_status()
@@ -102,13 +295,13 @@ def _fetch_statement_xml(entity_code: str, query_id: str = "") -> ET.Element:
         # Ready statements are rooted at <FlexQueryResponse>. A still-generating
         # or errored response comes back as <FlexStatementResponse> with a Status.
         if stmt.tag == "FlexQueryResponse":
-            logger.info(f"[{entity_code}] IBKR Flex statement retrieved (attempt {attempt + 1})")
+            logger.info(f"[{acct_prefix}] IBKR Flex statement retrieved (attempt {attempt + 1})")
             return stmt
 
         last_msg = f"{stmt.findtext('ErrorCode')} {stmt.findtext('ErrorMessage')}"
-        logger.info(f"[{entity_code}] IBKR Flex not ready ({last_msg}); retrying")
+        logger.info(f"[{acct_prefix}] IBKR Flex not ready ({last_msg}); retrying")
 
-    raise RuntimeError(f"[{entity_code}] IBKR Flex statement not ready after retries: {last_msg}")
+    raise RuntimeError(f"[{acct_prefix}] IBKR Flex statement not ready after retries: {last_msg}")
 
 
 # ---------------------------------------------------------------------------
@@ -119,44 +312,58 @@ def fetch_holdings(entity_code: str) -> list[dict]:
     """
     Open positions from the Flex statement, as attribute dicts.
 
-    Relevant OpenPosition attributes:
+    Pulls every IBKR login that feeds this entity (primary + numbered extras) and
+    concatenates the rows; the same symbol can appear once per (sub)account, so
+    normalise() sums them. Relevant OpenPosition attributes:
       symbol, isin, currency, position, costBasisPrice, markPrice,
       listingExchange, assetCategory, levelOfDetail
     """
-    root = _fetch_statement_xml(entity_code)
-    positions = [
-        el.attrib
-        for el in root.iter("OpenPosition")
-        # SUMMARY rows aggregate the LOT rows — keep only SUMMARY to avoid
-        # double-counting when the query is configured at lot level.
-        if el.attrib.get("levelOfDetail", "SUMMARY") != "LOT"
-    ]
-    logger.info(f"[{entity_code}] IBKR: fetched {len(positions)} open positions")
+    prefixes = _account_prefixes(entity_code)
+    positions: list[dict] = []
+    for p in prefixes:
+        root = _fetch_statement_xml(p)
+        positions += [
+            el.attrib
+            for el in root.iter("OpenPosition")
+            # SUMMARY rows aggregate the LOT rows — keep only SUMMARY to avoid
+            # double-counting when the query is configured at lot level.
+            if el.attrib.get("levelOfDetail", "SUMMARY") != "LOT"
+        ]
+    logger.info(f"[{entity_code}] IBKR: fetched {len(positions)} open positions "
+                f"across {len(prefixes)} login(s)")
     return positions
 
 
-def fetch_trades(entity_code: str) -> list[dict]:
+def fetch_trades(
+    entity_code: str,
+    from_date: "date | None" = None,
+    to_date: "date | None" = None,
+) -> list[dict]:
     """
     All executed trades from the *Trades* Flex query, as attribute dicts.
 
-    Uses a SEPARATE saved query — IBKR_{CODE}_TRADES_QUERY_ID — that has the
-    "Trades" section enabled (the daily QUERY_ID is positions/cash only). Used by
-    the one-time inception backfill (equity/ibkr_backfill_inception.py).
+    Uses a SEPARATE saved query per login — IBKR_{PREFIX}_TRADES_QUERY_ID — that
+    has the "Trades" section enabled (the daily QUERY_ID is positions/cash only).
+    Used by the one-time inception backfill (equity/ibkr_backfill_inception.py).
+    Pulls every login feeding this entity and concatenates; ledger dedup is by
+    `tradeID`, so trades from different accounts never collide.
 
-    NOTE: the Flex Web Service caps a single statement at 365 days and does not
-    accept date parameters — the range is whatever the saved query specifies. For
-    an account older than a year, run the backfill once per year-window, changing
-    the saved query's custom date range between runs; the ledger upsert dedups by
-    `tradeID`, so re-imported trades are harmless.
+    The Flex Web Service caps a single statement at 365 days, but DOES accept an
+    fd/td date-range override (yyyymmdd) on SendRequest — so pass from_date/to_date
+    to pull an arbitrary ~1-year window without editing the saved query. For an
+    account older than a year, call once per year-window; the ledger upsert dedups
+    by `tradeID`, so overlapping/re-imported trades are harmless.
 
     Relevant Trade attributes:
       symbol, isin, currency, tradeID, tradeDate (YYYYMMDD), buySell,
       quantity (signed: sells negative), tradePrice, ibCommission (negative),
       netCash (signed cash impact incl. commission)
     """
-    query_id = _env(entity_code, "TRADES_QUERY_ID")
-    root = _fetch_statement_xml(entity_code, query_id)
-    trades = [el.attrib for el in root.iter("Trade")]
+    trades: list[dict] = []
+    for p in _account_prefixes(entity_code):
+        query_id = _get(p, "TRADES_QUERY_ID")
+        root = _fetch_statement_xml(p, query_id, from_date, to_date)
+        trades += [el.attrib for el in root.iter("Trade")]
     logger.info(f"[{entity_code}] IBKR: fetched {len(trades)} trades")
     return trades
 
@@ -164,16 +371,63 @@ def fetch_trades(entity_code: str) -> list[dict]:
 def fetch_cash_balance(entity_code: str) -> Decimal:
     """
     Ending cash from the Flex Cash Report, in the account base currency
-    (BASE_SUMMARY row). Returns 0 if the query has no Cash Report section.
+    (BASE_SUMMARY row). Sums the BASE_SUMMARY row of every (sub)account across all
+    logins feeding this entity. Returns 0 if no query has a Cash Report section.
     """
-    root = _fetch_statement_xml(entity_code)
+    total = Decimal("0")
+    for p in _account_prefixes(entity_code):
+        root = _fetch_statement_xml(p)
+        total += _cash_from_root(root)
+    return total
+
+
+def _positions_from_root(root: ET.Element) -> list[dict]:
+    # SUMMARY rows aggregate the LOT rows — keep only SUMMARY to avoid double-counting.
+    return [el.attrib for el in root.iter("OpenPosition")
+            if el.attrib.get("levelOfDetail", "SUMMARY") != "LOT"]
+
+
+def _cash_from_root(root: ET.Element) -> Decimal:
+    total = Decimal("0")
     for el in root.iter("CashReportCurrency"):
         if el.attrib.get("currency") == "BASE_SUMMARY":
             try:
-                return Decimal(str(el.attrib.get("endingCash") or "0"))
+                total += Decimal(str(el.attrib.get("endingCash") or "0"))
             except Exception:
-                return Decimal("0")
-    return Decimal("0")
+                continue
+    return total
+
+
+def fetch_positions_and_cash(entity_code: str) -> "tuple[list[dict], Decimal, list[str]]":
+    """Open positions AND ending cash from ONE Flex statement per login.
+
+    Holdings and cash both come from the same query (Open Positions + Cash Report), so
+    this pulls the statement a single time and parses both sections out of it — exactly
+    one SendRequest per login, never the back-to-back same-query regeneration that trips
+    the 1001 throttle.
+
+    Returns (positions, cash_in_base_currency, failed_prefixes). One login failing does
+    NOT discard the logins that succeeded, but the caller must treat a non-empty
+    failed_prefixes as a PARTIAL result: positions/cash for this entity are an aggregate
+    across all its logins, so persisting a partial run would understate cash/holdings.
+    """
+    prefixes = _account_prefixes(entity_code)
+    positions: list[dict] = []
+    cash = Decimal("0")
+    failures: list[str] = []
+    for p in prefixes:
+        try:
+            root = _fetch_statement_xml(p)
+        except Exception as e:
+            logger.error(f"[{p}] IBKR fetch failed — {e}")
+            failures.append(p)
+            continue
+        positions += _positions_from_root(root)
+        cash      += _cash_from_root(root)
+    logger.info(f"[{entity_code}] IBKR: {len(positions)} positions + cash {cash} "
+                f"from {len(prefixes) - len(failures)}/{len(prefixes)} login(s)"
+                + (f"; FAILED: {failures}" if failures else ""))
+    return positions, cash, failures
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +435,11 @@ def fetch_cash_balance(entity_code: str) -> Decimal:
 # ---------------------------------------------------------------------------
 
 def normalise(entity_id: int, entity_code: str, raw: list[dict]) -> list[EquityHolding]:
-    result = []
+    # equity_holding is keyed (entity_id, broker, symbol), so the same symbol held
+    # in more than one (sub)account must be merged here — otherwise the upsert
+    # would overwrite rather than sum. Aggregate quantity and total cost (the cost
+    # basis is summed; avg_cost is recomputed as a quantity-weighted average).
+    agg: dict[str, dict] = {}
     for h in raw:
         try:
             qty = Decimal(str(h.get("position") or "0"))
@@ -193,17 +451,40 @@ def normalise(entity_id: int, entity_code: str, raw: list[dict]) -> list[EquityH
         if qty <= 0:
             continue
 
+        symbol = h.get("symbol", "") or h.get("isin", "")
+        a = agg.get(symbol)
+        if a is None:
+            agg[symbol] = {
+                "isin":     h.get("isin", "") or "",
+                "exchange": h.get("listingExchange", "") or "NASDAQ",
+                "qty":      qty,
+                "cost":     qty * avg,
+                "ltp":      ltp,
+                "currency": (h.get("currency") or CURRENCY).upper(),
+            }
+        else:
+            a["qty"]  += qty
+            a["cost"] += qty * avg
+            if ltp and not a["ltp"]:
+                a["ltp"] = ltp
+
+    result = []
+    for symbol, a in agg.items():
+        qty = a["qty"]
+        if qty <= 0:
+            continue
+        avg = (a["cost"] / qty) if qty else Decimal("0")
         result.append(EquityHolding(
             entity_id            = entity_id,
             broker               = _LABEL,
-            symbol               = h.get("symbol", "") or h.get("isin", ""),
-            isin                 = h.get("isin", "") or "",
-            exchange             = h.get("listingExchange", "") or "NASDAQ",
+            symbol               = symbol,
+            isin                 = a["isin"],
+            exchange             = a["exchange"],
             quantity             = qty,
-            avg_cost             = avg,
-            cost                 = (qty * avg).quantize(Decimal("0.01")),
-            current_price        = ltp,
-            current_market_value = (qty * ltp).quantize(Decimal("0.01")),
-            currency             = (h.get("currency") or CURRENCY).upper(),
+            avg_cost             = avg.quantize(Decimal("0.0001")),
+            cost                 = a["cost"].quantize(Decimal("0.01")),
+            current_price        = a["ltp"],
+            current_market_value = (qty * a["ltp"]).quantize(Decimal("0.01")),
+            currency             = a["currency"],
         ))
     return result

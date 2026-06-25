@@ -86,10 +86,12 @@ def current_value(cur, entity_id, fx):
     v = float(cur.fetchone()["v"])
     cur.execute("SELECT COALESCE(SUM(current_market_value),0) v FROM foreign_equity_holding WHERE entity_id=%s", (entity_id,))
     v += float(cur.fetchone()["v"])
-    cur.execute("SELECT broker, balance, currency FROM broker_cash WHERE entity_id=%s", (entity_id,))
+    # broker_cash.balance is ALREADY in INR (refresh_broker_cash converts foreign
+    # cash and stores the native amount separately in balance_native). Summing it
+    # directly — multiplying by fx here double-converts USD/SGD cash by ~95x.
+    cur.execute("SELECT balance FROM broker_cash WHERE entity_id=%s", (entity_id,))
     for row in cur.fetchall():
-        bal = float(row["balance"] or 0)
-        v += bal * (fx if (row["currency"] or "INR").upper() == "USD" else 1.0)
+        v += float(row["balance"] or 0)
     return v
 
 
@@ -128,11 +130,17 @@ def main():
         rate = xirr(flows)
         net_invested = -dep - wd          # dep is negative (outflow); wd positive (inflow)
         xirr_pct = round(rate * 100, 4) if rate is not None else None
-        # XIRR is only trustworthy when the ledger captures the capital behind the current
-        # value: implausible rate, non-positive net investment, or value >> net invested
-        # (pre-ledger holdings transferred in) all mean incomplete deposit history.
+        # XIRR is only trustworthy when the ledger and the holdings describe the SAME
+        # book. Reject it when they clearly don't: implausible rate, non-positive net
+        # investment, value >> net invested (pre-ledger holdings transferred in), or
+        # value far BELOW net invested. The last case isn't a real loss for a long-only
+        # book — it means the holdings table is mismatched/incomplete vs the deposit
+        # ledger (e.g. Rajani Corp's mislabelled Dhan import), which yields a spurious
+        # deeply-negative XIRR. Keep XIRR only when value sits within [0.25x, 3x] of
+        # net invested.
         plausible = (xirr_pct is not None and abs(xirr_pct) <= 300
-                     and net_invested > 0 and cv <= 3 * net_invested)
+                     and net_invested > 0
+                     and 0.25 * net_invested <= cv <= 3 * net_invested)
         cov = "full" if plausible else "partial"
         if not plausible:
             xirr_pct = None

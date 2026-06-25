@@ -1,0 +1,14 @@
+[Unit]
+Description=IWS MIS Portal — Foreign Equity Price Worker (every minute, US hours)
+Requires=mis-portal-foreign-price.service
+
+[Timer]
+# Fire 60s after the previous run finishes. With ~45 symbols = 45 Finnhub calls/run and
+# the free-tier limit of 60 calls/min, a 1-minute cadence is the most real-time refresh
+# that stays under the quota. Runs are guarded to US hours inside the worker.
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target

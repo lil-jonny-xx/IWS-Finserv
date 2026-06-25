@@ -61,10 +61,15 @@ def f(x):
     return float(x) if x is not None else None
 
 
+ANNUALISE_MIN_DAYS = 365   # only show annualised returns (CAGR/XIRR) once held ≥1 year
+
 def ann_guard(value_pct, days):
-    """Annualised returns are meaningless for very short holds and explode numerically.
-    Suppress (NULL) anything under ~90 days or outside a plausible [-99.99, 1000]% band."""
-    if value_pct is None or days is None or days < 90:
+    """Annualised returns (CAGR/XIRR) are only meaningful once a position has been held
+    for a full year — below that the per-period rate gets annualised into a misleading
+    figure (and explodes numerically for very short holds). For sub-year holdings the UI
+    shows the absolute return (returns_inception_pct) instead, so suppress (NULL) anything
+    under 365 days or outside a plausible [-99.99, 1000]% band."""
+    if value_pct is None or days is None or days < ANNUALISE_MIN_DAYS:
         return None
     if value_pct < -99.99 or value_pct > 1000.0:
         return None
@@ -153,8 +158,9 @@ def compute(cur, h):
         else:
             out["method"] += "*"                       # computed but suppressed (too short/extreme)
 
-    # CAGR (point-to-point)
-    if first_dt and cost > 0 and cmv is not None and days and days >= 1:
+    # CAGR (point-to-point) — only annualise once held ≥1 year; below that the UI shows
+    # the absolute return (returns_inception_pct) instead of a misleading annualised rate.
+    if first_dt and cost > 0 and cmv is not None and days and days >= ANNUALISE_MIN_DAYS:
         cagr = ann_guard(((cmv / cost) ** (365.0 / days) - 1) * 100, days)
         if cagr is not None:
             out["cagr_inception_pct"] = cagr

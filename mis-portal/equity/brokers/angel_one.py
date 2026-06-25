@@ -41,9 +41,14 @@ def _env(entity_code: str, key: str) -> str:
 
 def _smart_client(entity_code: str) -> SmartConnect:
     api_key      = _env(entity_code, "API_KEY")
+    # tokens.json is the authoritative, daily-refreshed store (written by
+    # token_refresh_worker and by refresh_access_token below). Read it FIRST so a
+    # stale value pinned in .env can never mask the fresh token — that mismatch is
+    # exactly what froze Angel cash/holdings with AB1007 for a full day. The env
+    # var remains only as a fallback for first-run before any refresh has happened.
     access_token = (
-        os.environ.get(f"ANGEL_{entity_code}_ACCESS_TOKEN")
-        or tokens.get(f"angel_one_{entity_code}")
+        tokens.get(f"angel_one_{entity_code}")
+        or os.environ.get(f"ANGEL_{entity_code}_ACCESS_TOKEN")
     )
     if not access_token:
         raise RuntimeError(
@@ -84,6 +89,9 @@ def refresh_access_token(entity_code: str) -> str:
     refresh_token = resp["data"].get("refreshToken", "")
 
     tokens.save(f"angel_one_{entity_code}", access_token)
+    # Keep the live process env in sync too, so the .env fallback in _smart_client
+    # never serves a stale token after a refresh (mirrors the Dhan token flow).
+    os.environ[f"ANGEL_{entity_code}_ACCESS_TOKEN"] = access_token
     # Store refresh token separately in case we want to use it for mid-day refresh
     if refresh_token:
         tokens.save(f"angel_one_{entity_code}_refresh", refresh_token)
@@ -93,10 +101,39 @@ def refresh_access_token(entity_code: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Intraday self-heal
+# ---------------------------------------------------------------------------
+
+def _call_with_reauth(entity_code: str, fn):
+    """Run fn(); on any failure refresh the access token once and retry.
+
+    Angel One allows a single active API session, so the daily JWT dies the moment
+    the user (or another app) logs in — every call then returns AB1007 'Invalid
+    Token' until the next 6:30 AM refresh. Re-running generateSession mints a fresh
+    JWT and makes ours the active session again, so cash/holdings self-heal mid-day
+    instead of freezing. If the refresh itself fails (e.g. a network blip), the
+    second attempt raises and the caller keeps the last known value — same as before.
+    """
+    try:
+        return fn()
+    except Exception as e:
+        logger.warning(
+            f"[{entity_code}] Angel One call failed ({e}); "
+            f"refreshing token and retrying once"
+        )
+        refresh_access_token(entity_code)
+        return fn()
+
+
+# ---------------------------------------------------------------------------
 # Holdings fetch
 # ---------------------------------------------------------------------------
 
 def fetch_holdings(entity_code: str) -> list[dict]:
+    return _call_with_reauth(entity_code, lambda: _fetch_holdings(entity_code))
+
+
+def _fetch_holdings(entity_code: str) -> list[dict]:
     """
     Raw holdings from SmartAPI.
 
@@ -118,6 +155,10 @@ def fetch_holdings(entity_code: str) -> list[dict]:
 
 
 def fetch_trades(entity_code: str) -> list[dict]:
+    return _call_with_reauth(entity_code, lambda: _fetch_trades(entity_code))
+
+
+def _fetch_trades(entity_code: str) -> list[dict]:
     """Today's executed trades from SmartAPI tradeBook (current day only).
     Each item: tradingsymbol, transactiontype(BUY/SELL), fillsize, fillprice,
     tradeid, exchange, filltime, symboltoken."""
@@ -134,6 +175,10 @@ def fetch_trades(entity_code: str) -> list[dict]:
 
 
 def fetch_cash_balance(entity_code: str) -> Decimal:
+    return _call_with_reauth(entity_code, lambda: _fetch_cash_balance(entity_code))
+
+
+def _fetch_cash_balance(entity_code: str) -> Decimal:
     """
     Available cash for the Angel One account via SmartAPI RMS limits.
     Uses `availablecash` (the free cash), falling back to `net`, then 0.

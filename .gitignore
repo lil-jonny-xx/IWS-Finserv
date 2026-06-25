@@ -68,5 +68,8 @@ mis-portal/.dbs_sessions/
 mis-portal/.dbs_downloads/
 mis-portal/equity/feeds/
 
+# IBKR Flex statement disk cache — holds account positions + cash; local fallback only
+mis-portal/.ibkr_statements/
+
 motion-audits/
 mis-portal/.isin_symbol_map.json

@@ -229,7 +229,10 @@ def ledger_metrics(conn, entity_id: int, broker: str, symbol: str,
     first_buy = min(buys) if buys else min(r["trade_date"] for r in rows)
 
     xirr_pct = None
-    if current_mv_native is not None:
+    # Like CAGR, XIRR is an annualised ("p.a.") figure — only meaningful once held
+    # ≥1 year. Below that the UI shows the absolute return instead, so leave it NULL.
+    # (first_buy is still returned; it anchors first_invested_date regardless.)
+    if current_mv_native is not None and (today - first_buy).days >= 365:
         flows = [(r["trade_date"], float(r["cash_flow_native"])) for r in rows]
         flows.append((today, float(current_mv_native)))
         rate = finmath.xirr(flows)
@@ -326,10 +329,12 @@ def compute_metrics(
             h.pnl_ytd / ytd_value * 100
         ).quantize(FOUR, ROUND_HALF_UP)
 
-    # CAGR inception
+    # CAGR inception — only annualise once held ≥1 year. Below that, annualising a
+    # partial-year return is misleading, so the UI shows the absolute return
+    # (returns_inception_pct) instead and CAGR stays NULL until the 1-year mark.
     if first_invested_date and h.cost > 0:
         years = (today - first_invested_date).days / 365.25
-        if years >= 0.08:  # at least ~1 month before computing CAGR
+        if years >= 1.0:
             ratio = float(h.current_market_value / h.cost)
             if ratio > 0:
                 cagr = (ratio ** (1.0 / years) - 1.0) * 100
@@ -613,7 +618,12 @@ def refresh_broker_cash(conn, emap: Optional[dict] = None) -> int:
     today   = date.today()
     cur     = conn.cursor()
     updated = 0
+    # TEMPORARY (2026-06-24): mirror the IBKR_SYNC_PAUSED guard in main() so the
+    # cash refresh doesn't poke the locked-out IBKR token either. Remove with it.
+    ibkr_paused = os.environ.get("IBKR_SYNC_PAUSED", "").strip().lower() in ("1", "true", "yes")
     for entity_code, broker_module, broker_label in active_broker_map(emap):
+        if ibkr_paused and broker_label == "ibkr":
+            continue
         entity_id = emap.get(entity_code)
         if entity_id is None or not hasattr(broker_module, "fetch_cash_balance"):
             continue
@@ -745,14 +755,20 @@ def sync_entity_broker(
     broker_label: str,
     today: date,
     foreign: bool = False,
+    raw: "Optional[list]" = None,
 ) -> int:
     """Sync one entity + broker pair. Returns count of holdings upserted.
 
     Foreign (multi-currency) brokers are written to foreign_equity_holding(+history)
     so the Equity page stays India-only; INR-converted columns are still populated
     so net-worth aggregators can union the foreign table.
+
+    Pass `raw` (already-fetched holding dicts) to skip the broker fetch entirely — used
+    by the paced IBKR worker so holdings come from the SAME statement it already pulled
+    for cash, guaranteeing one Flex hit and never a re-fetch.
     """
-    raw      = broker_module.fetch_holdings(entity_code)
+    if raw is None:
+        raw = broker_module.fetch_holdings(entity_code)
     holdings = broker_module.normalise(entity_id, entity_code, raw)
 
     if not holdings:
@@ -825,7 +841,17 @@ def main():
     errors  = []
     total   = 0
 
+    # TEMPORARY (2026-06-24): the DHR IBKR Flex token is in a 1025 lockout. Each
+    # failed sync attempt extends it, so skip the IBKR leg entirely while it rests
+    # / the token is re-verified. Remove this guard (and IBKR_SYNC_PAUSED in .env)
+    # once the token works again. Other brokers are unaffected.
+    ibkr_paused = os.environ.get("IBKR_SYNC_PAUSED", "").strip().lower() in ("1", "true", "yes")
+
     for entity_code, broker_module, broker_label in active_broker_map(emap):
+        if ibkr_paused and broker_label == "ibkr":
+            logger.warning(f"[{entity_code}/ibkr] SKIPPED — IBKR_SYNC_PAUSED set "
+                           f"(token in 1025 lockout; see .env note, remove when fixed)")
+            continue
         entity_id = emap.get(entity_code)
         if entity_id is None:
             logger.error(f"Entity '{entity_code}' not found in DB — skipping")

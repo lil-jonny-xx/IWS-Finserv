@@ -1,0 +1,16 @@
+[Unit]
+Description=IWS MIS Portal — Foreign Equity Price Worker
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=SAdmin
+WorkingDirectory=/var/www/mis-portal
+Environment=HOME=/home/SAdmin
+# --commit writes prices/metrics. The worker self-guards US regular hours (09:30–16:00
+# ET) and exits instantly when closed, and auto-writes the EOD history row in the last
+# 5 minutes before close — so the every-minute timer spends Finnhub quota only when US
+# prices are actually moving.
+ExecStart=/var/www/.venv/bin/python /var/www/mis-portal/workers/foreign_price_worker.py --commit
+StandardOutput=append:/var/log/mis-portal-foreign-price.log
+StandardError=append:/var/log/mis-portal-foreign-price.log
