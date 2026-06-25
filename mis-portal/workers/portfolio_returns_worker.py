@@ -81,7 +81,8 @@ def usd_inr(cur):
 
 
 def current_value(cur, entity_id, fx):
-    """Current brokerage portfolio value in INR: equity + foreign equity + broker cash."""
+    """Current brokerage portfolio value in INR: equity + foreign equity + broker cash
+    + brokerage-linked PMS (zerodha_pms)."""
     cur.execute("SELECT COALESCE(SUM(current_market_value),0) v FROM equity_holding WHERE entity_id=%s", (entity_id,))
     v = float(cur.fetchone()["v"])
     cur.execute("SELECT COALESCE(SUM(current_market_value),0) v FROM foreign_equity_holding WHERE entity_id=%s", (entity_id,))
@@ -92,6 +93,13 @@ def current_value(cur, entity_id, fx):
     cur.execute("SELECT balance FROM broker_cash WHERE entity_id=%s", (entity_id,))
     for row in cur.fetchall():
         v += float(row["balance"] or 0)
+    # zerodha_pms is a PMS strategy run INSIDE the client's own Zerodha account — the
+    # stock sits in their demat and the cash deposits flow through the Zerodha ledger
+    # (so they ARE in external_cashflow). Include it so the XIRR value side matches the
+    # flow side. nuvama_pms is a separate managed account whose deposits are NOT yet
+    # ingested, so it's deliberately excluded (adding value with no flows would distort).
+    cur.execute("SELECT COALESCE(SUM(market_value),0) v FROM pms_holding WHERE entity_id=%s AND source='zerodha_pms'", (entity_id,))
+    v += float(cur.fetchone()["v"])
     return v
 
 
