@@ -350,6 +350,14 @@ def compute_metrics(
 def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[date],
                           foreign: bool = False):
     tbl = _holding_table(foreign)
+    # Conflict key: domestic equity uses ISIN (the stable natural key) so a broker
+    # ticker/series-suffix change (e.g. VAML -> VAML-BE) UPDATES the existing row and
+    # adopts the new symbol, instead of inserting a double-counted duplicate. Foreign
+    # holdings keep the symbol key (their feeds often carry no ISIN).
+    if foreign:
+        conflict_cols, key_update = "entity_id, broker, symbol", "isin = EXCLUDED.isin"
+    else:
+        conflict_cols, key_update = "entity_id, broker, isin", "symbol = EXCLUDED.symbol"
     # If symbol was previously stored as empty string (before ISIN fallback was added),
     # remove the stale row so the new upsert doesn't create a duplicate.
     if h.isin:
@@ -385,8 +393,8 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
             %(xirr_inception_pct)s,
             %(first_invested_date)s, %(remarks)s, %(angel_one_token)s, NOW()
         )
-        ON CONFLICT (entity_id, broker, symbol) DO UPDATE SET
-            isin                  = EXCLUDED.isin,
+        ON CONFLICT ({conflict_cols}) DO UPDATE SET
+            {key_update},
             exchange              = EXCLUDED.exchange,
             sector                = EXCLUDED.sector,
             quantity              = EXCLUDED.quantity,

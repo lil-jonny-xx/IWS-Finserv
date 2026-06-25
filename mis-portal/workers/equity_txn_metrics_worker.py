@@ -43,8 +43,16 @@ from equity.finmath import xirr
 
 load_dotenv("/var/www/mis-portal/.env", override=True)
 
-FY_START = date(2026, 4, 1)   # current Indian financial year start
 TODAY = date.today()
+
+
+def fy_start(d: date) -> date:
+    """Start of the Indian financial year (1 April) containing date d. Self-advancing so
+    YTD resets correctly each April instead of measuring from a stale hardcoded year."""
+    return date(d.year if d.month >= 4 else d.year - 1, 4, 1)
+
+
+FY_START = fy_start(TODAY)     # current Indian financial year start
 INR_BROKERS = ("zerodha", "angel_one", "dhan")
 
 
