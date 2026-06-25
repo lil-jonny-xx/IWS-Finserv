@@ -375,7 +375,9 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
                   <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top">
                     {h.xirr_inception_pct != null
                       ? <span style={{ color: h.xirr_inception_pct >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(h.xirr_inception_pct)} p.a.</span>
-                      : <span className="text-ghost">—</span>}
+                      : h.returns_inception_pct != null
+                        ? <span style={{ color: h.returns_inception_pct >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(h.returns_inception_pct)} <span className="text-ghost">abs</span></span>
+                        : <span className="text-ghost">—</span>}
                   </td>
                   <td className="px-3 pr-5 sm:pr-6 py-3 text-xs text-ghost align-top max-w-[160px]">{h.remarks ?? '—'}</td>
                 </tr>
