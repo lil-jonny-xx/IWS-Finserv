@@ -458,6 +458,41 @@ def _broker_cash_report_rows(cash_rows: list) -> list:
     return out
 
 
+def _fetch_bank_accounts(conn, entity_id: Optional[int] = None):
+    """Bank-account cash per (entity, bank), in native currency, from bank_account."""
+    cur = conn.cursor()
+    q = """
+        SELECT entity_id, bank_name, account_type, currency, COALESCE(balance, 0) AS balance
+        FROM bank_account
+        {where}
+    """
+    if entity_id:
+        cur.execute(q.format(where="WHERE entity_id = %s"), (entity_id,))
+    else:
+        cur.execute(q.format(where=""))
+    rows = cur.fetchall()
+    cur.close()
+    return rows
+
+
+def _bank_account_report_rows(conn, bank_rows: list, as_of: date) -> list:
+    """One report row per bank account, native balance converted to INR at the
+    as-of fx rate (cost == value, no P&L). A balance whose currency has no rate
+    is skipped — it can't be valued in INR (matches the /overview behaviour)."""
+    out = []
+    for r in sorted(bank_rows, key=lambda x: (x["bank_name"], x["account_type"])):
+        fx = _fx_rate_on(conn, r["currency"], as_of)
+        if fx is None:
+            continue
+        bal_inr = float(r["balance"]) * fx
+        ccy = "" if r["currency"] == "INR" else f" ({r['currency']})"
+        out.append({
+            "label": f"{r['bank_name']}{ccy} (Bank)",
+            "cost": bal_inr, "current_value": bal_inr,
+        })
+    return out
+
+
 # ── shared cell helpers ───────────────────────────────────────────────────────
 
 def _v(holding, key):
@@ -745,6 +780,7 @@ def build_individual_report(conn, entity_id: int, entity_name: str, as_of: date)
     eq_rows  = _merge_equity_by_symbol(_fetch_equity_holdings(conn, entity_id))
     pms_items  = _pms_report_rows(_fetch_pms_holdings(conn, entity_id))
     cash_items = _broker_cash_report_rows(_fetch_broker_cash(conn, entity_id))
+    bank_items = _bank_account_report_rows(conn, _fetch_bank_accounts(conn, entity_id), as_of)
     man_rows = _fetch_manual_inputs(conn, entity_id)
 
     man_by_cat: dict = {}
@@ -861,6 +897,9 @@ def build_individual_report(conn, entity_id: int, entity_name: str, as_of: date)
         # Fold automated broker cash (broker_cash) into the Broker Balance line.
         if cat == "broker_balance":
             items = cash_items + items
+        # Fold bank-account balances (bank_account) into the Funds in Bank line.
+        if cat == "bank":
+            items = bank_items + items
         row = _write_section(ws, row, label)
         data_start = row
         for i, m in enumerate(items):
@@ -1016,12 +1055,13 @@ def build_combined_report(conn, as_of: date, ws=None):
         fe_broker  = _rollup_equity_by_broker(_fetch_foreign_equity_holdings(conn, eid))
         pms_items  = _pms_report_rows(_fetch_pms_holdings(conn, eid))
         cash_items = _broker_cash_report_rows(_fetch_broker_cash(conn, eid))
+        bank_items = _bank_account_report_rows(conn, _fetch_bank_accounts(conn, eid), as_of)
         man_rows   = _fetch_manual_inputs(conn, eid)
         man_by_cat: dict = {}
         for m in man_rows:
             man_by_cat.setdefault(m["category"], []).append(m)
 
-        if not (mf_rows or eq_broker or pms_items or cash_items or man_rows):
+        if not (mf_rows or eq_broker or pms_items or cash_items or bank_items or man_rows):
             continue
 
         # Entity header row
@@ -1154,12 +1194,14 @@ def build_combined_report(conn, as_of: date, ws=None):
         btl = []
         for cat in ("funds_transit", "broker_balance", "bank"):
             btl.extend(man_by_cat.get(cat, []))
-        if btl or cash_items:
+        if btl or cash_items or bank_items:
             row = _comb_section(ws, row, "Funds in Transit / Bank / Broker")
             data_start = row
             alt = False
             for h in cash_items:
                 _comb_data_row(ws, row, h, "Broker Cash", alt); row += 1; alt = not alt
+            for h in bank_items:
+                _comb_data_row(ws, row, h, "Bank Cash", alt); row += 1; alt = not alt
             for m in btl:
                 _comb_data_row(ws, row, m, "Bank/Broker", alt); row += 1; alt = not alt
             _comb_total(ws, row, "Total Liquidity", data_start, row - 1); row += 1

@@ -82,6 +82,7 @@ const CLASS_COLORS: Record<string, string> = {
   HYBRID:        '#8b5cf6',   // violet for hybrid MF
   ARBITRAGE:     '#14b8a6',   // teal for arbitrage
   CASH:          '#94a3b8',   // slate for cash / transit balances
+  BANK_CASH:     '#64748b',   // darker slate for bank-account cash
   MF:            'var(--chart-equity)',
 };
 
@@ -95,6 +96,7 @@ const CLASS_LABELS: Record<string, string> = {
   HYBRID:        'Hybrid MF',
   ARBITRAGE:     'Arbitrage',
   CASH:          'Cash & Transit',
+  BANK_CASH:     'Bank Accounts',
   MF:            'Mutual Funds',
 };
 
@@ -388,6 +390,7 @@ export default function DashboardPage() {
                 { href: '/mutual-funds', label: 'Mutual Funds' },
                 { href: '/equity', label: 'Equity' },
                 { href: '/foreign-equity', label: 'Foreign Equity' },
+                { href: '/bank-accounts', label: 'Banks' },
                 { href: '/pms', label: 'PMS' },
                 { href: '/manual-data', label: 'Manual Data' },
                 { href: '/reports', label: 'Reports' },

@@ -1,9 +1,10 @@
-from fastapi import FastAPI, HTTPException, Header, Request, Response
+from fastapi import FastAPI, HTTPException, Header, Request, Response, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, EmailStr, Field
 from typing import Optional, List
 import json
+import re
 import jwt
 import bcrypt
 from datetime import datetime, timedelta, date
@@ -1270,6 +1271,18 @@ def get_equity_holdings(
             cash_params,
         )
         cash_rows = cur.fetchall()
+
+        # Portfolio money-weighted return (XIRR) from real external cash flows (ledger-
+        # derived). Entity-level only: not meaningful per-broker or aggregated across
+        # entities, so it's surfaced only when a single entity is in scope.
+        pr_row = None
+        if not broker and eid is not None:
+            cur.execute(
+                """SELECT xirr_pct, income_inr, coverage FROM portfolio_returns
+                   WHERE entity_id = %s ORDER BY as_of_date DESC LIMIT 1""",
+                (eid,),
+            )
+            pr_row = cur.fetchone()
         cur.close()
 
         holdings = [_row_to_holding(r) for r in rows]
@@ -1280,6 +1293,14 @@ def get_equity_holdings(
         totals["value_plus_cash"] = round(
             float(totals.get("total_current_market_value") or 0) + cash_total, 2
         )
+
+        totals["portfolio_xirr_pct"] = (
+            float(pr_row["xirr_pct"]) if pr_row and pr_row["xirr_pct"] is not None else None
+        )
+        totals["portfolio_income"] = (
+            float(pr_row["income_inr"]) if pr_row and pr_row["income_inr"] is not None else None
+        )
+        totals["portfolio_coverage"] = pr_row["coverage"] if pr_row else None
 
         entity_name = "All Entities" if eid is None else (
             rows[0]["entity_name"] if rows else ""
@@ -1896,6 +1917,49 @@ def _fetch_broker_cash_overview_rows(conn, entity_id: Optional[int] = None):
     return out
 
 
+def _fetch_bank_cash_overview_rows(conn, entity_id: Optional[int] = None):
+    """
+    Bank-account cash (bank_account) shaped for the /overview aggregator. Balances
+    are held in native currency, so each is converted to INR at the latest fx_rate
+    before folding into the CASH bucket — keeping the dashboard total and allocation
+    inclusive of bank holdings. Cash has no cost basis, so pnl/ytd/weekly are 0.
+    A balance whose currency has no fx_rate yet is skipped (can't value it in INR).
+    """
+    cur    = conn.cursor()
+    fx     = _latest_fx_to_inr(cur)
+    where  = "WHERE ba.entity_id = %s" if entity_id else ""
+    params = [entity_id] if entity_id else []
+    cur.execute(f"""
+        SELECT ba.entity_id, e.entity_name, ba.currency, ba.balance
+        FROM bank_account ba
+        JOIN entity e ON e.id = ba.entity_id
+        {where}
+    """, params)
+    rows = cur.fetchall()
+    cur.close()
+
+    out = []
+    for r in rows:
+        rate = fx.get(r["currency"])
+        if rate is None:
+            continue
+        bal = (float(r["balance"]) if r["balance"] is not None else 0.0) * rate
+        out.append({
+            "entity_id":          r["entity_id"],
+            "entity_name":        r["entity_name"],
+            "asset_class":        "BANK_CASH",   # own slice in the dashboard cash breakdown
+            "security_type":      "BANK_CASH",
+            "invested":           bal,
+            "mkt_value":          bal,
+            "pnl_inception":      0.0,
+            "pnl_ytd":            0.0,
+            "weekly_change":      0.0,
+            "cagr_inception_pct": None,
+            "weight":             bal,
+        })
+    return out
+
+
 @app.get("/api/v1/overview")
 def get_overview(
     request: Request,
@@ -1981,7 +2045,11 @@ def get_overview(
         # Broker-account cash (Zerodha / Angel One / Dhan) → CASH bucket.
         broker_cash_rows = _fetch_broker_cash_overview_rows(conn)
 
-        all_rows = list(mf_rows) + list(eq_rows) + manual_rows + pms_rows + broker_cash_rows
+        # Bank-account cash (HSBC / DBS / FAB / …), native ccy → INR → CASH bucket.
+        bank_cash_rows = _fetch_bank_cash_overview_rows(conn)
+
+        all_rows = (list(mf_rows) + list(eq_rows) + manual_rows + pms_rows
+                    + broker_cash_rows + bank_cash_rows)
 
         def row_val(r, key):
             v = r[key]
@@ -2283,6 +2351,26 @@ class ManualInputsRequest(BaseModel):
     inputs:   List[ManualInputItem]
 
 
+# --- Bank accounts (cash-only, statement-fed) ------------------------------
+
+VALID_BANK_ACCOUNT_TYPES = {"savings", "current", "nre", "other"}
+
+
+class BankAccountCreate(BaseModel):
+    entity_id:    int
+    bank_name:    str = Field(min_length=1, max_length=120)
+    account_type: str = "savings"
+    currency:     str = "INR"
+    notes:        Optional[str] = None
+
+
+class BankBalanceUpdate(BaseModel):
+    balance:       float
+    balance_as_of: Optional[str] = None   # YYYY-MM-DD
+    statement_id:  Optional[int] = None   # mark this uploaded statement as committed
+    notes:         Optional[str] = None
+
+
 @app.get("/api/v1/manual-inputs")
 def get_manual_inputs(
     request: Request,
@@ -2454,6 +2542,385 @@ def get_fx_rates(
         raise
     except Exception as e:
         logger.error(f"Error in /api/v1/fx-rates: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+# ---------------------------------------------------------------------------
+# Bank accounts (cash-only; balances fed by uploaded statements or manual entry)
+# ---------------------------------------------------------------------------
+
+BANK_STATEMENT_DIR = "/var/www/mis-portal/bank_statements"
+MAX_STATEMENT_BYTES = 15 * 1024 * 1024   # 15 MB
+
+
+def _latest_fx_to_inr(cur) -> dict:
+    """{currency: rate} for the most recent INR rate of each currency (INR→1.0)."""
+    cur.execute("""
+        SELECT DISTINCT ON (from_currency) from_currency, rate
+        FROM fx_rate WHERE to_currency = 'INR'
+        ORDER BY from_currency, rate_date DESC
+    """)
+    rates = {r["from_currency"]: float(r["rate"]) for r in cur.fetchall()}
+    rates["INR"] = 1.0
+    return rates
+
+
+@app.get("/api/v1/bank-accounts")
+def list_bank_accounts(
+    request: Request,
+    entity_id: Optional[int] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """List bank accounts with native balance + INR equivalent. Admin only."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+
+        where  = "WHERE b.entity_id = %s" if entity_id else ""
+        params = [entity_id] if entity_id else []
+        cur.execute(f"""
+            SELECT b.id, b.entity_id, e.entity_name, b.bank_name, b.account_type,
+                   b.currency, b.balance, b.balance_as_of, b.notes, b.updated_at,
+                   u.full_name AS updated_by_name,
+                   (SELECT COUNT(*) FROM bank_statement s WHERE s.bank_account_id = b.id) AS statement_count
+            FROM bank_account b
+            JOIN entity e ON e.id = b.entity_id
+            LEFT JOIN users u ON u.id = b.updated_by
+            {where}
+            ORDER BY e.entity_name, b.bank_name, b.account_type
+        """, params)
+        rows = cur.fetchall()
+        fx = _latest_fx_to_inr(cur)
+        cur.close()
+
+        accounts, total_inr = [], 0.0
+        for r in rows:
+            bal = float(r["balance"]) if r["balance"] is not None else 0.0
+            rate = fx.get(r["currency"])
+            inr = bal * rate if rate is not None else None
+            if inr is not None:
+                total_inr += inr
+            accounts.append({
+                "id":             r["id"],
+                "entity_id":      r["entity_id"],
+                "entity_name":    r["entity_name"],
+                "bank_name":      r["bank_name"],
+                "account_type":   r["account_type"],
+                "currency":       r["currency"],
+                "balance":        bal,
+                "balance_inr":    inr,
+                "fx_rate":        rate,
+                "balance_as_of":  str(r["balance_as_of"]) if r["balance_as_of"] else None,
+                "notes":          r["notes"],
+                "statement_count": r["statement_count"],
+                "updated_at":     r["updated_at"].isoformat() if r["updated_at"] else None,
+                "updated_by":     r["updated_by_name"],
+            })
+        return {"accounts": accounts, "total_inr": total_inr, "fx_rates": fx}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/bank-accounts: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/bank-accounts")
+@limiter.limit("20/minute")
+def create_bank_account(
+    request: Request,
+    body: BankAccountCreate,
+    authorization: Optional[str] = Header(None),
+):
+    """Create a bank account (one entity per account). Admin only."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+
+        if body.account_type not in VALID_BANK_ACCOUNT_TYPES:
+            raise HTTPException(status_code=422, detail=f"Invalid account_type: {body.account_type}")
+        if body.currency not in VALID_CURRENCIES:
+            raise HTTPException(status_code=422, detail=f"Invalid currency: {body.currency}")
+
+        cur.execute("SELECT id FROM entity WHERE id = %s", (body.entity_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=422, detail="Unknown entity_id")
+        cur.execute("SELECT id FROM users WHERE email = %s", (payload["email"],))
+        user_id = cur.fetchone()["id"]
+
+        try:
+            cur.execute("""
+                INSERT INTO bank_account (entity_id, bank_name, account_type, currency, notes, updated_by)
+                VALUES (%s,%s,%s,%s,%s,%s) RETURNING id
+            """, (body.entity_id, body.bank_name.strip(), body.account_type,
+                  body.currency, body.notes, user_id))
+        except psycopg2.errors.UniqueViolation:
+            conn.rollback()
+            raise HTTPException(status_code=409,
+                                detail="An account with this entity, bank, and type already exists.")
+        new_id = cur.fetchone()["id"]
+        write_audit_log(conn, user_id, "BANK_ACCOUNT_CREATE", "bank_account", new_id,
+                        f"{body.bank_name} ({body.account_type}/{body.currency}) by {payload['email']}")
+        conn.commit()
+        cur.close()
+        return {"id": new_id}
+
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/bank-accounts: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.get("/api/v1/bank-accounts/{account_id}/statements")
+def list_bank_statements(
+    account_id: int,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    """Upload history for one account. Admin only."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+        cur.execute("""
+            SELECT s.id, s.filename, s.file_kind, s.parsed_balance, s.parsed_as_of,
+                   s.parse_status, s.parse_note, s.committed, s.uploaded_at,
+                   u.full_name AS uploaded_by_name
+            FROM bank_statement s
+            LEFT JOIN users u ON u.id = s.uploaded_by
+            WHERE s.bank_account_id = %s
+            ORDER BY s.uploaded_at DESC
+        """, (account_id,))
+        rows = cur.fetchall()
+        cur.close()
+        return [
+            {
+                "id":             r["id"],
+                "filename":       r["filename"],
+                "file_kind":      r["file_kind"],
+                "parsed_balance": float(r["parsed_balance"]) if r["parsed_balance"] is not None else None,
+                "parsed_as_of":   str(r["parsed_as_of"]) if r["parsed_as_of"] else None,
+                "parse_status":   r["parse_status"],
+                "parse_note":     r["parse_note"],
+                "committed":      r["committed"],
+                "uploaded_at":    r["uploaded_at"].isoformat() if r["uploaded_at"] else None,
+                "uploaded_by":    r["uploaded_by_name"],
+            }
+            for r in rows
+        ]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/bank-accounts/{account_id}/statements: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/bank-accounts/{account_id}/statements")
+@limiter.limit("20/minute")
+async def upload_bank_statement(
+    account_id: int,
+    request: Request,
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None),
+):
+    """Upload a statement (PDF/CSV/Excel), parse a best-guess balance, return it
+    for the admin to confirm. Does NOT change the account balance — that happens
+    on the separate /balance commit. Admin only."""
+    from equity import bank_statements
+
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+
+        cur.execute("SELECT id FROM bank_account WHERE id = %s", (account_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Bank account not found")
+        cur.execute("SELECT id FROM users WHERE email = %s", (payload["email"],))
+        user_id = cur.fetchone()["id"]
+
+        kind = bank_statements.detect_kind(file.filename or "")
+        if kind is None:
+            raise HTTPException(status_code=422,
+                                detail="Unsupported file type — upload a PDF, CSV, or Excel statement.")
+
+        data = await file.read()
+        if len(data) == 0:
+            raise HTTPException(status_code=422, detail="Uploaded file is empty.")
+        if len(data) > MAX_STATEMENT_BYTES:
+            raise HTTPException(status_code=413, detail="File too large (max 15 MB).")
+
+        folder = os.path.join(BANK_STATEMENT_DIR, str(account_id))
+        os.makedirs(folder, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(file.filename or f"statement.{kind}"))
+        stored = os.path.join(folder, f"{datetime.utcnow():%Y%m%d%H%M%S}_{safe}")
+        with open(stored, "wb") as fh:
+            fh.write(data)
+        os.chmod(stored, 0o600)
+
+        parsed = bank_statements.parse(stored, file.filename)
+        parsed_balance = float(parsed["balance"]) if parsed["balance"] is not None else None
+        parsed_as_of   = parsed["as_of"]
+
+        cur.execute("""
+            INSERT INTO bank_statement
+                (bank_account_id, filename, filepath, file_kind,
+                 parsed_balance, parsed_as_of, parse_status, parse_note, uploaded_by)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
+        """, (account_id, file.filename, stored, kind,
+              parsed_balance, parsed_as_of, parsed["status"], parsed["note"], user_id))
+        statement_id = cur.fetchone()["id"]
+        write_audit_log(conn, user_id, "BANK_STATEMENT_UPLOAD", "bank_statement", statement_id,
+                        f"{file.filename} → {parsed['status']} ({parsed_balance}) by {payload['email']}")
+        conn.commit()
+        cur.close()
+
+        return {
+            "statement_id":   statement_id,
+            "parsed_balance": parsed_balance,
+            "parsed_as_of":   str(parsed_as_of) if parsed_as_of else None,
+            "parse_status":   parsed["status"],
+            "parse_note":     parsed["note"],
+            "file_kind":      kind,
+        }
+
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/bank-accounts/{account_id}/statements: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/bank-accounts/{account_id}/balance")
+@limiter.limit("30/minute")
+def commit_bank_balance(
+    account_id: int,
+    request: Request,
+    body: BankBalanceUpdate,
+    authorization: Optional[str] = Header(None),
+):
+    """Commit a confirmed balance onto the account (admin-confirmed value from a
+    parsed statement, or a plain manual entry). Admin only."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+
+        cur.execute("SELECT id FROM bank_account WHERE id = %s", (account_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Bank account not found")
+        cur.execute("SELECT id FROM users WHERE email = %s", (payload["email"],))
+        user_id = cur.fetchone()["id"]
+
+        as_of = None
+        if body.balance_as_of:
+            try:
+                as_of = date.fromisoformat(body.balance_as_of)
+            except ValueError:
+                raise HTTPException(status_code=422, detail=f"Invalid balance_as_of: {body.balance_as_of}")
+
+        cur.execute("""
+            UPDATE bank_account
+               SET balance = %s, balance_as_of = %s,
+                   notes = COALESCE(%s, notes), updated_at = NOW(), updated_by = %s
+             WHERE id = %s
+        """, (body.balance, as_of, body.notes, user_id, account_id))
+
+        if body.statement_id is not None:
+            cur.execute("""
+                UPDATE bank_statement SET committed = TRUE
+                 WHERE id = %s AND bank_account_id = %s
+            """, (body.statement_id, account_id))
+
+        write_audit_log(conn, user_id, "BANK_BALANCE_COMMIT", "bank_account", account_id,
+                        f"balance={body.balance} as_of={body.balance_as_of} by {payload['email']}")
+        conn.commit()
+        cur.close()
+        return {"id": account_id, "balance": body.balance}
+
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/bank-accounts/{account_id}/balance: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/bank-accounts/{account_id}/delete")
+@limiter.limit("20/minute")
+def delete_bank_account(
+    account_id: int,
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    """Delete a bank account and its statement history (files left on disk). Admin only."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+        cur.execute("SELECT id FROM users WHERE email = %s", (payload["email"],))
+        user_id = cur.fetchone()["id"]
+        cur.execute("DELETE FROM bank_account WHERE id = %s RETURNING bank_name", (account_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Bank account not found")
+        write_audit_log(conn, user_id, "BANK_ACCOUNT_DELETE", "bank_account", account_id,
+                        f"{row['bank_name']} by {payload['email']}")
+        conn.commit()
+        cur.close()
+        return {"deleted": account_id}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/bank-accounts/{account_id}/delete: {e}")
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
     finally:
         release_db_connection(conn)

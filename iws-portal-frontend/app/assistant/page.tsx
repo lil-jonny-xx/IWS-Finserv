@@ -24,6 +24,7 @@ const NAV = [
   { href: '/mutual-funds', label: 'Mutual Funds' },
   { href: '/equity',       label: 'Equity'       },
   { href: '/foreign-equity', label: 'Foreign Equity' },
+  { href: '/bank-accounts', label: 'Banks' },
   { href: '/pms', label: 'PMS' },
   { href: '/manual-data',  label: 'Manual Data'  },
   { href: '/reports',      label: 'Reports'      },
