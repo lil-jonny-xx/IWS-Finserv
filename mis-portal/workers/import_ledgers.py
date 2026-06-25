@@ -82,7 +82,39 @@ def classify(text):
 
 
 # ---- parsers: yield normalised entries {date, text, debit, credit, balance} ----
+def _excel_rows(path, sheet=0):
+    """All cells of an Excel sheet as a list of row-lists (handles .xls via xlrd and
+    .xlsx via openpyxl, both through pandas)."""
+    import pandas as pd
+    df = pd.read_excel(path, sheet_name=sheet, header=None, dtype=object)
+    return df.where(df.notna(), None).values.tolist()
+
+
+def _hdr_index(rows, *required):
+    for i, r in enumerate(rows):
+        cells = {str(c).strip() for c in r if c is not None}
+        if all(req in cells for req in required):
+            return i, {str(c).strip(): j for j, c in enumerate(r) if c is not None}
+    return None, None
+
+
 def parse_zerodha_ledger(path):
+    # Zerodha ships the ledger as CSV or as an .xlsx with a preamble (header row
+    # "Particulars | Posting Date | … | Net Balance"). Same columns either way.
+    if path.lower().endswith((".xlsx", ".xls")):
+        rows = _excel_rows(path)
+        hdr, col = _hdr_index(rows, "Particulars", "Posting Date")
+        if hdr is None:
+            return
+        for r in rows[hdr + 1:]:
+            d = _date(r[col["Posting Date"]]) if "Posting Date" in col else None
+            if not d:
+                continue
+            yield {"date": d, "text": str(r[col["Particulars"]] or ""),
+                   "debit": _num(r[col.get("Debit")]) if "Debit" in col else 0.0,
+                   "credit": _num(r[col.get("Credit")]) if "Credit" in col else 0.0,
+                   "balance": _num(r[col.get("Net Balance")]) if "Net Balance" in col else 0.0}
+        return
     with open(path, newline="") as fh:
         for r in csv.DictReader(fh):
             d = _date(r.get("posting_date"))
@@ -94,6 +126,25 @@ def parse_zerodha_ledger(path):
 
 
 def parse_dhan_ledger(path):
+    # Dhan ships two layouts: the older CSV ("Posting Date" header) and the "Ledger
+    # Statement" .xls (preamble + "Sr|Date|Transaction ID|Type|Description|…|Running
+    # Balance"). Classification text = Type + Description so "Funds Deposited" matches.
+    if path.lower().endswith((".xls", ".xlsx")):
+        rows = _excel_rows(path)
+        hdr, col = _hdr_index(rows, "Date", "Running Balance")
+        if hdr is None:
+            return
+        for r in rows[hdr + 1:]:
+            d = _date(r[col["Date"]]) if "Date" in col else None
+            if not d:
+                continue
+            typ = str(r[col["Type"]] or "") if "Type" in col else ""
+            desc = str(r[col["Description"]] or "") if "Description" in col else ""
+            yield {"date": d, "text": f"{typ} {desc}".strip(),
+                   "debit": _num(r[col.get("Debit")]) if "Debit" in col else 0.0,
+                   "credit": _num(r[col.get("Credit")]) if "Credit" in col else 0.0,
+                   "balance": _num(r[col.get("Running Balance")]) if "Running Balance" in col else 0.0}
+        return
     with open(path, newline="") as fh:
         rows = list(csv.reader(fh))
     hdr = next((i for i, r in enumerate(rows) if r and r[0].strip() == "Posting Date"), None)
@@ -163,8 +214,10 @@ def detect(path):
         broker, kind = "dhan", "ledger"
         if "***REMOVED***" in b or "rajani" in low:   # mislabel: this Dhan account is HHR
             ent = "HHR"
-    elif "ledger-" in low and ".csv" in low:
-        broker, kind = "zerodha", "ledger"
+    elif "ledger-report" in low and low.endswith(".xls"):
+        broker, kind = "dhan", "ledger"          # Dhan "Ledger Statement" .xls export
+    elif "ledger-" in low and (".csv" in low or low.endswith(".xlsx")):
+        broker, kind = "zerodha", "ledger"       # Zerodha ledger (CSV or .xlsx)
     elif "yourstatement" in low and low.endswith(".xlsx"):
         broker, kind = "angel_one", "ledger"
     elif "vested_transactions" in low:
@@ -239,6 +292,7 @@ def main():
     ap = argparse.ArgumentParser(description="Import broker cash ledgers + dividends.")
     ap.add_argument("--commit", action="store_true")
     ap.add_argument("--dir", default=INCOMING)
+    ap.add_argument("--entity", help="force entity for all files (when the filename omits it)")
     args = ap.parse_args()
 
     conn = psycopg2.connect(host=os.getenv("DB_HOST", "localhost"),
@@ -254,6 +308,8 @@ def main():
         if not det:
             continue
         broker, ent_code, kind = det
+        if args.entity:
+            ent_code = args.entity          # override: these filenames omit the entity
         ent_id, account_id = get_ids(cur, ent_code, broker)
         if not ent_id:
             print(f"  !! {os.path.basename(path)} — unknown entity {ent_code}"); continue

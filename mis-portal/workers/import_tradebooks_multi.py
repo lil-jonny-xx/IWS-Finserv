@@ -90,7 +90,62 @@ def parse_zerodha_tradebook(path):
             }
 
 
+def _parse_dhan_global_txn_report(path):
+    """Dhan 'Global Transaction Report': a preamble (Name/UCC/…) then per-bill rows with
+    SEPARATE Buy Qty./Buy Value/Sell Qty./Sell Value columns — a single row can hold both a
+    buy and a sell (intraday), so it yields up to two records. No ISIN (names bridge to
+    holdings). Price = value/qty; the row's charges attach to the buy leg (else the sell)."""
+    rows = list(csv.reader(open(path, newline="", encoding="utf-8", errors="replace")))
+    def _joined(row):
+        return " | ".join(str(c).strip().lower() for c in row if c is not None)
+    hdr_idx = next((i for i, row in enumerate(rows)
+                    if "scrip name" in _joined(row) and "buy qty" in _joined(row)), None)
+    if hdr_idx is None:
+        return
+    idx = {str(c).strip(): i for i, c in enumerate(rows[hdr_idx])}
+    def g(row, key):
+        i = idx.get(key)
+        return row[i] if (i is not None and i < len(row)) else None
+    def gdate(v):
+        try:
+            return datetime.strptime(str(v).strip()[:11], "%d %b %Y").date()
+        except (ValueError, TypeError):
+            return _date(v)
+    for row in rows[hdr_idx + 1:]:
+        name = (g(row, "Scrip Name") or "").strip()
+        d = gdate(g(row, "Date"))
+        if not name or d is None:                       # blank line / footer (Net P&L, NOTE)
+            continue
+        exch = (g(row, "Exchange") or "").strip() or None
+        buy_qty, buy_val = _f(g(row, "Buy Qty.")), _f(g(row, "Buy Value"))
+        sell_qty, sell_val = _f(g(row, "Sell Qty.")), _f(g(row, "Sell Value"))
+        other = sum(x for x in (_f(g(row, c)) for c in
+                    ("GST", "SEBI Fees", "Stamp Duty", "Txn. Charges", "Oth. Charges")) if x) or None
+        brokerage, stt = _f(g(row, "Brokerage")), _f(g(row, "STT"))
+        charged = False
+        if buy_qty and buy_val:
+            yield {"symbol": name, "isin": None, "date": d, "side": "BUY",
+                   "qty": buy_qty, "price": round(buy_val / buy_qty, 4),
+                   "brokerage": brokerage, "stt": stt, "other": other,
+                   "currency": "INR", "exchange": exch, "trade_id": None, "skipped_reason": None}
+            charged = True
+        if sell_qty and sell_val:
+            yield {"symbol": name, "isin": None, "date": d, "side": "SELL",
+                   "qty": sell_qty, "price": round(sell_val / sell_qty, 4),
+                   "brokerage": None if charged else brokerage,
+                   "stt": None if charged else stt, "other": None if charged else other,
+                   "currency": "INR", "exchange": exch, "trade_id": None, "skipped_reason": None}
+
+
 def parse_dhan_tradebook(path):
+    # Dhan has two export layouts. The "Global Transaction Report" has a preamble and
+    # per-bill Buy/Sell qty+value columns; the older trade book is flat Name/Segment/
+    # Buy-Sell/Quantity rows. Detect and route.
+    with open(path, newline="", encoding="utf-8", errors="replace") as fh:
+        head = fh.read(4096).lower()
+    if "global transction report" in head or "scrip name" in head:
+        yield from _parse_dhan_global_txn_report(path)
+        return
     with open(path, newline="") as fh:
         for r in csv.DictReader(fh):
             name = (r.get("Name") or "").strip()

@@ -9,3 +9,4 @@ numpy>=1.26
 pandas>=2.0
 python-multipart>=0.0.20  # FastAPI file uploads (bank-statement upload endpoint)
 yfinance>=1.4
+xlrd>=2.0.1
