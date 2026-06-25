@@ -6,7 +6,7 @@ Per configured IBKR entity (IBKR_{CODE}_FLEX_TOKEN + IBKR_{CODE}_TRADES_QUERY_ID
 
   1. Pull every trade from the Trades Flex query and upsert it into
      equity_trade_ledger (native currency; deduped by IBKR tradeID).
-  2. For each current IBKR holding in equity_holding, compute from the ledger:
+  2. For each current IBKR holding in foreign_equity_holding, compute from the ledger:
        - first_invested_date  = earliest BUY date            -> "Since" + CAGR
        - xirr_inception_pct   = money-weighted return (native, ledger flows +
                                 current market value as the final inflow)
@@ -17,23 +17,24 @@ Per configured IBKR entity (IBKR_{CODE}_FLEX_TOKEN + IBKR_{CODE}_TRADES_QUERY_ID
 After this runs, the nightly equity sync keeps XIRR fresh by re-reading the
 ledger (see ledger_metrics() in equity_sync_worker.py) — no daily re-pull.
 
-Idempotent. The Flex Web Service caps a statement at 365 days and takes no date
-parameters, so the script asks at runtime how many years of history to pull and
-then walks one ~365-day window at a time, pausing before each so you can set the
-saved Trades query's Custom Date Range to the window it prints. Trades are deduped
-by tradeID, so overlapping/re-runs are harmless.
+Idempotent. The Flex Web Service caps a statement at 365 days but accepts an
+fd/td date-range override on SendRequest, so the script asks how many years of
+history to pull and then walks one ~365-day window at a time automatically,
+passing each window's dates to the Trades query — no need to edit the saved query
+in IBKR. Trades are deduped by tradeID, so overlapping/re-runs are harmless.
 
 Run (prompts for number of years):
   /var/www/.venv/bin/python -m equity.ibkr_backfill_inception
   /var/www/.venv/bin/python -m equity.ibkr_backfill_inception --entity DHR
   /var/www/.venv/bin/python -m equity.ibkr_backfill_inception --years 3       # skip prompt
-  /var/www/.venv/bin/python -m equity.ibkr_backfill_inception --years 1 --assume-ready
   /var/www/.venv/bin/python -m equity.ibkr_backfill_inception --dry-run       # no writes
 """
 import argparse
 import logging
 import os
+import random
 import sys
+import time
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -56,7 +57,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BROKER = "ibkr"
+# IBKR is a foreign broker — its holdings live in foreign_equity_holding (the
+# 2026-06-22 split), NOT equity_holding. The trade ledger is shared.
+HOLDING_TABLE = "foreign_equity_holding"
 FOUR   = Decimal("0.0001")
+
+# Pacing between trade-query windows. Regenerating the SAME Flex query in quick
+# succession is what trips IBKR's transient 1001 throttle, so on top of the
+# adapter's per-request gap we wait a longer, RANDOMIZED span between windows
+# (default 60–90s). Tunable via .env. The adapter (_flex_get) also paces every
+# individual request and retries 1001/1018 with jittered backoff.
+_WINDOW_GAP    = float(os.environ.get("IBKR_BACKFILL_WINDOW_GAP_SEC", "60"))
+_WINDOW_JITTER = float(os.environ.get("IBKR_BACKFILL_WINDOW_JITTER_SEC", "30"))
 
 # entity_name (DB) -> env var prefix when they differ (matches the adapters).
 _ENV_PREFIX = {"Rajani Corp": "RAJANIRCORP"}
@@ -81,19 +93,24 @@ def load_entity_map(conn) -> dict[str, int]:
 
 
 def configured_entities(emap: dict) -> list[str]:
-    """Entity codes that have an IBKR token + a Trades query id in .env."""
+    """Entity codes with at least one IBKR login (primary OR a numbered extra like
+    IBKR_DHR_2_*) that has a Trades query id. Uses the adapter's prefix discovery
+    so it still detects an entity when only a secondary login is active (e.g. the
+    primary token is temporarily disabled)."""
     found = []
     for code in emap:
-        prefix = _ENV_PREFIX.get(code, code)
-        if os.environ.get(f"IBKR_{prefix}_FLEX_TOKEN") \
-                and os.environ.get(f"IBKR_{prefix}_TRADES_QUERY_ID"):
+        try:
+            prefixes = ibkr._account_prefixes(code)   # primary + numbered extras
+        except KeyError:
+            continue   # no IBKR login configured for this entity
+        if any(os.environ.get(f"IBKR_{p}_TRADES_QUERY_ID") for p in prefixes):
             found.append(code)
     return found
 
 
 def prompt_years() -> int:
     """Ask the operator how many years of history to pull (one ~365-day Flex
-    window per year, since the Flex Web Service caps a statement at 365 days)."""
+    window per year, pulled automatically via the fd/td date-range override)."""
     while True:
         try:
             raw = input("\nHow many years of trade history to backfill from inception? "
@@ -228,8 +245,6 @@ def main():
     ap.add_argument("--entity", help="only this entity code (e.g. DHR)")
     ap.add_argument("--years", type=int, help="number of ~1-year windows to pull "
                     "(skips the runtime prompt)")
-    ap.add_argument("--assume-ready", action="store_true",
-                    help="don't pause between windows (saved query range already correct)")
     ap.add_argument("--dry-run", action="store_true", help="compute but do not write")
     args = ap.parse_args()
 
@@ -260,16 +275,17 @@ def main():
         total_added = 0
         for i, (start, end) in enumerate(windows, 1):
             print(f"\n  [{code}] Window {i}/{len(windows)}: {start} .. {end}")
-            if len(windows) > 1 and not args.assume_ready:
-                try:
-                    input(f"    In IBKR, set the Trades Flex query for {code} to a Custom "
-                          f"Date Range of {start} .. {end}, then press Enter to pull "
-                          f"(Ctrl-C to stop): ")
-                except (EOFError, KeyboardInterrupt):
-                    print("    aborted by user")
-                    break
+            # The Flex Web Service applies the fd/td override on SendRequest, so each
+            # window is pulled automatically — no need to edit the saved query.
+            # IBKR throttles regenerating the same query in quick succession (error
+            # 1001); space windows out with a randomized gap (fetch_trades also paces
+            # every request and retries 1001/1018 with jittered backoff).
+            if i > 1:
+                gap = _WINDOW_GAP + random.uniform(0, _WINDOW_JITTER)
+                logger.info(f"  [{code}] pacing {gap:.0f}s before next window (IBKR throttle)")
+                time.sleep(gap)
             try:
-                raw = ibkr.fetch_trades(code)
+                raw = ibkr.fetch_trades(code, start, end)
             except Exception as e:
                 logger.error(f"[{code}] trade fetch failed for window {i}: {e}")
                 continue
@@ -286,14 +302,14 @@ def main():
             """
             SELECT symbol, isin, cost, current_market_value,
                    current_market_value_native
-            FROM   equity_holding
+            FROM   {HOLDING_TABLE}
             WHERE  entity_id = %s AND broker = %s
-            """,
+            """.format(HOLDING_TABLE=HOLDING_TABLE),
             (entity_id, BROKER),
         )
         holdings = cur.fetchall()
         if not holdings:
-            logger.warning(f"[{code}] no IBKR holdings in equity_holding yet — run the "
+            logger.warning(f"[{code}] no IBKR holdings in {HOLDING_TABLE} yet — run the "
                            f"equity sync first so positions exist, then re-run this.")
             cur.close()
             continue
@@ -331,13 +347,13 @@ def main():
             if not args.dry_run:
                 cur.execute(
                     """
-                    UPDATE equity_holding
+                    UPDATE {HOLDING_TABLE}
                     SET    first_invested_date = %s,
                            xirr_inception_pct  = %s,
                            cagr_inception_pct  = COALESCE(%s, cagr_inception_pct),
                            updated_at          = NOW()
                     WHERE  entity_id = %s AND broker = %s AND symbol = %s
-                    """,
+                    """.format(HOLDING_TABLE=HOLDING_TABLE),
                     (first, xirr_pct, cagr_pct, entity_id, BROKER, symbol),
                 )
             grand_holdings += 1
