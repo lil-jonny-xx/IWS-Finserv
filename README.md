@@ -1,6 +1,6 @@
 # IWS Finserv MIS Portal
 
-Internal portfolio management and analytics system for IWS Finserv and its linked investment entities. Automates the full data pipeline — CAMS CAS statement ingestion, broker API sync, NAV/FX enrichment, and benchmark tracking — and presents consolidated holdings, P&L, and analytics through a Next.js dashboard with a built-in AI analyst.
+Internal portfolio management and analytics system for IWS Finserv and its linked investment entities. Automates the full data pipeline — CAMS CAS statement ingestion, domestic + international broker sync, PMS scraping, NAV/FX/market-data enrichment, and benchmark tracking — and presents consolidated holdings, P&L, and analytics across every asset class through a Next.js dashboard with a built-in AI analyst.
 
 **Entities (7, across 4 PAN groups):**
 
@@ -18,11 +18,14 @@ PAN numbers and CAS emails live in the database (`pan_group.pan_number`, `entity
 ## What it does
 
 - **Mutual funds** — automated nightly ingestion from CAMS CAS PDFs via a central Gmail inbox; parsed per entity by folio holder-name matching; CAGR/XIRR, realized & unrealized P&L, exposure
-- **Equity** — daily holdings sync from Angel One (SmartAPI), Zerodha (Kite Connect), and Dhan; live LTP every minute during market hours; stock-transaction ledger
+- **Equity (domestic)** — daily holdings sync from Angel One (SmartAPI), Zerodha (Kite Connect), and Dhan; live LTP every minute during market hours; FIFO transaction ledger driving inception XIRR/CAGR; per-(entity,broker) free cash
+- **Foreign equity** — international brokers (Interactive Brokers Flex, Vested, DBS) in their native currency, FX-converted to INR; prices refreshed from an independent market-data feed (Finnhub → Twelve Data → yfinance) decoupled from the broker sync; shown on its own page so the Equity page stays India-only
+- **PMS** — Nuvama WealthSpectrum discretionary portfolios scraped (Playwright) into `pms_holding` / `pms_realised`
+- **Bank accounts** — cash-only accounts whose balances are fed by uploaded statements (PDF/CSV/Excel, parse-then-confirm) or manual entry; fold into the dashboard CASH bucket
 - **Other assets** — manual inputs (PPF, cash balances, fixed deposits, unlisted/alternative holdings) folded into the same asset-class buckets
-- **Analytics** — today's P&L, inception P&L, YTD P&L, CAGR/XIRR, asset-class allocation, weekly delta, FX-adjusted values, daily snapshots and portfolio summaries
+- **Analytics** — today's P&L, inception P&L, YTD P&L, CAGR/XIRR, asset-class allocation, weekly delta, FX-adjusted values; per-entity money-weighted XIRR from real external cash flows (`portfolio_returns`). Annualised CAGR/XIRR are shown only once a holding is held ≥1 year — below that the absolute return is shown instead
 - **Benchmarks** — live index/benchmark ticker, per-security proxy benchmarks
-- **Reports** — on-demand generated reports (per entity / consolidated) with downloadable artifacts
+- **Reports** — on-demand generated reports (per entity / consolidated) with downloadable artifacts; include broker & bank cash, PMS, and real-estate lines
 - **AI analyst (Jarvis)** — streaming agentic assistant over the Claude Messages API; answers natural-language questions using entity-scoped DB tools plus Anthropic-hosted web search & code execution
 - **Multi-entity** — admin view across all PANs/entities; scoped per-entity view for non-admin users
 - **Security** — JWT auth, Redis token blacklist, bcrypt passwords, per-request CSP nonce, rate limiting, account lockout, audit log
@@ -37,8 +40,9 @@ PAN numbers and CAS emails live in the database (`pan_group.pan_number`, `entity
 | Frontend | Next.js 16, React 19, TypeScript 5, Tailwind CSS 4 |
 | Database | PostgreSQL 16 |
 | AI | Claude Messages API (`anthropic` SDK) — streaming tool-use loop |
+| Market data | AMFI (MF NAV), Finnhub / Twelve Data / yfinance (foreign equity), broker LTP (domestic) |
 | Auth | JWT (2h TTL) + Redis blacklist + httpOnly cookies |
-| Automation | Playwright (Chromium), playwright-stealth, Xvfb |
+| Automation | Playwright (Chromium), playwright-stealth, Xvfb (CAMS, Nuvama PMS, Vested, DBS) |
 | Email | Gmail API (OAuth 2.0) |
 | Reverse proxy | Nginx + Cloudflare |
 
@@ -72,14 +76,16 @@ Nginx :443  (SSL via Cloudflare origin cert; HSTS, CSP, Referrer-Policy)
   │
   ├── /        ──► Next.js :3000  (iws-frontend.service)
   │                middleware.ts injects a per-request CSP nonce
-  │                Pages: / (login)  /dashboard  /equity  /mutual-funds
+  │                Pages: / (login)  /dashboard  /equity  /foreign-equity
+  │                       /mutual-funds  /pms  /bank-accounts
   │                       /realised-gains  /manual-data  /benchmarks
   │                       /reports  /assistant
   │
   └── /api/    ──► Gunicorn + Uvicorn :8000  (mis-portal.service, 3 workers)
                    FastAPI app — mis-portal/main.py
                    Routes under /api/v1: auth, me, entities, overview,
-                     holdings (MF), equity, transactions, realised-gains,
+                     holdings (MF), equity, foreign-equity, pms,
+                     bank-accounts, transactions, realised-gains,
                      manual-inputs, benchmarks, fx-rates, dhan, reports,
                      assistant, health
 ```
@@ -95,12 +101,31 @@ NIGHTLY CAS PIPELINE
     ├── gmail_worker.py          Gmail API polls ***REMOVED*** for the PDF
     └── cas_parser_worker.py     PyMuPDF + casparser → upsert holdings/txns
 
-EQUITY PIPELINE
+EQUITY PIPELINE (domestic)
   token_refresh_worker.py   refreshes broker OAuth/TOTP tokens
-  equity_sync_worker.py     syncs holdings from Angel One, Zerodha, Dhan
+  equity_sync_worker.py     syncs holdings + broker cash from Angel One, Zerodha, Dhan
+                            (and, when configured, the international brokers below)
   equity_price_worker.py    live LTP every minute (systemd timer; self-guards
                             market hours 09:15–15:30 IST)
-  stock_transaction_worker.py   imports/normalises stock transactions (weekdays)
+  stock_transaction_worker.py / broker_txn_sync_worker.py   stock transactions
+  import_tradebooks_multi.py + symbol_bridge.py   tradebook import → stock_transaction
+  equity_txn_metrics_worker.py   FIFO inception XIRR/CAGR/YTD from transactions
+  portfolio_returns_worker.py    per-entity money-weighted XIRR from external_cashflow
+
+FOREIGN / INTERNATIONAL PIPELINE
+  vested_worker.py / dbs_worker.py   Playwright scrape (Vested USD, DBS SGD)
+  brokers/ibkr.py            Interactive Brokers Flex Web Service (positions + cash;
+                            holdings/cash fetched via ibkr_holdings_cash_worker.py,
+                            statement-cached, throttle-paced — see brokers section)
+  foreign_price_worker.py    independent native-price refresh during US hours
+                            (Finnhub → Twelve Data → yfinance), US-market-hours guard
+
+PMS PIPELINE
+  nuvama_pms_worker.py       Nuvama WealthSpectrum scrape → pms_holding / pms_realised
+
+BANK ACCOUNTS
+  equity/bank_statements.py  statement parser (PDF/CSV/Excel); balances confirmed via
+                            the Bank Accounts page → bank_account / bank_statement
 
 ENRICHMENT WORKERS
   amfi_nav_worker.py        AMFI NAV CSV → nav_history (twice nightly)
@@ -133,33 +158,56 @@ ENRICHMENT WORKERS
 │   │   ├── token_refresh_worker.py
 │   │   ├── tokens.py / equity_tokens.json   Broker token store (atomic write)
 │   │   ├── models.py            EquityHolding dataclass
+│   │   ├── finmath.py           XIRR/IRR solver
+│   │   ├── fx.py                FX-rate lookup/conversion helper
+│   │   ├── symbol_bridge.py / isin_lookup.py   name→ISIN/symbol resolution
+│   │   ├── bank_statements.py   bank-statement parser (PDF/CSV/Excel)
+│   │   ├── ibkr_backfill_inception.py   one-time IBKR trades backfill (shelved)
+│   │   ├── equity_history_backfill.py
 │   │   ├── zerodha_tradebook_import.py
 │   │   └── brokers/
 │   │       ├── zerodha.py       Kite Connect adapter
-│   │       ├── angel_one.py     SmartAPI adapter
-│   │       └── dhan.py          Dhan adapter (24h token, TOTP auto-renew)
-│   └── workers/
+│   │       ├── angel_one.py     SmartAPI adapter (token self-heal: tokens.json
+│   │       │                    first, reauth+retry on intraday session death)
+│   │       ├── dhan.py          Dhan adapter (24h token, TOTP auto-renew)
+│   │       ├── ibkr.py          Interactive Brokers Flex (statement cache + on-disk
+│   │       │                    fallback; 1001/1025 throttle-safe)
+│   │       ├── vested.py        Vested (US, USD) — scraped
+│   │       ├── dbs.py           DBS (SGD) — scraped
+│   │       └── _feed.py         shared scraped-feed cache helper
+│   ├── workers/
 │       ├── cron_wrapper.py      Shared launcher for all cron jobs
 │       ├── cas_automation_worker.py / cams_trigger_worker.py
 │       ├── gmail_worker.py / oauth_setup.py
 │       ├── cas_parser_worker.py
 │       ├── amfi_nav_worker.py / nav_history_backfill.py / isin_resolver.py
 │       ├── mf_metrics_worker.py
-│       ├── fx_rates_worker.py
+│       ├── fx_rates_worker.py / fx_backfill_worker.py
 │       ├── benchmark_worker.py
-│       ├── stock_transaction_worker.py / import_tradebook.py
+│       ├── stock_transaction_worker.py / broker_txn_sync_worker.py
+│       ├── import_tradebook.py / import_tradebooks_multi.py / import_ledgers.py
+│       ├── equity_txn_metrics_worker.py    FIFO inception XIRR/CAGR/YTD
+│       ├── portfolio_returns_worker.py     per-entity money-weighted XIRR
+│       ├── foreign_price_worker.py         foreign equity prices (Finnhub/TwelveData/yfinance)
+│       ├── ibkr_holdings_cash_worker.py    paced IBKR holdings+cash (one Flex hit/login)
+│       ├── vested_worker.py / dbs_worker.py / _portal_scraper.py   foreign scrapers
+│       ├── nuvama_pms_worker.py / import_pms_realised.py   PMS
 │       ├── report_generator.py
 │       ├── bootstrap_dhan_holdings.py / manual_cas_retrigger.py
 │       ├── alert.py             Email alerts on worker guards/failures
 │       ├── seed_users.py
 │       └── db_migrate_*.py      Schema migrations
+│   └── deploy/systemd/          Stageable unit files (foreign-price timer + README)
 │
 ├── iws-portal-frontend/
 │   ├── app/
 │   │   ├── page.tsx             Login
 │   │   ├── dashboard/           Portfolio overview + analytics
-│   │   ├── equity/              Equity holdings (sector-grouped)
+│   │   ├── equity/              Domestic equity holdings (sector-grouped)
+│   │   ├── foreign-equity/      International holdings (IBKR/Vested/DBS, multi-ccy)
 │   │   ├── mutual-funds/        MF holdings (CAGR, realized gain, filters)
+│   │   ├── pms/                 PMS (Nuvama) holdings + realised
+│   │   ├── bank-accounts/       Statement-fed cash accounts
 │   │   ├── realised-gains/      Realized gains ledger
 │   │   ├── manual-data/         Manual asset entry (PPF, cash, etc.)
 │   │   ├── benchmarks/          Benchmark dashboard
@@ -178,7 +226,7 @@ ENRICHMENT WORKERS
 
 ## Database schema
 
-29 tables in PostgreSQL. Grouped by domain (key columns shown):
+39 tables in PostgreSQL. Grouped by domain (key columns shown):
 
 **Identity & access**
 - `pan_group` — id, pan_name, pan_number, description
@@ -201,19 +249,31 @@ ENRICHMENT WORKERS
 
 **Equity**
 - `equity_holding` — id, entity_id, broker, symbol, isin, exchange, sector, quantity, avg_cost, cost, current_price, current_market_value, prev_week_value, exposure_pct, pnl_ytd, pnl_inception, returns_*_pct, cagr_inception_pct, first_invested_date, symbol_override, angel_one_token  (unique entity+broker+symbol)
-- `equity_holding_history` — periodic equity value snapshots
+- `equity_holding_history` — periodic equity value snapshots (FY-start onward)
+- `foreign_equity_holding` — international holdings; same metrics as `equity_holding` plus native-currency columns (avg_cost_native, cost_native, current_price_native, current_market_value_native), currency, fx_rate, symbol_override  (unique entity+broker+symbol)
+- `foreign_equity_holding_history` — foreign holding snapshots (native + INR)
 - `stock_transaction` — entity_id, security_id, transaction_date, transaction_type, quantity, price, amount, brokerage/stt/charges, total_cost, fx_rate_used, amount_inr, balance_quantity, source
+- `equity_trade_ledger` — dated per-trade cash flows (native) feeding inception XIRR (IBKR backfill)
+- `broker_cash` — per (entity, broker) free cash: balance (INR), balance_native, currency, fx_rate, as_of_date
 - `broker_api_credentials` — broker, entity_id, credentials (jsonb), access_token, token_expiry, is_active, last_synced_at
+
+**PMS (Nuvama)**
+- `pms_holding` — entity_id, scheme, security, quantity, cost, current_value, cash, metrics  (scraped from WealthSpectrum)
+- `pms_realised` — entity_id, realised gains ledger for the PMS account
 
 **Other assets / manual entry**
 - `manual_input` — entity_id, category, label, cost, current_value, prev_week_value, currency, fx_rate, inception_date
 - `manual_entry`, `manual_valuation` — manual holding/valuation records
 - `ppf_transaction` — entity_id, financial_year, contribution_date, principal_amount, interest_rate, interest_credited, closing_balance
 - `cash_ledger` — entity_id, account_id, balance_date, balance, currency, fx_rate, balance_inr, source
+- `bank_account` — entity_id, bank_name, account_type, currency, balance, fx_rate, as_of_date  (cash-only, statement-fed; one entity per account)
+- `bank_statement` — uploaded statement metadata + parse/confirm status feeding `bank_account`
+- `external_cashflow` — entity_id, flow_date, flow_type (DEPOSIT/WITHDRAWAL/DIVIDEND/INTEREST), amount_native, currency  (drives per-entity XIRR)
 
 **Analytics snapshots**
 - `daily_snapshot` — entity_id, security_id, snapshot_date, quantity, nav, market_value_inr, opening_value_inr, todays_pnl_inr/pct, inception_pnl_inr/pct, cost_basis_inr
 - `portfolio_summary` — entity_id, summary_date, asset_class, total_invested_inr, current_value_inr, inception/today P&L, weight_pct
+- `portfolio_returns` — entity_id, as_of_date, xirr_pct, deposits/withdrawals/income_inr, current_value_inr, coverage (full/partial)  (money-weighted return from external_cashflow)
 
 **Operations**
 - `ingestion_run` — run_type, run_date, status, records_processed, records_failed, error_message, started_at, completed_at  (worker run log; note: equity workers do **not** write here — their health shows via `broker_api_credentials.last_synced_at` + `equity_holding.updated_at`)
@@ -235,13 +295,17 @@ ENRICHMENT WORKERS
 | 00:30 | 06:00 | `fx_rates_worker.py` | `/var/log/mis-portal-fx-worker.log` |
 | 00:30 (Mon/Wed/Fri) | 06:00 | `nuvama_pms_worker.py` (randomised order + delays) | `/var/log/mis-portal-pms.log` |
 | 01:00 | 06:30 | `equity/token_refresh_worker.py` | `/var/log/mis-portal-equity-token.log` |
-| 01:30 | 07:00 | `equity/equity_sync_worker.py` | `/var/log/mis-portal-equity-sync.log` |
+| 01:05 (Mon/Wed/Fri) | 06:35 | `vested_worker.py` (USD scrape) | `/var/log/mis-portal-vested.log` |
+| 01:30 | 07:00 | `equity/equity_sync_worker.py` (IBKR leg gated by `IBKR_SYNC_PAUSED`) | `/var/log/mis-portal-equity-sync.log` |
+| 02:00 | 07:30 | `equity_txn_metrics_worker.py` (FIFO XIRR/CAGR/YTD) | `/var/log/mis-portal-equity-metrics.log` |
+| 02:05 | 07:35 | `portfolio_returns_worker.py` (per-entity XIRR) | `/var/log/mis-portal-equity-metrics.log` |
+| 11:00 (Mon–Fri) | 16:30 | `broker_txn_sync_worker.py` (live broker txns) | `/var/log/mis-portal-broker-txn-sync.log` |
 | 16:30 (Mon–Fri) | 22:00 | `stock_transaction_worker.py` | `/var/log/mis-portal-stock-txn.log` |
 | 16:30 / 18:00 | 22:00 / 23:30 | `amfi_nav_worker.py` (twice) | `/var/log/mis-portal-amfi-worker.log` |
 | 16:45 / 18:15 | 22:15 / 23:45 | `mf_metrics_worker.py` (twice) | `/var/log/mis-portal-mf-metrics.log` |
 | 17:30 | 23:00 | `cas_automation_worker.py` | `/var/log/mis-portal-cas-auto.log` |
 
-Equity-price runs via `mis-portal-equity-price.timer`; the rest are SAdmin cron jobs invoked through `workers/cron_wrapper.py`.
+Equity-price runs via `mis-portal-equity-price.timer`; the rest are SAdmin cron jobs invoked through `workers/cron_wrapper.py`. `foreign_price_worker.py` is staged as `mis-portal-foreign-price.timer` (`deploy/systemd/`, every minute, self-guards US market hours) but not yet installed. **IBKR is not on any schedule** — it runs manually via `ibkr_holdings_cash_worker.py` and stays off the daily sync while `IBKR_SYNC_PAUSED=1`, pending a per-token request-timing design.
 
 ---
 
@@ -279,6 +343,26 @@ Per-entity credentials live in `mis-portal/.env`, keyed by entity code (e.g. `AN
 | `DHAN_{E}_ACCESS_TOKEN` | Bootstrap once from web.dhan.co → Access DhanHQ APIs; thereafter auto-renewed in-place |
 
 Live LTP is read from the Dhan holdings feed (`get_holdings().lastTradedPrice`) rather than a separate quote call. `dhanhq` is pinned in `requirements.txt` because its price-fetch API surface changes between releases.
+
+### Interactive Brokers (Flex Web Service)
+A token + saved Flex query (Open Positions **+** Cash Report in one XML). Multiple logins per entity roll up under one entity via numbered prefixes (`IBKR_DHR_2_*`). The Flex service throttles hard — same-query regeneration returns `1001`, accumulated failures escalate to a `1025` lockout — so `ibkr.py` caches the statement (in-process + on-disk fallback) and `ibkr_holdings_cash_worker.py` makes at most one hit per login. **A fresh token must be regenerated in the IBKR portal once a token hits the stuck state.**
+
+| Variable | Where to find |
+|---|---|
+| `IBKR_{E}_FLEX_TOKEN` | Client Portal → Settings → Reporting → Flex Web Service |
+| `IBKR_{E}_QUERY_ID` | saved Activity Flex Query (Open Positions + Cash Report, XML) |
+| `IBKR_{E}_TRADES_QUERY_ID` | optional; Trades-section query for the inception backfill |
+| `IBKR_{E}_BASE_CURRENCY` | optional; account base currency for cash (default USD) |
+| `IBKR_SYNC_PAUSED` | global kill-switch — `1` keeps the daily sync + cash refresh off IBKR |
+
+### Vested (US) / DBS (SGD) — scraped
+Playwright portal scrapers (no public API). `VESTED_{E}_USERNAME` / `_PASSWORD` / `_PIN`; `DBS_{E}_USERNAME` / `_PASSWORD`. Holdings land in `foreign_equity_holding` in native currency, FX-converted to INR.
+
+### Nuvama PMS (WealthSpectrum) — scraped
+`NUVAMA_PMS_BASE_URL`, `NUVAMA_PMS_REPORT`, `NUVAMA_PMS_OUTPUT_FORMAT`, and per-entity `NUVAMA_PMS_{E}_USERNAME` / `_PASSWORD` / `_OWNER`.
+
+### Foreign-equity market data (prices, no broker needed)
+Independent price feed for `foreign_equity_holding`, tried in order: Finnhub → Twelve Data → yfinance. `FINNHUB_API_KEY` (free tier, US real-time) and optional `TWELVEDATA_API_KEY`; yfinance is the no-key fallback. Finnhub free is US-only, so non-US listings (e.g. an LSE ETF) fall through to yfinance via `symbol_override`.
 
 ---
 
@@ -324,8 +408,10 @@ A manual, streaming agentic loop over the Claude Messages API (`assistant/engine
 ```bash
 sudo systemctl status mis-portal               # FastAPI backend
 sudo systemctl status iws-frontend             # Next.js frontend
-sudo systemctl status mis-portal-equity-price.timer   # 1-min LTP timer
+sudo systemctl status mis-portal-equity-price.timer   # 1-min domestic LTP timer
 sudo systemctl restart mis-portal              # restart after config changes
 ```
+
+`mis-portal-foreign-price.timer` (1-min foreign-equity price refresh, US-hours guarded) is staged in `mis-portal/deploy/systemd/` with install steps in its `README.md`; install it when foreign prices should update live.
 
 Logs: `journalctl -u mis-portal -f`  ·  per-worker logs under `/var/log/mis-portal-*.log`
