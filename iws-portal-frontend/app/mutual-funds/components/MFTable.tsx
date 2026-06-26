@@ -471,6 +471,28 @@ function TableHead({
   );
 }
 
+// ── fund name (click to reveal full name) ─────────────────────────────────────
+
+function FundName({ name, type }: { name: string; type: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <button
+      type="button"
+      onClick={(e) => { e.stopPropagation(); setOpen(o => !o); }}
+      className="text-left cursor-pointer group"
+      title={open ? 'Click to collapse' : name}
+      aria-expanded={open}
+    >
+      <span
+        className={`block text-[10px] font-medium text-ink leading-snug max-w-[200px] group-hover:text-prime transition-colors ${open ? '' : 'line-clamp-3'}`}
+      >
+        {name}
+      </span>
+      <span className="block text-[9px] text-ghost mt-0.5">{SEC_TYPE_LABELS[type] ?? type}</span>
+    </button>
+  );
+}
+
 // ── data row ──────────────────────────────────────────────────────────────────
 
 function DataRow({
@@ -483,8 +505,7 @@ function DataRow({
     <tr className="border-t border-rule hover:bg-page transition-colors duration-100">
       <td className="px-3 pl-5 sm:pl-6 py-3 text-right tabular-nums text-xs text-ghost align-top">{srNo}</td>
       <td className="px-3 py-3 align-top">
-        <p className="text-[10px] font-medium text-ink leading-snug line-clamp-3 max-w-[200px]" title={h.security_name}>{h.security_name}</p>
-        <p className="text-[9px] text-ghost mt-0.5">{SEC_TYPE_LABELS[h.security_type] ?? h.security_type}</p>
+        <FundName name={h.security_name} type={h.security_type} />
       </td>
       {showEntityCol && (
         <td className="px-3 py-3 text-xs font-medium text-dim whitespace-nowrap align-top">{h.entity_name ?? '—'}</td>
@@ -625,8 +646,7 @@ function CombinedDataRow({
         </td>
         <td className="px-2 py-3 text-right tabular-nums text-xs text-ghost align-top">{srNo}</td>
         <td className="px-3 pl-5 sm:pl-6 py-3 align-top">
-          <p className="text-[10px] font-medium text-ink leading-snug line-clamp-3 max-w-[200px]" title={h.security_name}>{h.security_name}</p>
-          <p className="text-[9px] text-ghost mt-0.5">{SEC_TYPE_LABELS[h.security_type] ?? h.security_type}</p>
+          <FundName name={h.security_name} type={h.security_type} />
         </td>
         <td className="px-3 py-3 align-top">
           <div className="flex flex-wrap gap-1">
@@ -755,15 +775,6 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
     return localCombined;
   }, [localCombined, combinedHoldings]);
 
-  if (holdings.length === 0) {
-    return (
-      <div className="bg-card rounded-lg border border-rule px-6 py-12 text-center">
-        <p className="text-sm font-medium text-ink mb-1">No mutual fund holdings on record</p>
-        <p className="text-xs text-ghost">Holdings will appear once your CAS statement has been imported.</p>
-      </div>
-    );
-  }
-
   function handleSort(key: SortKey) {
     if (key === sortKey) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
     else { setSortKey(key); setSortDir('desc'); }
@@ -840,6 +851,18 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
 
   // serial number is global across all groups
   let srCounter = 0;
+
+  // Empty-state guard lives AFTER all hooks (filtered, groups, etc.) so the hook
+  // order stays stable when switching from a populated entity to an empty one
+  // (e.g. HHR) — an early return above the hooks would drop them and crash React.
+  if (holdings.length === 0) {
+    return (
+      <div className="bg-card rounded-lg border border-rule px-6 py-12 text-center">
+        <p className="text-sm font-medium text-ink mb-1">No mutual fund holdings on record</p>
+        <p className="text-xs text-ghost">Holdings will appear once your CAS statement has been imported.</p>
+      </div>
+    );
+  }
 
   return (
     <div className="bg-card rounded-lg border border-rule [overflow:clip]">
