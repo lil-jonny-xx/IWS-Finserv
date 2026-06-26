@@ -1,16 +1,20 @@
 'use client';
 import { useRef } from 'react';
-import type { HTMLAttributes, MouseEvent, CSSProperties } from 'react';
+import type { HTMLAttributes, MouseEvent } from 'react';
 
 /**
- * Horizontal click-and-drag scrolling for wide tables.
+ * Horizontal scrolling for wide tables.
  *
- * On a desktop without a horizontal-scroll trackpad, wide tables are awkward to
- * navigate. Press-and-drag left/right moves the table. Native wheel / vertical
- * scroll is unaffected; a small movement threshold preserves clicks on buttons,
- * links and sort headers (a real drag suppresses the click that follows).
+ * Two ways to scroll, neither of which fires on a plain hover:
+ *   - touchpad / wheel horizontal scroll (native, via `overflow-x-auto`), and
+ *   - press-and-drag left/right (hold the left button and move).
  *
- * Two ways to use it:
+ * Idle hover is left completely alone — no grab cursor, no captured events — so
+ * tooltips and hover states work normally. The grabbing cursor and text-select
+ * suppression only kick in once a real drag starts (>5px), and a real drag
+ * suppresses the click that would otherwise follow (so dragging across a sort
+ * header / row link doesn't trigger it).
+ *
  *   <DragScroll className="overflow-x-auto">…</DragScroll>
  * or, to keep an existing wrapper div:
  *   const ds = useDragScroll();
@@ -25,8 +29,6 @@ export function useDragScroll() {
     const el = ref.current;
     if (!el) return;
     drag.current = { down: true, startX: e.pageX, startLeft: el.scrollLeft, moved: false };
-    el.style.cursor = 'grabbing';
-    el.style.userSelect = 'none';
   }
 
   function onMouseMove(e: MouseEvent<HTMLDivElement>) {
@@ -34,7 +36,11 @@ export function useDragScroll() {
     const el = ref.current;
     if (!d.down || !el) return;
     const dx = e.pageX - d.startX;
-    if (!d.moved && Math.abs(dx) < 5) return;   // threshold → preserve clicks
+    if (!d.moved && Math.abs(dx) < 5) return;   // threshold → preserve clicks & hover
+    if (!d.moved) {                             // a real drag just started
+      el.style.cursor = 'grabbing';
+      el.style.userSelect = 'none';
+    }
     d.moved = true;
     el.scrollLeft = d.startLeft - dx;
   }
@@ -42,11 +48,10 @@ export function useDragScroll() {
   function end() {
     const el = ref.current;
     drag.current.down = false;
-    if (el) { el.style.cursor = 'grab'; el.style.userSelect = ''; }
+    if (el) { el.style.cursor = ''; el.style.userSelect = ''; }
   }
 
-  // If the press turned into a drag, swallow the click it would otherwise fire
-  // (so dragging across a sort header / row link doesn't trigger it).
+  // If the press turned into a drag, swallow the click it would otherwise fire.
   function onClickCapture(e: MouseEvent<HTMLDivElement>) {
     if (drag.current.moved) {
       e.preventDefault();
@@ -55,10 +60,7 @@ export function useDragScroll() {
     }
   }
 
-  const bind = {
-    onMouseDown, onMouseMove, onMouseUp: end, onMouseLeave: end, onClickCapture,
-    style: { cursor: 'grab' } as CSSProperties,
-  };
+  const bind = { onMouseDown, onMouseMove, onMouseUp: end, onMouseLeave: end, onClickCapture };
   return { ref, bind };
 }
 
@@ -67,13 +69,7 @@ export default function DragScroll({
 }: HTMLAttributes<HTMLDivElement>) {
   const { ref, bind } = useDragScroll();
   return (
-    <div
-      ref={ref}
-      className={className}
-      {...bind}
-      style={{ ...bind.style, ...style }}
-      {...rest}
-    >
+    <div ref={ref} className={className} {...bind} style={style} {...rest}>
       {children}
     </div>
   );
