@@ -79,6 +79,8 @@ const CLASS_COLORS: Record<string, string> = {
   FIXED_INCOME:  'var(--chart-fixed)',
   ALTERNATES:    'var(--chart-alt)',
   REAL_ESTATE:   '#0ea5e9',   // sky for real estate / property
+  GOLD_SILVER:   '#d4af37',   // gold for precious metals
+  COMMODITIES:   '#b45309',   // burnt amber for commodities
   HYBRID:        '#8b5cf6',   // violet for hybrid MF
   ARBITRAGE:     '#14b8a6',   // teal for arbitrage
   CASH:          '#94a3b8',   // slate for cash / transit balances
@@ -93,6 +95,8 @@ const CLASS_LABELS: Record<string, string> = {
   FIXED_INCOME:  'Fixed Income',
   ALTERNATES:    'Alternates',
   REAL_ESTATE:   'Real Estate',
+  GOLD_SILVER:   'Gold / Silver',
+  COMMODITIES:   'Commodities',
   HYBRID:        'Hybrid MF',
   ARBITRAGE:     'Arbitrage',
   CASH:          'Cash & Transit',
@@ -390,6 +394,7 @@ export default function DashboardPage() {
                 { href: '/mutual-funds', label: 'Mutual Funds' },
                 { href: '/equity', label: 'Equity' },
                 { href: '/foreign-equity', label: 'Foreign Equity' },
+                { href: '/gold-silver', label: 'Gold/Silver' },
                 { href: '/bank-accounts', label: 'Banks' },
                 { href: '/pms', label: 'PMS' },
                 { href: '/manual-data', label: 'Manual Data' },

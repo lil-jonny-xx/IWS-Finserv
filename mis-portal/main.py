@@ -1148,6 +1148,7 @@ _EQUITY_HOLDING_COLS = """
     eh.xirr_inception_pct,
     eh.first_invested_date,
     eh.sector,
+    eh.asset_class,
     eh.remarks,
     eh.updated_at
 """
@@ -1187,6 +1188,7 @@ def _row_to_holding(r: dict) -> dict:
         "xirr_inception_pct":    _fmt(r.get("xirr_inception_pct")),
         "first_invested_date":   str(r["first_invested_date"]) if r["first_invested_date"] else None,
         "sector":                r["sector"],
+        "asset_class":           r.get("asset_class") or "equity",
         "remarks":               r["remarks"],
         "updated_at":            r["updated_at"].isoformat() if r["updated_at"] else None,
     }
@@ -1229,6 +1231,10 @@ def get_equity_holdings(
         # Build WHERE clause
         conditions = []
         params     = []
+        # Gold/silver/commodity holdings moved to the dedicated Gold/Silver page
+        # (the 2026-06-26 split) — keep the Equity page to actual equity.
+        conditions.append(
+            "COALESCE(eh.asset_class, 'equity') NOT IN ('gold','silver','commodity')")
         if eid is not None:
             conditions.append("eh.entity_id = %s")
             params.append(eid)
@@ -1390,6 +1396,10 @@ def get_foreign_equity_holdings(
         eid  = _resolve_entity(cur, payload, entity_id)
 
         conditions, params = [], []
+        # Gold/silver/commodity (e.g. IBKR uranium) moved to the dedicated
+        # Gold/Silver page (2026-06-26 split) — exclude from Foreign Equity too.
+        conditions.append(
+            "COALESCE(eh.asset_class, 'equity') NOT IN ('gold','silver','commodity')")
         if eid is not None:
             conditions.append("eh.entity_id = %s")
             params.append(eid)
@@ -1482,6 +1492,97 @@ def get_foreign_equity_holdings(
         raise
     except Exception as e:
         logger.error(f"Error in /api/v1/foreign-equity/holdings: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+# ---------------------------------------------------------------------------
+# Gold / Silver / Commodities — instruments split out of the Equity & Foreign
+# pages (asset_class in gold/silver/commodity), unioned across both holding
+# tables. New broker buys of a known instrument land here automatically via the
+# daily sync's asset-class stamping. See equity/asset_class.py.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/gold-silver/holdings")
+def get_gold_silver_holdings(
+    request: Request,
+    entity_id: Optional[int] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Gold ETFs / sovereign gold bonds, silver ETFs, and tracked commodities
+    (e.g. IBKR uranium), grouped into precious metals vs commodities. Rows carry
+    both native (USD/SGD/…) and INR figures plus the latest fx_rates map so the
+    frontend can show native values where they exist (URNU in USD, SGBs in INR).
+    Admin sees all entities (or ?entity_id=N); a member sees only their entity.
+    """
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        eid  = _resolve_entity(cur, payload, entity_id)
+
+        conds  = ["COALESCE(eh.asset_class, 'equity') IN ('gold','silver','commodity')"]
+        params: list = []
+        if eid is not None:
+            conds.append("eh.entity_id = %s")
+            params.append(eid)
+        where = "WHERE " + " AND ".join(conds)
+
+        # Union the domestic + foreign holding tables (identical relevant columns).
+        cur.execute(
+            f"""
+            SELECT * FROM (
+                SELECT {_EQUITY_HOLDING_COLS}
+                FROM   equity_holding eh
+                JOIN   entity e ON e.id = eh.entity_id
+                {where}
+                UNION ALL
+                SELECT {_EQUITY_HOLDING_COLS}
+                FROM   foreign_equity_holding eh
+                JOIN   entity e ON e.id = eh.entity_id
+                {where}
+            ) u
+            ORDER BY entity_name, asset_class, symbol
+            """,
+            params + params,
+        )
+        rows = cur.fetchall()
+        fx_rates = _latest_fx_rates(conn)
+        cur.close()
+
+        holdings    = [_row_to_holding(r) for r in rows]
+        metals      = [h for h in holdings if h["asset_class"] in ("gold", "silver")]
+        commodities = [h for h in holdings if h["asset_class"] == "commodity"]
+        totals      = _equity_totals(rows)
+
+        def _mv(items):
+            return round(sum(float(h["current_market_value"] or 0) for h in items), 2)
+
+        entity_name = "All Entities" if eid is None else (
+            rows[0]["entity_name"] if rows else ""
+        )
+
+        return {
+            "entity_id":         eid or 0,
+            "entity_name":       entity_name,
+            "total_holdings":    len(holdings),
+            "totals":            totals,
+            "holdings":          holdings,
+            "metals":            metals,
+            "commodities":       commodities,
+            "metals_total":      _mv(metals),
+            "commodities_total": _mv(commodities),
+            "fx_rates":          fx_rates,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/v1/gold-silver/holdings: {e}")
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
     finally:
         release_db_connection(conn)
@@ -1776,7 +1877,7 @@ MANUAL_ASSET_CLASS = {
     "overseas_fund":   "ALTERNATES",
     "overseas_equity": "ALTERNATES",
     "forex":           "ALTERNATES",
-    "gold_etf":        "ALTERNATES",
+    "gold_etf":        "GOLD_SILVER",
     "unlisted":        "ALTERNATES",
     "startup":         "ALTERNATES",
     "properties":      "REAL_ESTATE",
@@ -2003,7 +2104,11 @@ def get_overview(
             SELECT
                 eh.entity_id,
                 e.entity_name,
-                'DIRECT_EQUITY'                       AS asset_class,
+                CASE
+                    WHEN COALESCE(eh.asset_class,'equity') IN ('gold','silver') THEN 'GOLD_SILVER'
+                    WHEN COALESCE(eh.asset_class,'equity') = 'commodity'         THEN 'COMMODITIES'
+                    ELSE 'DIRECT_EQUITY'
+                END                                   AS asset_class,
                 'DIRECT_EQUITY'                       AS security_type,
                 COALESCE(eh.cost, 0)                  AS invested,
                 COALESCE(eh.current_market_value, 0)  AS mkt_value,
@@ -2018,7 +2123,11 @@ def get_overview(
             SELECT
                 eh.entity_id,
                 e.entity_name,
-                'DIRECT_EQUITY'                       AS asset_class,
+                CASE
+                    WHEN COALESCE(eh.asset_class,'equity') IN ('gold','silver') THEN 'GOLD_SILVER'
+                    WHEN COALESCE(eh.asset_class,'equity') = 'commodity'         THEN 'COMMODITIES'
+                    ELSE 'DIRECT_EQUITY'
+                END                                   AS asset_class,
                 'DIRECT_EQUITY'                       AS security_type,
                 COALESCE(eh.cost, 0)                  AS invested,
                 COALESCE(eh.current_market_value, 0)  AS mkt_value,
@@ -2077,6 +2186,9 @@ def get_overview(
             class_totals[cls]["value"]    += row_val(r, "mkt_value")
             class_totals[cls]["pnl"]      += row_val(r, "pnl_inception")
 
+        # Drop empty buckets (no value AND nothing invested) so a category that
+        # exists but is currently empty doesn't render as a 0% slice on the pie /
+        # bar charts.
         asset_class_breakdown = [
             {
                 "asset_class": cls,
@@ -2086,6 +2198,7 @@ def get_overview(
                 "pct":         round(v["value"] / total_value * 100, 2) if total_value else 0,
             }
             for cls, v in sorted(class_totals.items(), key=lambda x: -x[1]["value"])
+            if round(v["value"], 2) > 0 or round(v["invested"], 2) > 0
         ]
 
         entity_map: dict = {}
@@ -2133,6 +2246,7 @@ def get_overview(
                     "pct":         round(v["value"] / ev * 100, 2) if ev else 0,
                 }
                 for broad, v in sorted(em["asset_classes"].items(), key=lambda x: -x[1]["value"])
+                if round(v["value"], 2) > 0 or round(v["invested"], 2) > 0
             ]
             entities_out.append({
                 "entity_id":      em["entity_id"],

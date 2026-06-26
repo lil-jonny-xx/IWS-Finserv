@@ -157,6 +157,24 @@ def fetch_history_value(
     return Decimal(str(row["market_value"])) if row else None
 
 
+from equity.asset_class import classify_asset_class, load_overrides
+
+# Asset-class override map (symbol/isin → gold|silver|commodity), loaded once per
+# process from asset_class_override the first time a holding is classified. Lets the
+# admin reclassify a new/unknown instrument without a deploy; curated rules cover the
+# rest. See equity/asset_class.py.
+_ASSET_CLASS_OVERRIDES: "dict | None" = None
+
+
+def _asset_class_for(conn, symbol: str, isin: str) -> str:
+    global _ASSET_CLASS_OVERRIDES
+    if _ASSET_CLASS_OVERRIDES is None:
+        c = conn.cursor()
+        _ASSET_CLASS_OVERRIDES = load_overrides(c)
+        c.close()
+    return classify_asset_class(symbol, isin, _ASSET_CLASS_OVERRIDES)
+
+
 def classify_sector(symbol: str, isin: str) -> str:
     """Classify a holding into a display sector based on symbol and ISIN prefix."""
     sym          = (symbol or '').upper()
@@ -371,7 +389,7 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
     cur.execute(
         f"""
         INSERT INTO {tbl} (
-            entity_id, broker, symbol, isin, exchange, sector,
+            entity_id, broker, symbol, isin, exchange, sector, asset_class,
             quantity, avg_cost, cost, current_price, current_market_value,
             currency, fx_rate,
             avg_cost_native, cost_native, current_price_native, current_market_value_native,
@@ -382,7 +400,7 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
             xirr_inception_pct,
             first_invested_date, remarks, angel_one_token, updated_at
         ) VALUES (
-            %(entity_id)s, %(broker)s, %(symbol)s, %(isin)s, %(exchange)s, %(sector)s,
+            %(entity_id)s, %(broker)s, %(symbol)s, %(isin)s, %(exchange)s, %(sector)s, %(asset_class)s,
             %(quantity)s, %(avg_cost)s, %(cost)s, %(current_price)s, %(current_market_value)s,
             %(currency)s, %(fx_rate)s,
             %(avg_cost_native)s, %(cost_native)s, %(current_price_native)s, %(current_market_value_native)s,
@@ -397,6 +415,7 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
             {key_update},
             exchange              = EXCLUDED.exchange,
             sector                = EXCLUDED.sector,
+            asset_class           = EXCLUDED.asset_class,
             quantity              = EXCLUDED.quantity,
             avg_cost              = EXCLUDED.avg_cost,
             cost                  = EXCLUDED.cost,
@@ -432,6 +451,7 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
             "isin":                  h.isin,
             "exchange":              h.exchange,
             "sector":                classify_sector(h.symbol, h.isin),
+            "asset_class":           classify_asset_class(h.symbol, h.isin, _ASSET_CLASS_OVERRIDES),
             "quantity":              float(h.quantity),
             "avg_cost":              float(h.avg_cost),
             "cost":                  float(h.cost),
@@ -801,6 +821,10 @@ def sync_entity_broker(
 
     prev_friday = last_friday(today - timedelta(days=1))  # last completed Friday
     ytd_date    = jan1(today)
+
+    # Prime the asset-class override map once (cheap, process-cached) so each
+    # upsert can stamp gold/silver/commodity vs equity from the same lookup.
+    _asset_class_for(conn, "", "")
 
     cur = conn.cursor()
     count = 0

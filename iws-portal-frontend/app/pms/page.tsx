@@ -247,6 +247,7 @@ export default function PmsPage() {
               { href: '/mutual-funds',  label: 'Mutual Funds'   },
               { href: '/equity',        label: 'Equity'         },
               { href: '/foreign-equity', label: 'Foreign Equity' },
+              { href: '/gold-silver', label: 'Gold/Silver' },
               { href: '/bank-accounts', label: 'Banks' },
               { href: '/pms',           label: 'PMS', active: true },
               { href: '/manual-data',   label: 'Manual Data'    },
