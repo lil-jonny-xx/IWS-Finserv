@@ -4,42 +4,101 @@ import { useRouter } from 'next/navigation';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
-const CURRENCIES     = ['INR', 'USD', 'GBP', 'EUR', 'AED', 'SGD', 'HKD'];
-const ACCOUNT_TYPES  = ['savings', 'current', 'nre', 'other'];
+interface User { role: string; full_name: string; entity_id?: number; }
+interface Entity { id: number; name: string; }
 
-interface User   { role: string; full_name: string; entity_id?: number; }
-interface Entity { id: number; entity_name?: string; name?: string; }
-
-interface BankAccount {
-  id: number;
-  entity_id: number;
-  entity_name: string;
-  bank_name: string;
-  account_type: string;
-  currency: string;
-  balance: number;
-  balance_inr: number | null;
-  fx_rate: number | null;
-  balance_as_of: string | null;
-  notes: string | null;
-  statement_count: number;
-  updated_at: string | null;
-  updated_by: string | null;
+interface Attachment {
+  id: number; kind: string; original_name: string | null; mime: string | null;
+  size_bytes: number | null; has_thumb: boolean;
+}
+interface BankAsset {
+  entity_id: number; entity_name: string; label: string;
+  cost: number | null; current_value: number | null; currency: string;
+  inception_date: string | null; notes: string | null;
+  attachments: Attachment[];
+}
+interface ManualAssetsResponse {
+  category: string; entity_id: number; total_value: number; count: number; assets: BankAsset[];
 }
 
-interface BankAccountsResponse {
-  accounts: BankAccount[];
-  total_inr: number;
-  fx_rates: Record<string, number>;
+function fmtINR(n: number | null | undefined): string {
+  if (n == null) return '—';
+  return '₹' + Math.round(n).toLocaleString('en-IN');
+}
+function fileUrl(id: number)  { return `${API_URL}/api/v1/manual-attachments/${id}/file`; }
+function thumbUrl(id: number) { return `${API_URL}/api/v1/manual-attachments/${id}/thumb`; }
+
+function EntitySwitcher({ entities, selectedId, onSelect }: {
+  entities: Entity[]; selectedId: number | null; onSelect: (id: number | null) => void;
+}) {
+  return (
+    <div className="flex flex-wrap gap-1.5 mb-5" role="tablist" aria-label="Entity filter">
+      {[{ id: null, name: 'All' }, ...entities.map(e => ({ id: e.id, name: e.name }))].map(tab => {
+        const active = tab.id === selectedId;
+        return (
+          <button key={tab.id ?? 'all'} role="tab" aria-selected={active}
+            onClick={() => onSelect(tab.id ?? null)}
+            className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
+              active ? 'bg-prime text-prime-fg' : 'bg-card border border-rule text-dim hover:border-dim hover:text-ink'}`}>
+            {tab.name}
+          </button>
+        );
+      })}
+    </div>
+  );
 }
 
-interface ParsedStatement {
-  statement_id: number;
-  parsed_balance: number | null;
-  parsed_as_of: string | null;
-  parse_status: 'parsed' | 'needs_review' | 'failed';
-  parse_note: string;
-  file_kind: string;
+function BankCard({ a, showEntity, onOpen }: {
+  a: BankAsset; showEntity: boolean; onOpen: (id: number) => void;
+}) {
+  const images = a.attachments.filter(t => (t.mime || '').startsWith('image/'));
+  const files  = a.attachments.filter(t => !(t.mime || '').startsWith('image/'));
+  return (
+    <div className="bg-card rounded-lg border border-rule overflow-hidden flex flex-col">
+      <div className="px-5 pt-4 pb-3 border-b border-rule flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold text-ink leading-tight">{a.label}</h3>
+          {showEntity && <p className="text-[11px] text-ghost mt-0.5">{a.entity_name}</p>}
+          {a.inception_date && <p className="text-[11px] text-ghost">As of {a.inception_date}</p>}
+        </div>
+        <div className="text-right shrink-0">
+          <p className="text-[11px] uppercase tracking-wide text-ghost">Balance</p>
+          <p className="text-base font-bold text-ink tabular-nums">{fmtINR(a.current_value)}</p>
+          {a.currency && a.currency !== 'INR' && (
+            <p className="text-[11px] text-ghost">{a.currency} account</p>
+          )}
+        </div>
+      </div>
+      <div className="p-4 flex flex-col gap-3 flex-1">
+        {images.length > 0 && (
+          <div className="grid grid-cols-3 gap-2">
+            {images.map(im => (
+              <button key={im.id} onClick={() => onOpen(im.id)} className="aspect-square bg-page rounded overflow-hidden" aria-label={`View ${im.original_name || 'statement'}`}>
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={thumbUrl(im.id)} alt={im.original_name || 'statement'} loading="lazy" className="w-full h-full object-cover hover:scale-[1.03] transition-transform" />
+              </button>
+            ))}
+          </div>
+        )}
+        {files.length > 0 ? (
+          <ul className="flex flex-col gap-1.5">
+            {files.map(d => (
+              <li key={d.id}>
+                <a href={fileUrl(d.id)} target="_blank" rel="noopener noreferrer"
+                   className="flex items-center justify-between gap-2 text-xs px-2.5 py-1.5 rounded border border-rule text-dim hover:text-ink hover:border-dim transition-colors">
+                  <span className="truncate">📄 {d.original_name || 'statement'}</span>
+                  <span className="text-[10px] uppercase tracking-wide text-ghost shrink-0">Statement</span>
+                </a>
+              </li>
+            ))}
+          </ul>
+        ) : images.length === 0 ? (
+          <p className="text-xs text-ghost">No statements uploaded.</p>
+        ) : null}
+        {a.notes && <p className="text-[11px] text-ghost border-t border-rule pt-2">{a.notes}</p>}
+      </div>
+    </div>
+  );
 }
 
 const NAV = [
@@ -47,7 +106,7 @@ const NAV = [
   { href: '/mutual-funds', label: 'Mutual Funds' },
   { href: '/equity', label: 'Equity' },
   { href: '/foreign-equity', label: 'Foreign Equity' },
-  { href: '/bank-accounts', label: 'Banks', active: true },
+  { href: '/bank-accounts', label: 'Banks' },
   { href: '/pms', label: 'PMS' },
   { href: '/gold-silver', label: 'Commodities' },
   { href: '/unlisted', label: 'Unlisted' },
@@ -59,189 +118,17 @@ const NAV = [
   { href: '/assistant', label: 'Assistant' },
 ];
 
-function entityName(e: Entity): string { return e.entity_name || e.name || `#${e.id}`; }
-
-function fmtINR(n: number | null): string {
-  if (n === null || n === undefined) return '—';
-  return new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(n);
-}
-function fmtNative(n: number, ccy: string): string {
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: ccy, maximumFractionDigits: 2 }).format(n);
-}
-function fmtAsOf(iso: string | null): string {
-  if (!iso) return '';
-  return new Date(iso).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
-}
-
-// ---------------------------------------------------------------------------
-
-function EntitySwitcher({ entities, selectedId, onSelect }: {
-  entities: Entity[]; selectedId: number | null; onSelect: (id: number | null) => void;
-}) {
-  return (
-    <div className="flex flex-wrap gap-1.5 mb-5" role="tablist" aria-label="Entity filter">
-      {[{ id: null, name: 'All' }, ...entities.map(e => ({ id: e.id, name: entityName(e) }))].map(tab => {
-        const active = tab.id === selectedId;
-        return (
-          <button key={tab.id ?? 'all'} role="tab" aria-selected={active}
-            onClick={() => onSelect(tab.id ?? null)}
-            className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
-              active ? 'bg-prime text-prime-fg'
-                     : 'bg-card border border-rule text-dim hover:border-dim hover:text-ink'}`}>
-            {tab.name}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-function AccountCard({ acct, onChanged }: { acct: BankAccount; onChanged: () => void }) {
-  const fileRef = useRef<HTMLInputElement>(null);
-  const [busy, setBusy]       = useState(false);
-  const [error, setError]     = useState<string | null>(null);
-  const [parsed, setParsed]   = useState<ParsedStatement | null>(null);
-  const [manual, setManual]   = useState(false);
-  // confirm/manual entry fields
-  const [bal, setBal]   = useState('');
-  const [asOf, setAsOf] = useState('');
-
-  async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
-    const f = e.target.files?.[0];
-    if (!f) return;
-    setBusy(true); setError(null); setParsed(null); setManual(false);
-    try {
-      const fd = new FormData();
-      fd.append('file', f);
-      const r = await fetch(`${API_URL}/api/v1/bank-accounts/${acct.id}/statements`, {
-        method: 'POST', credentials: 'include', body: fd,   // browser sets multipart boundary
-      });
-      if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || 'Upload failed.'); }
-      const p: ParsedStatement = await r.json();
-      setParsed(p);
-      setBal(p.parsed_balance !== null ? String(p.parsed_balance) : '');
-      setAsOf(p.parsed_as_of || '');
-    } catch (e) { setError(e instanceof Error ? e.message : 'Upload failed.'); }
-    finally { setBusy(false); if (fileRef.current) fileRef.current.value = ''; }
-  }
-
-  async function commit(statementId: number | null) {
-    if (bal === '' || isNaN(Number(bal))) { setError('Enter a valid balance.'); return; }
-    setBusy(true); setError(null);
-    try {
-      const r = await fetch(`${API_URL}/api/v1/bank-accounts/${acct.id}/balance`, {
-        method: 'POST', credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ balance: Number(bal), balance_as_of: asOf || null, statement_id: statementId }),
-      });
-      if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || 'Failed to save balance.'); }
-      setParsed(null); setManual(false); onChanged();
-    } catch (e) { setError(e instanceof Error ? e.message : 'Failed to save balance.'); }
-    finally { setBusy(false); }
-  }
-
-  async function remove() {
-    if (!confirm(`Delete ${acct.bank_name} (${acct.entity_name})? This removes its statement history.`)) return;
-    setBusy(true); setError(null);
-    try {
-      const r = await fetch(`${API_URL}/api/v1/bank-accounts/${acct.id}/delete`, { method: 'POST', credentials: 'include' });
-      if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || 'Failed to delete.'); }
-      onChanged();
-    } catch (e) { setError(e instanceof Error ? e.message : 'Failed to delete.'); setBusy(false); }
-  }
-
-  const statusColor = parsed?.parse_status === 'parsed' ? 'text-emerald-500'
-                    : parsed?.parse_status === 'needs_review' ? 'text-amber-500' : 'text-red-500';
-
-  return (
-    <div className="bg-card rounded-lg border border-rule p-5 flex flex-col gap-4">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <h3 className="text-base font-semibold text-ink">{acct.bank_name}</h3>
-          <div className="flex items-center gap-2 mt-0.5">
-            <span className="text-xs text-dim">{acct.entity_name}</span>
-            <span className="text-[10px] uppercase tracking-wide bg-page border border-rule text-ghost px-1.5 py-0.5 rounded">
-              {acct.account_type}
-            </span>
-          </div>
-        </div>
-        <button onClick={remove} disabled={busy} title="Delete account"
-          className="text-ghost hover:text-red-500 text-xs px-1.5 py-0.5 rounded disabled:opacity-50">✕</button>
-      </div>
-
-      <div>
-        <div className="text-2xl font-bold text-ink tabular-nums">{fmtNative(acct.balance, acct.currency)}</div>
-        <div className="text-xs text-ghost mt-0.5">
-          {acct.balance_inr !== null
-            ? <>≈ {fmtINR(acct.balance_inr)}{acct.fx_rate ? ` · 1 ${acct.currency} = ₹${acct.fx_rate.toFixed(2)}` : ''}</>
-            : <span className="text-amber-500">No FX rate for {acct.currency} yet</span>}
-          {acct.balance_as_of && <> · as of {fmtAsOf(acct.balance_as_of)}</>}
-        </div>
-      </div>
-
-      {/* upload + confirm */}
-      <div className="border-t border-rule pt-3">
-        {!parsed && !manual && (
-          <div className="flex flex-wrap items-center gap-2">
-            <input ref={fileRef} type="file" accept=".pdf,.csv,.xlsx,.xls" onChange={onFile} disabled={busy}
-              className="text-xs text-dim file:mr-2 file:text-xs file:font-medium file:border-0 file:rounded
-                         file:bg-prime file:text-prime-fg file:px-2.5 file:py-1.5 file:cursor-pointer" />
-            <button onClick={() => { setManual(true); setBal(String(acct.balance)); setAsOf(acct.balance_as_of || ''); }}
-              className="text-xs text-dim hover:text-ink underline underline-offset-2">enter manually</button>
-            {acct.statement_count > 0 && (
-              <span className="text-[11px] text-ghost ml-auto">{acct.statement_count} statement{acct.statement_count > 1 ? 's' : ''} uploaded</span>
-            )}
-          </div>
-        )}
-
-        {busy && !parsed && <p className="text-xs text-ghost">Working…</p>}
-
-        {(parsed || manual) && (
-          <div className="bg-page rounded-md border border-rule p-3 flex flex-col gap-2">
-            {parsed && (
-              <p className={`text-xs ${statusColor}`}>
-                {parsed.parse_status === 'parsed' ? 'Parsed from statement.' :
-                 parsed.parse_status === 'needs_review' ? 'Please review:' : 'Could not parse:'} {' '}
-                <span className="text-dim">{parsed.parse_note}</span>
-              </p>
-            )}
-            <div className="flex flex-wrap items-end gap-3">
-              <label className="text-xs text-dim flex flex-col gap-1">Balance ({acct.currency})
-                <input value={bal} onChange={e => setBal(e.target.value)} inputMode="decimal"
-                  className="bg-card border border-rule rounded px-2 py-1.5 text-sm text-ink w-40 tabular-nums" />
-              </label>
-              <label className="text-xs text-dim flex flex-col gap-1">As of
-                <input type="date" value={asOf} onChange={e => setAsOf(e.target.value)}
-                  className="bg-card border border-rule rounded px-2 py-1.5 text-sm text-ink" />
-              </label>
-              <button onClick={() => commit(parsed ? parsed.statement_id : null)} disabled={busy}
-                className="text-xs font-medium bg-prime text-prime-fg px-3 py-2 rounded hover:opacity-90 disabled:opacity-50">
-                {busy ? 'Saving…' : 'Confirm & save'}
-              </button>
-              <button onClick={() => { setParsed(null); setManual(false); setError(null); }}
-                className="text-xs border border-rule text-dim px-3 py-2 rounded hover:text-ink">Cancel</button>
-            </div>
-          </div>
-        )}
-
-        {error && <p className="text-xs text-red-500 mt-2">{error}</p>}
-      </div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-
-export default function BankAccountsPage() {
+export default function BanksPage() {
   const router = useRouter();
-  const [user, setUser]         = useState<User | null>(null);
-  const [entities, setEntities] = useState<Entity[]>([]);
-  const [selectedId, setSel]    = useState<number | null>(null);
-  const [data, setData]         = useState<BankAccountsResponse | null>(null);
-  const [loading, setLoading]   = useState(true);
-  const [error, setError]       = useState<string | null>(null);
-  const [reload, setReload]     = useState(0);
-  const refresh = useCallback(() => setReload(c => c + 1), []);
+  const [user, setUser]             = useState<User | null>(null);
+  const [entities, setEntities]     = useState<Entity[]>([]);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [data, setData]             = useState<ManualAssetsResponse | null>(null);
+  const [loading, setLoading]       = useState(true);
+  const [error, setError]           = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
+  const [lightbox, setLightbox]     = useState<number | null>(null);
+  const didInitialLoad              = useRef(false);
 
   useEffect(() => {
     fetch(`${API_URL}/api/v1/me`, { credentials: 'include' })
@@ -251,27 +138,27 @@ export default function BankAccountsPage() {
         setUser(u);
         if (u.role === 'admin') {
           fetch(`${API_URL}/api/v1/entities`, { credentials: 'include' })
-            .then(r => r.ok ? r.json() : []).then((ents: Entity[]) => setEntities(ents)).catch(() => {});
-        } else {
-          setLoading(false);   // non-admins see the access notice, not a spinner
+            .then(r => r.ok ? r.json() : []).then((e: Entity[]) => setEntities(e)).catch(() => {});
         }
       })
       .catch(() => router.push('/'));
   }, [router]);
 
   useEffect(() => {
-    if (!user || user.role !== 'admin') return;
     const controller = new AbortController();
+    if (!didInitialLoad.current) setLoading(true);
     setError(null);
-    const qs = selectedId !== null ? `?entity_id=${selectedId}` : '';
-    fetch(`${API_URL}/api/v1/bank-accounts${qs}`, { credentials: 'include', signal: controller.signal })
-      .then(r => { if (r.status === 401) { router.push('/'); return null; } if (!r.ok) throw new Error('Failed to load bank accounts.'); return r.json(); })
-      .then((d: BankAccountsResponse | null) => { if (d) setData(d); setLoading(false); })
+    const qs = selectedId !== null ? `&entity_id=${selectedId}` : '';
+    fetch(`${API_URL}/api/v1/manual-assets?category=bank${qs}`, { credentials: 'include', signal: controller.signal })
+      .then(r => { if (r.status === 401) { router.push('/'); return null; } if (!r.ok) throw new Error('Failed to load bank balances.'); return r.json(); })
+      .then((d: ManualAssetsResponse | null) => { if (d) setData(d); setLoading(false); didInitialLoad.current = true; })
       .catch(err => { if (err.name !== 'AbortError') { setError(err.message); setLoading(false); } });
     return () => controller.abort();
-  }, [router, user, selectedId, reload]);
+  }, [router, selectedId, retryCount]);
 
-  const isAdmin = user?.role === 'admin';
+  const isAdmin     = user?.role === 'admin';
+  const showEntity  = isAdmin && selectedId === null;
+  const handleRetry = useCallback(() => setRetryCount(c => c + 1), []);
 
   return (
     <main id="main-content" className="min-h-screen bg-page p-4 sm:p-8">
@@ -279,58 +166,79 @@ export default function BankAccountsPage() {
         <div className="flex flex-wrap justify-between items-start gap-3 mb-6">
           <div>
             <h1 className="text-2xl sm:text-3xl font-bold text-ink">Bank Accounts</h1>
-            <p className="text-sm text-ghost mt-0.5">Cash balances by entity · upload a statement (PDF / CSV / Excel) to update</p>
+            <span className="text-sm text-ghost">Cash balances — entered in Manual Data, with uploaded statements</span>
           </div>
-          <nav className="flex flex-wrap gap-1.5" aria-label="Sections">
-            {NAV.map(({ href, label, active }) => (
-              <a key={href} href={href} aria-current={active ? 'page' : undefined}
-                className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
-                  active ? 'bg-prime text-prime-fg'
-                         : 'bg-card border border-rule text-dim hover:border-dim hover:text-ink'}`}>
+          <nav className="flex gap-1.5 flex-wrap" aria-label="Sections">
+            {NAV.map(({ href, label }) => (
+              <a key={href} href={href} aria-current={href === '/bank-accounts' ? 'page' : undefined}
+                 className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
+                   href === '/bank-accounts' ? 'bg-prime text-prime-fg' : 'bg-card border border-rule text-dim hover:border-dim hover:text-ink'}`}>
                 {label}
               </a>
             ))}
           </nav>
         </div>
 
-        {isAdmin === false && (
-          <div className="bg-card rounded-lg border border-rule px-5 py-8 text-center">
-            <p className="text-sm text-dim">Bank accounts are managed by administrators.</p>
+        {isAdmin && entities.length > 0 && (
+          <EntitySwitcher entities={entities} selectedId={selectedId} onSelect={setSelectedId} />
+        )}
+
+        {loading && !data && (
+          <div className="bg-card rounded-lg border border-rule px-5 py-16 text-center text-sm text-ghost">Loading…</div>
+        )}
+
+        {error && !data && (
+          <div role="alert" className="bg-card rounded-lg border border-rule px-5 py-5 flex items-start justify-between gap-4">
+            <div>
+              <p className="text-sm font-medium text-dim">Could not load bank balances</p>
+              <p className="text-xs text-ghost mt-1">{error}</p>
+            </div>
+            <button onClick={handleRetry} className="shrink-0 text-xs border border-wire text-dim px-3 py-1.5 rounded hover:border-dim hover:text-ink transition-colors">Retry</button>
           </div>
         )}
 
-        {isAdmin && (
-          <>
-            {entities.length > 0 && <EntitySwitcher entities={entities} selectedId={selectedId} onSelect={setSel} />}
+        {data && (
+          <div className="fade-in">
+            <div className="bg-card rounded-lg border border-rule px-5 sm:px-6 py-4 mb-6 flex flex-wrap gap-8 items-end">
+              <div>
+                <p className="text-[11px] uppercase tracking-wide text-ghost">Total Bank Balance</p>
+                <p className="text-2xl font-bold text-ink tabular-nums">{fmtINR(data.total_value)}</p>
+              </div>
+              <div>
+                <p className="text-[11px] uppercase tracking-wide text-ghost">Accounts</p>
+                <p className="text-base font-semibold text-ink tabular-nums">{data.count}</p>
+              </div>
+              {isAdmin && (
+                <a href="/manual-data" className="ml-auto text-xs font-medium border border-rule text-dim px-3 py-1.5 rounded hover:border-dim hover:text-ink transition-colors">
+                  + Add / edit in Manual Data
+                </a>
+              )}
+            </div>
 
-            {data && (
-              <div className="mb-5 bg-card rounded-lg border border-rule px-5 py-4 inline-flex flex-col">
-                <span className="text-xs text-ghost uppercase tracking-wide">Total (INR equiv.)</span>
-                <span className="text-xl font-bold text-ink tabular-nums">{fmtINR(data.total_inr)}</span>
+            {data.count === 0 ? (
+              <div className="bg-card rounded-lg border border-rule px-5 py-16 text-center text-sm text-ghost">
+                No bank balances yet. Add one from the{' '}
+                <a href="/manual-data" className="text-prime hover:underline">Manual Data</a> page (category “Bank Balance”).
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                {data.assets.map(a => (
+                  <BankCard key={`${a.entity_id}-${a.label}`} a={a} showEntity={showEntity} onOpen={setLightbox} />
+                ))}
               </div>
             )}
-
-            {loading && !data && <p className="text-sm text-ghost">Loading…</p>}
-            {error && <p className="text-sm text-red-500 mb-4">{error}</p>}
-
-            {data && data.accounts.length === 0 && (
-              <div className="bg-card rounded-lg border border-rule px-5 py-8 text-center">
-                <p className="text-sm text-dim">No bank accounts yet. Add one from the <a href="/manual-data" className="text-prime hover:underline">Manual Data</a> page (category “Bank Balance”).</p>
-              </div>
-            )}
-
-            {data && data.accounts.length > 0 && (
-              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 fade-in">
-                {data.accounts.map(a => <AccountCard key={a.id} acct={a} onChanged={refresh} />)}
-              </div>
-            )}
-          </>
+          </div>
         )}
 
-        <p className="text-center text-xs text-ghost mt-8">
-          IWS Finserv &copy; {new Date().getFullYear()} · Bank balances are entered from uploaded statements
-        </p>
+        <p className="text-center text-xs text-ghost mt-8">IWS Finserv &copy; {new Date().getFullYear()}</p>
       </div>
+
+      {lightbox != null && (
+        <div className="fixed inset-0 z-50 bg-ink/80 flex items-center justify-center p-6" onClick={() => setLightbox(null)}>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={fileUrl(lightbox)} alt="Statement" className="max-w-full max-h-full object-contain rounded shadow-2xl" />
+        </div>
+      )}
     </main>
   );
 }
