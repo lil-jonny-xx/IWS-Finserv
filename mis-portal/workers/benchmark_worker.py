@@ -29,17 +29,26 @@ logging.basicConfig(level=logging.INFO,
                     handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger(__name__)
 
-# Market-hours guard — lets this run every minute (mirrors equity_price_worker).
-IST          = zoneinfo.ZoneInfo("Asia/Kolkata")
-MARKET_OPEN  = (9, 15)    # 09:15 IST
-MARKET_CLOSE = (15, 30)   # 15:30 IST
+# Market-hours guards — the worker runs every minute and fetches each index only
+# while ITS OWN exchange is open: Indian indices on NSE hours (IST), US indices on
+# NYSE/NASDAQ hours (US Eastern, DST-aware via zoneinfo). So Nifty/Sensex track the
+# Indian session and Dow/NASDAQ track the live US session.
+IST = zoneinfo.ZoneInfo("Asia/Kolkata")
+NY  = zoneinfo.ZoneInfo("America/New_York")
 
 
-def is_market_open() -> bool:
-    now = datetime.now(IST)
+def _within(now, open_hm, close_hm) -> bool:
     if now.weekday() >= 5:            # Sat / Sun
         return False
-    return MARKET_OPEN <= (now.hour, now.minute) < MARKET_CLOSE
+    return open_hm <= (now.hour, now.minute) < close_hm
+
+
+def is_nse_open() -> bool:
+    return _within(datetime.now(IST), (9, 15), (15, 30))   # 09:15–15:30 IST
+
+
+def is_us_open() -> bool:
+    return _within(datetime.now(NY), (9, 30), (16, 0))     # 09:30–16:00 ET
 
 DB_CONFIG = {
     "host":     os.getenv("DB_HOST", "localhost"),
@@ -48,14 +57,13 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD", ""),
 }
 
-# benchmark code -> Yahoo symbol. US indices (Dow Jones, NASDAQ) carry their
-# latest available close — Yahoo returns previousClose while the US market is
-# shut, which is when this worker runs (IST hours), so they refresh once a day.
+# benchmark code -> (Yahoo symbol, market). Each index is fetched only while its
+# own market is open ('IN' = NSE/IST, 'US' = NYSE-NASDAQ/ET).
 INDEX_SYMBOLS = {
-    "NIFTY":    "^NSEI",
-    "SENSEX":   "^BSESN",
-    "DOWJONES": "^DJI",
-    "NASDAQ":   "^IXIC",
+    "NIFTY":    ("^NSEI",  "IN"),
+    "SENSEX":   ("^BSESN", "IN"),
+    "DOWJONES": ("^DJI",   "US"),
+    "NASDAQ":   ("^IXIC",  "US"),
 }
 YF_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
@@ -73,15 +81,20 @@ def fetch_index(symbol: str) -> float:
 
 def main():
     force = "--force" in sys.argv or os.getenv("BENCHMARK_FORCE") == "1"
-    if not force and not is_market_open():
-        logger.info("Market closed — skipping benchmark fetch (use --force to override).")
+    nse_open, us_open = is_nse_open(), is_us_open()
+    if not force and not (nse_open or us_open):
+        logger.info("Both markets closed — skipping benchmark fetch (use --force to override).")
         return
 
+    market_open = {"IN": nse_open, "US": us_open}
     today = date.today()
     conn = psycopg2.connect(**DB_CONFIG)
     cur = conn.cursor()
-    ok = 0
-    for code, symbol in INDEX_SYMBOLS.items():
+    ok = attempted = 0
+    for code, (symbol, market) in INDEX_SYMBOLS.items():
+        if not force and not market_open.get(market, False):
+            continue                       # this index's exchange is shut right now
+        attempted += 1
         try:
             value = fetch_index(symbol)
         except Exception as e:
@@ -100,7 +113,8 @@ def main():
     conn.commit()
     cur.close()
     conn.close()
-    logger.info("Benchmark worker done (%d/%d indices updated).", ok, len(INDEX_SYMBOLS))
+    logger.info("Benchmark worker done (%d/%d fetched; NSE %s, US %s).",
+                ok, attempted, "open" if nse_open else "closed", "open" if us_open else "closed")
 
 
 if __name__ == "__main__":
