@@ -170,7 +170,6 @@ const SEC_TYPE_LABELS: Record<string, string> = {
 
 type SortKey = keyof MFHoldingRow;
 type SortDir = 'asc' | 'desc';
-type GroupMode = 'entity' | 'pan';
 
 // ── weighted averages ─────────────────────────────────────────────────────────
 
@@ -396,10 +395,9 @@ function AssetClassHeader({ cls, rows, colCount }: { cls: string; rows: MFHoldin
 // ── table headers ─────────────────────────────────────────────────────────────
 
 function TableHead({
-  showEntityCol, showPanCol, sortKey, sortDir, onSort,
+  showEntityCol, sortKey, sortDir, onSort,
 }: {
   showEntityCol: boolean;
-  showPanCol: boolean;
   sortKey: SortKey;
   sortDir: SortDir;
   onSort: (k: SortKey) => void;
@@ -438,7 +436,6 @@ function TableHead({
         <th scope="col" rowSpan={2} className={`${base} text-right pl-5 sm:pl-6 w-8`}>#</th>
         <Th col="security_name"     label="Fund"          right={false} rowSpan={2} />
         {showEntityCol && <Th col="entity_name"  label="Entity"        right={false} rowSpan={2} />}
-        {showPanCol    && <Th col="pan_group_name" label="PAN"         right={false} rowSpan={2} />}
         <Th col="folio_number"      label="Folio"         right={false} rowSpan={2} />
         <Th col="quantity"          label="Units"                       rowSpan={2} />
         <Th col="nav"               label="NAV"                         rowSpan={2} />
@@ -471,7 +468,7 @@ function TableHead({
   );
 }
 
-// ── fund name (click to reveal full name) ─────────────────────────────────────
+// ── fund name (3-line clamp; full name via hover tooltip) ─────────────────────
 
 function FundName({ name, type }: { name: string; type: string }) {
   return (
@@ -485,9 +482,9 @@ function FundName({ name, type }: { name: string; type: string }) {
 // ── data row ──────────────────────────────────────────────────────────────────
 
 function DataRow({
-  h, srNo, showEntityCol, showPanCol,
+  h, srNo, showEntityCol,
 }: {
-  h: MFHoldingRow; srNo: number; showEntityCol: boolean; showPanCol: boolean;
+  h: MFHoldingRow; srNo: number; showEntityCol: boolean;
 }) {
   const mktVal = h.market_value_as_on ?? h.current_value;
   return (
@@ -498,9 +495,6 @@ function DataRow({
       </td>
       {showEntityCol && (
         <td className="px-3 py-3 text-xs font-medium text-dim whitespace-nowrap align-top">{h.entity_name ?? '—'}</td>
-      )}
-      {showPanCol && (
-        <td className="px-3 py-3 text-xs font-medium text-dim whitespace-nowrap align-top">{h.pan_group_name ?? '—'}</td>
       )}
       <td className="px-3 py-3 font-mono text-xs text-dim whitespace-nowrap align-top">{h.folio_number}</td>
       <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{h.quantity.toFixed(3)}</td>
@@ -727,7 +721,6 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
   const [sortKey, setSortKey]       = useState<SortKey>('market_value_as_on');
   const [sortDir, setSortDir]       = useState<SortDir>('desc');
   const [search, setSearch]         = useState('');
-  const [groupMode, setGroupMode]   = useState<GroupMode>('entity');
   const [filterClass, setFilterClass]   = useState<string | null>(null);
   const [filterType, setFilterType]     = useState<string | null>(null);
   const [filterEntity, setFilterEntity] = useState<string | null>(null);
@@ -798,11 +791,8 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
   const totalWeeklyChg     = holdings.reduce((s, h) => s + (h.weekly_change  ?? 0), 0);
   const totalRealized      = holdings.reduce((s, h) => s + (h.realized_gain ?? 0), 0);
 
-  // show PAN col only when groupMode=entity AND admin all-entities; in PAN mode grouping replaces it
-  const showPanCol  = showEntityCol && groupMode === 'entity';
   const colCount    = 3                          // sr + fund + folio
-    + (showEntityCol && groupMode === 'entity' ? 1 : 0)
-    + (showPanCol ? 1 : 0)
+    + (showEntityCol ? 1 : 0)
     + 8                                          // units nav cost since exp% mktval prevwk wklychg
     + 7                                          // pnl×3 returns×4
     + 2;                                         // realized remarks
@@ -811,17 +801,6 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
   type GroupEntry = { key: string; label: string; rows: MFHoldingRow[] };
 
   const groups: GroupEntry[] = useMemo(() => {
-    if (groupMode === 'pan') {
-      const map = new Map<string, MFHoldingRow[]>();
-      for (const h of filtered) {
-        const key = h.pan_group_name ?? 'Unknown';
-        if (!map.has(key)) map.set(key, []);
-        map.get(key)!.push(h);
-      }
-      return [...map.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([key, rows]) => ({
-        key, label: key, rows,
-      }));
-    }
     // entity grouping
     if (showEntityCol) {
       const map = new Map<string, MFHoldingRow[]>();
@@ -836,7 +815,7 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
     }
     // single entity — one group, no header
     return [{ key: 'all', label: '', rows: filtered }];
-  }, [filtered, groupMode, showEntityCol]);
+  }, [filtered, showEntityCol]);
 
   // serial number is global across all groups
   let srCounter = 0;
@@ -935,7 +914,7 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
         </div>
       </div>
 
-      {/* Toolbar: search + grouping toggle + filters */}
+      {/* Toolbar: search + combined toggle + filters */}
       <div className="px-5 sm:px-6 py-3 border-b border-rule flex flex-wrap gap-3 items-start">
         {/* Search */}
         <input
@@ -962,25 +941,6 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
           </button>
         )}
 
-        {/* Group-by toggle */}
-        {showEntityCol && viewMode === 'normal' && (
-          <div className="flex items-center gap-1 bg-page border border-wire rounded p-0.5 shrink-0">
-            <span className="text-[10px] text-ghost px-1.5 font-medium">Group by</span>
-            {(['entity', 'pan'] as GroupMode[]).map(m => (
-              <button
-                key={m}
-                onClick={() => setGroupMode(m)}
-                className={`px-2.5 py-1 rounded text-[10px] font-medium transition-colors ${
-                  groupMode === m
-                    ? 'bg-prime text-prime-fg'
-                    : 'text-dim hover:text-ink'
-                }`}
-              >
-                {m === 'entity' ? 'Entity' : 'PAN'}
-              </button>
-            ))}
-          </div>
-        )}
 
         {/* Filter pills */}
         <div className="flex flex-wrap gap-x-5 gap-y-2 items-center">
@@ -1091,8 +1051,7 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
         {viewMode === 'normal' && (
           <table className="w-full text-sm" style={{ minWidth: '1800px' }}>
             <TableHead
-              showEntityCol={showEntityCol && groupMode === 'entity'}
-              showPanCol={showPanCol}
+              showEntityCol={showEntityCol}
               sortKey={sortKey}
               sortDir={sortDir}
               onSort={handleSort}
@@ -1105,7 +1064,7 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
                   </td>
                 </tr>
               ) : groups.map(group => {
-                const showGroupHeader = showEntityCol || groupMode === 'pan';
+                const showGroupHeader = showEntityCol;
 
                 // Known classes first, then any class outside ASSET_CLASS_ORDER so a
                 // holding with an unexpected asset_class is still shown under its own
@@ -1136,8 +1095,7 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
                             key={h.id}
                             h={h}
                             srNo={++srCounter}
-                            showEntityCol={showEntityCol && groupMode === 'entity'}
-                            showPanCol={showPanCol}
+                            showEntityCol={showEntityCol}
                           />
                         ))}
                       </Fragment>
