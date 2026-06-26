@@ -3137,8 +3137,8 @@ def get_manual_assets(
                 rcond.append("entity_id = %s"); rparams.append(eid)
             rwhere = "WHERE " + " AND ".join(rcond)
             cur.execute(
-                f"""SELECT id, entity_id, label, round_name, round_date, price_per_share,
-                           shares, amount_invested, notes
+                f"""SELECT id, entity_id, label, round_name, round_date, round_valuation,
+                           price_per_share, shares, amount_invested, notes
                     FROM unlisted_round {rwhere} ORDER BY sort_order, id""",
                 rparams,
             )
@@ -3147,7 +3147,7 @@ def get_manual_assets(
                 rr_by_key.setdefault((r["entity_id"], r["label"]), []).append(dict(r))
             cur.execute(
                 f"""SELECT id, entity_id, label, event_type, event_date, factor,
-                           ratio_text, notes
+                           bonus_shares, ratio_text, notes
                     FROM unlisted_event {rwhere} ORDER BY sort_order, id""",
                 rparams,
             )
@@ -3217,6 +3217,7 @@ def get_manual_assets(
 class UnlistedRoundItem(BaseModel):
     round_name:      Optional[str]   = None
     round_date:      Optional[str]   = None   # YYYY-MM-DD
+    round_valuation: Optional[float] = None   # company valuation at this round (informational)
     price_per_share: Optional[float] = None
     shares:          Optional[float] = None
     amount_invested: Optional[float] = None   # defaults to price × shares when omitted
@@ -3224,11 +3225,12 @@ class UnlistedRoundItem(BaseModel):
 
 
 class UnlistedEventItem(BaseModel):
-    event_type: str                            # split | bonus
-    event_date: Optional[str]   = None         # YYYY-MM-DD
-    factor:     float                          # share multiplier (2:1 -> 2.0)
-    ratio_text: Optional[str]   = None         # display, e.g. '2:1'
-    notes:      Optional[str]   = None
+    event_type:   str                          # split | bonus
+    event_date:   Optional[str]   = None       # YYYY-MM-DD
+    factor:       Optional[float] = None       # split: share multiplier (2:1 -> 2.0)
+    bonus_shares: Optional[float] = None       # bonus: absolute number of new shares
+    ratio_text:   Optional[str]   = None       # display, e.g. '2:1' or '+1,500'
+    notes:        Optional[str]   = None
 
 
 class UnlistedRoundsRequest(BaseModel):
@@ -3253,6 +3255,7 @@ def _unlisted_round_row(r: dict) -> dict:
         "id":              r.get("id"),
         "round_name":      r.get("round_name"),
         "round_date":      str(r["round_date"]) if r.get("round_date") else None,
+        "round_valuation": float(r["round_valuation"]) if r.get("round_valuation") is not None else None,
         "price_per_share": float(r["price_per_share"]) if r.get("price_per_share") is not None else None,
         "shares":          float(r["shares"]) if r.get("shares") is not None else None,
         "amount_invested": float(r["amount_invested"]) if r.get("amount_invested") is not None else None,
@@ -3262,74 +3265,100 @@ def _unlisted_round_row(r: dict) -> dict:
 
 def _unlisted_event_row(e: dict) -> dict:
     return {
-        "id":         e.get("id"),
-        "event_type": e.get("event_type"),
-        "event_date": str(e["event_date"]) if e.get("event_date") else None,
-        "factor":     float(e["factor"]) if e.get("factor") is not None else None,
-        "ratio_text": e.get("ratio_text"),
-        "notes":      e.get("notes"),
+        "id":           e.get("id"),
+        "event_type":   e.get("event_type"),
+        "event_date":   str(e["event_date"]) if e.get("event_date") else None,
+        "factor":       float(e["factor"]) if e.get("factor") is not None else None,
+        "bonus_shares": float(e["bonus_shares"]) if e.get("bonus_shares") is not None else None,
+        "ratio_text":   e.get("ratio_text"),
+        "notes":        e.get("notes"),
     }
 
 
 def _compute_unlisted(rounds: list, events: list) -> dict:
-    """Derive cost, total current shares, current effective price-per-share,
-    current value and a per-round breakdown. A split/bonus applies to every
-    round dated on or before the event (missing round_date => oldest, missing
-    event_date => newest). Accepts DB rows or request-item dicts; numbers may be
-    Decimal or float."""
+    """Walk rounds + corporate events in date order over a running share pool.
+    A SPLIT multiplies the pool by `factor`; a BONUS adds `bonus_shares` to the
+    pool (its effective factor = (pool + bonus) / pool, so the per-share price
+    drops proportionally and total value is unchanged). Current value = final
+    pool × the latest round's price-per-share adjusted by the events that follow
+    it. Cost = Σ round investments. Accepts DB rows or request dicts; numbers may
+    be Decimal or float. Missing round_date => oldest, missing event_date =>
+    newest."""
     DMIN, DMAX = date.min, date.max
 
     def gd(x, k):
-        v = x.get(k) if isinstance(x, dict) else getattr(x, k, None)
-        return v
+        return x.get(k) if isinstance(x, dict) else getattr(x, k, None)
 
-    ev = [{"event_date": gd(e, "event_date"), "factor": float(gd(e, "factor") or 1)} for e in events]
+    # Build a single date-ordered timeline; rounds sort before events on a tie.
+    items = []
+    for i, r in enumerate(rounds):
+        items.append(((gd(r, "round_date") or DMIN), 0, i, "round", r))
+    for i, e in enumerate(events):
+        items.append(((gd(e, "event_date") or DMAX), 1, i, "event", e))
+    items.sort(key=lambda t: (t[0], t[1], t[2]))
 
-    def factor_after(rd):
-        f = 1.0
-        for e in ev:
-            ed = e["event_date"] or DMAX
-            if ed >= (rd or DMIN):
-                f *= e["factor"]
-        return f
-
-    # order rounds by (date, original index) so "latest" is well-defined
-    indexed = sorted(enumerate(rounds), key=lambda t: ((gd(t[1], "round_date") or DMIN), t[0]))
-
-    current_pps = None
-    if indexed:
-        latest = indexed[-1][1]
-        lpps = gd(latest, "price_per_share")
-        if lpps is not None:
-            f = factor_after(gd(latest, "round_date"))
-            current_pps = float(lpps) / f if f else float(lpps)
-
+    pool = 0.0
     cost = 0.0
-    total_shares = 0.0
+    last_price = None          # latest round's recorded price-per-share
+    post_factor = 1.0          # product of event factors applied AFTER the latest priced round
+    round_eff = []             # per-round running effective share count
+    event_out = []             # per-event resulting pool (in original event order)
+    event_pool_by_i = {}
+
+    for _, _, idx, kind, obj in items:
+        if kind == "round":
+            sh  = float(gd(obj, "shares") or 0)
+            pps = gd(obj, "price_per_share")
+            amt = gd(obj, "amount_invested")
+            if amt is None and pps is not None:
+                amt = float(pps) * sh
+            cost += float(amt or 0)
+            pool += sh
+            entry = {"obj": obj, "eff": sh}
+            round_eff.append(entry)
+            if pps is not None:
+                last_price = float(pps)
+                post_factor = 1.0
+        else:
+            etype = gd(obj, "event_type")
+            bonus = gd(obj, "bonus_shares")
+            if etype == "bonus" and bonus is not None:
+                c = float(bonus or 0)
+                f = (pool + c) / pool if pool > 0 else 1.0
+                pool += c
+            else:
+                f = float(gd(obj, "factor") or 1)
+                pool *= f
+            post_factor *= f
+            for entry in round_eff:
+                entry["eff"] *= f
+            event_pool_by_i[idx] = pool
+
+    total_shares = pool
+    current_pps = (last_price / post_factor) if (last_price is not None and post_factor) else last_price
+    current_value = round(total_shares * current_pps, 2) if current_pps is not None else None
+
     breakdown = []
-    for _, r in indexed:
+    for entry in round_eff:
+        r = entry["obj"]
         sh  = float(gd(r, "shares") or 0)
         pps = gd(r, "price_per_share")
         amt = gd(r, "amount_invested")
         if amt is None and pps is not None:
             amt = float(pps) * sh
-        amt = float(amt or 0)
-        cost += amt
-        rd  = gd(r, "round_date")
-        eff_shares = sh * factor_after(rd)
-        total_shares += eff_shares
+        rd = gd(r, "round_date")
         breakdown.append({
             "round_name":       gd(r, "round_name"),
             "round_date":       str(rd) if rd else None,
+            "round_valuation":  float(gd(r, "round_valuation")) if gd(r, "round_valuation") is not None else None,
             "price_per_share":  float(pps) if pps is not None else None,
             "shares":           sh,
-            "amount_invested":  round(amt, 2),
-            "effective_shares": round(eff_shares, 4),
-            "current_value":    round(eff_shares * current_pps, 2) if current_pps is not None else None,
+            "amount_invested":  round(float(amt or 0), 2),
+            "effective_shares": round(entry["eff"], 4),
+            "current_value":    round(entry["eff"] * current_pps, 2) if current_pps is not None else None,
             "notes":            gd(r, "notes"),
         })
 
-    current_value = round(total_shares * current_pps, 2) if current_pps is not None else None
     return {
         "cost":                    round(cost, 2),
         "total_shares":            round(total_shares, 4),
@@ -3337,6 +3366,7 @@ def _compute_unlisted(rounds: list, events: list) -> dict:
         "current_value":           current_value,
         "pnl":                     round(current_value - cost, 2) if current_value is not None else None,
         "breakdown":               breakdown,
+        "event_pool":              {str(k): round(v, 4) for k, v in event_pool_by_i.items()},
     }
 
 
@@ -3363,6 +3393,7 @@ def save_unlisted_rounds(request: Request, body: UnlistedRoundsRequest,
         rounds_in = [{
             "round_name":      r.round_name,
             "round_date":      _parse_date_opt(r.round_date, "round_date"),
+            "round_valuation": r.round_valuation,
             "price_per_share": r.price_per_share,
             "shares":          r.shares,
             "amount_invested": r.amount_invested,
@@ -3372,14 +3403,19 @@ def save_unlisted_rounds(request: Request, body: UnlistedRoundsRequest,
         for e in body.events:
             if e.event_type not in ("split", "bonus"):
                 raise HTTPException(status_code=422, detail=f"Invalid event_type: {e.event_type}")
-            if e.factor is None or e.factor <= 0:
-                raise HTTPException(status_code=422, detail="event factor must be greater than 0")
+            if e.event_type == "split":
+                if e.factor is None or e.factor <= 0:
+                    raise HTTPException(status_code=422, detail="split ratio must be greater than 0")
+            else:  # bonus
+                if e.bonus_shares is None or e.bonus_shares <= 0:
+                    raise HTTPException(status_code=422, detail="bonus shares must be greater than 0")
             events_in.append({
-                "event_type": e.event_type,
-                "event_date": _parse_date_opt(e.event_date, "event_date"),
-                "factor":     e.factor,
-                "ratio_text": e.ratio_text,
-                "notes":      e.notes,
+                "event_type":   e.event_type,
+                "event_date":   _parse_date_opt(e.event_date, "event_date"),
+                "factor":       e.factor if e.event_type == "split" else None,
+                "bonus_shares": e.bonus_shares if e.event_type == "bonus" else None,
+                "ratio_text":   e.ratio_text,
+                "notes":        e.notes,
             })
 
         agg = _compute_unlisted(rounds_in, events_in)
@@ -3409,19 +3445,20 @@ def save_unlisted_rounds(request: Request, body: UnlistedRoundsRequest,
         for i, r in enumerate(rounds_in):
             cur.execute("""
                 INSERT INTO unlisted_round
-                    (entity_id, category, label, round_name, round_date, price_per_share,
-                     shares, amount_invested, notes, sort_order, created_by)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    (entity_id, category, label, round_name, round_date, round_valuation,
+                     price_per_share, shares, amount_invested, notes, sort_order, created_by)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, (body.entity_id, body.category, label, r["round_name"], r["round_date"],
-                  r["price_per_share"], r["shares"], r["amount_invested"], r["notes"], i, user_id))
+                  r["round_valuation"], r["price_per_share"], r["shares"], r["amount_invested"],
+                  r["notes"], i, user_id))
         for i, e in enumerate(events_in):
             cur.execute("""
                 INSERT INTO unlisted_event
                     (entity_id, category, label, event_type, event_date, factor,
-                     ratio_text, notes, sort_order, created_by)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     bonus_shares, ratio_text, notes, sort_order, created_by)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, (body.entity_id, body.category, label, e["event_type"], e["event_date"],
-                  e["factor"], e["ratio_text"], e["notes"], i, user_id))
+                  e["factor"], e["bonus_shares"], e["ratio_text"], e["notes"], i, user_id))
 
         # Derived aggregate as a fresh manual_input version.
         cur.execute("""
@@ -3472,13 +3509,13 @@ def get_unlisted_rounds(
             raise HTTPException(status_code=400, detail="entity_id is required")
 
         cur.execute("""
-            SELECT id, round_name, round_date, price_per_share, shares, amount_invested, notes
+            SELECT id, round_name, round_date, round_valuation, price_per_share, shares, amount_invested, notes
             FROM unlisted_round WHERE entity_id=%s AND category=%s AND label=%s
             ORDER BY sort_order, id
         """, (eid, category, label))
         rounds = [dict(r) for r in cur.fetchall()]
         cur.execute("""
-            SELECT id, event_type, event_date, factor, ratio_text, notes
+            SELECT id, event_type, event_date, factor, bonus_shares, ratio_text, notes
             FROM unlisted_event WHERE entity_id=%s AND category=%s AND label=%s
             ORDER BY sort_order, id
         """, (eid, category, label))

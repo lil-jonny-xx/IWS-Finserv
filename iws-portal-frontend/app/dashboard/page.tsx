@@ -205,8 +205,8 @@ function EntityCard({ entity }: { entity: EntitySummary }) {
               </span>
             </div>
             <div className="flex items-center gap-3 shrink-0">
-              <span className="text-[11px] text-dim tabular-nums">{fmtINRCompact(cls.value)}</span>
-              <span className="text-[11px] font-medium" style={{ color: gainColor(cls.pnl) }}>
+              <span className="text-[11px] text-dim tabular-nums w-20 text-right">{fmtINRCompact(cls.value)}</span>
+              <span className="text-[11px] font-medium tabular-nums w-20 text-right" style={{ color: gainColor(cls.pnl) }}>
                 {cls.pnl >= 0 ? '+' : ''}{fmtINRCompact(cls.pnl)}
               </span>
               <span className="text-[11px] text-ghost w-8 text-right tabular-nums">{cls.pct.toFixed(0)}%</span>
@@ -396,16 +396,15 @@ export default function DashboardPage() {
                 { href: '/mutual-funds', label: 'Mutual Funds' },
                 { href: '/equity', label: 'Equity' },
                 { href: '/foreign-equity', label: 'Foreign Equity' },
-                { href: '/gold-silver', label: 'Gold/Silver' },
-                { href: '/unlisted', label: 'Unlisted' },
-                { href: '/art', label: 'Art' },
-                { href: '/properties', label: 'Properties' },
                 { href: '/bank-accounts', label: 'Banks' },
                 { href: '/pms', label: 'PMS' },
+                { href: '/gold-silver', label: 'Commodities' },
+                { href: '/unlisted', label: 'Unlisted' },
+                { href: '/properties', label: 'Properties' },
+                { href: '/art', label: 'Art' },
+                { href: '/realised-gains', label: 'Realised Gains' },
                 { href: '/manual-data', label: 'Manual Data' },
                 { href: '/reports', label: 'Reports' },
-                { href: '/benchmarks', label: 'Benchmarks' },
-                { href: '/realised-gains', label: 'Realised Gains' },
                 { href: '/assistant', label: 'Assistant' },
               ].map(link => (
                 <a key={link.href} href={link.href}

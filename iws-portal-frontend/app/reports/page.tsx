@@ -89,21 +89,20 @@ export default function ReportsPage() {
           <span className="font-bold text-sm" style={{ color: 'var(--ink)' }}>IWS MIS</span>
           <nav className="flex gap-4">
             {[
-              { href: '/dashboard',    label: 'Dashboard' },
+              { href: '/dashboard', label: 'Overview' },
               { href: '/mutual-funds', label: 'Mutual Funds' },
-              { href: '/equity',       label: 'Equity' },
+              { href: '/equity', label: 'Equity' },
               { href: '/foreign-equity', label: 'Foreign Equity' },
-              { href: '/gold-silver', label: 'Gold/Silver' },
-              { href: '/unlisted', label: 'Unlisted' },
-              { href: '/art', label: 'Art' },
-              { href: '/properties', label: 'Properties' },
               { href: '/bank-accounts', label: 'Banks' },
               { href: '/pms', label: 'PMS' },
-              { href: '/manual-data',  label: 'Manual Data' },
-              { href: '/reports',      label: 'Reports', active: true },
-              { href: '/benchmarks',   label: 'Benchmarks' },
+              { href: '/gold-silver', label: 'Commodities' },
+              { href: '/unlisted', label: 'Unlisted' },
+              { href: '/properties', label: 'Properties' },
+              { href: '/art', label: 'Art' },
               { href: '/realised-gains', label: 'Realised Gains' },
-              { href: '/assistant',    label: 'Assistant' },
+              { href: '/manual-data', label: 'Manual Data' },
+              { href: '/reports', label: 'Reports', active: true },
+              { href: '/assistant', label: 'Assistant' },
             ].map(link => (
               <a key={link.href} href={link.href}
                  className="text-xs font-medium transition-colors"

@@ -43,21 +43,20 @@ interface ParsedStatement {
 }
 
 const NAV = [
-  { href: '/dashboard',      label: 'Overview'       },
-  { href: '/mutual-funds',   label: 'Mutual Funds'   },
-  { href: '/equity',         label: 'Equity'         },
+  { href: '/dashboard', label: 'Overview' },
+  { href: '/mutual-funds', label: 'Mutual Funds' },
+  { href: '/equity', label: 'Equity' },
   { href: '/foreign-equity', label: 'Foreign Equity' },
-  { href: '/gold-silver', label: 'Gold/Silver' },
+  { href: '/bank-accounts', label: 'Banks', active: true },
+  { href: '/pms', label: 'PMS' },
+  { href: '/gold-silver', label: 'Commodities' },
   { href: '/unlisted', label: 'Unlisted' },
-  { href: '/art', label: 'Art' },
   { href: '/properties', label: 'Properties' },
-  { href: '/bank-accounts',  label: 'Banks', active: true },
-  { href: '/pms',            label: 'PMS'            },
-  { href: '/manual-data',    label: 'Manual Data'    },
-  { href: '/reports',        label: 'Reports'        },
-  { href: '/benchmarks',     label: 'Benchmarks'     },
+  { href: '/art', label: 'Art' },
   { href: '/realised-gains', label: 'Realised Gains' },
-  { href: '/assistant',      label: 'Assistant'      },
+  { href: '/manual-data', label: 'Manual Data' },
+  { href: '/reports', label: 'Reports' },
+  { href: '/assistant', label: 'Assistant' },
 ];
 
 function entityName(e: Entity): string { return e.entity_name || e.name || `#${e.id}`; }
@@ -93,77 +92,6 @@ function EntitySwitcher({ entities, selectedId, onSelect }: {
           </button>
         );
       })}
-    </div>
-  );
-}
-
-function AddAccountForm({ entities, onCreated }: { entities: Entity[]; onCreated: () => void }) {
-  const [open, setOpen]       = useState(false);
-  const [entityId, setEntity] = useState<number | ''>('');
-  const [bankName, setBank]   = useState('');
-  const [type, setType]       = useState('savings');
-  const [currency, setCcy]    = useState('INR');
-  const [saving, setSaving]   = useState(false);
-  const [error, setError]     = useState<string | null>(null);
-
-  async function submit() {
-    if (!entityId || !bankName.trim()) { setError('Entity and bank name are required.'); return; }
-    setSaving(true); setError(null);
-    try {
-      const r = await fetch(`${API_URL}/api/v1/bank-accounts`, {
-        method: 'POST', credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ entity_id: entityId, bank_name: bankName.trim(), account_type: type, currency }),
-      });
-      if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || 'Failed to create account.'); }
-      setBank(''); setEntity(''); setType('savings'); setCcy('INR'); setOpen(false);
-      onCreated();
-    } catch (e) { setError(e instanceof Error ? e.message : 'Failed to create account.'); }
-    finally { setSaving(false); }
-  }
-
-  if (!open) {
-    return (
-      <button onClick={() => setOpen(true)}
-        className="mb-5 text-xs font-medium bg-prime text-prime-fg px-3 py-1.5 rounded hover:opacity-90 transition-opacity">
-        + Add bank account
-      </button>
-    );
-  }
-  return (
-    <div className="mb-5 bg-card rounded-lg border border-rule p-4">
-      <div className="flex flex-wrap items-end gap-3">
-        <label className="text-xs text-dim flex flex-col gap-1">Entity
-          <select value={entityId} onChange={e => setEntity(e.target.value ? Number(e.target.value) : '')}
-            className="bg-page border border-rule rounded px-2 py-1.5 text-sm text-ink min-w-32">
-            <option value="">Select…</option>
-            {entities.map(e => <option key={e.id} value={e.id}>{entityName(e)}</option>)}
-          </select>
-        </label>
-        <label className="text-xs text-dim flex flex-col gap-1">Bank name
-          <input value={bankName} onChange={e => setBank(e.target.value)} placeholder="e.g. UK HSBC"
-            className="bg-page border border-rule rounded px-2 py-1.5 text-sm text-ink min-w-48" />
-        </label>
-        <label className="text-xs text-dim flex flex-col gap-1">Type
-          <select value={type} onChange={e => setType(e.target.value)}
-            className="bg-page border border-rule rounded px-2 py-1.5 text-sm text-ink capitalize">
-            {ACCOUNT_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
-          </select>
-        </label>
-        <label className="text-xs text-dim flex flex-col gap-1">Currency
-          <select value={currency} onChange={e => setCcy(e.target.value)}
-            className="bg-page border border-rule rounded px-2 py-1.5 text-sm text-ink">
-            {CURRENCIES.map(c => <option key={c} value={c}>{c}</option>)}
-          </select>
-        </label>
-        <button onClick={submit} disabled={saving}
-          className="text-xs font-medium bg-prime text-prime-fg px-3 py-2 rounded hover:opacity-90 disabled:opacity-50">
-          {saving ? 'Saving…' : 'Create'}
-        </button>
-        <button onClick={() => { setOpen(false); setError(null); }}
-          className="text-xs border border-rule text-dim px-3 py-2 rounded hover:text-ink">Cancel</button>
-      </div>
-      {error && <p className="text-xs text-red-500 mt-2">{error}</p>}
     </div>
   );
 }
@@ -374,7 +302,6 @@ export default function BankAccountsPage() {
         {isAdmin && (
           <>
             {entities.length > 0 && <EntitySwitcher entities={entities} selectedId={selectedId} onSelect={setSel} />}
-            <AddAccountForm entities={entities} onCreated={refresh} />
 
             {data && (
               <div className="mb-5 bg-card rounded-lg border border-rule px-5 py-4 inline-flex flex-col">
@@ -388,7 +315,7 @@ export default function BankAccountsPage() {
 
             {data && data.accounts.length === 0 && (
               <div className="bg-card rounded-lg border border-rule px-5 py-8 text-center">
-                <p className="text-sm text-dim">No bank accounts yet. Add one above.</p>
+                <p className="text-sm text-dim">No bank accounts yet. Add one from the <a href="/manual-data" className="text-prime hover:underline">Manual Data</a> page (category “Bank Balance”).</p>
               </div>
             )}
 

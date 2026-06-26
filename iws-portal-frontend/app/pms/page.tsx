@@ -246,21 +246,20 @@ export default function PmsPage() {
           </div>
           <nav className="flex gap-1.5" aria-label="Sections">
             {[
-              { href: '/dashboard',     label: 'Overview'       },
-              { href: '/mutual-funds',  label: 'Mutual Funds'   },
-              { href: '/equity',        label: 'Equity'         },
+              { href: '/dashboard', label: 'Overview' },
+              { href: '/mutual-funds', label: 'Mutual Funds' },
+              { href: '/equity', label: 'Equity' },
               { href: '/foreign-equity', label: 'Foreign Equity' },
-              { href: '/gold-silver', label: 'Gold/Silver' },
-              { href: '/unlisted', label: 'Unlisted' },
-              { href: '/art', label: 'Art' },
-              { href: '/properties', label: 'Properties' },
               { href: '/bank-accounts', label: 'Banks' },
-              { href: '/pms',           label: 'PMS', active: true },
-              { href: '/manual-data',   label: 'Manual Data'    },
-              { href: '/reports',       label: 'Reports'        },
-              { href: '/benchmarks',    label: 'Benchmarks'     },
+              { href: '/pms', label: 'PMS', active: true },
+              { href: '/gold-silver', label: 'Commodities' },
+              { href: '/unlisted', label: 'Unlisted' },
+              { href: '/properties', label: 'Properties' },
+              { href: '/art', label: 'Art' },
               { href: '/realised-gains', label: 'Realised Gains' },
-              { href: '/assistant',     label: 'Assistant'      },
+              { href: '/manual-data', label: 'Manual Data' },
+              { href: '/reports', label: 'Reports' },
+              { href: '/assistant', label: 'Assistant' },
             ].map(({ href, label, active }) => (
               <a
                 key={href}

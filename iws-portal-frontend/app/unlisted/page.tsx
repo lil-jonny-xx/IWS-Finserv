@@ -12,13 +12,13 @@ interface Attachment {
   size_bytes: number | null; has_thumb: boolean;
 }
 interface Breakdown {
-  round_name: string | null; round_date: string | null; price_per_share: number | null;
-  shares: number; amount_invested: number; effective_shares: number;
+  round_name: string | null; round_date: string | null; round_valuation: number | null;
+  price_per_share: number | null; shares: number; amount_invested: number; effective_shares: number;
   current_value: number | null; notes: string | null;
 }
 interface UEvent {
   event_type: string; event_date: string | null; factor: number | null;
-  ratio_text: string | null; notes: string | null;
+  bonus_shares: number | null; ratio_text: string | null; notes: string | null;
 }
 interface Aggregate {
   cost: number; total_shares: number; current_price_per_share: number | null;
@@ -123,7 +123,7 @@ function CompanyRow({ a, showEntity, expanded, onToggle }: {
               <table className="w-full text-[11px]" style={{ minWidth: '640px' }}>
                 <thead>
                   <tr className="text-ghost">
-                    {['Round', 'Date', 'Price/share', 'Shares', 'Now (adj.)', 'Invested', 'Value'].map((h, i) => (
+                    {['Round', 'Date', 'Valuation', 'Price/share', 'Shares', 'Now (adj.)', 'Invested', 'Value'].map((h, i) => (
                       <th key={h} className={`px-2 py-1 font-medium ${i < 2 ? 'text-left' : 'text-right'} ${i === 0 ? 'pl-0' : ''}`}>{h}</th>
                     ))}
                   </tr>
@@ -133,6 +133,7 @@ function CompanyRow({ a, showEntity, expanded, onToggle }: {
                     <tr key={i} className="border-t border-rule/50">
                       <td className="px-2 py-1.5 pl-0 text-ink">{r.round_name || '—'}</td>
                       <td className="px-2 py-1.5 text-dim whitespace-nowrap">{r.round_date || '—'}</td>
+                      <td className="px-2 py-1.5 text-right tabular-nums text-dim">{r.round_valuation != null ? fmtINR(r.round_valuation) : '—'}</td>
                       <td className="px-2 py-1.5 text-right tabular-nums text-dim">{r.price_per_share != null ? '₹' + fmtNum(r.price_per_share, 2) : '—'}</td>
                       <td className="px-2 py-1.5 text-right tabular-nums text-dim">{fmtNum(r.shares, 2)}</td>
                       <td className="px-2 py-1.5 text-right tabular-nums text-dim">{fmtNum(r.effective_shares, 2)}</td>
@@ -151,8 +152,9 @@ function CompanyRow({ a, showEntity, expanded, onToggle }: {
               <div className="flex flex-wrap gap-2">
                 {a.events.map((e, i) => (
                   <span key={i} className="text-[11px] px-2 py-0.5 rounded border border-rule text-dim">
-                    {e.event_type === 'bonus' ? 'Bonus' : 'Split'} {e.ratio_text || ''}
-                    {e.factor != null && <span className="text-ghost"> · shares ×{(+e.factor).toLocaleString('en-IN', { maximumFractionDigits: 3 })}</span>}
+                    {e.event_type === 'bonus'
+                      ? <>Bonus{e.bonus_shares != null ? <span className="text-ghost"> · +{fmtNum(e.bonus_shares, 2)} shares</span> : ''}</>
+                      : <>Split{e.factor != null ? <span className="text-ghost"> · shares ×{(+e.factor).toLocaleString('en-IN', { maximumFractionDigits: 3 })}</span> : ''}</>}
                     {e.event_date && <span className="text-ghost"> · {e.event_date}</span>}
                   </span>
                 ))}
@@ -193,16 +195,15 @@ const NAV = [
   { href: '/mutual-funds', label: 'Mutual Funds' },
   { href: '/equity', label: 'Equity' },
   { href: '/foreign-equity', label: 'Foreign Equity' },
-  { href: '/gold-silver', label: 'Gold/Silver' },
-  { href: '/unlisted', label: 'Unlisted' },
-  { href: '/art', label: 'Art' },
-  { href: '/properties', label: 'Properties' },
   { href: '/bank-accounts', label: 'Banks' },
   { href: '/pms', label: 'PMS' },
+  { href: '/gold-silver', label: 'Commodities' },
+  { href: '/unlisted', label: 'Unlisted' },
+  { href: '/properties', label: 'Properties' },
+  { href: '/art', label: 'Art' },
+  { href: '/realised-gains', label: 'Realised Gains' },
   { href: '/manual-data', label: 'Manual Data' },
   { href: '/reports', label: 'Reports' },
-  { href: '/benchmarks', label: 'Benchmarks' },
-  { href: '/realised-gains', label: 'Realised Gains' },
   { href: '/assistant', label: 'Assistant' },
 ];
 

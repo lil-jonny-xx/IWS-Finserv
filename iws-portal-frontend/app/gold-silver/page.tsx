@@ -200,26 +200,25 @@ export default function GoldSilverPage() {
 
         <div className="flex flex-wrap justify-between items-start gap-3 mb-6">
           <div>
-            <h1 className="text-2xl sm:text-3xl font-bold text-ink">Gold / Silver</h1>
+            <h1 className="text-2xl sm:text-3xl font-bold text-ink">Commodities</h1>
             <span className="text-sm text-ghost">Precious metals (gold &amp; silver ETFs, sovereign gold bonds) and commodities</span>
           </div>
           <nav className="flex gap-1.5 flex-wrap" aria-label="Sections">
             {[
-              { href: '/dashboard',      label: 'Overview'       },
-              { href: '/mutual-funds',   label: 'Mutual Funds'   },
-              { href: '/equity',         label: 'Equity'         },
+              { href: '/dashboard', label: 'Overview' },
+              { href: '/mutual-funds', label: 'Mutual Funds' },
+              { href: '/equity', label: 'Equity' },
               { href: '/foreign-equity', label: 'Foreign Equity' },
-              { href: '/gold-silver',    label: 'Gold/Silver', active: true },
+              { href: '/bank-accounts', label: 'Banks' },
+              { href: '/pms', label: 'PMS' },
+              { href: '/gold-silver', label: 'Commodities', active: true },
               { href: '/unlisted', label: 'Unlisted' },
-              { href: '/art', label: 'Art' },
               { href: '/properties', label: 'Properties' },
-              { href: '/bank-accounts',  label: 'Banks'          },
-              { href: '/pms',            label: 'PMS'            },
-              { href: '/manual-data',    label: 'Manual Data'    },
-              { href: '/reports',        label: 'Reports'        },
-              { href: '/benchmarks',     label: 'Benchmarks'     },
+              { href: '/art', label: 'Art' },
               { href: '/realised-gains', label: 'Realised Gains' },
-              { href: '/assistant',      label: 'Assistant'      },
+              { href: '/manual-data', label: 'Manual Data' },
+              { href: '/reports', label: 'Reports' },
+              { href: '/assistant', label: 'Assistant' },
             ].map(({ href, label, active }) => (
               <a
                 key={href}

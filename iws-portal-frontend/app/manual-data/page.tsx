@@ -130,68 +130,73 @@ function defaultKind(category: string): string {
 // ── Unlisted / startup funding-rounds editor ─────────────────────────────────
 
 interface RoundForm {
-  round_name: string; round_date: string; price_per_share: string;
-  shares: string; amount_invested: string; notes: string;
+  round_name: string; round_date: string; round_valuation: string;
+  price_per_share: string; shares: string; amount_invested: string; notes: string;
 }
 interface EventForm {
-  event_type: 'split' | 'bonus'; event_date: string; a: string; b: string; notes: string;
+  // split: `ratio` is the share multiplier (2 = 2-for-1). bonus: `bonus_shares`
+  // is the absolute number of new shares issued.
+  event_type: 'split' | 'bonus'; event_date: string; ratio: string; bonus_shares: string; notes: string;
 }
 interface RoundsAggregate {
   cost: number; total_shares: number; current_price_per_share: number | null;
   current_value: number | null; pnl: number | null;
+  eventPool: Record<number, number>;   // resulting share pool after each event (by index)
 }
 
 function emptyRoundForm(): RoundForm {
-  return { round_name: '', round_date: '', price_per_share: '', shares: '', amount_invested: '', notes: '' };
+  return { round_name: '', round_date: '', round_valuation: '', price_per_share: '', shares: '', amount_invested: '', notes: '' };
 }
 function emptyEventForm(): EventForm {
-  return { event_type: 'split', event_date: '', a: '2', b: '1', notes: '' };
+  return { event_type: 'split', event_date: '', ratio: '2', bonus_shares: '', notes: '' };
 }
 
-// A split "a-for-b" multiplies shares by a/b. A bonus "a:b" issues a new shares
-// for every b held, so total shares multiply by (a+b)/b. Per-share price divides
-// by the same factor — total value unchanged.
-function eventFactor(ev: EventForm): number {
-  const a = parseFloat(ev.a), b = parseFloat(ev.b);
-  if (!a || !b || a <= 0 || b <= 0) return 1;
-  return ev.event_type === 'bonus' ? (a + b) / b : a / b;
-}
-
-// Client-side mirror of the backend _compute_unlisted, for live preview.
+// Client-side mirror of the backend _compute_unlisted, for live preview. Walks
+// rounds + events in date order over a running share pool: a SPLIT multiplies
+// the pool by its ratio; a BONUS adds its share count (price-per-share drops so
+// total value is unchanged).
 function computeRoundsLocal(rounds: RoundForm[], events: EventForm[]): RoundsAggregate {
   const DMIN = -Infinity, DMAX = Infinity;
-  const ev = events.map(e => ({ d: e.event_date ? Date.parse(e.event_date) : DMAX, f: eventFactor(e) }));
-  const factorAfter = (rd: number) => ev.reduce((f, e) => (e.d >= rd ? f * e.f : f), 1);
+  type Item = { d: number; kind: 0 | 1; i: number };
+  const items: Item[] = [];
+  rounds.forEach((r, i) => items.push({ d: r.round_date ? Date.parse(r.round_date) : DMIN, kind: 0, i }));
+  events.forEach((e, i) => items.push({ d: e.event_date ? Date.parse(e.event_date) : DMAX, kind: 1, i }));
+  items.sort((a, b) => a.d - b.d || a.kind - b.kind || a.i - b.i);
 
-  const idx = rounds
-    .map((r, i) => ({ d: r.round_date ? Date.parse(r.round_date) : DMIN, i, r }))
-    .sort((x, y) => x.d - y.d || x.i - y.i);
-
-  let curPps: number | null = null;
-  if (idx.length) {
-    const last = idx[idx.length - 1].r;
-    const pps = last.price_per_share ? parseFloat(last.price_per_share) : NaN;
-    if (!isNaN(pps)) {
-      const f = factorAfter(last.round_date ? Date.parse(last.round_date) : DMIN);
-      curPps = f ? pps / f : pps;
+  let pool = 0, cost = 0, lastPrice: number | null = null, postFactor = 1;
+  const eventPool: Record<number, number> = {};
+  for (const it of items) {
+    if (it.kind === 0) {
+      const r = rounds[it.i];
+      const sh = r.shares ? parseFloat(r.shares) : 0;
+      const pps = r.price_per_share ? parseFloat(r.price_per_share) : NaN;
+      let amt = r.amount_invested ? parseFloat(r.amount_invested) : NaN;
+      if (isNaN(amt)) amt = isNaN(pps) ? 0 : pps * sh;
+      cost += amt || 0; pool += sh;
+      if (!isNaN(pps)) { lastPrice = pps; postFactor = 1; }
+    } else {
+      const e = events[it.i];
+      let f = 1;
+      if (e.event_type === 'bonus') {
+        const c = e.bonus_shares ? parseFloat(e.bonus_shares) : 0;
+        f = pool > 0 ? (pool + c) / pool : 1; pool += c;
+      } else {
+        const ra = e.ratio ? parseFloat(e.ratio) : 1;
+        f = ra > 0 ? ra : 1; pool *= f;
+      }
+      postFactor *= f;
+      eventPool[it.i] = pool;
     }
   }
-  let cost = 0, shares = 0;
-  for (const { r } of idx) {
-    const sh = r.shares ? parseFloat(r.shares) : 0;
-    const pps = r.price_per_share ? parseFloat(r.price_per_share) : NaN;
-    let amt = r.amount_invested ? parseFloat(r.amount_invested) : NaN;
-    if (isNaN(amt)) amt = isNaN(pps) ? 0 : pps * sh;
-    cost += amt || 0;
-    shares += sh * factorAfter(r.round_date ? Date.parse(r.round_date) : DMIN);
-  }
-  const value = curPps != null ? shares * curPps : null;
+  const curPps = lastPrice != null ? lastPrice / postFactor : null;
+  const value = curPps != null ? pool * curPps : null;
   return {
     cost: Math.round(cost * 100) / 100,
-    total_shares: Math.round(shares * 10000) / 10000,
+    total_shares: Math.round(pool * 10000) / 10000,
     current_price_per_share: curPps != null ? Math.round(curPps * 1e6) / 1e6 : null,
     current_value: value != null ? Math.round(value * 100) / 100 : null,
     pnl: value != null ? Math.round((value - cost) * 100) / 100 : null,
+    eventPool,
   };
 }
 
@@ -209,20 +214,21 @@ function RoundsEditor({ entityId, category, label, onSaved }: {
     const r = await fetch(`${API_URL}/api/v1/unlisted-rounds?${q.toString()}`, { credentials: 'include' });
     if (!r.ok) { setRounds([]); setEvents([]); return; }
     const d = await r.json();
-    setRounds((d.rounds || []).map((x: { round_name?: string; round_date?: string; price_per_share?: number; shares?: number; amount_invested?: number; notes?: string }) => ({
+    setRounds((d.rounds || []).map((x: { round_name?: string; round_date?: string; round_valuation?: number; price_per_share?: number; shares?: number; amount_invested?: number; notes?: string }) => ({
       round_name: x.round_name || '', round_date: x.round_date || '',
+      round_valuation: x.round_valuation != null ? String(x.round_valuation) : '',
       price_per_share: x.price_per_share != null ? String(x.price_per_share) : '',
       shares: x.shares != null ? String(x.shares) : '',
       amount_invested: x.amount_invested != null ? String(x.amount_invested) : '',
       notes: x.notes || '',
     })));
-    setEvents((d.events || []).map((x: { event_type?: string; event_date?: string; ratio_text?: string; factor?: number; notes?: string }) => {
-      const [a, b] = (x.ratio_text || '').split(':');
+    setEvents((d.events || []).map((x: { event_type?: string; event_date?: string; factor?: number; bonus_shares?: number; notes?: string }) => {
       const type = (x.event_type === 'bonus' ? 'bonus' : 'split') as 'split' | 'bonus';
       return {
         event_type: type, event_date: x.event_date || '',
-        a: a || (x.factor != null ? String(type === 'bonus' ? x.factor - 1 : x.factor) : '2'),
-        b: b || '1', notes: x.notes || '',
+        ratio: type === 'split' ? (x.factor != null ? String(x.factor) : '2') : '2',
+        bonus_shares: type === 'bonus' ? (x.bonus_shares != null ? String(x.bonus_shares) : '') : '',
+        notes: x.notes || '',
       };
     }));
   }, [entityId, category, label]);
@@ -245,6 +251,7 @@ function RoundsEditor({ entityId, category, label, onSaved }: {
       rounds: rounds.map(r => ({
         round_name: r.round_name || null,
         round_date: r.round_date || null,
+        round_valuation: r.round_valuation ? parseFloat(r.round_valuation) : null,
         price_per_share: r.price_per_share ? parseFloat(r.price_per_share) : null,
         shares: r.shares ? parseFloat(r.shares) : null,
         amount_invested: r.amount_invested ? parseFloat(r.amount_invested) : null,
@@ -253,8 +260,9 @@ function RoundsEditor({ entityId, category, label, onSaved }: {
       events: events.map(e => ({
         event_type: e.event_type,
         event_date: e.event_date || null,
-        factor: eventFactor(e),
-        ratio_text: `${e.a}:${e.b}`,
+        factor: e.event_type === 'split' ? (e.ratio ? parseFloat(e.ratio) : null) : null,
+        bonus_shares: e.event_type === 'bonus' ? (e.bonus_shares ? parseFloat(e.bonus_shares) : null) : null,
+        ratio_text: e.event_type === 'split' ? `${e.ratio}:1` : `+${e.bonus_shares}`,
         notes: e.notes || null,
       })),
     };
@@ -285,7 +293,7 @@ function RoundsEditor({ entityId, category, label, onSaved }: {
         <table className="text-[11px] border-collapse">
           <thead>
             <tr style={{ color: 'var(--ghost)' }}>
-              {['Round', 'Date', 'Price/share', 'Shares', 'Amount (₹)', 'Notes', ''].map(h => (
+              {['Round', 'Date', 'Valuation (₹)', 'Price/share', 'Shares', 'Amount (₹)', 'Notes', ''].map(h => (
                 <th key={h} className="px-1.5 py-1 text-left font-medium">{h}</th>
               ))}
             </tr>
@@ -295,6 +303,7 @@ function RoundsEditor({ entityId, category, label, onSaved }: {
               <tr key={i}>
                 <td className="px-1"><input value={r.round_name} placeholder="Seed / Series A" onChange={e => setRound(i, 'round_name', e.target.value)} className={`w-28 ${inp}`} style={inpStyle} /></td>
                 <td className="px-1"><input type="date" value={r.round_date} onChange={e => setRound(i, 'round_date', e.target.value)} className={`w-32 ${inp}`} style={inpStyle} /></td>
+                <td className="px-1"><input type="number" value={r.round_valuation} placeholder="company val." onChange={e => setRound(i, 'round_valuation', e.target.value)} className={`w-28 ${inp} text-right`} style={inpStyle} /></td>
                 <td className="px-1"><input type="number" value={r.price_per_share} placeholder="100" onChange={e => setRound(i, 'price_per_share', e.target.value)} className={`w-24 ${inp} text-right`} style={inpStyle} /></td>
                 <td className="px-1"><input type="number" value={r.shares} placeholder="1000" onChange={e => setRound(i, 'shares', e.target.value)} className={`w-24 ${inp} text-right`} style={inpStyle} /></td>
                 <td className="px-1"><input type="number" value={r.amount_invested} placeholder={r.price_per_share && r.shares ? String(Math.round(parseFloat(r.price_per_share) * parseFloat(r.shares))) : 'auto'} onChange={e => setRound(i, 'amount_invested', e.target.value)} className={`w-28 ${inp} text-right`} style={inpStyle} /></td>
@@ -319,7 +328,7 @@ function RoundsEditor({ entityId, category, label, onSaved }: {
         <table className="text-[11px] border-collapse">
           <thead>
             <tr style={{ color: 'var(--ghost)' }}>
-              {['Type', 'Date', 'Ratio', 'Effect', 'Notes', ''].map(h => (
+              {['Type', 'Date', 'Split ratio / Bonus shares', 'New total shares', 'Notes', ''].map(h => (
                 <th key={h} className="px-1.5 py-1 text-left font-medium">{h}</th>
               ))}
             </tr>
@@ -335,13 +344,21 @@ function RoundsEditor({ entityId, category, label, onSaved }: {
                 </td>
                 <td className="px-1"><input type="date" value={e.event_date} onChange={ev => setEvent(i, 'event_date', ev.target.value)} className={`w-32 ${inp}`} style={inpStyle} /></td>
                 <td className="px-1">
-                  <span className="inline-flex items-center gap-1">
-                    <input type="number" value={e.a} onChange={ev => setEvent(i, 'a', ev.target.value)} className={`w-12 ${inp} text-right`} style={inpStyle} />
-                    <span style={{ color: 'var(--ghost)' }}>{e.event_type === 'bonus' ? 'for' : ':'}</span>
-                    <input type="number" value={e.b} onChange={ev => setEvent(i, 'b', ev.target.value)} className={`w-12 ${inp} text-right`} style={inpStyle} />
-                  </span>
+                  {e.event_type === 'split' ? (
+                    <span className="inline-flex items-center gap-1">
+                      <input type="number" value={e.ratio} onChange={ev => setEvent(i, 'ratio', ev.target.value)} className={`w-14 ${inp} text-right`} style={inpStyle} placeholder="2" />
+                      <span style={{ color: 'var(--ghost)' }} className="whitespace-nowrap">-for-1 (× shares)</span>
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1">
+                      <input type="number" value={e.bonus_shares} onChange={ev => setEvent(i, 'bonus_shares', ev.target.value)} className={`w-24 ${inp} text-right`} style={inpStyle} placeholder="e.g. 1000" />
+                      <span style={{ color: 'var(--ghost)' }} className="whitespace-nowrap">bonus shares</span>
+                    </span>
+                  )}
                 </td>
-                <td className="px-1.5" style={{ color: 'var(--ghost)' }}>shares ×{eventFactor(e).toFixed(3).replace(/\.?0+$/, '')}</td>
+                <td className="px-1.5 tabular-nums" style={{ color: 'var(--ink)' }}>
+                  {agg.eventPool[i] != null ? agg.eventPool[i].toLocaleString('en-IN', { maximumFractionDigits: 2 }) : '—'}
+                </td>
                 <td className="px-1"><input value={e.notes} placeholder="—" onChange={ev => setEvent(i, 'notes', ev.target.value)} className={`w-28 ${inp}`} style={inpStyle} /></td>
                 <td className="px-1"><button onClick={() => setEvents(es => es.filter((_, j) => j !== i))} className="text-[11px]" style={{ color: 'var(--peril)' }}>✕</button></td>
               </tr>
@@ -754,21 +771,20 @@ export default function ManualDataPage() {
           <span className="font-bold text-sm" style={{ color: 'var(--ink)' }}>IWS MIS</span>
           <nav className="flex gap-4">
             {[
-              { href: '/dashboard',   label: 'Dashboard' },
-              { href: '/mutual-funds',label: 'Mutual Funds' },
-              { href: '/equity',      label: 'Equity' },
+              { href: '/dashboard', label: 'Overview' },
+              { href: '/mutual-funds', label: 'Mutual Funds' },
+              { href: '/equity', label: 'Equity' },
               { href: '/foreign-equity', label: 'Foreign Equity' },
-              { href: '/gold-silver', label: 'Gold/Silver' },
-              { href: '/unlisted', label: 'Unlisted' },
-              { href: '/art', label: 'Art' },
-              { href: '/properties', label: 'Properties' },
               { href: '/bank-accounts', label: 'Banks' },
               { href: '/pms', label: 'PMS' },
-              { href: '/manual-data', label: 'Manual Data', active: true },
-              { href: '/reports',     label: 'Reports' },
-              { href: '/benchmarks',  label: 'Benchmarks' },
+              { href: '/gold-silver', label: 'Commodities' },
+              { href: '/unlisted', label: 'Unlisted' },
+              { href: '/properties', label: 'Properties' },
+              { href: '/art', label: 'Art' },
               { href: '/realised-gains', label: 'Realised Gains' },
-              { href: '/assistant',   label: 'Assistant' },
+              { href: '/manual-data', label: 'Manual Data', active: true },
+              { href: '/reports', label: 'Reports' },
+              { href: '/assistant', label: 'Assistant' },
             ].map(link => (
               <a key={link.href} href={link.href}
                  className="text-xs font-medium transition-colors"
