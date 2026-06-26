@@ -474,22 +474,11 @@ function TableHead({
 // ── fund name (click to reveal full name) ─────────────────────────────────────
 
 function FundName({ name, type }: { name: string; type: string }) {
-  const [open, setOpen] = useState(false);
   return (
-    <button
-      type="button"
-      onClick={(e) => { e.stopPropagation(); setOpen(o => !o); }}
-      className="text-left cursor-pointer group"
-      title={open ? 'Click to collapse' : name}
-      aria-expanded={open}
-    >
-      <span
-        className={`block text-[10px] font-medium text-ink leading-snug max-w-[200px] group-hover:text-prime transition-colors ${open ? '' : 'line-clamp-3'}`}
-      >
-        {name}
-      </span>
-      <span className="block text-[9px] text-ghost mt-0.5">{SEC_TYPE_LABELS[type] ?? type}</span>
-    </button>
+    <div title={name}>
+      <p className="text-[10px] font-medium text-ink leading-snug line-clamp-3 max-w-[200px]">{name}</p>
+      <p className="text-[9px] text-ghost mt-0.5">{SEC_TYPE_LABELS[type] ?? type}</p>
+    </div>
   );
 }
 
