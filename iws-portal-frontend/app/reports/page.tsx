@@ -94,6 +94,7 @@ export default function ReportsPage() {
               { href: '/equity',       label: 'Equity' },
               { href: '/foreign-equity', label: 'Foreign Equity' },
               { href: '/gold-silver', label: 'Gold/Silver' },
+              { href: '/unlisted', label: 'Unlisted' },
               { href: '/art', label: 'Art' },
               { href: '/properties', label: 'Properties' },
               { href: '/bank-accounts', label: 'Banks' },

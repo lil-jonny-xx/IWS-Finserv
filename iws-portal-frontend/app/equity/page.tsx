@@ -177,6 +177,7 @@ export default function EquityPage() {
               { href: '/equity',       label: 'Equity',       active: true },
               { href: '/foreign-equity', label: 'Foreign Equity' },
               { href: '/gold-silver', label: 'Gold/Silver' },
+              { href: '/unlisted', label: 'Unlisted' },
               { href: '/art', label: 'Art' },
               { href: '/properties', label: 'Properties' },
               { href: '/bank-accounts', label: 'Banks' },

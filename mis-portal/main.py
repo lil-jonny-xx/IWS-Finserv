@@ -2448,6 +2448,10 @@ VALID_CATEGORIES = {
 
 VALID_CURRENCIES = {"INR", "USD", "GBP", "EUR", "AED", "SGD", "HKD"}
 
+# Categories whose value is built from funding rounds + corporate events
+# (Phase 3) rather than a single hand-typed cost / current value.
+UNLISTED_CATEGORIES = {"unlisted", "startup"}
+
 
 class ManualInputItem(BaseModel):
     entity_id:       int
@@ -2673,6 +2677,11 @@ def delete_manual_input(
         if category == "art":
             cur.execute("DELETE FROM art_detail WHERE entity_id = %s AND label = %s",
                         (entity_id, label))
+        if category in UNLISTED_CATEGORIES:
+            cur.execute("DELETE FROM unlisted_round WHERE entity_id = %s AND category = %s AND label = %s",
+                        (entity_id, category, label))
+            cur.execute("DELETE FROM unlisted_event WHERE entity_id = %s AND category = %s AND label = %s",
+                        (entity_id, category, label))
         cur.execute(
             "DELETE FROM manual_input WHERE entity_id = %s AND category = %s AND label = %s",
             (entity_id, category, label),
@@ -3119,6 +3128,40 @@ def get_manual_assets(
                     "painter_name":  d["painter_name"],
                     "painter_about": d["painter_about"],
                 }
+
+        # Unlisted / startup funding rounds + corporate events, grouped by key.
+        rounds_by_key: dict = {}
+        if category in UNLISTED_CATEGORIES:
+            rcond, rparams = ["category = %s"], [category]
+            if eid is not None:
+                rcond.append("entity_id = %s"); rparams.append(eid)
+            rwhere = "WHERE " + " AND ".join(rcond)
+            cur.execute(
+                f"""SELECT id, entity_id, label, round_name, round_date, price_per_share,
+                           shares, amount_invested, notes
+                    FROM unlisted_round {rwhere} ORDER BY sort_order, id""",
+                rparams,
+            )
+            rr_by_key: dict = {}
+            for r in cur.fetchall():
+                rr_by_key.setdefault((r["entity_id"], r["label"]), []).append(dict(r))
+            cur.execute(
+                f"""SELECT id, entity_id, label, event_type, event_date, factor,
+                           ratio_text, notes
+                    FROM unlisted_event {rwhere} ORDER BY sort_order, id""",
+                rparams,
+            )
+            ee_by_key: dict = {}
+            for e in cur.fetchall():
+                ee_by_key.setdefault((e["entity_id"], e["label"]), []).append(dict(e))
+            for key in set(list(rr_by_key.keys()) + list(ee_by_key.keys())):
+                rds = rr_by_key.get(key, [])
+                evs = ee_by_key.get(key, [])
+                rounds_by_key[key] = {
+                    "rounds":    [_unlisted_round_row(x) for x in rds],
+                    "events":    [_unlisted_event_row(x) for x in evs],
+                    "aggregate": _compute_unlisted(rds, evs),
+                }
         cur.close()
 
         out = []
@@ -3138,6 +3181,8 @@ def get_manual_assets(
             }
             if category == "art":
                 item.update(art_by_key.get(key, {"painter_name": None, "painter_about": None}))
+            if category in UNLISTED_CATEGORIES:
+                item.update(rounds_by_key.get(key, {"rounds": [], "events": [], "aggregate": None}))
             out.append(item)
 
         total_value = round(sum(a["current_value"] or 0 for a in out), 2)
@@ -3152,6 +3197,306 @@ def get_manual_assets(
         raise
     except Exception as e:
         logger.error(f"Error in GET /api/v1/manual-assets: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+# ---------------------------------------------------------------------------
+# Unlisted / startup funding rounds + corporate events (Phase 3).
+# Each round records price-per-share, shares acquired and amount invested.
+# Splits / bonuses adjust the share count (factor) only — per-share price
+# divides by the same factor, so total value is unchanged. Current value =
+# total shares (after events) × the latest round's effective price-per-share;
+# cost = Σ round investments. The derived aggregate is written to a fresh
+# manual_input version so Overview and the manual list keep working unchanged.
+# Keyed by the STABLE (entity_id, category, label). Admin (IWS) writes; the
+# owning entity (and admin) can read.
+# ---------------------------------------------------------------------------
+
+class UnlistedRoundItem(BaseModel):
+    round_name:      Optional[str]   = None
+    round_date:      Optional[str]   = None   # YYYY-MM-DD
+    price_per_share: Optional[float] = None
+    shares:          Optional[float] = None
+    amount_invested: Optional[float] = None   # defaults to price × shares when omitted
+    notes:           Optional[str]   = None
+
+
+class UnlistedEventItem(BaseModel):
+    event_type: str                            # split | bonus
+    event_date: Optional[str]   = None         # YYYY-MM-DD
+    factor:     float                          # share multiplier (2:1 -> 2.0)
+    ratio_text: Optional[str]   = None         # display, e.g. '2:1'
+    notes:      Optional[str]   = None
+
+
+class UnlistedRoundsRequest(BaseModel):
+    entity_id: int
+    category:  str
+    label:     str = Field(min_length=1, max_length=200)
+    rounds:    List[UnlistedRoundItem] = []
+    events:    List[UnlistedEventItem] = []
+
+
+def _parse_date_opt(s, field):
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(s)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail=f"Invalid {field}: {s}")
+
+
+def _unlisted_round_row(r: dict) -> dict:
+    return {
+        "id":              r.get("id"),
+        "round_name":      r.get("round_name"),
+        "round_date":      str(r["round_date"]) if r.get("round_date") else None,
+        "price_per_share": float(r["price_per_share"]) if r.get("price_per_share") is not None else None,
+        "shares":          float(r["shares"]) if r.get("shares") is not None else None,
+        "amount_invested": float(r["amount_invested"]) if r.get("amount_invested") is not None else None,
+        "notes":           r.get("notes"),
+    }
+
+
+def _unlisted_event_row(e: dict) -> dict:
+    return {
+        "id":         e.get("id"),
+        "event_type": e.get("event_type"),
+        "event_date": str(e["event_date"]) if e.get("event_date") else None,
+        "factor":     float(e["factor"]) if e.get("factor") is not None else None,
+        "ratio_text": e.get("ratio_text"),
+        "notes":      e.get("notes"),
+    }
+
+
+def _compute_unlisted(rounds: list, events: list) -> dict:
+    """Derive cost, total current shares, current effective price-per-share,
+    current value and a per-round breakdown. A split/bonus applies to every
+    round dated on or before the event (missing round_date => oldest, missing
+    event_date => newest). Accepts DB rows or request-item dicts; numbers may be
+    Decimal or float."""
+    DMIN, DMAX = date.min, date.max
+
+    def gd(x, k):
+        v = x.get(k) if isinstance(x, dict) else getattr(x, k, None)
+        return v
+
+    ev = [{"event_date": gd(e, "event_date"), "factor": float(gd(e, "factor") or 1)} for e in events]
+
+    def factor_after(rd):
+        f = 1.0
+        for e in ev:
+            ed = e["event_date"] or DMAX
+            if ed >= (rd or DMIN):
+                f *= e["factor"]
+        return f
+
+    # order rounds by (date, original index) so "latest" is well-defined
+    indexed = sorted(enumerate(rounds), key=lambda t: ((gd(t[1], "round_date") or DMIN), t[0]))
+
+    current_pps = None
+    if indexed:
+        latest = indexed[-1][1]
+        lpps = gd(latest, "price_per_share")
+        if lpps is not None:
+            f = factor_after(gd(latest, "round_date"))
+            current_pps = float(lpps) / f if f else float(lpps)
+
+    cost = 0.0
+    total_shares = 0.0
+    breakdown = []
+    for _, r in indexed:
+        sh  = float(gd(r, "shares") or 0)
+        pps = gd(r, "price_per_share")
+        amt = gd(r, "amount_invested")
+        if amt is None and pps is not None:
+            amt = float(pps) * sh
+        amt = float(amt or 0)
+        cost += amt
+        rd  = gd(r, "round_date")
+        eff_shares = sh * factor_after(rd)
+        total_shares += eff_shares
+        breakdown.append({
+            "round_name":       gd(r, "round_name"),
+            "round_date":       str(rd) if rd else None,
+            "price_per_share":  float(pps) if pps is not None else None,
+            "shares":           sh,
+            "amount_invested":  round(amt, 2),
+            "effective_shares": round(eff_shares, 4),
+            "current_value":    round(eff_shares * current_pps, 2) if current_pps is not None else None,
+            "notes":            gd(r, "notes"),
+        })
+
+    current_value = round(total_shares * current_pps, 2) if current_pps is not None else None
+    return {
+        "cost":                    round(cost, 2),
+        "total_shares":            round(total_shares, 4),
+        "current_price_per_share": round(current_pps, 6) if current_pps is not None else None,
+        "current_value":           current_value,
+        "pnl":                     round(current_value - cost, 2) if current_value is not None else None,
+        "breakdown":               breakdown,
+    }
+
+
+@app.post("/api/v1/unlisted-rounds")
+@limiter.limit("30/minute")
+def save_unlisted_rounds(request: Request, body: UnlistedRoundsRequest,
+                         authorization: Optional[str] = Header(None)):
+    """Replace all funding rounds + corporate events for an unlisted/startup
+    holding and write the derived aggregate (cost, current value) to a fresh
+    manual_input version. Admin (IWS) only."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+        if body.category not in UNLISTED_CATEGORIES:
+            raise HTTPException(status_code=422, detail=f"Category does not support rounds: {body.category}")
+        label = body.label.strip()
+        if not label:
+            raise HTTPException(status_code=422, detail="label is required")
+
+        rounds_in = [{
+            "round_name":      r.round_name,
+            "round_date":      _parse_date_opt(r.round_date, "round_date"),
+            "price_per_share": r.price_per_share,
+            "shares":          r.shares,
+            "amount_invested": r.amount_invested,
+            "notes":           r.notes,
+        } for r in body.rounds]
+        events_in = []
+        for e in body.events:
+            if e.event_type not in ("split", "bonus"):
+                raise HTTPException(status_code=422, detail=f"Invalid event_type: {e.event_type}")
+            if e.factor is None or e.factor <= 0:
+                raise HTTPException(status_code=422, detail="event factor must be greater than 0")
+            events_in.append({
+                "event_type": e.event_type,
+                "event_date": _parse_date_opt(e.event_date, "event_date"),
+                "factor":     e.factor,
+                "ratio_text": e.ratio_text,
+                "notes":      e.notes,
+            })
+
+        agg = _compute_unlisted(rounds_in, events_in)
+
+        cur.execute("SELECT id FROM users WHERE email = %s", (payload["email"],))
+        urow = cur.fetchone()
+        user_id = urow["id"] if urow else None
+
+        # Carry forward prev_week_value / inception / currency / notes from the
+        # latest existing version so weekly change and metadata persist.
+        cur.execute("""
+            SELECT prev_week_value, inception_date, currency, notes
+            FROM manual_input
+            WHERE entity_id = %s AND category = %s AND label = %s
+            ORDER BY updated_at DESC LIMIT 1
+        """, (body.entity_id, body.category, label))
+        prev = cur.fetchone()
+        prev_week = prev["prev_week_value"] if prev else None
+        inception = prev["inception_date"] if prev else None
+        currency  = (prev["currency"] if prev else None) or "INR"
+        mi_notes  = prev["notes"] if prev else None
+
+        cur.execute("DELETE FROM unlisted_round WHERE entity_id=%s AND category=%s AND label=%s",
+                    (body.entity_id, body.category, label))
+        cur.execute("DELETE FROM unlisted_event WHERE entity_id=%s AND category=%s AND label=%s",
+                    (body.entity_id, body.category, label))
+        for i, r in enumerate(rounds_in):
+            cur.execute("""
+                INSERT INTO unlisted_round
+                    (entity_id, category, label, round_name, round_date, price_per_share,
+                     shares, amount_invested, notes, sort_order, created_by)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (body.entity_id, body.category, label, r["round_name"], r["round_date"],
+                  r["price_per_share"], r["shares"], r["amount_invested"], r["notes"], i, user_id))
+        for i, e in enumerate(events_in):
+            cur.execute("""
+                INSERT INTO unlisted_event
+                    (entity_id, category, label, event_type, event_date, factor,
+                     ratio_text, notes, sort_order, created_by)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (body.entity_id, body.category, label, e["event_type"], e["event_date"],
+                  e["factor"], e["ratio_text"], e["notes"], i, user_id))
+
+        # Derived aggregate as a fresh manual_input version.
+        cur.execute("""
+            INSERT INTO manual_input
+                (entity_id, category, label, cost, current_value, prev_week_value,
+                 currency, raw_amount, fx_rate, inception_date, notes, updated_by, updated_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,NULL,NULL,%s,%s,%s,NOW())
+        """, (body.entity_id, body.category, label, agg["cost"], agg["current_value"],
+              prev_week, currency, inception, mi_notes, user_id))
+
+        write_audit_log(conn, user_id, "UNLISTED_ROUNDS_SAVE", "unlisted_round", None,
+                        f"{body.category}/{label}: {len(rounds_in)} round(s), {len(events_in)} event(s)")
+        conn.commit()
+        cur.close()
+        return {"saved": True, "aggregate": agg}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/unlisted-rounds: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.get("/api/v1/unlisted-rounds")
+def get_unlisted_rounds(
+    request: Request,
+    category: str,
+    label: str,
+    entity_id: Optional[int] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """Funding rounds + corporate events + derived aggregate/breakdown for one
+    unlisted/startup holding. Entity-scoped for non-admins."""
+    conn = None
+    try:
+        if category not in UNLISTED_CATEGORIES:
+            raise HTTPException(status_code=422, detail=f"Invalid category: {category}")
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        eid  = _resolve_entity(cur, payload, entity_id)
+        if eid is None:
+            raise HTTPException(status_code=400, detail="entity_id is required")
+
+        cur.execute("""
+            SELECT id, round_name, round_date, price_per_share, shares, amount_invested, notes
+            FROM unlisted_round WHERE entity_id=%s AND category=%s AND label=%s
+            ORDER BY sort_order, id
+        """, (eid, category, label))
+        rounds = [dict(r) for r in cur.fetchall()]
+        cur.execute("""
+            SELECT id, event_type, event_date, factor, ratio_text, notes
+            FROM unlisted_event WHERE entity_id=%s AND category=%s AND label=%s
+            ORDER BY sort_order, id
+        """, (eid, category, label))
+        events = [dict(e) for e in cur.fetchall()]
+        cur.close()
+
+        return {
+            "entity_id": eid,
+            "category":  category,
+            "label":     label,
+            "rounds":    [_unlisted_round_row(r) for r in rounds],
+            "events":    [_unlisted_event_row(e) for e in events],
+            "aggregate": _compute_unlisted(rounds, events),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/unlisted-rounds: {e}")
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
     finally:
         release_db_connection(conn)

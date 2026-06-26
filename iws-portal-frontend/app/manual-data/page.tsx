@@ -68,6 +68,14 @@ const CURRENCIES = ['INR', 'USD', 'GBP', 'AED', 'SGD', 'EUR', 'HKD'];
 
 const FOREIGN_CATS = new Set(['overseas_fund', 'overseas_equity', 'forex']);
 
+// Categories whose cost / current value are derived from funding rounds +
+// corporate events (Phase 3) rather than hand-typed.
+const UNLISTED_CATS = new Set(['unlisted', 'startup']);
+
+function fmtINR(n: number): string {
+  return (n < 0 ? '−₹' : '₹') + Math.round(Math.abs(n)).toLocaleString('en-IN');
+}
+
 function emptyRow(entity_id: number): ManualInputRow {
   return {
     entity_id, category: 'pms', label: '', cost: '', current_value: '',
@@ -119,7 +127,254 @@ function defaultKind(category: string): string {
   return 'document';
 }
 
-function AssetExtras({ entityId, category, label }: { entityId: number; category: string; label: string }) {
+// ── Unlisted / startup funding-rounds editor ─────────────────────────────────
+
+interface RoundForm {
+  round_name: string; round_date: string; price_per_share: string;
+  shares: string; amount_invested: string; notes: string;
+}
+interface EventForm {
+  event_type: 'split' | 'bonus'; event_date: string; a: string; b: string; notes: string;
+}
+interface RoundsAggregate {
+  cost: number; total_shares: number; current_price_per_share: number | null;
+  current_value: number | null; pnl: number | null;
+}
+
+function emptyRoundForm(): RoundForm {
+  return { round_name: '', round_date: '', price_per_share: '', shares: '', amount_invested: '', notes: '' };
+}
+function emptyEventForm(): EventForm {
+  return { event_type: 'split', event_date: '', a: '2', b: '1', notes: '' };
+}
+
+// A split "a-for-b" multiplies shares by a/b. A bonus "a:b" issues a new shares
+// for every b held, so total shares multiply by (a+b)/b. Per-share price divides
+// by the same factor — total value unchanged.
+function eventFactor(ev: EventForm): number {
+  const a = parseFloat(ev.a), b = parseFloat(ev.b);
+  if (!a || !b || a <= 0 || b <= 0) return 1;
+  return ev.event_type === 'bonus' ? (a + b) / b : a / b;
+}
+
+// Client-side mirror of the backend _compute_unlisted, for live preview.
+function computeRoundsLocal(rounds: RoundForm[], events: EventForm[]): RoundsAggregate {
+  const DMIN = -Infinity, DMAX = Infinity;
+  const ev = events.map(e => ({ d: e.event_date ? Date.parse(e.event_date) : DMAX, f: eventFactor(e) }));
+  const factorAfter = (rd: number) => ev.reduce((f, e) => (e.d >= rd ? f * e.f : f), 1);
+
+  const idx = rounds
+    .map((r, i) => ({ d: r.round_date ? Date.parse(r.round_date) : DMIN, i, r }))
+    .sort((x, y) => x.d - y.d || x.i - y.i);
+
+  let curPps: number | null = null;
+  if (idx.length) {
+    const last = idx[idx.length - 1].r;
+    const pps = last.price_per_share ? parseFloat(last.price_per_share) : NaN;
+    if (!isNaN(pps)) {
+      const f = factorAfter(last.round_date ? Date.parse(last.round_date) : DMIN);
+      curPps = f ? pps / f : pps;
+    }
+  }
+  let cost = 0, shares = 0;
+  for (const { r } of idx) {
+    const sh = r.shares ? parseFloat(r.shares) : 0;
+    const pps = r.price_per_share ? parseFloat(r.price_per_share) : NaN;
+    let amt = r.amount_invested ? parseFloat(r.amount_invested) : NaN;
+    if (isNaN(amt)) amt = isNaN(pps) ? 0 : pps * sh;
+    cost += amt || 0;
+    shares += sh * factorAfter(r.round_date ? Date.parse(r.round_date) : DMIN);
+  }
+  const value = curPps != null ? shares * curPps : null;
+  return {
+    cost: Math.round(cost * 100) / 100,
+    total_shares: Math.round(shares * 10000) / 10000,
+    current_price_per_share: curPps != null ? Math.round(curPps * 1e6) / 1e6 : null,
+    current_value: value != null ? Math.round(value * 100) / 100 : null,
+    pnl: value != null ? Math.round((value - cost) * 100) / 100 : null,
+  };
+}
+
+function RoundsEditor({ entityId, category, label, onSaved }: {
+  entityId: number; category: string; label: string; onSaved?: () => void;
+}) {
+  const [rounds, setRounds] = useState<RoundForm[]>([]);
+  const [events, setEvents] = useState<EventForm[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  const load = useCallback(async () => {
+    if (!label.trim()) { setRounds([]); setEvents([]); return; }
+    const q = new URLSearchParams({ entity_id: String(entityId), category, label });
+    const r = await fetch(`${API_URL}/api/v1/unlisted-rounds?${q.toString()}`, { credentials: 'include' });
+    if (!r.ok) { setRounds([]); setEvents([]); return; }
+    const d = await r.json();
+    setRounds((d.rounds || []).map((x: { round_name?: string; round_date?: string; price_per_share?: number; shares?: number; amount_invested?: number; notes?: string }) => ({
+      round_name: x.round_name || '', round_date: x.round_date || '',
+      price_per_share: x.price_per_share != null ? String(x.price_per_share) : '',
+      shares: x.shares != null ? String(x.shares) : '',
+      amount_invested: x.amount_invested != null ? String(x.amount_invested) : '',
+      notes: x.notes || '',
+    })));
+    setEvents((d.events || []).map((x: { event_type?: string; event_date?: string; ratio_text?: string; factor?: number; notes?: string }) => {
+      const [a, b] = (x.ratio_text || '').split(':');
+      const type = (x.event_type === 'bonus' ? 'bonus' : 'split') as 'split' | 'bonus';
+      return {
+        event_type: type, event_date: x.event_date || '',
+        a: a || (x.factor != null ? String(type === 'bonus' ? x.factor - 1 : x.factor) : '2'),
+        b: b || '1', notes: x.notes || '',
+      };
+    }));
+  }, [entityId, category, label]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const agg = computeRoundsLocal(rounds, events);
+
+  function setRound(i: number, field: keyof RoundForm, v: string) {
+    setRounds(rs => rs.map((r, j) => j === i ? { ...r, [field]: v } : r));
+  }
+  function setEvent(i: number, field: keyof EventForm, v: string) {
+    setEvents(es => es.map((e, j) => j === i ? { ...e, [field]: v } : e));
+  }
+
+  async function save() {
+    setBusy(true); setMsg('');
+    const payload = {
+      entity_id: entityId, category, label,
+      rounds: rounds.map(r => ({
+        round_name: r.round_name || null,
+        round_date: r.round_date || null,
+        price_per_share: r.price_per_share ? parseFloat(r.price_per_share) : null,
+        shares: r.shares ? parseFloat(r.shares) : null,
+        amount_invested: r.amount_invested ? parseFloat(r.amount_invested) : null,
+        notes: r.notes || null,
+      })),
+      events: events.map(e => ({
+        event_type: e.event_type,
+        event_date: e.event_date || null,
+        factor: eventFactor(e),
+        ratio_text: `${e.a}:${e.b}`,
+        notes: e.notes || null,
+      })),
+    };
+    const r = await fetch(`${API_URL}/api/v1/unlisted-rounds`, {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+    });
+    setBusy(false);
+    if (r.ok) { setMsg('Rounds saved'); onSaved?.(); }
+    else { const d = await r.json().catch(() => ({})); setMsg(d.detail || 'Save failed'); }
+  }
+
+  const inp = 'px-2 py-1 rounded text-xs outline-none';
+  const inpStyle = { background: 'var(--card)', border: '1px solid var(--wire)', color: 'var(--ink)' };
+
+  return (
+    <div className="flex flex-col gap-3 pb-1">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <span className="text-[11px] font-semibold" style={{ color: 'var(--dim)' }}>Funding rounds</span>
+        <button onClick={() => setRounds(rs => [...rs, emptyRoundForm()])}
+                className="px-2 py-0.5 rounded text-[11px]"
+                style={{ background: 'var(--card)', border: '1px solid var(--rule)', color: 'var(--dim)' }}>
+          + Add round
+        </button>
+      </div>
+
+      {rounds.length > 0 && (
+        <table className="text-[11px] border-collapse">
+          <thead>
+            <tr style={{ color: 'var(--ghost)' }}>
+              {['Round', 'Date', 'Price/share', 'Shares', 'Amount (₹)', 'Notes', ''].map(h => (
+                <th key={h} className="px-1.5 py-1 text-left font-medium">{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rounds.map((r, i) => (
+              <tr key={i}>
+                <td className="px-1"><input value={r.round_name} placeholder="Seed / Series A" onChange={e => setRound(i, 'round_name', e.target.value)} className={`w-28 ${inp}`} style={inpStyle} /></td>
+                <td className="px-1"><input type="date" value={r.round_date} onChange={e => setRound(i, 'round_date', e.target.value)} className={`w-32 ${inp}`} style={inpStyle} /></td>
+                <td className="px-1"><input type="number" value={r.price_per_share} placeholder="100" onChange={e => setRound(i, 'price_per_share', e.target.value)} className={`w-24 ${inp} text-right`} style={inpStyle} /></td>
+                <td className="px-1"><input type="number" value={r.shares} placeholder="1000" onChange={e => setRound(i, 'shares', e.target.value)} className={`w-24 ${inp} text-right`} style={inpStyle} /></td>
+                <td className="px-1"><input type="number" value={r.amount_invested} placeholder={r.price_per_share && r.shares ? String(Math.round(parseFloat(r.price_per_share) * parseFloat(r.shares))) : 'auto'} onChange={e => setRound(i, 'amount_invested', e.target.value)} className={`w-28 ${inp} text-right`} style={inpStyle} /></td>
+                <td className="px-1"><input value={r.notes} placeholder="—" onChange={e => setRound(i, 'notes', e.target.value)} className={`w-28 ${inp}`} style={inpStyle} /></td>
+                <td className="px-1"><button onClick={() => setRounds(rs => rs.filter((_, j) => j !== i))} className="text-[11px]" style={{ color: 'var(--peril)' }}>✕</button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      <div className="flex items-center justify-between flex-wrap gap-2 mt-1">
+        <span className="text-[11px] font-semibold" style={{ color: 'var(--dim)' }}>Splits &amp; bonuses</span>
+        <button onClick={() => setEvents(es => [...es, emptyEventForm()])}
+                className="px-2 py-0.5 rounded text-[11px]"
+                style={{ background: 'var(--card)', border: '1px solid var(--rule)', color: 'var(--dim)' }}>
+          + Add split / bonus
+        </button>
+      </div>
+
+      {events.length > 0 && (
+        <table className="text-[11px] border-collapse">
+          <thead>
+            <tr style={{ color: 'var(--ghost)' }}>
+              {['Type', 'Date', 'Ratio', 'Effect', 'Notes', ''].map(h => (
+                <th key={h} className="px-1.5 py-1 text-left font-medium">{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {events.map((e, i) => (
+              <tr key={i}>
+                <td className="px-1">
+                  <select value={e.event_type} onChange={ev => setEvent(i, 'event_type', ev.target.value)} className={`w-20 ${inp}`} style={inpStyle}>
+                    <option value="split">Split</option>
+                    <option value="bonus">Bonus</option>
+                  </select>
+                </td>
+                <td className="px-1"><input type="date" value={e.event_date} onChange={ev => setEvent(i, 'event_date', ev.target.value)} className={`w-32 ${inp}`} style={inpStyle} /></td>
+                <td className="px-1">
+                  <span className="inline-flex items-center gap-1">
+                    <input type="number" value={e.a} onChange={ev => setEvent(i, 'a', ev.target.value)} className={`w-12 ${inp} text-right`} style={inpStyle} />
+                    <span style={{ color: 'var(--ghost)' }}>{e.event_type === 'bonus' ? 'for' : ':'}</span>
+                    <input type="number" value={e.b} onChange={ev => setEvent(i, 'b', ev.target.value)} className={`w-12 ${inp} text-right`} style={inpStyle} />
+                  </span>
+                </td>
+                <td className="px-1.5" style={{ color: 'var(--ghost)' }}>shares ×{eventFactor(e).toFixed(3).replace(/\.?0+$/, '')}</td>
+                <td className="px-1"><input value={e.notes} placeholder="—" onChange={ev => setEvent(i, 'notes', ev.target.value)} className={`w-28 ${inp}`} style={inpStyle} /></td>
+                <td className="px-1"><button onClick={() => setEvents(es => es.filter((_, j) => j !== i))} className="text-[11px]" style={{ color: 'var(--peril)' }}>✕</button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      {/* Derived aggregate */}
+      <div className="flex flex-wrap gap-x-5 gap-y-1 mt-1 px-2 py-1.5 rounded"
+           style={{ background: 'var(--card)', border: '1px solid var(--rule)' }}>
+        <span className="text-[11px]" style={{ color: 'var(--ghost)' }}>Cost <b style={{ color: 'var(--ink)' }}>{fmtINR(agg.cost)}</b></span>
+        <span className="text-[11px]" style={{ color: 'var(--ghost)' }}>Shares <b style={{ color: 'var(--ink)' }}>{agg.total_shares.toLocaleString('en-IN')}</b></span>
+        <span className="text-[11px]" style={{ color: 'var(--ghost)' }}>Price/share <b style={{ color: 'var(--ink)' }}>{agg.current_price_per_share != null ? '₹' + agg.current_price_per_share.toLocaleString('en-IN') : '—'}</b></span>
+        <span className="text-[11px]" style={{ color: 'var(--ghost)' }}>Current value <b style={{ color: 'var(--ink)' }}>{agg.current_value != null ? fmtINR(agg.current_value) : '—'}</b></span>
+        {agg.pnl != null && (
+          <span className="text-[11px]" style={{ color: 'var(--ghost)' }}>P&amp;L <b style={{ color: agg.pnl >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{agg.pnl >= 0 ? '+' : ''}{fmtINR(agg.pnl)}</b></span>
+        )}
+      </div>
+
+      <div className="flex items-center gap-2">
+        <button onClick={save} disabled={busy || !label.trim()}
+                className="px-3 py-1 rounded text-xs font-medium"
+                style={{ background: 'var(--prime)', color: 'var(--prime-fg)', opacity: busy || !label.trim() ? 0.6 : 1 }}>
+          {busy ? 'Saving…' : 'Save rounds'}
+        </button>
+        {msg && <span className="text-[11px]" style={{ color: 'var(--ghost)' }}>{msg}</span>}
+      </div>
+    </div>
+  );
+}
+
+function AssetExtras({ entityId, category, label, onSaved }: { entityId: number; category: string; label: string; onSaved?: () => void }) {
   const [atts, setAtts] = useState<AttachmentMeta[]>([]);
   const [kind, setKind] = useState(defaultKind(category));
   const [busy, setBusy] = useState(false);
@@ -180,6 +435,7 @@ function AssetExtras({ entityId, category, label }: { entityId: number; category
         Enter a name in the “Label / Name” column first — then you can{' '}
         {category === 'art' ? 'upload artwork photos and add the painter’s details'
           : category === 'properties' ? 'upload deeds, plans and other documents'
+          : UNLISTED_CATS.has(category) ? 'add funding rounds, splits/bonuses and supporting documents'
           : 'upload supporting documents and files'} here.
       </div>
     );
@@ -187,6 +443,9 @@ function AssetExtras({ entityId, category, label }: { entityId: number; category
 
   return (
     <div className="px-4 py-4 flex flex-col gap-4" style={{ fontSize: 12 }}>
+      {UNLISTED_CATS.has(category) && (
+        <RoundsEditor entityId={entityId} category={category} label={label} onSaved={onSaved} />
+      )}
       {category === 'art' && (
         <div className="flex flex-wrap gap-3 items-start">
           <div className="flex flex-col gap-1">
@@ -411,6 +670,9 @@ export default function ManualDataPage() {
         setError(`Please enter a name/label for the ${catLabel} entry before saving.`);
         return;
       }
+      // Unlisted/startup values are derived from the funding-rounds panel, so the
+      // main form doesn't require a hand-typed cost / current value for them.
+      if (UNLISTED_CATS.has(r.category)) continue;
       if (!r.current_value.trim() && !r.cost.trim() && !r.raw_amount.trim()) {
         setError(`"${r.label}" has no value entered — add a cost or current value before saving.`);
         return;
@@ -427,19 +689,32 @@ export default function ManualDataPage() {
     setSaving(true);
     setAuthError('');
 
-    const inputs = dirtyRows.map(r => ({
-      entity_id:       r.entity_id,
-      category:        r.category,
-      label:           r.label,
-      cost:            r.cost            ? parseFloat(r.cost)            : null,
-      current_value:   r.current_value   ? parseFloat(r.current_value)   : null,
-      prev_week_value: r.prev_week_value ? parseFloat(r.prev_week_value) : null,
-      currency:        r.currency,
-      raw_amount:      r.raw_amount      ? parseFloat(r.raw_amount)      : null,
-      fx_rate:         r.fx_rate         ? parseFloat(r.fx_rate)         : null,
-      inception_date:  r.inception_date  || null,
-      notes:           r.notes           || null,
-    }));
+    // Skip unlisted/startup rows that have no derived value yet — those are
+    // persisted by the Rounds panel, and sending null here would wipe the
+    // aggregate it computes.
+    const inputs = dirtyRows
+      .filter(r => !UNLISTED_CATS.has(r.category) || r.cost.trim() || r.current_value.trim())
+      .map(r => ({
+        entity_id:       r.entity_id,
+        category:        r.category,
+        label:           r.label,
+        cost:            r.cost            ? parseFloat(r.cost)            : null,
+        current_value:   r.current_value   ? parseFloat(r.current_value)   : null,
+        prev_week_value: r.prev_week_value ? parseFloat(r.prev_week_value) : null,
+        currency:        r.currency,
+        raw_amount:      r.raw_amount      ? parseFloat(r.raw_amount)      : null,
+        fx_rate:         r.fx_rate         ? parseFloat(r.fx_rate)         : null,
+        inception_date:  r.inception_date  || null,
+        notes:           r.notes           || null,
+      }));
+
+    if (inputs.length === 0) {
+      setSaving(false);
+      setShowAuth(false);
+      setSuccess('Nothing to save here — unlisted values are saved from the Rounds panel.');
+      setTimeout(() => setSuccess(''), 4000);
+      return;
+    }
 
     const res = await fetch(`${API_URL}/api/v1/manual-inputs`, {
       method: 'POST',
@@ -452,7 +727,7 @@ export default function ManualDataPage() {
 
     if (res.ok) {
       setShowAuth(false);
-      setSuccess(`Saved ${dirtyRows.length} item(s) successfully.`);
+      setSuccess(`Saved ${inputs.length} item(s) successfully.`);
       if (selectedEntity != null) fetchInputs(selectedEntity);
       setTimeout(() => setSuccess(''), 4000);
     } else if (res.status === 401) {
@@ -484,6 +759,7 @@ export default function ManualDataPage() {
               { href: '/equity',      label: 'Equity' },
               { href: '/foreign-equity', label: 'Foreign Equity' },
               { href: '/gold-silver', label: 'Gold/Silver' },
+              { href: '/unlisted', label: 'Unlisted' },
               { href: '/art', label: 'Art' },
               { href: '/properties', label: 'Properties' },
               { href: '/bank-accounts', label: 'Banks' },
@@ -599,6 +875,7 @@ export default function ManualDataPage() {
                     : null;
 
                   const showFiles = true;   // attachments available for every manual entry
+                  const isUnlisted = UNLISTED_CATS.has(row.category);
                   const isOpen = openExtras === idx;
                   return (
                     <Fragment key={idx}>
@@ -631,25 +908,39 @@ export default function ManualDataPage() {
 
                       {/* Cost */}
                       <td className="px-2 py-1.5">
-                        <input type="number" value={row.cost} placeholder="0"
-                               onChange={e => updateRow(idx, 'cost', e.target.value)}
-                               className="w-28 px-2 py-1 rounded text-xs outline-none text-right"
-                               style={{ background: 'var(--page)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
+                        {isUnlisted ? (
+                          <div className="w-28 text-right">
+                            <span className="text-xs" style={{ color: 'var(--ink)' }}>{row.cost ? '₹' + Number(row.cost).toLocaleString('en-IN') : '—'}</span>
+                            <div style={{ color: 'var(--ghost)', fontSize: 9 }}>from rounds</div>
+                          </div>
+                        ) : (
+                          <input type="number" value={row.cost} placeholder="0"
+                                 onChange={e => updateRow(idx, 'cost', e.target.value)}
+                                 className="w-28 px-2 py-1 rounded text-xs outline-none text-right"
+                                 style={{ background: 'var(--page)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
+                        )}
                       </td>
 
                       {/* Current value */}
                       <td className="px-2 py-1.5">
-                        <div>
-                          <input type="number" value={row.current_value} placeholder="0"
-                                 onChange={e => updateRow(idx, 'current_value', e.target.value)}
-                                 className="w-28 px-2 py-1 rounded text-xs outline-none text-right"
-                                 style={{ background: 'var(--page)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
-                          {computedINR && (
-                            <div className="text-right mt-0.5" style={{ color: 'var(--ghost)', fontSize: 10 }}>
-                              ≈ ₹{parseInt(computedINR).toLocaleString('en-IN')}
-                            </div>
-                          )}
-                        </div>
+                        {isUnlisted ? (
+                          <div className="w-28 text-right">
+                            <span className="text-xs" style={{ color: 'var(--ink)' }}>{row.current_value ? '₹' + Number(row.current_value).toLocaleString('en-IN') : '—'}</span>
+                            <div style={{ color: 'var(--ghost)', fontSize: 9 }}>from rounds</div>
+                          </div>
+                        ) : (
+                          <div>
+                            <input type="number" value={row.current_value} placeholder="0"
+                                   onChange={e => updateRow(idx, 'current_value', e.target.value)}
+                                   className="w-28 px-2 py-1 rounded text-xs outline-none text-right"
+                                   style={{ background: 'var(--page)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
+                            {computedINR && (
+                              <div className="text-right mt-0.5" style={{ color: 'var(--ghost)', fontSize: 10 }}>
+                                ≈ ₹{parseInt(computedINR).toLocaleString('en-IN')}
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </td>
 
                       {/* Prev week */}
@@ -719,10 +1010,11 @@ export default function ManualDataPage() {
                             <button onClick={() => setOpenExtras(isOpen ? null : idx)}
                                     title={row.category === 'art' ? 'Artwork photos & painter details'
                                       : row.category === 'properties' ? 'Deeds, plans & documents'
+                                      : isUnlisted ? 'Funding rounds, splits/bonuses & documents'
                                       : 'Attach documents / files'}
                                     className="px-2 py-0.5 rounded text-xs whitespace-nowrap"
                                     style={{ color: isOpen ? 'var(--prime-fg)' : 'var(--dim)', background: isOpen ? 'var(--prime)' : 'transparent', border: '1px solid var(--rule)' }}>
-                              {row.category === 'art' ? '🖼 Photos' : '📎 Files'}
+                              {row.category === 'art' ? '🖼 Photos' : isUnlisted ? '📊 Rounds' : '📎 Files'}
                             </button>
                           )}
                           {row._dirty && (
@@ -750,7 +1042,8 @@ export default function ManualDataPage() {
                     {showFiles && isOpen && (
                       <tr>
                         <td colSpan={11} style={{ background: 'var(--page)', borderBottom: '1px solid var(--rule)' }}>
-                          <AssetExtras entityId={row.entity_id} category={row.category} label={row.label} />
+                          <AssetExtras entityId={row.entity_id} category={row.category} label={row.label}
+                                       onSaved={() => { if (selectedEntity != null) fetchInputs(selectedEntity); }} />
                         </td>
                       </tr>
                     )}
