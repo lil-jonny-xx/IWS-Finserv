@@ -16,9 +16,13 @@ Setup (one-time, in IBKR Client Portal → Settings → Account Settings):
 
 Env vars (per entity, replace {CODE} with the entity code e.g. DHR):
   IBKR_{CODE}_FLEX_TOKEN      — Flex Web Service token
-  IBKR_{CODE}_QUERY_ID        — saved Flex Query ID (Open Positions + Cash Report)
-  IBKR_{CODE}_TRADES_QUERY_ID — optional; saved Flex Query with the Trades section,
-                                used once by the inception backfill (Since / XIRR)
+  IBKR_{CODE}_QUERY_ID        — saved Flex Query ID. As of 2026-06-26 this query
+                                bundles Open Positions + Cash Report + Trades (365d),
+                                so fetch_all() gets holdings, cash AND the trade ledger
+                                from a single SendRequest per login (one call/day).
+  IBKR_{CODE}_TRADES_QUERY_ID — optional; trades-only query for the inception backfill
+                                (>1yr history via fd/td windows). Not used by the daily
+                                path now that QUERY_ID carries 365d of trades.
   IBKR_{CODE}_BASE_CURRENCY   — optional; account base currency for cash (default USD)
 """
 import logging
@@ -396,6 +400,44 @@ def _cash_from_root(root: ET.Element) -> Decimal:
             except Exception:
                 continue
     return total
+
+
+def _trades_from_root(root: ET.Element) -> list[dict]:
+    return [el.attrib for el in root.iter("Trade")]
+
+
+def fetch_all(entity_code: str) -> "tuple[list[dict], Decimal, list[dict], list[str]]":
+    """Open positions, ending cash AND executed trades from ONE Flex statement per login.
+
+    The daily QUERY_ID now bundles the Trades section (last 365 days) alongside Open
+    Positions + Cash Report, so a single SendRequest per login yields all three — never
+    the back-to-back same-query regeneration that escalates 1001 → token-wide throttle →
+    1025 lockout. This is the "make one call a day, get everything" path.
+
+    Returns (positions, cash_in_base_currency, trades, failed_prefixes). One login failing
+    does NOT discard the logins that succeeded, but the caller MUST treat a non-empty
+    failed_prefixes as a PARTIAL result: positions/cash/trades for an entity aggregate
+    across all its logins, so persisting a partial run would understate them.
+    """
+    prefixes = _account_prefixes(entity_code)
+    positions: list[dict] = []
+    trades: list[dict] = []
+    cash = Decimal("0")
+    failures: list[str] = []
+    for p in prefixes:
+        try:
+            root = _fetch_statement_xml(p)
+        except Exception as e:
+            logger.error(f"[{p}] IBKR fetch failed — {e}")
+            failures.append(p)
+            continue
+        positions += _positions_from_root(root)
+        cash      += _cash_from_root(root)
+        trades    += _trades_from_root(root)
+    logger.info(f"[{entity_code}] IBKR: {len(positions)} positions + cash {cash} + "
+                f"{len(trades)} trades from {len(prefixes) - len(failures)}/{len(prefixes)} "
+                f"login(s)" + (f"; FAILED: {failures}" if failures else ""))
+    return positions, cash, trades, failures
 
 
 def fetch_positions_and_cash(entity_code: str) -> "tuple[list[dict], Decimal, list[str]]":
