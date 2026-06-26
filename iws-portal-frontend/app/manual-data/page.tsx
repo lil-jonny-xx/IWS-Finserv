@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useState, useCallback, Fragment } from 'react';
 import { useRouter } from 'next/navigation';
+import DragScroll from '@/app/components/DragScroll';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -848,7 +849,8 @@ export default function ManualDataPage() {
           <div className="py-16 text-center text-xs" style={{ color: 'var(--ghost)' }}>Loading…</div>
         ) : (
           <div style={{ background: 'var(--card)', border: '1px solid var(--rule)', borderRadius: 8, overflow: 'hidden' }}>
-            <table className="w-full text-xs border-collapse">
+            <DragScroll className="overflow-x-auto" role="region" aria-label="Manual data table" tabIndex={0}>
+            <table className="w-full text-xs border-collapse" style={{ minWidth: 1100 }}>
               <thead>
                 <tr style={{ background: 'var(--page)' }}>
                   {['Category', 'Label / Name', 'Cost (₹)', 'Current Value', 'Prev Week (₹)', 'Currency', 'Raw Amount', 'FX Rate', 'Inception Date', 'Notes', ''].map(h => (
@@ -1040,6 +1042,7 @@ export default function ManualDataPage() {
                 })}
               </tbody>
             </table>
+            </DragScroll>
           </div>
         )}
       </main>
