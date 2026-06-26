@@ -96,14 +96,12 @@ function savedToRow(s: SavedInput): ManualInputRow {
   };
 }
 
-// Categories that support file uploads (and, for art, painter details).
-const ATTACH_CATS = new Set(['art', 'properties']);
-
 interface AttachmentMeta {
   id: number; kind: string; original_name: string | null; mime: string | null;
   size_bytes: number | null; has_thumb: boolean;
 }
 
+const DEFAULT_KINDS = [{ value: 'document', label: 'Document' }];
 const KIND_OPTS: Record<string, { value: string; label: string }[]> = {
   art: [
     { value: 'art_image', label: 'Artwork image' },
@@ -115,16 +113,22 @@ const KIND_OPTS: Record<string, { value: string; label: string }[]> = {
     { value: 'document', label: 'Document' },
   ],
 };
+function defaultKind(category: string): string {
+  if (category === 'art') return 'art_image';
+  if (category === 'properties') return 'deed';
+  return 'document';
+}
 
 function AssetExtras({ entityId, category, label }: { entityId: number; category: string; label: string }) {
   const [atts, setAtts] = useState<AttachmentMeta[]>([]);
-  const [kind, setKind] = useState(category === 'art' ? 'art_image' : 'deed');
+  const [kind, setKind] = useState(defaultKind(category));
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState('');
   const [painterName, setPainterName] = useState('');
   const [painterAbout, setPainterAbout] = useState('');
 
   const load = useCallback(async () => {
+    if (!label.trim()) { setAtts([]); return; }
     const q = new URLSearchParams({ entity_id: String(entityId), category, label });
     const r = await fetch(`${API_URL}/api/v1/manual-attachments?${q.toString()}`, { credentials: 'include' });
     if (r.ok) setAtts(await r.json());
@@ -170,6 +174,17 @@ function AssetExtras({ entityId, category, label }: { entityId: number; category
     setMsg(r.ok ? 'Painter details saved' : 'Save failed');
   }
 
+  if (!label.trim()) {
+    return (
+      <div className="px-4 py-4 text-[11px]" style={{ color: 'var(--ghost)' }}>
+        Enter a name in the “Label / Name” column first — then you can{' '}
+        {category === 'art' ? 'upload artwork photos and add the painter’s details'
+          : category === 'properties' ? 'upload deeds, plans and other documents'
+          : 'upload supporting documents and files'} here.
+      </div>
+    );
+  }
+
   return (
     <div className="px-4 py-4 flex flex-col gap-4" style={{ fontSize: 12 }}>
       {category === 'art' && (
@@ -197,12 +212,14 @@ function AssetExtras({ entityId, category, label }: { entityId: number; category
 
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-[11px] font-medium" style={{ color: 'var(--dim)' }}>
-          {category === 'art' ? 'Artwork image / documents' : 'Deeds, plans & documents'}:
+          {category === 'art' ? 'Artwork image / documents'
+            : category === 'properties' ? 'Deeds, plans & documents'
+            : 'Documents / files'}:
         </span>
         <select value={kind} onChange={e => setKind(e.target.value)}
                 className="px-2 py-1 rounded text-xs outline-none"
                 style={{ background: 'var(--card)', border: '1px solid var(--wire)', color: 'var(--ink)' }}>
-          {(KIND_OPTS[category] || KIND_OPTS.properties).map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+          {(KIND_OPTS[category] || DEFAULT_KINDS).map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
         </select>
         <label className="px-3 py-1 rounded text-xs font-medium cursor-pointer"
                style={{ background: 'var(--card)', border: '1px solid var(--rule)', color: 'var(--dim)' }}>
@@ -251,6 +268,8 @@ export default function ManualDataPage() {
   const [selectedEntity, setSelectedEntity] = useState<number | null>(null);
   const [fxRates, setFxRates] = useState<FxRates>({});
   const [rows, setRows] = useState<ManualInputRow[]>([]);
+  // Last-saved snapshot, used to revert individual rows or discard all edits.
+  const [savedSnapshot, setSavedSnapshot] = useState<ManualInputRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
@@ -280,9 +299,12 @@ export default function ManualDataPage() {
     const res = await fetch(`${API_URL}/api/v1/manual-inputs?entity_id=${eid}`, { credentials: 'include' });
     if (res.ok) {
       const data: SavedInput[] = await res.json();
-      setRows(data.map(savedToRow));
+      const mapped = data.map(savedToRow);
+      setRows(mapped);
+      setSavedSnapshot(mapped.map(r => ({ ...r })));
     } else {
       setRows([]);
+      setSavedSnapshot([]);
     }
     setLoading(false);
   }, []);
@@ -313,8 +335,49 @@ export default function ManualDataPage() {
     setRows(r => [...r, emptyRow(selectedEntity)]);
   }
 
-  function removeRow(idx: number) {
-    setRows(r => r.filter((_, i) => i !== idx));
+  async function removeRow(idx: number) {
+    const row = rows[idx];
+    // Unsaved (new) row → just drop it from the table.
+    if (row.id == null) {
+      setRows(r => r.filter((_, i) => i !== idx));
+      return;
+    }
+    // Saved entry → delete it (and its files) from the server. Versioned, so this
+    // removes every version of this (entity, category, label).
+    if (!confirm(`Delete "${row.label || 'this entry'}" and all its files? This cannot be undone.`)) return;
+    const q = new URLSearchParams({
+      entity_id: String(row.entity_id), category: row.category, label: row.label,
+    });
+    const res = await fetch(`${API_URL}/api/v1/manual-inputs?${q.toString()}`, {
+      method: 'DELETE', credentials: 'include',
+    });
+    if (res.ok) {
+      setRows(r => r.filter((_, i) => i !== idx));
+      setSavedSnapshot(s => s.filter(r => r.id !== row.id));
+      setSuccess('Entry deleted.');
+      setTimeout(() => setSuccess(''), 3000);
+    } else {
+      setError('Could not delete the entry. Please try again.');
+    }
+  }
+
+  // Undo edits on one row: restore the saved version, or drop it if it was new.
+  function revertRow(idx: number) {
+    const row = rows[idx];
+    const saved = row.id != null ? savedSnapshot.find(s => s.id === row.id) : undefined;
+    if (saved) {
+      setRows(r => r.map((x, i) => i === idx ? { ...saved } : x));
+    } else {
+      setRows(r => r.filter((_, i) => i !== idx));
+    }
+  }
+
+  // Discard ALL unsaved changes — restore the last-saved snapshot.
+  function discardAll() {
+    setRows(savedSnapshot.map(r => ({ ...r })));
+    setError('');
+    setSuccess('Changes discarded.');
+    setTimeout(() => setSuccess(''), 3000);
   }
 
   function updateRow(idx: number, field: keyof ManualInputRow, value: string) {
@@ -339,6 +402,20 @@ export default function ManualDataPage() {
 
   function openSaveModal() {
     if (dirtyRows.length === 0) { setError('No changes to save.'); return; }
+    // Validate: every row needs a name and at least one monetary value, so an
+    // empty row (e.g. picking "Art" and entering nothing) is rejected with a clear
+    // message instead of saving a blank/garbage entry.
+    for (const r of dirtyRows) {
+      const catLabel = CATEGORIES.find(c => c.value === r.category)?.label || r.category;
+      if (!r.label.trim()) {
+        setError(`Please enter a name/label for the ${catLabel} entry before saving.`);
+        return;
+      }
+      if (!r.current_value.trim() && !r.cost.trim() && !r.raw_amount.trim()) {
+        setError(`"${r.label}" has no value entered — add a cost or current value before saving.`);
+        return;
+      }
+    }
     setPassword('');
     setAuthError('');
     setError('');
@@ -441,6 +518,13 @@ export default function ManualDataPage() {
                     style={{ background: 'var(--card)', border: '1px solid var(--rule)', color: 'var(--dim)' }}>
               + Add Row
             </button>
+            {dirtyRows.length > 0 && (
+              <button onClick={discardAll}
+                      className="px-3 py-1.5 rounded text-xs font-medium transition-colors"
+                      style={{ background: 'var(--card)', border: '1px solid var(--rule)', color: 'var(--peril)' }}>
+                Discard Changes
+              </button>
+            )}
             <button onClick={openSaveModal}
                     className="px-4 py-1.5 rounded text-xs font-semibold transition-colors"
                     style={{ background: 'var(--prime)', color: 'var(--prime-fg)' }}>
@@ -514,7 +598,7 @@ export default function ManualDataPage() {
                     ? (parseFloat(row.raw_amount) * parseFloat(row.fx_rate)).toFixed(0)
                     : null;
 
-                  const showFiles = ATTACH_CATS.has(row.category) && row.label.trim() !== '';
+                  const showFiles = true;   // attachments available for every manual entry
                   const isOpen = openExtras === idx;
                   return (
                     <Fragment key={idx}>
@@ -628,18 +712,29 @@ export default function ManualDataPage() {
                                style={{ background: 'var(--page)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
                       </td>
 
-                      {/* Files + Remove */}
+                      {/* Files + Revert + Remove */}
                       <td className="px-2 py-1.5">
                         <div className="flex items-center gap-1">
                           {showFiles && (
                             <button onClick={() => setOpenExtras(isOpen ? null : idx)}
-                                    title="Attachments / details"
+                                    title={row.category === 'art' ? 'Artwork photos & painter details'
+                                      : row.category === 'properties' ? 'Deeds, plans & documents'
+                                      : 'Attach documents / files'}
+                                    className="px-2 py-0.5 rounded text-xs whitespace-nowrap"
+                                    style={{ color: isOpen ? 'var(--prime-fg)' : 'var(--dim)', background: isOpen ? 'var(--prime)' : 'transparent', border: '1px solid var(--rule)' }}>
+                              {row.category === 'art' ? '🖼 Photos' : '📎 Files'}
+                            </button>
+                          )}
+                          {row._dirty && (
+                            <button onClick={() => revertRow(idx)}
+                                    title="Undo changes to this row"
                                     className="px-2 py-0.5 rounded text-xs"
-                                    style={{ color: isOpen ? 'var(--prime)' : 'var(--dim)', background: 'transparent', border: '1px solid var(--rule)' }}>
-                              📎
+                                    style={{ color: 'var(--dim)', background: 'transparent', border: '1px solid var(--rule)' }}>
+                              ↶
                             </button>
                           )}
                           <button onClick={() => removeRow(idx)}
+                                  title={row.id != null ? 'Delete this entry' : 'Remove row'}
                                   className="px-2 py-0.5 rounded text-xs"
                                   style={{ color: 'var(--peril)', background: 'transparent', border: '1px solid var(--rule)' }}>
                             ✕

@@ -2631,6 +2631,73 @@ def save_manual_inputs(
         release_db_connection(conn)
 
 
+@app.delete("/api/v1/manual-inputs")
+def delete_manual_input(
+    request: Request,
+    entity_id: int,
+    category: str,
+    label: str,
+    authorization: Optional[str] = Header(None),
+):
+    """Delete a manual asset entirely (all versioned rows for the stable
+    (entity_id, category, label) key) plus its art details and attachments +
+    files. Admin (IWS) only."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+
+        # Remove attachment files from disk, then their rows.
+        cur.execute(
+            "SELECT stored_path, thumb_path FROM manual_attachment "
+            "WHERE entity_id = %s AND category = %s AND label = %s",
+            (entity_id, category, label),
+        )
+        for a in cur.fetchall():
+            for rel in (a["stored_path"], a["thumb_path"]):
+                if not rel:
+                    continue
+                try:
+                    p = _uploads_abspath(rel)
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception as e:
+                    logger.warning(f"could not remove attachment file {rel}: {e}")
+        cur.execute(
+            "DELETE FROM manual_attachment WHERE entity_id = %s AND category = %s AND label = %s",
+            (entity_id, category, label),
+        )
+        if category == "art":
+            cur.execute("DELETE FROM art_detail WHERE entity_id = %s AND label = %s",
+                        (entity_id, label))
+        cur.execute(
+            "DELETE FROM manual_input WHERE entity_id = %s AND category = %s AND label = %s",
+            (entity_id, category, label),
+        )
+        deleted = cur.rowcount
+        cur.execute("SELECT id FROM users WHERE email = %s", (payload["email"],))
+        urow = cur.fetchone()
+        write_audit_log(conn, urow["id"] if urow else None, "MANUAL_INPUT_DELETE",
+                        "manual_input", None, f"{category}/{label} ({deleted} version(s))")
+        conn.commit()
+        cur.close()
+        return {"deleted": deleted}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in DELETE /api/v1/manual-inputs: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
 # ---------------------------------------------------------------------------
 # Manual-asset attachments (artwork images, property deeds / plans / documents)
 # and Art details (painter). Files live on the filesystem under UPLOADS_ROOT;
