@@ -146,6 +146,8 @@ export default function ForeignEquityPage() {
               { href: '/equity',       label: 'Equity'       },
               { href: '/foreign-equity', label: 'Foreign Equity', active: true },
               { href: '/gold-silver', label: 'Gold/Silver' },
+              { href: '/art', label: 'Art' },
+              { href: '/properties', label: 'Properties' },
               { href: '/bank-accounts', label: 'Banks' },
               { href: '/pms', label: 'PMS' },
               { href: '/manual-data',  label: 'Manual Data'  },

@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, Fragment } from 'react';
 import { useRouter } from 'next/navigation';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
@@ -57,6 +57,7 @@ const CATEGORIES: { value: string; label: string; group: string }[] = [
   { value: 'gold_etf',       label: 'Gold / Silver ETF',          group: 'Alternates' },
   { value: 'unlisted',       label: 'Unlisted Equity',            group: 'Alternates' },
   { value: 'startup',        label: 'Startup',                    group: 'Alternates' },
+  { value: 'art',            label: 'Art / Collectibles',         group: 'Alternates' },
   { value: 'properties',     label: 'Real Estate / Property',     group: 'Real Estate' },
   { value: 'funds_transit',  label: 'Funds in Transit',           group: 'Other' },
   { value: 'broker_balance', label: 'Broker Balance',             group: 'Other' },
@@ -95,8 +96,157 @@ function savedToRow(s: SavedInput): ManualInputRow {
   };
 }
 
+// Categories that support file uploads (and, for art, painter details).
+const ATTACH_CATS = new Set(['art', 'properties']);
+
+interface AttachmentMeta {
+  id: number; kind: string; original_name: string | null; mime: string | null;
+  size_bytes: number | null; has_thumb: boolean;
+}
+
+const KIND_OPTS: Record<string, { value: string; label: string }[]> = {
+  art: [
+    { value: 'art_image', label: 'Artwork image' },
+    { value: 'document',  label: 'Certificate / document' },
+  ],
+  properties: [
+    { value: 'deed',     label: 'Deed' },
+    { value: 'plan',     label: 'Plan' },
+    { value: 'document', label: 'Document' },
+  ],
+};
+
+function AssetExtras({ entityId, category, label }: { entityId: number; category: string; label: string }) {
+  const [atts, setAtts] = useState<AttachmentMeta[]>([]);
+  const [kind, setKind] = useState(category === 'art' ? 'art_image' : 'deed');
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+  const [painterName, setPainterName] = useState('');
+  const [painterAbout, setPainterAbout] = useState('');
+
+  const load = useCallback(async () => {
+    const q = new URLSearchParams({ entity_id: String(entityId), category, label });
+    const r = await fetch(`${API_URL}/api/v1/manual-attachments?${q.toString()}`, { credentials: 'include' });
+    if (r.ok) setAtts(await r.json());
+    if (category === 'art') {
+      const ar = await fetch(`${API_URL}/api/v1/manual-assets?category=art&entity_id=${entityId}`, { credentials: 'include' });
+      if (ar.ok) {
+        const d = await ar.json();
+        const m = (d.assets || []).find((a: { label: string }) => a.label === label);
+        if (m) { setPainterName(m.painter_name || ''); setPainterAbout(m.painter_about || ''); }
+      }
+    }
+  }, [entityId, category, label]);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function onUpload(file: File) {
+    setBusy(true); setMsg('');
+    const fd = new FormData();
+    fd.append('entity_id', String(entityId));
+    fd.append('category', category);
+    fd.append('label', label);
+    fd.append('kind', kind);
+    fd.append('file', file);
+    const r = await fetch(`${API_URL}/api/v1/manual-attachments`, { method: 'POST', credentials: 'include', body: fd });
+    setBusy(false);
+    if (r.ok) { setMsg('Uploaded'); load(); }
+    else { const d = await r.json().catch(() => ({})); setMsg(d.detail || 'Upload failed'); }
+  }
+
+  async function onDelete(id: number) {
+    if (!confirm('Delete this file?')) return;
+    const r = await fetch(`${API_URL}/api/v1/manual-attachments/${id}`, { method: 'DELETE', credentials: 'include' });
+    if (r.ok) load();
+  }
+
+  async function savePainter() {
+    setBusy(true); setMsg('');
+    const r = await fetch(`${API_URL}/api/v1/art-detail`, {
+      method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entity_id: entityId, label, painter_name: painterName, painter_about: painterAbout }),
+    });
+    setBusy(false);
+    setMsg(r.ok ? 'Painter details saved' : 'Save failed');
+  }
+
+  return (
+    <div className="px-4 py-4 flex flex-col gap-4" style={{ fontSize: 12 }}>
+      {category === 'art' && (
+        <div className="flex flex-wrap gap-3 items-start">
+          <div className="flex flex-col gap-1">
+            <label className="text-[11px]" style={{ color: 'var(--dim)' }}>Painter name</label>
+            <input value={painterName} onChange={e => setPainterName(e.target.value)} placeholder="e.g. M.F. Husain"
+                   className="w-56 px-2 py-1 rounded text-xs outline-none"
+                   style={{ background: 'var(--card)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
+          </div>
+          <div className="flex flex-col gap-1 flex-1 min-w-[14rem]">
+            <label className="text-[11px]" style={{ color: 'var(--dim)' }}>About the painter</label>
+            <textarea value={painterAbout} onChange={e => setPainterAbout(e.target.value)} rows={2}
+                      placeholder="Short note on the artist / provenance"
+                      className="w-full px-2 py-1 rounded text-xs outline-none"
+                      style={{ background: 'var(--card)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
+          </div>
+          <button onClick={savePainter} disabled={busy}
+                  className="mt-5 px-3 py-1 rounded text-xs font-medium"
+                  style={{ background: 'var(--prime)', color: 'var(--prime-fg)', opacity: busy ? 0.6 : 1 }}>
+            Save painter
+          </button>
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-[11px] font-medium" style={{ color: 'var(--dim)' }}>
+          {category === 'art' ? 'Artwork image / documents' : 'Deeds, plans & documents'}:
+        </span>
+        <select value={kind} onChange={e => setKind(e.target.value)}
+                className="px-2 py-1 rounded text-xs outline-none"
+                style={{ background: 'var(--card)', border: '1px solid var(--wire)', color: 'var(--ink)' }}>
+          {(KIND_OPTS[category] || KIND_OPTS.properties).map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
+        <label className="px-3 py-1 rounded text-xs font-medium cursor-pointer"
+               style={{ background: 'var(--card)', border: '1px solid var(--rule)', color: 'var(--dim)' }}>
+          {busy ? 'Uploading…' : '+ Upload file'}
+          <input type="file" hidden disabled={busy}
+                 onChange={e => { const f = e.target.files?.[0]; if (f) onUpload(f); e.target.value = ''; }} />
+        </label>
+        {msg && <span className="text-[11px]" style={{ color: 'var(--ghost)' }}>{msg}</span>}
+      </div>
+
+      {atts.length > 0 && (
+        <div className="flex flex-wrap gap-3">
+          {atts.map(a => {
+            const isImg = (a.mime || '').startsWith('image/');
+            return (
+              <div key={a.id} className="rounded overflow-hidden flex flex-col"
+                   style={{ border: '1px solid var(--rule)', width: 120 }}>
+                {isImg ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img src={`${API_URL}/api/v1/manual-attachments/${a.id}/thumb`} alt={a.original_name || ''}
+                       className="w-full h-20 object-cover" />
+                ) : (
+                  <a href={`${API_URL}/api/v1/manual-attachments/${a.id}/file`} target="_blank" rel="noopener noreferrer"
+                     className="w-full h-20 flex items-center justify-center text-xs"
+                     style={{ background: 'var(--card)', color: 'var(--dim)' }}>📄 open</a>
+                )}
+                <div className="flex items-center justify-between gap-1 px-1.5 py-1" style={{ background: 'var(--card)' }}>
+                  <span className="truncate text-[10px]" style={{ color: 'var(--ghost)' }} title={a.original_name || ''}>
+                    {a.original_name || a.kind}
+                  </span>
+                  <button onClick={() => onDelete(a.id)} className="text-[11px]" style={{ color: 'var(--peril)' }}>✕</button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function ManualDataPage() {
   const router = useRouter();
+  const [openExtras, setOpenExtras] = useState<number | null>(null);
   const [entities, setEntities] = useState<Entity[]>([]);
   const [selectedEntity, setSelectedEntity] = useState<number | null>(null);
   const [fxRates, setFxRates] = useState<FxRates>({});
@@ -136,6 +286,18 @@ export default function ManualDataPage() {
     }
     setLoading(false);
   }, []);
+
+  // Manual data entry is admin (IWS) only — entity logins get read-only views
+  // on the dedicated pages (Art, Properties, Gold/Silver, …), not this editor.
+  useEffect(() => {
+    fetch(`${API_URL}/api/v1/me`, { credentials: 'include' })
+      .then(r => r.ok ? r.json() : null)
+      .then((u: { role?: string } | null) => {
+        if (!u) { router.push('/'); return; }
+        if (u.role !== 'admin') { router.push('/dashboard'); return; }
+      })
+      .catch(() => router.push('/'));
+  }, [router]);
 
   useEffect(() => {
     fetchEntities();
@@ -245,6 +407,8 @@ export default function ManualDataPage() {
               { href: '/equity',      label: 'Equity' },
               { href: '/foreign-equity', label: 'Foreign Equity' },
               { href: '/gold-silver', label: 'Gold/Silver' },
+              { href: '/art', label: 'Art' },
+              { href: '/properties', label: 'Properties' },
               { href: '/bank-accounts', label: 'Banks' },
               { href: '/pms', label: 'PMS' },
               { href: '/manual-data', label: 'Manual Data', active: true },
@@ -350,11 +514,14 @@ export default function ManualDataPage() {
                     ? (parseFloat(row.raw_amount) * parseFloat(row.fx_rate)).toFixed(0)
                     : null;
 
+                  const showFiles = ATTACH_CATS.has(row.category) && row.label.trim() !== '';
+                  const isOpen = openExtras === idx;
                   return (
-                    <tr key={idx}
+                    <Fragment key={idx}>
+                    <tr
                         style={{
                           background: row._dirty ? 'oklch(97% 0.012 75)' : idx % 2 === 0 ? 'var(--card)' : 'var(--page)',
-                          borderBottom: '1px solid var(--rule)',
+                          borderBottom: showFiles && isOpen ? 'none' : '1px solid var(--rule)',
                         }}>
                       {/* Category */}
                       <td className="px-2 py-1.5">
@@ -461,13 +628,23 @@ export default function ManualDataPage() {
                                style={{ background: 'var(--page)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
                       </td>
 
-                      {/* Remove */}
+                      {/* Files + Remove */}
                       <td className="px-2 py-1.5">
-                        <button onClick={() => removeRow(idx)}
-                                className="px-2 py-0.5 rounded text-xs"
-                                style={{ color: 'var(--peril)', background: 'transparent', border: '1px solid var(--rule)' }}>
-                          ✕
-                        </button>
+                        <div className="flex items-center gap-1">
+                          {showFiles && (
+                            <button onClick={() => setOpenExtras(isOpen ? null : idx)}
+                                    title="Attachments / details"
+                                    className="px-2 py-0.5 rounded text-xs"
+                                    style={{ color: isOpen ? 'var(--prime)' : 'var(--dim)', background: 'transparent', border: '1px solid var(--rule)' }}>
+                              📎
+                            </button>
+                          )}
+                          <button onClick={() => removeRow(idx)}
+                                  className="px-2 py-0.5 rounded text-xs"
+                                  style={{ color: 'var(--peril)', background: 'transparent', border: '1px solid var(--rule)' }}>
+                            ✕
+                          </button>
+                        </div>
                         {row.updated_by && (
                           <div className="text-center mt-0.5" style={{ color: 'var(--ghost)', fontSize: 9 }}>
                             {row.updated_by}
@@ -475,6 +652,14 @@ export default function ManualDataPage() {
                         )}
                       </td>
                     </tr>
+                    {showFiles && isOpen && (
+                      <tr>
+                        <td colSpan={11} style={{ background: 'var(--page)', borderBottom: '1px solid var(--rule)' }}>
+                          <AssetExtras entityId={row.entity_id} category={row.category} label={row.label} />
+                        </td>
+                      </tr>
+                    )}
+                    </Fragment>
                   );
                 })}
               </tbody>

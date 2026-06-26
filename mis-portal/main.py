@@ -9,6 +9,8 @@ import jwt
 import bcrypt
 from datetime import datetime, timedelta, date
 import os
+import uuid
+import mimetypes
 from dotenv import load_dotenv
 import psycopg2
 import psycopg2.pool  # required: psycopg2.pool is a submodule, not exposed by `import psycopg2` alone
@@ -1880,6 +1882,7 @@ MANUAL_ASSET_CLASS = {
     "gold_etf":        "GOLD_SILVER",
     "unlisted":        "ALTERNATES",
     "startup":         "ALTERNATES",
+    "art":             "ART",
     "properties":      "REAL_ESTATE",
     "funds_transit":   "CASH",
     "broker_balance":  "CASH",
@@ -2439,7 +2442,7 @@ VALID_CATEGORIES = {
     "liquid_fund", "debt_fund", "arbitrage_fund", "ppf",
     "pms", "direct_equity", "aif",
     "overseas_fund", "overseas_equity", "forex", "gold_etf",
-    "unlisted", "startup", "properties",
+    "unlisted", "startup", "properties", "art",
     "funds_transit", "broker_balance", "bank",
 }
 
@@ -2623,6 +2626,465 @@ def save_manual_inputs(
         if conn:
             conn.rollback()
         logger.error(f"Error in POST /api/v1/manual-inputs: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+# ---------------------------------------------------------------------------
+# Manual-asset attachments (artwork images, property deeds / plans / documents)
+# and Art details (painter). Files live on the filesystem under UPLOADS_ROOT;
+# the DB holds path + metadata only. Keyed by the STABLE (entity_id, category,
+# label) — manual_input rows are versioned so their id is not stable. Admin (IWS)
+# writes; the owning entity (and admin) can read/serve.
+# ---------------------------------------------------------------------------
+
+UPLOADS_ROOT          = os.getenv("UPLOADS_DIR", "/var/www/uploads")
+MANUAL_UPLOAD_SUBDIR  = "manual"
+MAX_UPLOAD_BYTES      = 25 * 1024 * 1024   # 25 MB per file
+ATTACHMENT_KINDS      = {"art_image", "deed", "plan", "document"}
+
+
+def _uploads_abspath(rel: str) -> str:
+    """Resolve a stored-relative path to an absolute one, refusing traversal."""
+    root = os.path.normpath(UPLOADS_ROOT)
+    full = os.path.normpath(os.path.join(root, rel))
+    if full != root and not full.startswith(root + os.sep):
+        raise HTTPException(status_code=400, detail="Invalid attachment path")
+    return full
+
+
+def _make_thumbnail(src_abs: str, dst_abs: str) -> bool:
+    """Best-effort 480px JPEG thumbnail. Returns False if Pillow is unavailable
+    or the source isn't a decodable image (callers then fall back to the original)."""
+    try:
+        from PIL import Image
+    except Exception:
+        return False
+    try:
+        with Image.open(src_abs) as im:
+            im.thumbnail((480, 480))
+            im.convert("RGB").save(dst_abs, "JPEG", quality=80)
+        return True
+    except Exception:
+        return False
+
+
+def _member_entity(cur, payload) -> "Optional[int]":
+    """Entity id a member is scoped to (None for admin)."""
+    if _live_role(cur, payload["email"]) == "admin":
+        return None
+    return _resolve_entity(cur, payload, None)
+
+
+@app.post("/api/v1/manual-attachments")
+@limiter.limit("60/minute")
+async def upload_manual_attachment(
+    request: Request,
+    entity_id: int = Form(...),
+    category: str = Form(...),
+    label: str = Form(...),
+    kind: str = Form("document"),
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None),
+):
+    """Upload one file for a manual asset (admin/IWS only)."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+        if category not in VALID_CATEGORIES:
+            raise HTTPException(status_code=422, detail=f"Invalid category: {category}")
+        if not label.strip():
+            raise HTTPException(status_code=422, detail="label is required")
+        if kind not in ATTACHMENT_KINDS:
+            kind = "document"
+
+        data = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="File too large (max 25 MB)")
+        if not data:
+            raise HTTPException(status_code=422, detail="Empty file")
+
+        mime = (file.content_type
+                or mimetypes.guess_type(file.filename or "")[0]
+                or "application/octet-stream")
+        ext  = os.path.splitext(file.filename or "")[1].lower()[:12]
+        uid  = uuid.uuid4().hex
+        rel_dir = os.path.join(MANUAL_UPLOAD_SUBDIR, str(entity_id))
+        os.makedirs(os.path.join(UPLOADS_ROOT, rel_dir), exist_ok=True)
+        rel_path = os.path.join(rel_dir, uid + ext)
+        with open(_uploads_abspath(rel_path), "wb") as fh:
+            fh.write(data)
+
+        thumb_rel = None
+        if mime.startswith("image/"):
+            cand = os.path.join(rel_dir, uid + "_thumb.jpg")
+            if _make_thumbnail(_uploads_abspath(rel_path), _uploads_abspath(cand)):
+                thumb_rel = cand
+
+        cur.execute("SELECT id FROM users WHERE email = %s", (payload["email"],))
+        urow = cur.fetchone()
+        user_id = urow["id"] if urow else None
+
+        cur.execute(
+            """
+            INSERT INTO manual_attachment
+                (entity_id, category, label, kind, original_name, stored_path,
+                 thumb_path, mime, size_bytes, uploaded_by)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id, uploaded_at
+            """,
+            (entity_id, category, label.strip(), kind, file.filename, rel_path,
+             thumb_rel, mime, len(data), user_id),
+        )
+        row = cur.fetchone()
+        write_audit_log(conn, user_id, "MANUAL_ATTACHMENT_UPLOAD", "manual_attachment",
+                        row["id"], f"{category}/{label} ({file.filename})")
+        conn.commit()
+        cur.close()
+        return {
+            "id":            row["id"],
+            "kind":          kind,
+            "original_name": file.filename,
+            "mime":          mime,
+            "size_bytes":    len(data),
+            "has_thumb":     thumb_rel is not None,
+            "uploaded_at":   row["uploaded_at"].isoformat(),
+        }
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/manual-attachments: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+def _attachment_row(r: dict) -> dict:
+    return {
+        "id":            r["id"],
+        "entity_id":     r["entity_id"],
+        "category":      r["category"],
+        "label":         r["label"],
+        "kind":          r["kind"],
+        "original_name": r["original_name"],
+        "mime":          r["mime"],
+        "size_bytes":    int(r["size_bytes"]) if r["size_bytes"] is not None else None,
+        "has_thumb":     bool(r["thumb_path"]),
+        "uploaded_at":   r["uploaded_at"].isoformat() if r["uploaded_at"] else None,
+    }
+
+
+@app.get("/api/v1/manual-attachments")
+def list_manual_attachments(
+    request: Request,
+    entity_id: Optional[int] = None,
+    category: Optional[str] = None,
+    label: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """List attachments, entity-scoped (a member sees only their entity's)."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        eid  = _resolve_entity(cur, payload, entity_id)
+
+        conds, params = [], []
+        if eid is not None:
+            conds.append("entity_id = %s"); params.append(eid)
+        if category:
+            conds.append("category = %s"); params.append(category)
+        if label:
+            conds.append("label = %s"); params.append(label)
+        where = ("WHERE " + " AND ".join(conds)) if conds else ""
+        cur.execute(
+            f"""
+            SELECT id, entity_id, category, label, kind, original_name,
+                   thumb_path, mime, size_bytes, uploaded_at
+            FROM   manual_attachment
+            {where}
+            ORDER BY uploaded_at DESC
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return [_attachment_row(r) for r in rows]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/manual-attachments: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+def _serve_attachment(att_id: int, request: Request, authorization, want_thumb: bool):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        cur.execute(
+            "SELECT entity_id, stored_path, thumb_path, mime, original_name "
+            "FROM manual_attachment WHERE id = %s",
+            (att_id,),
+        )
+        r = cur.fetchone()
+        if not r:
+            raise HTTPException(status_code=404, detail="Attachment not found")
+        member_eid = _member_entity(cur, payload)
+        cur.close()
+        if member_eid is not None and member_eid != r["entity_id"]:
+            raise HTTPException(status_code=403, detail="Not permitted")
+
+        use_thumb = want_thumb and bool(r["thumb_path"])
+        rel       = r["thumb_path"] if use_thumb else r["stored_path"]
+        abs_path  = _uploads_abspath(rel)
+        if not os.path.exists(abs_path):
+            raise HTTPException(status_code=404, detail="File missing on disk")
+        media = "image/jpeg" if use_thumb else (r["mime"] or "application/octet-stream")
+        # Inline so images/PDFs render in the browser; private + cacheable.
+        return FileResponse(
+            abs_path,
+            media_type=media,
+            headers={"Cache-Control": "private, max-age=86400"},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error serving attachment {att_id}: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.get("/api/v1/manual-attachments/{att_id}/file")
+def serve_manual_attachment_file(att_id: int, request: Request,
+                                 authorization: Optional[str] = Header(None)):
+    return _serve_attachment(att_id, request, authorization, want_thumb=False)
+
+
+@app.get("/api/v1/manual-attachments/{att_id}/thumb")
+def serve_manual_attachment_thumb(att_id: int, request: Request,
+                                  authorization: Optional[str] = Header(None)):
+    return _serve_attachment(att_id, request, authorization, want_thumb=True)
+
+
+@app.delete("/api/v1/manual-attachments/{att_id}")
+def delete_manual_attachment(att_id: int, request: Request,
+                             authorization: Optional[str] = Header(None)):
+    """Delete an attachment + its files (admin/IWS only)."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+        cur.execute(
+            "SELECT stored_path, thumb_path, category, label FROM manual_attachment WHERE id = %s",
+            (att_id,),
+        )
+        r = cur.fetchone()
+        if not r:
+            raise HTTPException(status_code=404, detail="Attachment not found")
+        for rel in (r["stored_path"], r["thumb_path"]):
+            if not rel:
+                continue
+            try:
+                p = _uploads_abspath(rel)
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception as e:
+                logger.warning(f"could not remove attachment file {rel}: {e}")
+        cur.execute("DELETE FROM manual_attachment WHERE id = %s", (att_id,))
+        cur.execute("SELECT id FROM users WHERE email = %s", (payload["email"],))
+        urow = cur.fetchone()
+        write_audit_log(conn, urow["id"] if urow else None, "MANUAL_ATTACHMENT_DELETE",
+                        "manual_attachment", att_id, f"{r['category']}/{r['label']}")
+        conn.commit()
+        cur.close()
+        return {"deleted": att_id}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error deleting attachment {att_id}: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+class ArtDetailRequest(BaseModel):
+    entity_id:     int
+    label:         str
+    painter_name:  Optional[str] = None
+    painter_about: Optional[str] = None
+
+
+@app.post("/api/v1/art-detail")
+@limiter.limit("30/minute")
+def save_art_detail(request: Request, body: ArtDetailRequest,
+                    authorization: Optional[str] = Header(None)):
+    """Upsert painter name / about for an Art entry (admin/IWS only)."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+        if not body.label.strip():
+            raise HTTPException(status_code=422, detail="label is required")
+        cur.execute("SELECT id FROM users WHERE email = %s", (payload["email"],))
+        urow = cur.fetchone()
+        user_id = urow["id"] if urow else None
+        cur.execute(
+            """
+            INSERT INTO art_detail (entity_id, label, painter_name, painter_about, updated_by, updated_at)
+            VALUES (%s,%s,%s,%s,%s,NOW())
+            ON CONFLICT (entity_id, label) DO UPDATE SET
+                painter_name  = EXCLUDED.painter_name,
+                painter_about = EXCLUDED.painter_about,
+                updated_by    = EXCLUDED.updated_by,
+                updated_at    = NOW()
+            """,
+            (body.entity_id, body.label.strip(), body.painter_name, body.painter_about, user_id),
+        )
+        conn.commit()
+        cur.close()
+        return {"saved": True}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/art-detail: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.get("/api/v1/manual-assets")
+def get_manual_assets(
+    request: Request,
+    category: str,
+    entity_id: Optional[int] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """Latest manual_input per (entity, label) for one category, entity-scoped,
+    enriched with art_detail (painter) and grouped attachments. Drives the
+    read-only Art and Properties pages for entity logins."""
+    conn = None
+    try:
+        if category not in VALID_CATEGORIES:
+            raise HTTPException(status_code=422, detail=f"Invalid category: {category}")
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        eid  = _resolve_entity(cur, payload, entity_id)
+
+        conds, params = ["m.category = %s"], [category]
+        if eid is not None:
+            conds.append("m.entity_id = %s"); params.append(eid)
+        where = "WHERE " + " AND ".join(conds)
+        cur.execute(
+            f"""
+            SELECT DISTINCT ON (m.entity_id, m.label)
+                m.entity_id, e.entity_name, m.label, m.cost, m.current_value,
+                m.currency, m.inception_date, m.notes, m.updated_at
+            FROM   manual_input m
+            JOIN   entity e ON e.id = m.entity_id
+            {where}
+            ORDER BY m.entity_id, m.label, m.updated_at DESC
+            """,
+            params,
+        )
+        assets = cur.fetchall()
+
+        # Attachments for the same scope, grouped by (entity_id, label).
+        acond, aparams = ["category = %s"], [category]
+        if eid is not None:
+            acond.append("entity_id = %s"); aparams.append(eid)
+        cur.execute(
+            f"""
+            SELECT id, entity_id, category, label, kind, original_name,
+                   thumb_path, mime, size_bytes, uploaded_at
+            FROM   manual_attachment
+            WHERE  {" AND ".join(acond)}
+            ORDER BY uploaded_at DESC
+            """,
+            aparams,
+        )
+        att_by_key: dict = {}
+        for a in cur.fetchall():
+            att_by_key.setdefault((a["entity_id"], a["label"]), []).append(_attachment_row(a))
+
+        # Art painter details.
+        art_by_key: dict = {}
+        if category == "art":
+            dcond, dparams = [], []
+            if eid is not None:
+                dcond.append("entity_id = %s"); dparams.append(eid)
+            dwhere = ("WHERE " + " AND ".join(dcond)) if dcond else ""
+            cur.execute(
+                f"SELECT entity_id, label, painter_name, painter_about FROM art_detail {dwhere}",
+                dparams,
+            )
+            for d in cur.fetchall():
+                art_by_key[(d["entity_id"], d["label"])] = {
+                    "painter_name":  d["painter_name"],
+                    "painter_about": d["painter_about"],
+                }
+        cur.close()
+
+        out = []
+        for m in assets:
+            key = (m["entity_id"], m["label"])
+            item = {
+                "entity_id":     m["entity_id"],
+                "entity_name":   m["entity_name"],
+                "label":         m["label"],
+                "cost":          float(m["cost"])          if m["cost"]          is not None else None,
+                "current_value": float(m["current_value"]) if m["current_value"] is not None else None,
+                "currency":      m["currency"],
+                "inception_date": str(m["inception_date"]) if m["inception_date"] else None,
+                "notes":         m["notes"],
+                "updated_at":    m["updated_at"].isoformat() if m["updated_at"] else None,
+                "attachments":   att_by_key.get(key, []),
+            }
+            if category == "art":
+                item.update(art_by_key.get(key, {"painter_name": None, "painter_about": None}))
+            out.append(item)
+
+        total_value = round(sum(a["current_value"] or 0 for a in out), 2)
+        return {
+            "category":      category,
+            "entity_id":     eid or 0,
+            "total_value":   total_value,
+            "count":         len(out),
+            "assets":        out,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/manual-assets: {e}")
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
     finally:
         release_db_connection(conn)

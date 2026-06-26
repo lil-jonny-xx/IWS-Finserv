@@ -248,6 +248,8 @@ export default function PmsPage() {
               { href: '/equity',        label: 'Equity'         },
               { href: '/foreign-equity', label: 'Foreign Equity' },
               { href: '/gold-silver', label: 'Gold/Silver' },
+              { href: '/art', label: 'Art' },
+              { href: '/properties', label: 'Properties' },
               { href: '/bank-accounts', label: 'Banks' },
               { href: '/pms',           label: 'PMS', active: true },
               { href: '/manual-data',   label: 'Manual Data'    },
