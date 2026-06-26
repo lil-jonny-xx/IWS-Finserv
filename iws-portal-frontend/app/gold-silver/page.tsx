@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
+import DragScroll from '@/app/components/DragScroll';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -103,7 +104,7 @@ function HoldingsSection({
           <p className="text-lg font-bold text-ink tabular-nums">{fmtINR(total)}</p>
         </div>
       </div>
-      <div className="overflow-x-auto">
+      <DragScroll className="overflow-x-auto">
         <table className="w-full text-xs">
           <thead>
             <tr className="text-left text-ghost border-b border-rule">
@@ -139,7 +140,7 @@ function HoldingsSection({
             ))}
           </tbody>
         </table>
-      </div>
+      </DragScroll>
     </section>
   );
 }

@@ -2,6 +2,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import MFTable, { type MFHoldingRow, type MFTotals, type CombinedHolding } from './components/MFTable';
+import DragScroll from '@/app/components/DragScroll';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 const TXN_PAGE_SIZE = 25;
@@ -356,7 +357,7 @@ export default function MutualFundsPage() {
                 })}
               </div>
             </div>
-            <div className="overflow-auto max-h-[60vh]">
+            <DragScroll className="overflow-auto max-h-[60vh]">
               <table className="w-full text-xs" style={{ minWidth: '800px' }}>
                 <thead>
                   <tr>
@@ -391,7 +392,7 @@ export default function MutualFundsPage() {
                   })}
                 </tbody>
               </table>
-            </div>
+            </DragScroll>
           </div>
         )}
 

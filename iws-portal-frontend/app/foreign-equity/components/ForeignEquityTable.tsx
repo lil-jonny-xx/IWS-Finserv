@@ -1,5 +1,6 @@
 'use client';
 import { useState, useMemo } from 'react';
+import DragScroll from '@/app/components/DragScroll';
 
 export interface EquityHoldingRow {
   id: number;
@@ -317,7 +318,7 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
       </div>
 
       {/* Table */}
-      <div className="overflow-auto max-h-[75vh]" role="region" aria-label="Foreign equity holdings table" tabIndex={0}>
+      <DragScroll className="overflow-auto max-h-[75vh]" role="region" aria-label="Foreign equity holdings table" tabIndex={0}>
         <table className="w-full text-sm" style={{ minWidth: '1100px' }}>
           <thead>
             <tr>
@@ -411,7 +412,7 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
             )}
           </tbody>
         </table>
-      </div>
+      </DragScroll>
     </div>
   );
 }

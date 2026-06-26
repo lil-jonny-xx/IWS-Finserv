@@ -1,5 +1,6 @@
 'use client';
 import { useState, Fragment, useMemo, useEffect, useRef } from 'react';
+import DragScroll from '@/app/components/DragScroll';
 
 export interface MFHoldingRow {
   id: number;
@@ -482,8 +483,8 @@ function DataRow({
     <tr className="border-t border-rule hover:bg-page transition-colors duration-100">
       <td className="px-3 pl-5 sm:pl-6 py-3 text-right tabular-nums text-xs text-ghost align-top">{srNo}</td>
       <td className="px-3 py-3 align-top">
-        <p className="text-xs text-ink leading-snug">{h.security_name}</p>
-        <p className="text-[10px] text-ghost mt-0.5">{SEC_TYPE_LABELS[h.security_type] ?? h.security_type}</p>
+        <p className="text-[10px] font-medium text-ink leading-snug line-clamp-3 max-w-[200px]" title={h.security_name}>{h.security_name}</p>
+        <p className="text-[9px] text-ghost mt-0.5">{SEC_TYPE_LABELS[h.security_type] ?? h.security_type}</p>
       </td>
       {showEntityCol && (
         <td className="px-3 py-3 text-xs font-medium text-dim whitespace-nowrap align-top">{h.entity_name ?? '—'}</td>
@@ -530,7 +531,9 @@ function DataRow({
           ? <span className="text-dim">{fmtINR(h.realized_gain)}</span>
           : <span className="text-ghost">—</span>}
       </td>
-      <td className="px-3 pr-5 sm:pr-6 py-3 text-xs text-ghost align-top max-w-[160px]">{h.remarks ?? '—'}</td>
+      <td className="px-3 pr-5 sm:pr-6 py-3 align-top">
+        <p className="text-[10px] text-ghost leading-snug line-clamp-3 max-w-[160px]" title={h.remarks ?? undefined}>{h.remarks ?? '—'}</p>
+      </td>
     </tr>
   );
 }
@@ -622,8 +625,8 @@ function CombinedDataRow({
         </td>
         <td className="px-2 py-3 text-right tabular-nums text-xs text-ghost align-top">{srNo}</td>
         <td className="px-3 pl-5 sm:pl-6 py-3 align-top">
-          <p className="text-xs text-ink leading-snug">{h.security_name}</p>
-          <p className="text-[10px] text-ghost mt-0.5">{SEC_TYPE_LABELS[h.security_type] ?? h.security_type}</p>
+          <p className="text-[10px] font-medium text-ink leading-snug line-clamp-3 max-w-[200px]" title={h.security_name}>{h.security_name}</p>
+          <p className="text-[9px] text-ghost mt-0.5">{SEC_TYPE_LABELS[h.security_type] ?? h.security_type}</p>
         </td>
         <td className="px-3 py-3 align-top">
           <div className="flex flex-wrap gap-1">
@@ -993,7 +996,7 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
       </div>
 
       {/* Table */}
-      <div className="overflow-x-auto" role="region" aria-label="MF holdings table" tabIndex={0}>
+      <DragScroll className="overflow-x-auto" role="region" aria-label="MF holdings table" tabIndex={0}>
 
         {/* ── Combined mode ── */}
         {viewMode === 'combined' && (
@@ -1134,7 +1137,7 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
           </table>
         )}
 
-      </div>
+      </DragScroll>
     </div>
   );
 }

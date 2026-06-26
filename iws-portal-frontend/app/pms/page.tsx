@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
+import { useDragScroll } from '@/app/components/DragScroll';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -95,9 +96,10 @@ function TotalCard({ label, value, sub, accent }: {
 }
 
 function InvestedByEntity({ rows }: { rows: PmsByEntity[] }) {
+  const ds = useDragScroll();
   const grand = rows.reduce((s, r) => s + r.invested_cost, 0);
   return (
-    <div className="bg-card rounded-lg border border-rule overflow-x-auto mb-5">
+    <div ref={ds.ref} {...ds.bind} className="bg-card rounded-lg border border-rule overflow-x-auto mb-5">
       <table className="w-full min-w-[480px]">
         <thead>
           <tr className="text-left text-xs text-ghost">
@@ -131,6 +133,7 @@ function InvestedByEntity({ rows }: { rows: PmsByEntity[] }) {
 }
 
 function HoldingsTable({ rows, showEntityCol }: { rows: PmsHolding[]; showEntityCol: boolean }) {
+  const ds = useDragScroll();
   const equity = rows.filter(r => r.holding_type === 'equity');
   const cash   = rows.filter(r => r.holding_type === 'cash');
 
@@ -165,7 +168,7 @@ function HoldingsTable({ rows, showEntityCol }: { rows: PmsHolding[]; showEntity
   );
 
   return (
-    <div className="bg-card rounded-lg border border-rule overflow-x-auto">
+    <div ref={ds.ref} {...ds.bind} className="bg-card rounded-lg border border-rule overflow-x-auto">
       <table className="w-full min-w-[640px]">
         <thead>
           <tr className="text-left text-xs text-ghost">
