@@ -68,17 +68,120 @@ function EntitySwitcher({ entities, selectedId, onSelect }: {
   );
 }
 
-function CompanyRow({ a, showEntity, expanded, onToggle }: {
-  a: UnlistedAsset; showEntity: boolean; expanded: boolean; onToggle: () => void;
+// A company name held by more than one entity is ONE company; the per-entity
+// holdings are aggregated and broken out on expand.
+interface MergedCompany {
+  label: string; category: string; holdings: UnlistedAsset[];
+  value: number; cost: number; pnl: number; shares: number; entities: string[];
+}
+
+function groupByLabel(assets: UnlistedAsset[]): MergedCompany[] {
+  const map = new Map<string, UnlistedAsset[]>();
+  for (const a of assets) {
+    const key = a.label.trim().toLowerCase();
+    if (!map.has(key)) map.set(key, []);
+    map.get(key)!.push(a);
+  }
+  return [...map.values()].map(hs => {
+    const value  = hs.reduce((s, a) => s + (a.aggregate?.current_value ?? a.current_value ?? 0), 0);
+    const cost   = hs.reduce((s, a) => s + (a.aggregate?.cost ?? a.cost ?? 0), 0);
+    const shares = hs.reduce((s, a) => s + (a.aggregate?.total_shares ?? 0), 0);
+    return {
+      label: hs[0].label, category: hs[0].category, holdings: hs,
+      value, cost, pnl: value - cost, shares,
+      entities: [...new Set(hs.map(a => a.entity_name).filter(Boolean) as string[])],
+    };
+  }).sort((a, b) => b.value - a.value);
+}
+
+// Rounds / events / documents for one entity's holding of a company.
+function HoldingDetail({ a, header }: { a: UnlistedAsset; header: string | null }) {
+  const rounds = a.aggregate?.breakdown ?? [];
+  const docs   = a.attachments;
+  return (
+    <div className="flex flex-col gap-3">
+      {header && (
+        <p className="text-[11px] font-semibold text-ink flex items-center gap-2">
+          {header}
+          <span className="text-ghost font-normal">{fmtINR(a.aggregate?.current_value ?? a.current_value)}</span>
+        </p>
+      )}
+      {rounds.length > 0 && (
+        <div className="overflow-x-auto">
+          <p className="text-[11px] font-semibold text-dim mb-1.5">Funding rounds</p>
+          <table className="w-full text-[11px]" style={{ minWidth: '680px' }}>
+            <thead>
+              <tr className="text-ghost">
+                {['Round', 'Date', 'Valuation', 'Price/share', 'Shares', 'Now (adj.)', 'Invested', 'Value'].map((h, i) => (
+                  <th key={h} className={`px-2 py-1 font-medium ${i < 2 ? 'text-left' : 'text-right'} ${i === 0 ? 'pl-0' : ''}`}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rounds.map((r, i) => (
+                <tr key={i} className="border-t border-rule/50">
+                  <td className="px-2 py-1.5 pl-0 text-ink">{r.round_name || '—'}</td>
+                  <td className="px-2 py-1.5 text-dim whitespace-nowrap">{r.round_date || '—'}</td>
+                  <td className="px-2 py-1.5 text-right tabular-nums text-dim">{r.round_valuation != null ? fmtINR(r.round_valuation) : '—'}</td>
+                  <td className="px-2 py-1.5 text-right tabular-nums text-dim">{r.price_per_share != null ? '₹' + fmtNum(r.price_per_share, 2) : '—'}</td>
+                  <td className="px-2 py-1.5 text-right tabular-nums text-dim">{fmtNum(r.shares, 2)}</td>
+                  <td className="px-2 py-1.5 text-right tabular-nums text-dim">{fmtNum(r.effective_shares, 2)}</td>
+                  <td className="px-2 py-1.5 text-right tabular-nums text-dim">{fmtINR(r.amount_invested)}</td>
+                  <td className="px-2 py-1.5 text-right tabular-nums text-ink">{fmtINR(r.current_value)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {a.events.length > 0 && (
+        <div>
+          <p className="text-[11px] font-semibold text-dim mb-1.5">Splits &amp; bonuses</p>
+          <div className="flex flex-wrap gap-2">
+            {a.events.map((e, i) => (
+              <span key={i} className="text-[11px] px-2 py-0.5 rounded border border-rule text-dim">
+                {e.event_type === 'bonus'
+                  ? <>Bonus{e.bonus_shares != null ? <span className="text-ghost"> · +{fmtNum(e.bonus_shares, 2)} shares</span> : ''}</>
+                  : <>Split{e.factor != null ? <span className="text-ghost"> · shares ×{(+e.factor).toLocaleString('en-IN', { maximumFractionDigits: 3 })}</span> : ''}</>}
+                {e.event_date && <span className="text-ghost"> · {e.event_date}</span>}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {docs.length > 0 && (
+        <div className="flex flex-wrap gap-2 items-center">
+          <span className="text-[11px] font-semibold text-dim">Documents:</span>
+          {docs.map(d => {
+            const isImg = (d.mime || '').startsWith('image/');
+            return isImg ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <a key={d.id} href={fileUrl(d.id)} target="_blank" rel="noopener noreferrer">
+                <img src={thumbUrl(d.id)} alt={d.original_name || ''} loading="lazy"
+                     className="h-12 w-12 object-cover rounded border border-rule" />
+              </a>
+            ) : (
+              <a key={d.id} href={fileUrl(d.id)} target="_blank" rel="noopener noreferrer"
+                 className="text-[11px] px-2 py-0.5 rounded border border-rule text-dim hover:text-ink hover:border-dim">
+                📄 {d.original_name || 'document'}
+              </a>
+            );
+          })}
+        </div>
+      )}
+
+      {a.notes && <p className="text-[11px] text-ghost">{a.notes}</p>}
+    </div>
+  );
+}
+
+function CompanyRow({ c, showEntity, expanded, onToggle }: {
+  c: MergedCompany; showEntity: boolean; expanded: boolean; onToggle: () => void;
 }) {
-  const agg     = a.aggregate;
-  const value   = agg?.current_value ?? a.current_value;
-  const cost    = agg?.cost ?? a.cost;
-  const pnl     = agg?.pnl ?? (value != null && cost != null ? value - cost : null);
-  const shares  = agg?.total_shares ?? null;
-  const docs    = a.attachments;
-  const rounds  = agg?.breakdown ?? [];
-  const hasDetail = rounds.length > 0 || a.events.length > 0 || docs.length > 0;
+  const multiEntity = c.holdings.length > 1;
+  const hasDetail = c.holdings.some(h => (h.aggregate?.breakdown?.length ?? 0) > 0 || h.events.length > 0 || h.attachments.length > 0);
 
   return (
     <div className="bg-card rounded-lg border border-rule overflow-hidden">
@@ -89,101 +192,40 @@ function CompanyRow({ a, showEntity, expanded, onToggle }: {
           {hasDetail ? '▶' : ''}
         </span>
         <div className="flex-1 min-w-[10rem]">
-          <div className="flex items-center gap-2">
-            <h3 className="text-sm font-semibold text-ink leading-tight">{a.label}</h3>
-            <span className="text-[9px] uppercase tracking-wide px-1.5 py-0.5 rounded border border-rule text-ghost shrink-0">{CAT_LABEL[a.category] ?? a.category}</span>
+          <div className="flex items-center gap-2 flex-wrap">
+            <h3 className="text-sm font-semibold text-ink leading-tight">{c.label}</h3>
+            <span className="text-[9px] uppercase tracking-wide px-1.5 py-0.5 rounded border border-rule text-ghost shrink-0">{CAT_LABEL[c.category] ?? c.category}</span>
+            {multiEntity && (
+              <span className="text-[9px] uppercase tracking-wide px-1.5 py-0.5 rounded border border-rule text-ghost shrink-0">{c.holdings.length} entities</span>
+            )}
           </div>
-          {showEntity && <p className="text-[11px] text-ghost mt-0.5">{a.entity_name}</p>}
+          {showEntity && <p className="text-[11px] text-ghost mt-0.5">{c.entities.join(' · ') || '—'}</p>}
         </div>
         <div className="text-right w-20">
           <p className="text-[10px] uppercase tracking-wide text-ghost">Shares</p>
-          <p className="text-xs font-medium text-dim tabular-nums">{fmtNum(shares, 0)}</p>
+          <p className="text-xs font-medium text-dim tabular-nums">{fmtNum(c.shares, 0)}</p>
         </div>
         <div className="text-right w-28">
           <p className="text-[10px] uppercase tracking-wide text-ghost">Cost</p>
-          <p className="text-xs font-medium text-dim tabular-nums">{fmtINR(cost)}</p>
+          <p className="text-xs font-medium text-dim tabular-nums">{fmtINR(c.cost)}</p>
         </div>
         <div className="text-right w-28">
           <p className="text-[10px] uppercase tracking-wide text-ghost">Value</p>
-          <p className="text-sm font-bold text-ink tabular-nums">{fmtINR(value)}</p>
+          <p className="text-sm font-bold text-ink tabular-nums">{fmtINR(c.value)}</p>
         </div>
         <div className="text-right w-28">
           <p className="text-[10px] uppercase tracking-wide text-ghost">P&amp;L</p>
-          <p className="text-xs font-semibold tabular-nums" style={{ color: (pnl ?? 0) >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
-            {pnl != null ? (pnl >= 0 ? '+' : '') + fmtINR(pnl) : '—'}
+          <p className="text-xs font-semibold tabular-nums" style={{ color: c.pnl >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
+            {c.pnl >= 0 ? '+' : ''}{fmtINR(c.pnl)}
           </p>
         </div>
       </button>
 
       {expanded && hasDetail && (
-        <div className="border-t border-rule px-4 sm:px-5 py-4 bg-page/40 flex flex-col gap-4 fade-in">
-          {rounds.length > 0 && (
-            <div className="overflow-x-auto">
-              <p className="text-[11px] font-semibold text-dim mb-1.5">Funding rounds</p>
-              <table className="w-full text-[11px]" style={{ minWidth: '640px' }}>
-                <thead>
-                  <tr className="text-ghost">
-                    {['Round', 'Date', 'Valuation', 'Price/share', 'Shares', 'Now (adj.)', 'Invested', 'Value'].map((h, i) => (
-                      <th key={h} className={`px-2 py-1 font-medium ${i < 2 ? 'text-left' : 'text-right'} ${i === 0 ? 'pl-0' : ''}`}>{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {rounds.map((r, i) => (
-                    <tr key={i} className="border-t border-rule/50">
-                      <td className="px-2 py-1.5 pl-0 text-ink">{r.round_name || '—'}</td>
-                      <td className="px-2 py-1.5 text-dim whitespace-nowrap">{r.round_date || '—'}</td>
-                      <td className="px-2 py-1.5 text-right tabular-nums text-dim">{r.round_valuation != null ? fmtINR(r.round_valuation) : '—'}</td>
-                      <td className="px-2 py-1.5 text-right tabular-nums text-dim">{r.price_per_share != null ? '₹' + fmtNum(r.price_per_share, 2) : '—'}</td>
-                      <td className="px-2 py-1.5 text-right tabular-nums text-dim">{fmtNum(r.shares, 2)}</td>
-                      <td className="px-2 py-1.5 text-right tabular-nums text-dim">{fmtNum(r.effective_shares, 2)}</td>
-                      <td className="px-2 py-1.5 text-right tabular-nums text-dim">{fmtINR(r.amount_invested)}</td>
-                      <td className="px-2 py-1.5 text-right tabular-nums text-ink">{fmtINR(r.current_value)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-
-          {a.events.length > 0 && (
-            <div>
-              <p className="text-[11px] font-semibold text-dim mb-1.5">Splits &amp; bonuses</p>
-              <div className="flex flex-wrap gap-2">
-                {a.events.map((e, i) => (
-                  <span key={i} className="text-[11px] px-2 py-0.5 rounded border border-rule text-dim">
-                    {e.event_type === 'bonus'
-                      ? <>Bonus{e.bonus_shares != null ? <span className="text-ghost"> · +{fmtNum(e.bonus_shares, 2)} shares</span> : ''}</>
-                      : <>Split{e.factor != null ? <span className="text-ghost"> · shares ×{(+e.factor).toLocaleString('en-IN', { maximumFractionDigits: 3 })}</span> : ''}</>}
-                    {e.event_date && <span className="text-ghost"> · {e.event_date}</span>}
-                  </span>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {docs.length > 0 && (
-            <div className="flex flex-wrap gap-2 items-center">
-              <span className="text-[11px] font-semibold text-dim">Documents:</span>
-              {docs.map(d => {
-                const isImg = (d.mime || '').startsWith('image/');
-                return isImg ? (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <a key={d.id} href={fileUrl(d.id)} target="_blank" rel="noopener noreferrer">
-                    <img src={thumbUrl(d.id)} alt={d.original_name || ''} loading="lazy"
-                         className="h-12 w-12 object-cover rounded border border-rule" />
-                  </a>
-                ) : (
-                  <a key={d.id} href={fileUrl(d.id)} target="_blank" rel="noopener noreferrer"
-                     className="text-[11px] px-2 py-0.5 rounded border border-rule text-dim hover:text-ink hover:border-dim">
-                    📄 {d.original_name || 'document'}
-                  </a>
-                );
-              })}
-            </div>
-          )}
-
-          {a.notes && <p className="text-[11px] text-ghost">{a.notes}</p>}
+        <div className="border-t border-rule px-4 sm:px-5 py-4 bg-page/40 flex flex-col gap-5 fade-in">
+          {c.holdings.map((h, i) => (
+            <HoldingDetail key={`${h.entity_id}-${i}`} a={h} header={multiEntity ? (h.entity_name || `Entity ${h.entity_id}`) : null} />
+          ))}
         </div>
       )}
     </div>
@@ -260,6 +302,7 @@ export default function UnlistedPage() {
     setExpanded(prev => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
   }
 
+  const companies  = assets ? groupByLabel(assets) : [];
   const totalValue = (assets ?? []).reduce((s, a) => s + (a.aggregate?.current_value ?? a.current_value ?? 0), 0);
   const totalCost  = (assets ?? []).reduce((s, a) => s + (a.aggregate?.cost ?? a.cost ?? 0), 0);
   const totalPnl   = totalValue - totalCost;
@@ -320,21 +363,21 @@ export default function UnlistedPage() {
               </div>
               <div>
                 <p className="text-[11px] uppercase tracking-wide text-ghost">Companies</p>
-                <p className="text-base font-semibold text-ink tabular-nums">{assets.length}</p>
+                <p className="text-base font-semibold text-ink tabular-nums">{companies.length}</p>
               </div>
             </div>
 
-            {assets.length === 0 ? (
+            {companies.length === 0 ? (
               <div className="bg-card rounded-lg border border-rule px-5 py-16 text-center text-sm text-ghost">
                 No unlisted or startup holdings recorded yet.
               </div>
             ) : (
               <div className="flex flex-col gap-3">
-                {assets.map(a => {
-                  const key = `${a.category}-${a.entity_id}-${a.label}`;
+                {companies.map(c => {
+                  const key = c.label.trim().toLowerCase();
                   return (
                     <Fragment key={key}>
-                      <CompanyRow a={a} showEntity={showEntity} expanded={expanded.has(key)} onToggle={() => toggle(key)} />
+                      <CompanyRow c={c} showEntity={showEntity} expanded={expanded.has(key)} onToggle={() => toggle(key)} />
                     </Fragment>
                   );
                 })}

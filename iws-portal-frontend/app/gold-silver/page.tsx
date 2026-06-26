@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback, useRef, Fragment } from 'react';
 import { useRouter } from 'next/navigation';
 import DragScroll from '@/app/components/DragScroll';
 
@@ -85,13 +85,53 @@ function EntitySwitcher({
   );
 }
 
+interface GroupedHolding {
+  symbol: string; sector: string | null; currency: string;
+  quantity: number | null; cost: number | null;
+  current_market_value: number | null; current_market_value_native: number | null;
+  pnl_inception: number | null; returns_inception_pct: number | null;
+  entities: string[]; rows: HoldingRow[];
+}
+
+function sumKey(rows: HoldingRow[], key: keyof HoldingRow): number | null {
+  let any = false, t = 0;
+  for (const r of rows) { const v = r[key] as number | null; if (v != null) { any = true; t += v; } }
+  return any ? t : null;
+}
+
+// Collapse the same instrument held across multiple brokers (and entities) into
+// one row; the per-broker lines are revealed on expand.
+function groupBySymbol(rows: HoldingRow[]): GroupedHolding[] {
+  const map = new Map<string, HoldingRow[]>();
+  for (const r of rows) { if (!map.has(r.symbol)) map.set(r.symbol, []); map.get(r.symbol)!.push(r); }
+  return [...map.values()].map(group => {
+    const cost = sumKey(group, 'cost');
+    const pnl  = sumKey(group, 'pnl_inception');
+    const sameCcy = group.every(g => g.currency === group[0].currency);
+    return {
+      symbol: group[0].symbol, sector: group[0].sector, currency: group[0].currency,
+      quantity: sumKey(group, 'quantity'), cost,
+      current_market_value: sumKey(group, 'current_market_value'),
+      current_market_value_native: sameCcy ? sumKey(group, 'current_market_value_native') : null,
+      pnl_inception: pnl,
+      returns_inception_pct: cost && cost !== 0 && pnl != null ? (pnl / cost) * 100 : null,
+      entities: [...new Set(group.map(g => g.entity_name).filter(Boolean) as string[])],
+      rows: group,
+    };
+  }).sort((a, b) => (b.current_market_value ?? 0) - (a.current_market_value ?? 0));
+}
+
 function HoldingsSection({
   title, subtitle, rows, total, showEntityCol, showNative,
 }: {
   title: string; subtitle: string; rows: HoldingRow[]; total: number;
   showEntityCol: boolean; showNative: boolean;
 }) {
+  const [open, setOpen] = useState<Set<string>>(new Set());
   if (rows.length === 0) return null;
+  const groups = groupBySymbol(rows);
+  const toggle = (s: string) => setOpen(prev => { const n = new Set(prev); if (n.has(s)) n.delete(s); else n.add(s); return n; });
+
   return (
     <section className="bg-card rounded-lg border border-rule overflow-hidden mb-6">
       <div className="px-5 sm:px-6 pt-5 pb-4 border-b border-rule flex flex-wrap items-end justify-between gap-3">
@@ -119,25 +159,65 @@ function HoldingsSection({
             </tr>
           </thead>
           <tbody>
-            {rows.map(h => (
-              <tr key={`${h.broker}-${h.entity_id}-${h.symbol}`} className="border-b border-rule last:border-0 hover:bg-page/60 transition-colors">
-                <td className="px-4 py-3">
-                  <div className="font-medium text-ink">{h.symbol}</div>
-                  <div className="text-[11px] text-ghost">{h.sector || '—'}{h.currency !== 'INR' ? ` · ${h.currency}` : ''}</div>
-                </td>
-                {showEntityCol && <td className="px-4 py-3 text-dim">{h.entity_name}</td>}
-                <td className="px-4 py-3 text-right tabular-nums text-dim">{fmtNum(h.quantity)}</td>
-                <td className="px-4 py-3 text-right tabular-nums text-dim">{fmtINR(h.cost)}</td>
-                {showNative && (
-                  <td className="px-4 py-3 text-right tabular-nums text-dim">
-                    {h.currency !== 'INR' ? fmtNative(h.current_market_value_native, h.currency) : '—'}
-                  </td>
-                )}
-                <td className="px-4 py-3 text-right tabular-nums font-medium text-ink">{fmtINR(h.current_market_value)}</td>
-                <td className={`px-4 py-3 text-right tabular-nums ${gainClass(h.pnl_inception)}`}>{fmtINR(h.pnl_inception)}</td>
-                <td className={`px-4 py-3 text-right tabular-nums ${gainClass(h.returns_inception_pct)}`}>{fmtPct(h.returns_inception_pct)}</td>
-              </tr>
-            ))}
+            {groups.map(g => {
+              const multi = g.rows.length > 1;
+              const isOpen = open.has(g.symbol);
+              return (
+                <Fragment key={g.symbol}>
+                  <tr
+                    className={`border-b border-rule last:border-0 transition-colors ${multi ? 'cursor-pointer hover:bg-page/60' : 'hover:bg-page/60'} ${isOpen ? 'bg-page/40' : ''}`}
+                    onClick={multi ? () => toggle(g.symbol) : undefined}
+                  >
+                    <td className="px-4 py-3">
+                      <div className="font-medium text-ink flex items-center gap-1.5">
+                        {multi && (
+                          <span className="inline-block text-[9px] text-ghost transition-transform" style={{ transform: isOpen ? 'rotate(90deg)' : 'none' }}>▶</span>
+                        )}
+                        {g.symbol}
+                      </div>
+                      <div className="text-[11px] text-ghost">
+                        {g.sector || '—'}{g.currency !== 'INR' ? ` · ${g.currency}` : ''}
+                        {multi && ` · ${g.rows.length} brokers`}
+                      </div>
+                    </td>
+                    {showEntityCol && (
+                      <td className="px-4 py-3 text-dim">
+                        {g.entities.length <= 1 ? (g.entities[0] ?? '—') : `${g.entities.length} entities`}
+                      </td>
+                    )}
+                    <td className="px-4 py-3 text-right tabular-nums text-dim">{fmtNum(g.quantity)}</td>
+                    <td className="px-4 py-3 text-right tabular-nums text-dim">{fmtINR(g.cost)}</td>
+                    {showNative && (
+                      <td className="px-4 py-3 text-right tabular-nums text-dim">
+                        {g.currency !== 'INR' ? fmtNative(g.current_market_value_native, g.currency) : '—'}
+                      </td>
+                    )}
+                    <td className="px-4 py-3 text-right tabular-nums font-medium text-ink">{fmtINR(g.current_market_value)}</td>
+                    <td className={`px-4 py-3 text-right tabular-nums ${gainClass(g.pnl_inception)}`}>{fmtINR(g.pnl_inception)}</td>
+                    <td className={`px-4 py-3 text-right tabular-nums ${gainClass(g.returns_inception_pct)}`}>{fmtPct(g.returns_inception_pct)}</td>
+                  </tr>
+                  {multi && isOpen && g.rows.map(h => (
+                    <tr key={`${h.broker}-${h.entity_id}`} className="border-b border-rule last:border-0 bg-page/20 text-[11px]">
+                      <td className="px-4 py-2 pl-9">
+                        <span className="text-dim capitalize">{h.broker}</span>
+                        {showEntityCol && <span className="text-ghost"> · {h.entity_name}</span>}
+                      </td>
+                      {showEntityCol && <td className="px-4 py-2 text-ghost">{h.entity_name}</td>}
+                      <td className="px-4 py-2 text-right tabular-nums text-ghost">{fmtNum(h.quantity)}</td>
+                      <td className="px-4 py-2 text-right tabular-nums text-ghost">{fmtINR(h.cost)}</td>
+                      {showNative && (
+                        <td className="px-4 py-2 text-right tabular-nums text-ghost">
+                          {h.currency !== 'INR' ? fmtNative(h.current_market_value_native, h.currency) : '—'}
+                        </td>
+                      )}
+                      <td className="px-4 py-2 text-right tabular-nums text-dim">{fmtINR(h.current_market_value)}</td>
+                      <td className={`px-4 py-2 text-right tabular-nums ${gainClass(h.pnl_inception)}`}>{fmtINR(h.pnl_inception)}</td>
+                      <td className={`px-4 py-2 text-right tabular-nums ${gainClass(h.returns_inception_pct)}`}>{fmtPct(h.returns_inception_pct)}</td>
+                    </tr>
+                  ))}
+                </Fragment>
+              );
+            })}
           </tbody>
         </table>
       </DragScroll>

@@ -13,6 +13,7 @@ interface Benchmark {
 
 const SHORT: Record<string, string> = {
   NIFTY: 'NIFTY', SENSEX: 'SENSEX',
+  DOWJONES: 'DOW JONES', NASDAQ: 'NASDAQ',
   GS2032_YTM: 'GS 2032', GS2030_YTM: 'GS 2030',
   GS2032_PRICE: 'GS 2032 ₹', GS2030_PRICE: 'GS 2030 ₹',
 };

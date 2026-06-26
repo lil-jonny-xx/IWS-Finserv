@@ -48,10 +48,14 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD", ""),
 }
 
-# benchmark code -> Yahoo symbol
+# benchmark code -> Yahoo symbol. US indices (Dow Jones, NASDAQ) carry their
+# latest available close — Yahoo returns previousClose while the US market is
+# shut, which is when this worker runs (IST hours), so they refresh once a day.
 INDEX_SYMBOLS = {
-    "NIFTY":  "^NSEI",
-    "SENSEX": "^BSESN",
+    "NIFTY":    "^NSEI",
+    "SENSEX":   "^BSESN",
+    "DOWJONES": "^DJI",
+    "NASDAQ":   "^IXIC",
 }
 YF_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
