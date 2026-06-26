@@ -687,9 +687,6 @@ export default function ManualDataPage() {
         setError(`Please enter a name/label for the ${catLabel} entry before saving.`);
         return;
       }
-      // Unlisted/startup values are derived from the funding-rounds panel, so the
-      // main form doesn't require a hand-typed cost / current value for them.
-      if (UNLISTED_CATS.has(r.category)) continue;
       if (!r.current_value.trim() && !r.cost.trim() && !r.raw_amount.trim()) {
         setError(`"${r.label}" has no value entered — add a cost or current value before saving.`);
         return;
@@ -706,32 +703,19 @@ export default function ManualDataPage() {
     setSaving(true);
     setAuthError('');
 
-    // Skip unlisted/startup rows that have no derived value yet — those are
-    // persisted by the Rounds panel, and sending null here would wipe the
-    // aggregate it computes.
-    const inputs = dirtyRows
-      .filter(r => !UNLISTED_CATS.has(r.category) || r.cost.trim() || r.current_value.trim())
-      .map(r => ({
-        entity_id:       r.entity_id,
-        category:        r.category,
-        label:           r.label,
-        cost:            r.cost            ? parseFloat(r.cost)            : null,
-        current_value:   r.current_value   ? parseFloat(r.current_value)   : null,
-        prev_week_value: r.prev_week_value ? parseFloat(r.prev_week_value) : null,
-        currency:        r.currency,
-        raw_amount:      r.raw_amount      ? parseFloat(r.raw_amount)      : null,
-        fx_rate:         r.fx_rate         ? parseFloat(r.fx_rate)         : null,
-        inception_date:  r.inception_date  || null,
-        notes:           r.notes           || null,
-      }));
-
-    if (inputs.length === 0) {
-      setSaving(false);
-      setShowAuth(false);
-      setSuccess('Nothing to save here — unlisted values are saved from the Rounds panel.');
-      setTimeout(() => setSuccess(''), 4000);
-      return;
-    }
+    const inputs = dirtyRows.map(r => ({
+      entity_id:       r.entity_id,
+      category:        r.category,
+      label:           r.label,
+      cost:            r.cost            ? parseFloat(r.cost)            : null,
+      current_value:   r.current_value   ? parseFloat(r.current_value)   : null,
+      prev_week_value: r.prev_week_value ? parseFloat(r.prev_week_value) : null,
+      currency:        r.currency,
+      raw_amount:      r.raw_amount      ? parseFloat(r.raw_amount)      : null,
+      fx_rate:         r.fx_rate         ? parseFloat(r.fx_rate)         : null,
+      inception_date:  r.inception_date  || null,
+      notes:           r.notes           || null,
+    }));
 
     const res = await fetch(`${API_URL}/api/v1/manual-inputs`, {
       method: 'POST',
@@ -924,39 +908,27 @@ export default function ManualDataPage() {
 
                       {/* Cost */}
                       <td className="px-2 py-1.5">
-                        {isUnlisted ? (
-                          <div className="w-28 text-right">
-                            <span className="text-xs" style={{ color: 'var(--ink)' }}>{row.cost ? '₹' + Number(row.cost).toLocaleString('en-IN') : '—'}</span>
-                            <div style={{ color: 'var(--ghost)', fontSize: 9 }}>from rounds</div>
-                          </div>
-                        ) : (
-                          <input type="number" value={row.cost} placeholder="0"
-                                 onChange={e => updateRow(idx, 'cost', e.target.value)}
-                                 className="w-28 px-2 py-1 rounded text-xs outline-none text-right"
-                                 style={{ background: 'var(--page)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
-                        )}
+                        <input type="number" value={row.cost} placeholder="0"
+                               onChange={e => updateRow(idx, 'cost', e.target.value)}
+                               className="w-28 px-2 py-1 rounded text-xs outline-none text-right"
+                               style={{ background: 'var(--page)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
                       </td>
 
                       {/* Current value */}
                       <td className="px-2 py-1.5">
-                        {isUnlisted ? (
-                          <div className="w-28 text-right">
-                            <span className="text-xs" style={{ color: 'var(--ink)' }}>{row.current_value ? '₹' + Number(row.current_value).toLocaleString('en-IN') : '—'}</span>
-                            <div style={{ color: 'var(--ghost)', fontSize: 9 }}>from rounds</div>
-                          </div>
-                        ) : (
-                          <div>
-                            <input type="number" value={row.current_value} placeholder="0"
-                                   onChange={e => updateRow(idx, 'current_value', e.target.value)}
-                                   className="w-28 px-2 py-1 rounded text-xs outline-none text-right"
-                                   style={{ background: 'var(--page)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
-                            {computedINR && (
-                              <div className="text-right mt-0.5" style={{ color: 'var(--ghost)', fontSize: 10 }}>
-                                ≈ ₹{parseInt(computedINR).toLocaleString('en-IN')}
-                              </div>
-                            )}
-                          </div>
-                        )}
+                        <div>
+                          <input type="number" value={row.current_value} placeholder="0"
+                                 onChange={e => updateRow(idx, 'current_value', e.target.value)}
+                                 className="w-28 px-2 py-1 rounded text-xs outline-none text-right"
+                                 style={{ background: 'var(--page)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
+                          {isUnlisted ? (
+                            <div className="text-right mt-0.5" style={{ color: 'var(--ghost)', fontSize: 9 }}>or use 📊 Rounds</div>
+                          ) : computedINR && (
+                            <div className="text-right mt-0.5" style={{ color: 'var(--ghost)', fontSize: 10 }}>
+                              ≈ ₹{parseInt(computedINR).toLocaleString('en-IN')}
+                            </div>
+                          )}
+                        </div>
                       </td>
 
                       {/* Prev week */}
