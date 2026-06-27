@@ -2452,6 +2452,15 @@ VALID_CURRENCIES = {"INR", "USD", "GBP", "EUR", "AED", "SGD", "HKD"}
 # (Phase 3) rather than a single hand-typed cost / current value.
 UNLISTED_CATEGORIES = {"unlisted", "startup"}
 
+# Real-estate value band derived from the admin-entered Ready Reckoner rate.
+# The RRR (circle / guidance value) typically runs ~20-40% below real market
+# value, so market ~= RRR / 0.7 ~= 1.4x. We express the estimate as a range —
+# RRR x 1.5 (low) .. RRR x 2.0 (high) — and feed the midpoint (x 1.75) into the
+# portfolio total. Kept here so the multipliers live in exactly one place.
+RRR_LOW_MULT  = 1.5
+RRR_HIGH_MULT = 2.0
+RRR_MID_MULT  = 1.75
+
 
 class ManualInputItem(BaseModel):
     entity_id:       int
@@ -2676,6 +2685,9 @@ def delete_manual_input(
         )
         if category == "art":
             cur.execute("DELETE FROM art_detail WHERE entity_id = %s AND label = %s",
+                        (entity_id, label))
+        if category == "properties":
+            cur.execute("DELETE FROM property_detail WHERE entity_id = %s AND label = %s",
                         (entity_id, label))
         if category in UNLISTED_CATEGORIES:
             cur.execute("DELETE FROM unlisted_round WHERE entity_id = %s AND category = %s AND label = %s",
@@ -3057,6 +3069,108 @@ def save_art_detail(request: Request, body: ArtDetailRequest,
         release_db_connection(conn)
 
 
+class PropertyDetailRequest(BaseModel):
+    entity_id:           int
+    label:               str
+    location:            Optional[str]   = None
+    area_sqft:           Optional[float] = None
+    ready_reckoner_rate: Optional[float] = None
+
+
+@app.post("/api/v1/property-detail")
+@limiter.limit("30/minute")
+def save_property_detail(request: Request, body: PropertyDetailRequest,
+                         authorization: Optional[str] = Header(None)):
+    """Upsert a property's Ready-Reckoner inputs (location, area, RRR) and, when
+    both area and rate are present, write the derived value (RRR x area x 1.75
+    midpoint) into a fresh manual_input version so the portfolio total reflects
+    it. The manual_input row is created if it does not exist yet, so a property
+    can be entered entirely from this panel. Admin only."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+        label = body.label.strip()
+        if not label:
+            raise HTTPException(status_code=422, detail="label is required")
+        cur.execute("SELECT id FROM users WHERE email = %s", (payload["email"],))
+        urow = cur.fetchone()
+        user_id = urow["id"] if urow else None
+
+        cur.execute(
+            """
+            INSERT INTO property_detail
+                (entity_id, label, location, area_sqft, ready_reckoner_rate, updated_by, updated_at)
+            VALUES (%s,%s,%s,%s,%s,%s,NOW())
+            ON CONFLICT (entity_id, label) DO UPDATE SET
+                location            = EXCLUDED.location,
+                area_sqft           = EXCLUDED.area_sqft,
+                ready_reckoner_rate = EXCLUDED.ready_reckoner_rate,
+                updated_by          = EXCLUDED.updated_by,
+                updated_at          = NOW()
+            """,
+            (body.entity_id, label, body.location, body.area_sqft,
+             body.ready_reckoner_rate, user_id),
+        )
+
+        # Derive the value band; the midpoint becomes the property's current_value.
+        mid = low = high = None
+        if body.area_sqft and body.ready_reckoner_rate:
+            base = float(body.area_sqft) * float(body.ready_reckoner_rate)
+            low  = round(base * RRR_LOW_MULT, 2)
+            high = round(base * RRR_HIGH_MULT, 2)
+            mid  = round(base * RRR_MID_MULT, 2)
+
+            # Carry forward cost / currency / inception / notes from the latest
+            # version so we only overwrite the derived current_value.
+            cur.execute(
+                """
+                SELECT cost, currency, inception_date, notes
+                FROM   manual_input
+                WHERE  entity_id = %s AND category = 'properties' AND label = %s
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (body.entity_id, label),
+            )
+            prev = cur.fetchone()
+            cur.execute(
+                """
+                INSERT INTO manual_input
+                    (entity_id, category, label, cost, current_value, prev_week_value,
+                     currency, raw_amount, fx_rate, inception_date, notes, updated_by, updated_at)
+                VALUES (%s,'properties',%s,%s,%s,NULL,%s,NULL,NULL,%s,%s,%s,NOW())
+                """,
+                (
+                    body.entity_id, label,
+                    prev["cost"] if prev else None,
+                    mid,
+                    prev["currency"] if prev else "INR",
+                    prev["inception_date"] if prev else None,
+                    prev["notes"] if prev else None,
+                    user_id,
+                ),
+            )
+
+        conn.commit()
+        cur.close()
+        return {"saved": True, "value_low": low, "value_high": high, "value_mid": mid}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/property-detail: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
 @app.get("/api/v1/manual-assets")
 def get_manual_assets(
     request: Request,
@@ -3129,6 +3243,31 @@ def get_manual_assets(
                     "painter_about": d["painter_about"],
                 }
 
+        # Property Ready-Reckoner inputs + derived value band, grouped by key.
+        prop_by_key: dict = {}
+        if category == "properties":
+            pcond, pparams = [], []
+            if eid is not None:
+                pcond.append("entity_id = %s"); pparams.append(eid)
+            pwhere = ("WHERE " + " AND ".join(pcond)) if pcond else ""
+            cur.execute(
+                f"""SELECT entity_id, label, location, area_sqft, ready_reckoner_rate
+                    FROM property_detail {pwhere}""",
+                pparams,
+            )
+            for d in cur.fetchall():
+                area = float(d["area_sqft"]) if d["area_sqft"] is not None else None
+                rate = float(d["ready_reckoner_rate"]) if d["ready_reckoner_rate"] is not None else None
+                base = area * rate if (area and rate) else None
+                prop_by_key[(d["entity_id"], d["label"])] = {
+                    "location":            d["location"],
+                    "area_sqft":           area,
+                    "ready_reckoner_rate": rate,
+                    "value_low":  round(base * RRR_LOW_MULT, 2)  if base is not None else None,
+                    "value_high": round(base * RRR_HIGH_MULT, 2) if base is not None else None,
+                    "value_mid":  round(base * RRR_MID_MULT, 2)  if base is not None else None,
+                }
+
         # Unlisted / startup funding rounds + corporate events, grouped by key.
         rounds_by_key: dict = {}
         if category in UNLISTED_CATEGORIES:
@@ -3181,6 +3320,11 @@ def get_manual_assets(
             }
             if category == "art":
                 item.update(art_by_key.get(key, {"painter_name": None, "painter_about": None}))
+            if category == "properties":
+                item.update(prop_by_key.get(key, {
+                    "location": None, "area_sqft": None, "ready_reckoner_rate": None,
+                    "value_low": None, "value_high": None, "value_mid": None,
+                }))
             if category in UNLISTED_CATEGORIES:
                 item.update(rounds_by_key.get(key, {"rounds": [], "events": [], "aggregate": None}))
             out.append(item)

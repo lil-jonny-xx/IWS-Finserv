@@ -399,6 +399,9 @@ function AssetExtras({ entityId, category, label, onSaved }: { entityId: number;
   const [msg, setMsg] = useState('');
   const [painterName, setPainterName] = useState('');
   const [painterAbout, setPainterAbout] = useState('');
+  const [propLocation, setPropLocation] = useState('');
+  const [propArea, setPropArea] = useState('');
+  const [propRate, setPropRate] = useState('');
 
   const load = useCallback(async () => {
     if (!label.trim()) { setAtts([]); return; }
@@ -411,6 +414,18 @@ function AssetExtras({ entityId, category, label, onSaved }: { entityId: number;
         const d = await ar.json();
         const m = (d.assets || []).find((a: { label: string }) => a.label === label);
         if (m) { setPainterName(m.painter_name || ''); setPainterAbout(m.painter_about || ''); }
+      }
+    }
+    if (category === 'properties') {
+      const pr = await fetch(`${API_URL}/api/v1/manual-assets?category=properties&entity_id=${entityId}`, { credentials: 'include' });
+      if (pr.ok) {
+        const d = await pr.json();
+        const m = (d.assets || []).find((a: { label: string }) => a.label === label);
+        if (m) {
+          setPropLocation(m.location || '');
+          setPropArea(m.area_sqft != null ? String(m.area_sqft) : '');
+          setPropRate(m.ready_reckoner_rate != null ? String(m.ready_reckoner_rate) : '');
+        }
       }
     }
   }, [entityId, category, label]);
@@ -445,6 +460,22 @@ function AssetExtras({ entityId, category, label, onSaved }: { entityId: number;
     });
     setBusy(false);
     setMsg(r.ok ? 'Painter details saved' : 'Save failed');
+  }
+
+  async function savePropertyDetail() {
+    setBusy(true); setMsg('');
+    const r = await fetch(`${API_URL}/api/v1/property-detail`, {
+      method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        entity_id: entityId, label,
+        location: propLocation || null,
+        area_sqft: propArea ? parseFloat(propArea) : null,
+        ready_reckoner_rate: propRate ? parseFloat(propRate) : null,
+      }),
+    });
+    setBusy(false);
+    if (r.ok) { setMsg('Property details saved'); onSaved?.(); }
+    else { const d = await r.json().catch(() => ({})); setMsg(d.detail || 'Save failed'); }
   }
 
   if (!label.trim()) {
@@ -486,6 +517,50 @@ function AssetExtras({ entityId, category, label, onSaved }: { entityId: number;
           </button>
         </div>
       )}
+
+      {category === 'properties' && (() => {
+        const area = parseFloat(propArea);
+        const rate = parseFloat(propRate);
+        const base = area > 0 && rate > 0 ? area * rate : null;
+        return (
+          <div className="flex flex-col gap-2">
+            <div className="flex flex-wrap gap-3 items-start">
+              <div className="flex flex-col gap-1">
+                <label className="text-[11px]" style={{ color: 'var(--dim)' }}>Location</label>
+                <input value={propLocation} onChange={e => setPropLocation(e.target.value)} placeholder="e.g. Panaji, Goa"
+                       className="w-56 px-2 py-1 rounded text-xs outline-none"
+                       style={{ background: 'var(--card)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
+              </div>
+              <div className="flex flex-col gap-1">
+                <label className="text-[11px]" style={{ color: 'var(--dim)' }}>Area (sq ft)</label>
+                <input type="number" value={propArea} onChange={e => setPropArea(e.target.value)} placeholder="e.g. 1200"
+                       className="w-32 px-2 py-1 rounded text-xs outline-none text-right"
+                       style={{ background: 'var(--card)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
+              </div>
+              <div className="flex flex-col gap-1">
+                <label className="text-[11px]" style={{ color: 'var(--dim)' }}>Ready Reckoner rate (₹/sq ft)</label>
+                <input type="number" value={propRate} onChange={e => setPropRate(e.target.value)} placeholder="e.g. 8500"
+                       className="w-40 px-2 py-1 rounded text-xs outline-none text-right"
+                       style={{ background: 'var(--card)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
+              </div>
+              <button onClick={savePropertyDetail} disabled={busy}
+                      className="mt-5 px-3 py-1 rounded text-xs font-medium"
+                      style={{ background: 'var(--prime)', color: 'var(--prime-fg)', opacity: busy ? 0.6 : 1 }}>
+                Save property
+              </button>
+            </div>
+            {base != null && (
+              <div className="text-[11px]" style={{ color: 'var(--ghost)' }}>
+                Estimated market value:{' '}
+                <b style={{ color: 'var(--ink)' }}>{fmtINR(Math.round(base * 1.5))}</b>
+                {' – '}
+                <b style={{ color: 'var(--ink)' }}>{fmtINR(Math.round(base * 2))}</b>
+                {' '}(portfolio uses midpoint <b style={{ color: 'var(--ink)' }}>{fmtINR(Math.round(base * 1.75))}</b>)
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-[11px] font-medium" style={{ color: 'var(--dim)' }}>

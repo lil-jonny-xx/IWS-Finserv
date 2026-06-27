@@ -15,6 +15,8 @@ interface PropertyAsset {
   entity_id: number; entity_name: string; label: string;
   cost: number | null; current_value: number | null; currency: string;
   inception_date: string | null; notes: string | null;
+  location: string | null; area_sqft: number | null; ready_reckoner_rate: number | null;
+  value_low: number | null; value_high: number | null; value_mid: number | null;
   attachments: Attachment[];
 }
 interface ManualAssetsResponse {
@@ -71,6 +73,24 @@ function PropertyCard({ a, showEntity, onOpen }: {
         </div>
       </div>
       <div className="p-4 flex flex-col gap-3 flex-1">
+        {(a.location || a.value_mid != null) && (
+          <div className="flex flex-col gap-1.5 rounded border border-rule px-3 py-2 bg-page">
+            {a.location && <p className="text-xs text-ink">📍 {a.location}</p>}
+            {a.area_sqft != null && a.ready_reckoner_rate != null && (
+              <p className="text-[11px] text-ghost">
+                {Math.round(a.area_sqft).toLocaleString('en-IN')} sq ft × RRR {fmtINR(a.ready_reckoner_rate)}/sq ft
+              </p>
+            )}
+            {a.value_low != null && a.value_high != null && (
+              <p className="text-[11px] text-ghost">
+                Est. market value{' '}
+                <span className="text-ink font-medium">{fmtINR(a.value_low)}</span>
+                {' – '}
+                <span className="text-ink font-medium">{fmtINR(a.value_high)}</span>
+              </p>
+            )}
+          </div>
+        )}
         {images.length > 0 && (
           <div className="grid grid-cols-3 gap-2">
             {images.map(im => (
