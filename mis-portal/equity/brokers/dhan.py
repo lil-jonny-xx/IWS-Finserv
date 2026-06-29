@@ -181,9 +181,20 @@ def fetch_holdings(entity_code: str) -> list[dict]:
     resp = dhan.get_holdings()
 
     if resp.get("status") == "failure":
-        raise RuntimeError(
-            f"[{entity_code}] Dhan holdings failed: {resp.get('remarks')}"
-        )
+        remarks = resp.get("remarks")
+        code = remarks.get("error_code") if isinstance(remarks, dict) else ""
+        msg  = remarks.get("error_message", "") if isinstance(remarks, dict) else str(remarks)
+        # DH-1111 "No holdings available" is how Dhan reports an empty *or* not-yet-
+        # ready holdings snapshot (common pre-market). Treat it as empty rather than a
+        # hard error: the caller's "no holdings → skip" guard then leaves the last good
+        # holdings untouched instead of aborting the whole sync. Real errors still raise.
+        if code == "DH-1111" or "no holdings" in str(msg).lower():
+            logger.warning(
+                f"[{entity_code}] Dhan: no holdings available (DH-1111) — "
+                f"keeping existing holdings, not treating as a failure"
+            )
+            return []
+        raise RuntimeError(f"[{entity_code}] Dhan holdings failed: {remarks}")
 
     holdings = resp.get("data") or []
     logger.info(f"[{entity_code}] Dhan: fetched {len(holdings)} holdings")
