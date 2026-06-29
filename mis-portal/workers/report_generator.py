@@ -4,6 +4,7 @@ Report generator — produces per-entity and combined portfolio Excel reports.
 Call generate_reports(conn, generated_by_user_id) to create reports.
 """
 import os
+import re
 from datetime import date, datetime
 from typing import Optional
 from collections import defaultdict
@@ -2010,8 +2011,10 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
 
 
 def build_weekly_sheet(wb, sheet_title: str, label: str, bundle: dict, as_of: date,
-                       benchmarks: list = None, realised_total: float = None):
-    """Create a data-driven Weekly Report sheet; sections appear only when non-empty."""
+                       benchmarks: list = None, realised: list = None):
+    """Create a data-driven Weekly Report sheet; sections appear only when non-empty.
+    The FY-to-date Realised P&L detail (when any) is appended at the bottom of this
+    same sheet — there is no separate Realised P&L sheet."""
     ws = wb.create_sheet(sheet_title)
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = "A3"
@@ -2187,20 +2190,6 @@ def build_weekly_sheet(wb, sheet_title: str, label: str, bundle: dict, as_of: da
         ws.cell(row=state["row"], column=1,
                 value="No holdings on record for this entity.").font = LABEL_FONT
 
-    # ---- Realised P&L (FY YTD) summary line (detail on the Realised P&L sheet) ----
-    if realised_total is not None:
-        state["row"] += 1
-        r = state["row"]
-        c1 = ws.cell(row=r, column=1, value="Realised Profit & Loss (FY YTD)")
-        c1.font = GTOT_FONT; c1.fill = YELLOW_FILL; c1.alignment = Alignment(horizontal="left", indent=1)
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=9)
-        for c in range(2, 10):
-            ws.cell(row=r, column=c).fill = YELLOW_FILL
-        c2 = ws.cell(row=r, column=10, value=realised_total)
-        c2.font = GTOT_FONT; c2.fill = YELLOW_FILL; c2.number_format = MONEY_FMT
-        c2.alignment = Alignment(horizontal="right"); c2.border = GOLD_BORDER
-        state["row"] += 1
-
     # ---- Market Statistics block (benchmarks) ----
     if benchmarks:
         state["row"] += 1
@@ -2229,6 +2218,11 @@ def build_weekly_sheet(wb, sheet_title: str, label: str, bundle: dict, as_of: da
                     cell.number_format = PCT_FMT; cell.alignment = Alignment(horizontal="right")
             state["row"] += 1
 
+    # ---- Realised P&L detail — appended at the bottom of this same sheet ----
+    if realised:
+        state["row"] += 2
+        state["row"] = _render_realised_block(ws, state["row"], label, realised, as_of, width=NWK)
+
     for c, (_, width) in enumerate(WK_COLS, 1):
         ws.column_dimensions[get_column_letter(c)].width = width
     ws.print_title_rows = "1:2"
@@ -2245,36 +2239,23 @@ REAL_COLS = [
 ]
 
 
-def build_realised_sheet(wb, sheet_title: str, label: str, rows: list, as_of: date):
-    """FY-to-date Realised Profit & Loss sheet.
+def _render_realised_block(ws, start_row: int, label: str, rows: list, as_of: date,
+                           width: Optional[int] = None) -> int:
+    """Render the FY-to-date Realised P&L table into `ws` starting at `start_row`,
+    returning the next free row.
 
-    One section per asset `category`, matching the Realised Gains page's split and
-    order (Equity / Mutual Funds / Foreign Equity / PMS, then any other present),
-    so every realised row is shown and direct equity is separated from MF — nothing
-    is dropped just because its category wasn't in a hard-coded list.
+    One section per asset `category` (Equity / Mutual Funds / Foreign Equity / PMS,
+    then any other present), mirroring the Realised Gains page's split and order,
+    with Fixed Income / Equity sub-headers inside Mutual Funds. Used to append the
+    realised detail to the bottom of a Weekly Report sheet (no separate sheet).
+    `width` is how far the title/note banners span (defaults to the table's own
+    6 columns; pass the host sheet's column count when embedding).
     """
-    ws = wb.create_sheet(sheet_title)
-    ws.sheet_view.showGridLines = False
-    ws.freeze_panes = "A3"
     NRC = len(REAL_COLS)
+    w = width or NRC
+    state = {"row": start_row}
 
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=NRC)
-    t = ws.cell(row=1, column=1,
-                value=f"REALISED PROFIT & LOSS — {label}    |    FY {_fy_start(as_of).year}-"
-                      f"{(_fy_start(as_of).year + 1) % 100:02d}   (as on {as_of.strftime('%d %b %Y')})")
-    t.font = GOLD_HDR_FONT; t.fill = GOLD_FILL
-    t.alignment = Alignment(horizontal="left", vertical="center")
-    ws.row_dimensions[1].height = 22
-
-    for c, (name, _) in enumerate(REAL_COLS, 1):
-        cell = ws.cell(row=2, column=c, value=name)
-        cell.font = GOLD_COL_FONT; cell.fill = GOLD_FILL; cell.border = GOLD_BORDER
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.row_dimensions[2].height = 26
-
-    state = {"row": 3}
-
-    def emit(text, fill, font, vals):
+    def emit(fill, font, vals):
         r = state["row"]
         for c, val in enumerate(vals, 1):
             cell = ws.cell(row=r, column=c, value=val)
@@ -2289,21 +2270,32 @@ def build_realised_sheet(wb, sheet_title: str, label: str, rows: list, as_of: da
                 cell.number_format = MONEY_FMT; cell.alignment = Alignment(horizontal="right")
         state["row"] += 1
 
-    # One section per asset `category` (Equity / Mutual Funds / …), mirroring the
-    # Realised Gains page's split, in the same order. Known categories first, then
-    # any other present category sorted after so nothing is silently skipped.
-    # Falls back to `group` for any legacy row that predates the category tag.
-    def _cat(r):
-        return r.get("category") or r["group"]
+    # Title banner
+    r = state["row"]
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=w)
+    t = ws.cell(row=r, column=1,
+                value=f"REALISED PROFIT & LOSS — {label}    |    FY {_fy_start(as_of).year}-"
+                      f"{(_fy_start(as_of).year + 1) % 100:02d}   (as on {as_of.strftime('%d %b %Y')})")
+    t.font = GOLD_HDR_FONT; t.fill = GOLD_FILL
+    t.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[r].height = 22
+    state["row"] += 1
+
+    # Column headers
+    for c, (name, _) in enumerate(REAL_COLS, 1):
+        cell = ws.cell(row=state["row"], column=c, value=name)
+        cell.font = GOLD_COL_FONT; cell.fill = GOLD_FILL; cell.border = GOLD_BORDER
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ws.row_dimensions[state["row"]].height = 26
+    state["row"] += 1
+
+    # Sectioning by category, falling back to `group` for legacy rows.
+    def _cat(rr):
+        return rr.get("category") or rr["group"]
 
     _KNOWN = ["Equity", "Mutual Funds", "Foreign Equity", "PMS"]
     _present = {_cat(r) for r in rows}
     categories = [c for c in _KNOWN if c in _present] + sorted(_present - set(_KNOWN))
-
-    # Within a category, split rows by `group` (e.g. Mutual Funds → Fixed Income /
-    # Equity) and show a sub-header per group — but only when the category actually
-    # spans more than one group, so single-group sections (Equity, Foreign Equity,
-    # PMS) stay flat with no redundant sub-header.
     _GROUP_ORDER = ["Fixed Income", "Equity", "Foreign Equity", "PMS", "Alternates"]
 
     def _sub_header(text):
@@ -2339,7 +2331,7 @@ def build_realised_sheet(wb, sheet_title: str, label: str, rows: list, as_of: da
             if show_sub:
                 _sub_header(sg)
             for rr in sg_rows:
-                emit(None, BAND_FILL if band % 2 else WHITE_FILL, BODY_FONT,
+                emit(BAND_FILL if band % 2 else WHITE_FILL, BODY_FONT,
                      [rr["security_name"], rr["purchase_amount"], rr["sale_date"],
                       rr["sale_amount"], rr["pnl"], rr["return_pct"]])
                 band += 1
@@ -2348,7 +2340,7 @@ def build_realised_sheet(wb, sheet_title: str, label: str, rows: list, as_of: da
         sa = sum(r["sale_amount"] for r in grp if r["sale_amount"] is not None) or None
         pl = sum(r["pnl"] for r in grp if r["pnl"] is not None) or None
         ret = (pl / pa) if (pl is not None and pa) else None
-        emit(None, YELLOW_FILL, GTOT_FONT, [f"Total {category}", pa, None, sa, pl, ret])
+        emit(YELLOW_FILL, GTOT_FONT, [f"Total {category}", pa, None, sa, pl, ret])
 
     if any_rows:
         pa = sum(r["purchase_amount"] for r in rows if r["purchase_amount"] is not None) or None
@@ -2356,24 +2348,22 @@ def build_realised_sheet(wb, sheet_title: str, label: str, rows: list, as_of: da
         pl = sum(r["pnl"] for r in rows if r["pnl"] is not None) or None
         ret = (pl / pa) if (pl is not None and pa) else None
         gt = state["row"]
-        emit(None, GOLD_FILL, Font(name="Calibri", bold=True, color="FFFFFF", size=9),
+        emit(GOLD_FILL, Font(name="Calibri", bold=True, color="FFFFFF", size=9),
              ["GRAND TOTAL", pa, None, sa, pl, ret])
         ws.cell(row=gt, column=1).font = Font(name="Calibri", bold=True, color="FFFFFF", size=9)
     else:
         ws.cell(row=state["row"], column=1,
                 value="No realised gains/losses recorded for this financial year.").font = LABEL_FONT
+        state["row"] += 1
 
-    note = ws.cell(row=state["row"] + 2, column=1,
+    note_r = state["row"] + 1
+    note = ws.cell(row=note_r, column=1,
                    value="MF realised auto-computed from CAS transactions (average cost). "
                          "Equity realised appears once broker trades are imported. "
                          "Blank cost basis = original purchase predates available transaction history.")
     note.font = LABEL_FONT
-    ws.merge_cells(start_row=state["row"] + 2, start_column=1, end_row=state["row"] + 2, end_column=NRC)
-
-    for c, (_, width) in enumerate(REAL_COLS, 1):
-        ws.column_dimensions[get_column_letter(c)].width = width
-    ws.print_title_rows = "1:2"
-    return ws
+    ws.merge_cells(start_row=note_r, start_column=1, end_row=note_r, end_column=w)
+    return note_r + 1
 
 
 def build_master_workbook(conn, as_of: date):
@@ -2407,51 +2397,82 @@ def build_master_workbook(conn, as_of: date):
     def _emit(label, ids):
         bundle   = _bundle_for(conn, ids, as_of)
         realised = _fetch_realised_gains(conn, ids, as_of)
-        rtotal   = sum(r["pnl"] for r in realised if r["pnl"] is not None) if realised else None
-        build_weekly_sheet(wb, f"{label} Weekly Report", label, bundle, as_of, benchmarks, rtotal)
-        build_realised_sheet(wb, f"{label} Realised P&L", label, realised, as_of)
+        # Realised P&L is appended at the bottom of the Weekly sheet — no separate sheet.
+        build_weekly_sheet(wb, f"{label} Weekly Report", label, bundle, as_of, benchmarks, realised)
 
-    # Per-group sheets (Weekly + Realised)
+    # Per-group sheets (Weekly + realised-at-bottom)
     for g in _pan_groups(conn):
         _emit(g["label"], g["entity_ids"])
 
-    # Per-entity sheets (Weekly + Realised)
+    # Per-entity sheets (Weekly + realised-at-bottom)
     for e in entities:
         _emit(e["entity_name"], [e["id"]])
 
     return wb
 
 
+def build_entity_workbook(conn, entity: dict, as_of: date, benchmarks: list):
+    """One standalone workbook for a single entity: its Weekly Report (holdings
+    across every asset class) with the FY-to-date Realised P&L appended at the
+    bottom of that same sheet. Saved per entity as ENTITYNAME-DATE.xlsx."""
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)  # build_weekly_sheet creates its own sheet
+    bundle   = _bundle_for(conn, [entity["id"]], as_of)
+    realised = _fetch_realised_gains(conn, [entity["id"]], as_of)
+    build_weekly_sheet(wb, "Weekly Report", entity["entity_name"],
+                       bundle, as_of, benchmarks, realised)
+    return wb
+
+
+def _safe_filename(name: str) -> str:
+    """Filesystem-safe entity name for report filenames (spaces/slashes → '_')."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "entity"
+
+
 # ── public entry point ────────────────────────────────────────────────────────
 
 def generate_reports(conn, generated_by_user_id: Optional[int] = None) -> list[dict]:
     """
-    Generate the single consolidated MIS workbook (modelled on MIS-REPORT.xlsx) and
-    register it in generated_report.  Returns a one-item list describing the file.
+    Generate (1) the consolidated master MIS workbook (all entities) and (2) one
+    standalone workbook per entity, named ENTITYNAME-DATE.xlsx. Realised P&L is
+    embedded at the bottom of each Weekly sheet — never a separate sheet/report.
+    Registers every file in generated_report and returns a row per file.
     """
     as_of  = date.today()
     folder = os.path.join(REPORTS_DIR, as_of.strftime("%Y-%m-%d"))
     os.makedirs(folder, exist_ok=True)
 
-    fname = f"MIS-Report_{as_of.strftime('%Y%m%d')}.xlsx"
-    fpath = os.path.join(folder, fname)
-
-    wb = build_master_workbook(conn, as_of)
-    wb.save(fpath)
-
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO generated_report
-            (report_type, entity_id, entity_name, filename, filepath, as_of_date, generated_by, generated_at)
-        VALUES ('master', NULL, 'MIS Report — All Entities', %s, %s, %s, %s, NOW())
-        RETURNING id
-    """, (fname, fpath, as_of, generated_by_user_id))
-    report_id = cur.fetchone()["id"]
+    results: list[dict] = []
+
+    def _register(report_type, entity_id, entity_name, fname, fpath):
+        cur.execute("""
+            INSERT INTO generated_report
+                (report_type, entity_id, entity_name, filename, filepath, as_of_date, generated_by, generated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+            RETURNING id
+        """, (report_type, entity_id, entity_name, fname, fpath, as_of, generated_by_user_id))
+        results.append({"id": cur.fetchone()["id"], "type": report_type,
+                        "entity": entity_name, "filename": fname, "path": fpath})
+
+    # 1) Consolidated master workbook (all entities)
+    m_name = f"MIS-Report_{as_of.strftime('%Y%m%d')}.xlsx"
+    m_path = os.path.join(folder, m_name)
+    build_master_workbook(conn, as_of).save(m_path)
+    _register("master", None, "MIS Report — All Entities", m_name, m_path)
+
+    # 2) One standalone workbook per entity (ENTITYNAME-DATE.xlsx)
+    benchmarks = _fetch_benchmarks(conn, as_of)
+    for e in _fetch_entities(conn):
+        ename = e["entity_name"]
+        fname = f"{_safe_filename(ename)}-{as_of.strftime('%Y-%m-%d')}.xlsx"
+        fpath = os.path.join(folder, fname)
+        build_entity_workbook(conn, e, as_of, benchmarks).save(fpath)
+        _register("individual", e["id"], ename, fname, fpath)
+
     conn.commit()
     cur.close()
-
-    return [{"id": report_id, "type": "master", "entity": "MIS Report — All Entities",
-             "filename": fname, "path": fpath}]
+    return results
 
 
 if __name__ == "__main__":
