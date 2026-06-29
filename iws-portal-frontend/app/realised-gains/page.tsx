@@ -1,11 +1,12 @@
 'use client';
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useMemo, Fragment } from 'react';
 import { useRouter } from 'next/navigation';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
 interface RealisedRow {
   entity: string;
+  category: string;
   group: string;
   security_name: string;
   purchase_amount: number | null;
@@ -14,6 +15,9 @@ interface RealisedRow {
   pnl: number | null;
   return_pct: number | null;
 }
+
+// Section order on the page; any category not listed falls in after these, sorted.
+const CATEGORY_ORDER = ['Equity', 'Mutual Funds', 'Foreign Equity', 'PMS'];
 
 const NAV = [
   { href: '/dashboard', label: 'Overview' },
@@ -101,6 +105,29 @@ export default function RealisedGainsPage() {
 
   const totalPnl = rows.reduce((s, r) => s + (r.pnl ?? 0), 0);
 
+  // Split rows into asset sections (Equity / Mutual Funds / …). In "since inception"
+  // mode each section is ordered latest sale first; FY-to-date keeps the backend's
+  // chronological order.
+  const sections = useMemo(() => {
+    const map = new Map<string, RealisedRow[]>();
+    for (const r of rows) {
+      const c = r.category || r.group || 'Other';
+      if (!map.has(c)) map.set(c, []);
+      map.get(c)!.push(r);
+    }
+    const ordered = [
+      ...CATEGORY_ORDER.filter(c => map.has(c)),
+      ...[...map.keys()].filter(c => !CATEGORY_ORDER.includes(c)).sort(),
+    ];
+    return ordered.map(cat => {
+      let rs = map.get(cat)!;
+      if (period === 'inception') {
+        rs = [...rs].sort((a, b) => b.sale_date.localeCompare(a.sale_date));
+      }
+      return { cat, rows: rs };
+    });
+  }, [rows, period]);
+
   return (
     <div className="min-h-screen" style={{ background: 'var(--page)' }}>
       <header style={{ background: 'var(--card)', borderBottom: '1px solid var(--rule)' }}
@@ -170,19 +197,35 @@ export default function RealisedGainsPage() {
                 </tr>
               </thead>
               <tbody>
-                {rows.map((r, i) => (
-                  <tr key={i} style={{ borderTop: '1px solid var(--rule)' }}>
-                    <td className="px-3 py-2" style={{ color: 'var(--dim)' }}>{r.entity}</td>
-                    <td className="px-3 py-2" style={{ color: 'var(--ghost)' }}>{r.group}</td>
-                    <td className="px-3 py-2" style={{ color: 'var(--ink)' }}>{r.security_name}</td>
-                    <td className="px-3 py-2 text-right">{inr(r.purchase_amount)}</td>
-                    <td className="px-3 py-2">{r.sale_date}</td>
-                    <td className="px-3 py-2 text-right">{inr(r.sale_amount)}</td>
-                    <td className="px-3 py-2 text-right font-medium"
-                        style={{ color: (r.pnl ?? 0) >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{inr(r.pnl)}</td>
-                    <td className="px-3 py-2 text-right">{pct(r.return_pct)}</td>
-                  </tr>
-                ))}
+                {sections.map(sec => {
+                  const secPnl = sec.rows.reduce((s, r) => s + (r.pnl ?? 0), 0);
+                  return (
+                    <Fragment key={sec.cat}>
+                      <tr style={{ background: 'var(--page)', borderTop: '1px solid var(--rule)' }}>
+                        <td colSpan={6} className="px-3 py-1.5 font-semibold" style={{ color: 'var(--ink)' }}>
+                          {sec.cat}
+                          <span className="ml-2 font-normal" style={{ color: 'var(--ghost)' }}>({sec.rows.length})</span>
+                        </td>
+                        <td className="px-3 py-1.5 text-right font-semibold"
+                            style={{ color: secPnl >= 0 ? 'var(--gain)' : 'var(--peril)' }}>₹{inr(secPnl)}</td>
+                        <td className="px-3 py-1.5" />
+                      </tr>
+                      {sec.rows.map((r, i) => (
+                        <tr key={`${sec.cat}-${i}`} style={{ borderTop: '1px solid var(--rule)' }}>
+                          <td className="px-3 py-2" style={{ color: 'var(--dim)' }}>{r.entity}</td>
+                          <td className="px-3 py-2" style={{ color: 'var(--ghost)' }}>{r.group}</td>
+                          <td className="px-3 py-2" style={{ color: 'var(--ink)' }}>{r.security_name}</td>
+                          <td className="px-3 py-2 text-right">{inr(r.purchase_amount)}</td>
+                          <td className="px-3 py-2">{r.sale_date}</td>
+                          <td className="px-3 py-2 text-right">{inr(r.sale_amount)}</td>
+                          <td className="px-3 py-2 text-right font-medium"
+                              style={{ color: (r.pnl ?? 0) >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{inr(r.pnl)}</td>
+                          <td className="px-3 py-2 text-right">{pct(r.return_pct)}</td>
+                        </tr>
+                      ))}
+                    </Fragment>
+                  );
+                })}
               </tbody>
             </table>
           </div>

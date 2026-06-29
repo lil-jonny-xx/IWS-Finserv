@@ -395,9 +395,8 @@ function AssetClassHeader({ cls, rows, colCount }: { cls: string; rows: MFHoldin
 // ── table headers ─────────────────────────────────────────────────────────────
 
 function TableHead({
-  showEntityCol, sortKey, sortDir, onSort,
+  sortKey, sortDir, onSort,
 }: {
-  showEntityCol: boolean;
   sortKey: SortKey;
   sortDir: SortDir;
   onSort: (k: SortKey) => void;
@@ -435,7 +434,6 @@ function TableHead({
         {/* Sr. No. */}
         <th scope="col" rowSpan={2} className={`${base} text-right pl-5 sm:pl-6 w-8`}>#</th>
         <Th col="security_name"     label="Fund"          right={false} rowSpan={2} />
-        {showEntityCol && <Th col="entity_name"  label="Entity"        right={false} rowSpan={2} />}
         <Th col="folio_number"      label="Folio"         right={false} rowSpan={2} />
         <Th col="quantity"          label="Units"                       rowSpan={2} />
         <Th col="nav"               label="NAV"                         rowSpan={2} />
@@ -482,9 +480,9 @@ function FundName({ name, type }: { name: string; type: string }) {
 // ── data row ──────────────────────────────────────────────────────────────────
 
 function DataRow({
-  h, srNo, showEntityCol,
+  h, srNo,
 }: {
-  h: MFHoldingRow; srNo: number; showEntityCol: boolean;
+  h: MFHoldingRow; srNo: number;
 }) {
   const mktVal = h.market_value_as_on ?? h.current_value;
   return (
@@ -493,9 +491,6 @@ function DataRow({
       <td className="px-3 py-3 align-top">
         <FundName name={h.security_name} type={h.security_type} />
       </td>
-      {showEntityCol && (
-        <td className="px-3 py-3 text-xs font-medium text-dim whitespace-nowrap align-top">{h.entity_name ?? '—'}</td>
-      )}
       <td className="px-3 py-3 font-mono text-xs text-dim whitespace-nowrap align-top">{h.folio_number}</td>
       <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{h.quantity.toFixed(3)}</td>
       <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">{h.nav != null ? h.nav.toFixed(4) : '—'}</td>
@@ -792,7 +787,6 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
   const totalRealized      = holdings.reduce((s, h) => s + (h.realized_gain ?? 0), 0);
 
   const colCount    = 3                          // sr + fund + folio
-    + (showEntityCol ? 1 : 0)
     + 8                                          // units nav cost since exp% mktval prevwk wklychg
     + 7                                          // pnl×3 returns×4
     + 2;                                         // realized remarks
@@ -1051,7 +1045,6 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
         {viewMode === 'normal' && (
           <table className="w-full text-sm" style={{ minWidth: '1800px' }}>
             <TableHead
-              showEntityCol={showEntityCol}
               sortKey={sortKey}
               sortDir={sortDir}
               onSort={handleSort}
@@ -1095,7 +1088,6 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
                             key={h.id}
                             h={h}
                             srNo={++srCounter}
-                            showEntityCol={showEntityCol}
                           />
                         ))}
                       </Fragment>

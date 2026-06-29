@@ -187,13 +187,14 @@ def _fetch_equity_holdings(conn, entity_id: Optional[int] = None):
             eh.weekly_change, eh.exposure_pct, eh.remarks
         FROM equity_holding eh
         JOIN entity e ON e.id = eh.entity_id
-        {where}
+        WHERE COALESCE(eh.asset_class, 'equity') NOT IN ('gold', 'silver', 'commodity')
+        {ent}
         ORDER BY eh.symbol
     """
     if entity_id:
-        cur.execute(q.format(where="WHERE eh.entity_id = %s"), (entity_id,))
+        cur.execute(q.format(ent="AND eh.entity_id = %s"), (entity_id,))
     else:
-        cur.execute(q.format(where=""))
+        cur.execute(q.format(ent=""))
     rows = cur.fetchall()
     cur.close()
     return rows
@@ -220,13 +221,46 @@ def _fetch_foreign_equity_holdings(conn, entity_id: Optional[int] = None):
             eh.xirr_inception_pct
         FROM foreign_equity_holding eh
         JOIN entity e ON e.id = eh.entity_id
-        {where}
+        WHERE COALESCE(eh.asset_class, 'equity') NOT IN ('gold', 'silver', 'commodity')
+        {ent}
         ORDER BY eh.broker, eh.symbol
     """
     if entity_id:
-        cur.execute(q.format(where="WHERE eh.entity_id = %s"), (entity_id,))
+        cur.execute(q.format(ent="AND eh.entity_id = %s"), (entity_id,))
     else:
-        cur.execute(q.format(where=""))
+        cur.execute(q.format(ent=""))
+    rows = cur.fetchall()
+    cur.close()
+    return rows
+
+
+def _fetch_commodity_holdings(conn, entity_id: Optional[int] = None):
+    """Gold / silver / commodity holdings (asset_class in gold/silver/commodity),
+    unioned across domestic (equity_holding) and foreign (foreign_equity_holding).
+    These are split out of the Equity / Foreign Equity sections — mirroring the
+    dedicated Commodities page — and reported on their own. Foreign rows use their
+    INR-converted value columns so the grand totals stay whole."""
+    cur = conn.cursor()
+    cols = """
+            eh.entity_id, e.entity_name, eh.broker,
+            COALESCE(eh.symbol_override, eh.symbol) AS symbol, eh.isin,
+            COALESCE(eh.asset_class, 'commodity') AS asset_class,
+            eh.cost, eh.current_market_value AS current_value,
+            eh.prev_week_value, eh.market_value_as_on,
+            eh.pnl_ytd, eh.pnl_inception,
+            eh.returns_ytd_pct, eh.returns_inception_pct, eh.cagr_inception_pct,
+            eh.first_invested_date, eh.weekly_change, eh.exposure_pct, eh.remarks
+    """
+    ent = "AND eh.entity_id = %s" if entity_id else ""
+    q = f"""
+        SELECT {cols} FROM equity_holding eh JOIN entity e ON e.id = eh.entity_id
+        WHERE COALESCE(eh.asset_class, 'equity') IN ('gold', 'silver', 'commodity') {ent}
+        UNION ALL
+        SELECT {cols} FROM foreign_equity_holding eh JOIN entity e ON e.id = eh.entity_id
+        WHERE COALESCE(eh.asset_class, 'equity') IN ('gold', 'silver', 'commodity') {ent}
+        ORDER BY broker, symbol
+    """
+    cur.execute(q, ([entity_id, entity_id] if entity_id else []))
     rows = cur.fetchall()
     cur.close()
     return rows
@@ -1053,6 +1087,7 @@ def build_combined_report(conn, as_of: date, ws=None):
         mf_rows    = _fetch_mf_holdings(conn, eid)
         eq_broker  = _rollup_equity_by_broker(_fetch_equity_holdings(conn, eid))
         fe_broker  = _rollup_equity_by_broker(_fetch_foreign_equity_holdings(conn, eid))
+        comm_broker = _rollup_equity_by_broker(_fetch_commodity_holdings(conn, eid))
         pms_items  = _pms_report_rows(_fetch_pms_holdings(conn, eid))
         cash_items = _broker_cash_report_rows(_fetch_broker_cash(conn, eid))
         bank_items = _bank_account_report_rows(conn, _fetch_bank_accounts(conn, eid), as_of)
@@ -1061,7 +1096,8 @@ def build_combined_report(conn, as_of: date, ws=None):
         for m in man_rows:
             man_by_cat.setdefault(m["category"], []).append(m)
 
-        if not (mf_rows or eq_broker or pms_items or cash_items or bank_items or man_rows):
+        if not (mf_rows or eq_broker or fe_broker or comm_broker
+                or pms_items or cash_items or bank_items or man_rows):
             continue
 
         # Entity header row
@@ -1069,9 +1105,13 @@ def build_combined_report(conn, as_of: date, ws=None):
 
         # ── Fixed Income ──────────────────────────────────────────────────────
         debt_holds = [h for h in mf_rows if h["security_type"] == "MF_DEBT"]
-        ppf_man    = man_by_cat.get("ppf", []) + man_by_cat.get("fixed_income", [])
+        # Manual fixed income: PPF + manually-entered MF (liquid/debt/arbitrage) +
+        # any legacy "fixed_income" rows. Previously only ppf/fixed_income showed.
+        fi_man     = (man_by_cat.get("liquid_fund", []) + man_by_cat.get("debt_fund", [])
+                      + man_by_cat.get("arbitrage_fund", []) + man_by_cat.get("ppf", [])
+                      + man_by_cat.get("fixed_income", []))
 
-        if debt_holds or ppf_man:
+        if debt_holds or fi_man:
             row = _comb_section(ws, row, "FIXED INCOME")
             fi_sub_total_rows: list = []
 
@@ -1084,13 +1124,13 @@ def build_combined_report(conn, as_of: date, ws=None):
                 _comb_total(ws, row, "Total MF Debt / Liquid", sub_start, row - 1)
                 fi_sub_total_rows.append(row); row += 1
 
-            if ppf_man:
-                row = _comb_section(ws, row, "PPF / Other Fixed Income")
+            if fi_man:
+                row = _comb_section(ws, row, "PPF / Manual Fixed Income")
                 sub_start = row
                 alt = False
-                for m in ppf_man:
+                for m in fi_man:
                     _comb_data_row(ws, row, m, "Manual", alt); row += 1; alt = not alt
-                _comb_total(ws, row, "Total PPF / Fixed Income", sub_start, row - 1)
+                _comb_total(ws, row, "Total PPF / Manual Fixed Income", sub_start, row - 1)
                 fi_sub_total_rows.append(row); row += 1
 
             _comb_total(ws, row, "Total Fixed Income"); row += 1
@@ -1098,10 +1138,11 @@ def build_combined_report(conn, as_of: date, ws=None):
         # ── Equity ────────────────────────────────────────────────────────────
         eq_mf  = [h for h in mf_rows if h["security_type"] == "MF_EQUITY"]
         hyb_mf = [h for h in mf_rows if h["security_type"] == "MF_HYBRID"]
+        deq_man = man_by_cat.get("direct_equity", [])
         pms    = man_by_cat.get("pms", [])
         aif    = man_by_cat.get("aif", [])
 
-        if eq_mf or hyb_mf or eq_broker or fe_broker or pms_items or pms or aif:
+        if eq_mf or hyb_mf or eq_broker or deq_man or fe_broker or pms_items or pms or aif:
             row = _comb_section(ws, row, "EQUITY")
 
             if eq_mf or hyb_mf:
@@ -1121,6 +1162,14 @@ def build_combined_report(conn, as_of: date, ws=None):
                 for h in eq_broker:
                     _comb_data_row(ws, row, h, "Equity", alt); row += 1; alt = not alt
                 _comb_total(ws, row, "Total Direct Equities", sub_start, row - 1); row += 1
+
+            if deq_man:
+                row = _comb_section(ws, row, "Direct Equity (Manual)")
+                sub_start = row
+                alt = False
+                for m in deq_man:
+                    _comb_data_row(ws, row, m, "Manual", alt); row += 1; alt = not alt
+                _comb_total(ws, row, "Total Direct Equity (Manual)", sub_start, row - 1); row += 1
 
             # Foreign equity: one summary row per broker (detail in the
             # "Foreign Equity Print" sheet). INR-converted, so it folds into the
@@ -1159,14 +1208,28 @@ def build_combined_report(conn, as_of: date, ws=None):
 
             _comb_total(ws, row, "Total Equity"); row += 1
 
+        # ── Commodities & Precious Metals ──────────────────────────────────────
+        # Gold / silver / commodity broker holdings split out of Equity, plus
+        # manually-entered gold/silver ETFs — all under one Commodities heading.
+        gold_etf_man = man_by_cat.get("gold_etf", [])
+        if comm_broker or gold_etf_man:
+            row = _comb_section(ws, row, "COMMODITIES & PRECIOUS METALS")
+            sub_start = row
+            alt = False
+            for h in comm_broker:
+                _comb_data_row(ws, row, h, "Commodity", alt); row += 1; alt = not alt
+            for m in gold_etf_man:
+                _comb_data_row(ws, row, m, "Manual", alt); row += 1; alt = not alt
+            _comb_total(ws, row, "Total Commodities", sub_start, row - 1); row += 1
+
         # ── Alternates ────────────────────────────────────────────────────────
         alt_cats = [
             ("overseas_fund",   "Overseas Funds"),
             ("overseas_equity", "Overseas Direct Equity"),
             ("forex",           "Forex / Foreign Cash"),
-            ("gold_etf",        "Gold / Silver ETF"),
             ("unlisted",        "Unlisted Equity"),
             ("startup",         "Startups"),
+            ("art",             "Art / Collectibles"),
         ]
         alt_items = [(cat, label, man_by_cat.get(cat, [])) for cat, label in alt_cats if man_by_cat.get(cat)]
         if alt_items:
@@ -1494,6 +1557,7 @@ def build_foreign_equity_print(conn, as_of: date, ws=None):
 GOLD_FILL    = PatternFill("solid", fgColor="BF9000")
 YELLOW_FILL  = PatternFill("solid", fgColor="FFD965")
 BAND_FILL    = PatternFill("solid", fgColor="FFF2CC")   # light gold band (alt rows)
+SUBSEC_FILL  = PatternFill("solid", fgColor="FFE699")   # mid gold — group sub-header
 GOLD_HDR_FONT = Font(name="Calibri", bold=True, color="FFFFFF", size=11)
 GOLD_COL_FONT = Font(name="Calibri", bold=True, color="FFFFFF", size=8)
 SUBSEC_FONT   = Font(name="Calibri", bold=True, color="3F2E00", size=9)
@@ -1553,28 +1617,34 @@ def _pan_groups(conn) -> list[dict]:
     return groups
 
 
-def _bundle_for(conn, entity_ids: list) -> dict:
+def _bundle_for(conn, entity_ids: list, as_of: date) -> dict:
     """
     Gather + merge holdings for one entity or a set of entities (a group).
     Direct equity is merged by ISIN ACROSS the whole bundle so the same share held
     via several brokers (or several entities in a group) collapses to one line, with
-    every broker named.  Returns {mf, eq, manual_by_cat}.
+    every broker named.  Returns {mf, eq, fe, comm, pms, cash, bank, manual_by_cat}.
     """
-    mf_rows, eq_raw, fe_raw, man_rows = [], [], [], []
+    mf_rows, eq_raw, fe_raw, comm_raw, man_rows = [], [], [], [], []
+    pms_raw, cash_raw, bank_raw = [], [], []
     for eid in entity_ids:
         mf_rows.extend(_fetch_mf_holdings(conn, eid))
         eq_raw.extend(_fetch_equity_holdings(conn, eid))
         fe_raw.extend(_fetch_foreign_equity_holdings(conn, eid))
+        comm_raw.extend(_fetch_commodity_holdings(conn, eid))
+        pms_raw.extend(_fetch_pms_holdings(conn, eid))
+        cash_raw.extend(_fetch_broker_cash(conn, eid))
+        bank_raw.extend(_fetch_bank_accounts(conn, eid))
         man_rows.extend(_fetch_manual_inputs(conn, eid))
 
     # Collapse entity_id so _merge_equity_by_symbol merges across the whole bundle.
-    for r in eq_raw + fe_raw:
+    for r in eq_raw + fe_raw + comm_raw:
         r["entity_id"] = 0
-    eq = _merge_equity_by_symbol(eq_raw)
-    fe = _merge_equity_by_symbol(fe_raw)   # foreign, merged by symbol across the bundle
+    eq   = _merge_equity_by_symbol(eq_raw)
+    fe   = _merge_equity_by_symbol(fe_raw)    # foreign, merged by symbol across the bundle
+    comm = _merge_equity_by_symbol(comm_raw)  # gold/silver/commodity, merged by symbol
 
     # Normalise broker labels (single-broker rows arrive raw e.g. "zerodha").
-    for r in eq + fe:
+    for r in eq + fe + comm:
         b = r.get("broker")
         if b:
             r["broker"] = ", ".join(
@@ -1583,7 +1653,11 @@ def _bundle_for(conn, entity_ids: list) -> dict:
     man_by_cat: dict = defaultdict(list)
     for m in man_rows:
         man_by_cat[m["category"]].append(m)
-    return {"mf": mf_rows, "eq": eq, "fe": fe, "manual_by_cat": man_by_cat}
+    return {"mf": mf_rows, "eq": eq, "fe": fe, "comm": comm,
+            "pms":  _pms_report_rows(pms_raw),
+            "cash": _broker_cash_report_rows(cash_raw),
+            "bank": _bank_account_report_rows(conn, bank_raw, as_of),
+            "manual_by_cat": man_by_cat}
 
 
 def _wk_pct(h, key):
@@ -1690,6 +1764,82 @@ def _avg_cost_realised(seq: list, fy_start: date) -> list:
     return out
 
 
+def _avg_cost_realised_grouped(seq: list, fy_start: date) -> list:
+    """
+    Equity realised P&L for ONE entity's chronological trade stream, consolidating
+    CONSECUTIVE sells of the same security into a single realised event.
+
+    Continuity is strict: any interleaving trade — a buy, or a sell of a different
+    security — closes the current run, so a later sell of the same security starts a
+    fresh ('discontinuous') realised row. Average cost is tracked per security across
+    the whole stream (buys before fy_start still establish basis); only sells on/after
+    fy_start contribute to an emitted row. seq items carry an extra `sec` (security_id)
+    key alongside the usual {date, kind, units, amount, name, group}.
+
+    If any sell folded into a run has no known cost basis (CAS/tradebook omitted the
+    purchase), that run's purchase_amount and pnl are left None rather than overstating
+    the gain — same policy as _avg_cost_realised.
+    """
+    state: dict = defaultdict(lambda: {"held": 0.0, "cost": 0.0})  # per security
+    out: list = []
+    run = None  # open run of consecutive same-security sells
+
+    def flush():
+        nonlocal run
+        if run is None:
+            return
+        if run["qualifying"]:
+            if run["unknown_cost"]:
+                purchase = pnl = ret = None
+            else:
+                purchase = run["purchase_amount"]
+                pnl = run["sale_amount"] - purchase
+                ret = (pnl / purchase) if purchase else None
+            out.append({"group": "Equity", "security_name": run["name"],
+                        "purchase_amount": purchase, "sale_date": run["sale_date"],
+                        "sale_amount": run["sale_amount"], "pnl": pnl, "return_pct": ret})
+        run = None
+
+    for t in seq:
+        sec = t["sec"]
+        u   = abs(float(t["units"] or 0))
+        amt = abs(float(t["amount"] or 0))
+        st  = state[sec]
+
+        if t["kind"] == "buy":
+            flush()                       # a buy always breaks a sell run
+            st["held"] += u; st["cost"] += amt
+            continue
+
+        # sell — consume average-cost basis whether or not the row is emitted
+        if st["held"] > 1e-9 and u > 0:
+            avg       = st["cost"] / st["held"]
+            sold      = min(u, st["held"])
+            cost_sold = avg * sold
+            st["held"] -= sold; st["cost"] -= cost_sold
+        else:
+            cost_sold = None
+
+        if run is not None and run["sec"] != sec:
+            flush()                       # a different stock's sell breaks the run
+        if run is None:
+            run = {"sec": sec, "name": t["name"], "sale_amount": 0.0,
+                   "purchase_amount": 0.0, "sale_date": None,
+                   "qualifying": False, "unknown_cost": False}
+
+        if t["date"] >= fy_start:
+            run["qualifying"]   = True
+            run["sale_amount"] += amt
+            run["sale_date"]    = t["date"]
+            if cost_sold is None:
+                run["unknown_cost"] = True
+            else:
+                run["purchase_amount"] += cost_sold
+
+    flush()
+    return out
+
+
 def _fx_rate_on(conn, currency: str, on_date: date) -> Optional[float]:
     """Currency→INR rate as of a date (nearest rate on/before; else earliest available).
 
@@ -1735,6 +1885,15 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
     cur = conn.cursor()
     ph = ",".join(["%s"] * len(entity_ids))
 
+    # `category` is the asset bucket the Realised Gains page groups by (Equity vs
+    # Mutual Funds vs …). It is intentionally separate from `group` (Fixed Income /
+    # Equity / Alternates) which the XLSX realised sheet buckets by, so MF and stock
+    # rows stay distinguishable on the page without disturbing the report.
+    def _add(rows, category):
+        for r in rows:
+            r["category"] = category
+            out.append(r)
+
     # ---- MF ----
     cur.execute(f"""
         SELECT t.security_id, sm.security_name, sm.security_type,
@@ -1757,25 +1916,30 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
             grp = "Fixed Income" if r["security_type"] == "MF_DEBT" else "Equity"
             seq.append({"date": r["d"], "kind": kind, "units": r["units"],
                         "amount": r["amount"], "name": r["security_name"], "group": grp})
-        out += _avg_cost_realised(seq, fy)
+        _add(_avg_cost_realised(seq, fy), "Mutual Funds")
 
     # ---- Equity (stock_transaction; empty until tradebooks imported) ----
+    # Processed per entity as one chronological stream across all stocks, so that
+    # consecutive sells of the same stock collapse into a single realised event.
+    # Any interleaving trade (a buy, or a sell of a different stock) breaks the run —
+    # the next same-stock sell then becomes its own discontinuous row. See
+    # _avg_cost_realised_grouped. Ordering within a date falls back to insert order (id).
     try:
         cur.execute(f"""
-            SELECT t.security_id, sm.security_name, t.transaction_date AS d,
-                   t.transaction_type AS tt, COALESCE(t.amount_inr, t.amount) AS amount,
-                   t.quantity AS units
+            SELECT t.entity_id, t.security_id, sm.security_name,
+                   t.transaction_date AS d, t.transaction_type AS tt,
+                   COALESCE(t.amount_inr, t.amount) AS amount, t.quantity AS units
             FROM stock_transaction t JOIN security_master sm ON sm.id = t.security_id
             WHERE t.entity_id IN ({ph})
-            ORDER BY t.security_id, t.transaction_date
+            ORDER BY t.entity_id, t.transaction_date, t.id
         """, entity_ids)
         srows = cur.fetchall()
     except Exception:
         conn.rollback(); srows = []
-    eq_by_sec: dict = defaultdict(list)
+    eq_by_entity: dict = defaultdict(list)
     for r in srows:
-        eq_by_sec[r["security_id"]].append(r)
-    for txns in eq_by_sec.values():
+        eq_by_entity[r["entity_id"]].append(r)
+    for txns in eq_by_entity.values():
         seq = []
         for r in txns:
             tt = (r["tt"] or "").upper()
@@ -1783,8 +1947,9 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
             if not kind:
                 continue
             seq.append({"date": r["d"], "kind": kind, "units": r["units"],
-                        "amount": r["amount"], "name": r["security_name"], "group": "Equity"})
-        out += _avg_cost_realised(seq, fy)
+                        "amount": r["amount"], "name": r["security_name"],
+                        "group": "Equity", "sec": r["security_id"]})
+        _add(_avg_cost_realised_grouped(seq, fy), "Equity")
 
     # ---- Foreign equity (equity_trade_ledger; native cash flows → INR at trade-date FX) ----
     # Switches do not exist for brokers, so include_switches is irrelevant here.
@@ -1817,7 +1982,7 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
             amt_inr = abs(float(r["cash_flow_native"] or 0)) * fx
             seq.append({"date": r["d"], "kind": kind, "units": r["units"],
                         "amount": amt_inr, "name": r["symbol"], "group": "Foreign Equity"})
-        out += _avg_cost_realised(seq, fy)
+        _add(_avg_cost_realised(seq, fy), "Foreign Equity")
 
     # ---- PMS (pms_realised; broker-provided realised P&L, already computed) ----
     # No avg-cost: the statement gives cost/proceeds/P&L per lot directly. INR only.
@@ -1835,7 +2000,7 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
         pnl = float(r["pnl"]) if r["pnl"] is not None else None
         pa  = float(r["purchase_amount"]) if r["purchase_amount"] is not None else None
         ret = (pnl / pa) if (pnl is not None and pa) else None
-        out.append({"group": "PMS", "security_name": r["security_name"],
+        out.append({"group": "PMS", "category": "PMS", "security_name": r["security_name"],
                     "purchase_amount": pa, "sale_date": r["d"],
                     "sale_amount": float(r["sale_amount"]) if r["sale_amount"] is not None else None,
                     "pnl": pnl, "return_pct": ret})
@@ -1851,14 +2016,20 @@ def build_weekly_sheet(wb, sheet_title: str, label: str, bundle: dict, as_of: da
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = "A3"
 
-    mf  = bundle["mf"]
-    eq  = bundle["eq"]
-    fe  = bundle.get("fe", [])
-    man = bundle["manual_by_cat"]
+    mf   = bundle["mf"]
+    eq   = bundle["eq"]
+    fe   = bundle.get("fe", [])
+    comm = bundle.get("comm", [])
+    pms_managed = bundle.get("pms", [])
+    cash = bundle.get("cash", [])
+    bank = bundle.get("bank", [])
+    man  = bundle["manual_by_cat"]
 
     def _cmv(rows):
         return sum(float(r["current_value"]) for r in rows if r.get("current_value")) or 0.0
-    total_cmv = _cmv(mf) + _cmv(eq) + _cmv(fe) + sum(_cmv(v) for v in man.values())
+    total_cmv = (_cmv(mf) + _cmv(eq) + _cmv(fe) + _cmv(comm)
+                 + _cmv(pms_managed) + _cmv(cash) + _cmv(bank)
+                 + sum(_cmv(v) for v in man.values()))
 
     # Title
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=NWK)
@@ -1954,6 +2125,8 @@ def build_weekly_sheet(wb, sheet_title: str, label: str, bundle: dict, as_of: da
     groups = [
         ("A. FIXED INCOME", [
             ("MF Debt / Liquid Funds", mf_by("MF_DEBT")),
+            ("MF Liquid (Manual)",     man.get("liquid_fund", [])),
+            ("MF Debt (Manual)",       man.get("debt_fund", [])),
             ("Arbitrage Fund",         man.get("arbitrage_fund", [])),
             ("Public Provident Fund",  man.get("ppf", [])),
             ("Other Fixed Income",     man.get("fixed_income", [])),
@@ -1961,22 +2134,33 @@ def build_weekly_sheet(wb, sheet_title: str, label: str, bundle: dict, as_of: da
         ("B. EQUITY", [
             ("MF Equity Funds",        mf_by("MF_EQUITY")),
             ("MF Hybrid Funds",        mf_by("MF_HYBRID")),
-            ("PMS",                    man.get("pms", [])),
             ("Direct Equities",        eq),
+            ("Direct Equity (Manual)", man.get("direct_equity", [])),
             ("Foreign Equity",         fe),
+            ("PMS (Managed)",          pms_managed),
+            ("PMS (Manual)",           man.get("pms", [])),
             ("AIF",                    man.get("aif", [])),
             ("Foreign Funds (Manual)", man.get("overseas_fund", []) + man.get("overseas_equity", [])),
         ]),
-        ("C. ALTERNATES", [
+        ("C. COMMODITIES & PRECIOUS METALS", [
+            ("Gold / Silver / Commodities", comm),
+            ("Gold / Silver ETF (Manual)",  man.get("gold_etf", [])),
+        ]),
+        ("D. ALTERNATES", [
             ("Unlisted Equity",        man.get("unlisted", [])),
             ("Startups",               man.get("startup", [])),
-            ("Gold / Silver ETF",      man.get("gold_etf", [])),
+            ("Art / Collectibles",     man.get("art", [])),
             ("Forex / Foreign Cash",   man.get("forex", [])),
         ]),
-        ("D. LIQUIDITY", [
+        ("E. REAL ESTATE", [
+            ("Properties",             man.get("properties", [])),
+        ]),
+        ("F. LIQUIDITY", [
+            ("Broker Cash",            cash),
+            ("Bank Accounts",          bank),
             ("Funds in Transit",       man.get("funds_transit", [])),
-            ("Broker Balance",         man.get("broker_balance", [])),
-            ("Funds in Bank",          man.get("bank", [])),
+            ("Broker Balance (Manual)", man.get("broker_balance", [])),
+            ("Funds in Bank (Manual)", man.get("bank", [])),
         ]),
     ]
 
@@ -2062,7 +2246,13 @@ REAL_COLS = [
 
 
 def build_realised_sheet(wb, sheet_title: str, label: str, rows: list, as_of: date):
-    """FY-to-date Realised Profit & Loss sheet (sections: Fixed Income / Equity / Alternates)."""
+    """FY-to-date Realised Profit & Loss sheet.
+
+    One section per asset `category`, matching the Realised Gains page's split and
+    order (Equity / Mutual Funds / Foreign Equity / PMS, then any other present),
+    so every realised row is shown and direct equity is separated from MF — nothing
+    is dropped just because its category wasn't in a hard-coded list.
+    """
     ws = wb.create_sheet(sheet_title)
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = "A3"
@@ -2099,27 +2289,66 @@ def build_realised_sheet(wb, sheet_title: str, label: str, rows: list, as_of: da
                 cell.number_format = MONEY_FMT; cell.alignment = Alignment(horizontal="right")
         state["row"] += 1
 
+    # One section per asset `category` (Equity / Mutual Funds / …), mirroring the
+    # Realised Gains page's split, in the same order. Known categories first, then
+    # any other present category sorted after so nothing is silently skipped.
+    # Falls back to `group` for any legacy row that predates the category tag.
+    def _cat(r):
+        return r.get("category") or r["group"]
+
+    _KNOWN = ["Equity", "Mutual Funds", "Foreign Equity", "PMS"]
+    _present = {_cat(r) for r in rows}
+    categories = [c for c in _KNOWN if c in _present] + sorted(_present - set(_KNOWN))
+
+    # Within a category, split rows by `group` (e.g. Mutual Funds → Fixed Income /
+    # Equity) and show a sub-header per group — but only when the category actually
+    # spans more than one group, so single-group sections (Equity, Foreign Equity,
+    # PMS) stay flat with no redundant sub-header.
+    _GROUP_ORDER = ["Fixed Income", "Equity", "Foreign Equity", "PMS", "Alternates"]
+
+    def _sub_header(text):
+        r = state["row"]
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=NRC)
+        cell = ws.cell(row=r, column=1, value=text)
+        cell.font = SUBSEC_FONT; cell.fill = SUBSEC_FILL
+        cell.alignment = Alignment(horizontal="left", indent=2)
+        state["row"] += 1
+
     any_rows = False
-    for group in ("Fixed Income", "Equity", "Alternates"):
-        grp = [r for r in rows if r["group"] == group]
+    for category in categories:
+        grp = [r for r in rows if _cat(r) == category]
         if not grp:
             continue
         any_rows = True
         r = state["row"]
         ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=NRC)
-        b = ws.cell(row=r, column=1, value=group.upper())
+        b = ws.cell(row=r, column=1, value=category.upper())
         b.font = GOLD_HDR_FONT; b.fill = GOLD_FILL
         b.alignment = Alignment(horizontal="left", indent=1)
         state["row"] += 1
-        for i, rr in enumerate(grp):
-            emit(None, BAND_FILL if i % 2 else WHITE_FILL, BODY_FONT,
-                 [rr["security_name"], rr["purchase_amount"], rr["sale_date"],
-                  rr["sale_amount"], rr["pnl"], rr["return_pct"]])
+
+        present_groups = {(rr.get("group") or category) for rr in grp}
+        subgroups = ([g for g in _GROUP_ORDER if g in present_groups]
+                     + sorted(present_groups - set(_GROUP_ORDER)))
+        show_sub = len(subgroups) > 1
+        band = 0
+        for sg in subgroups:
+            sg_rows = [rr for rr in grp if (rr.get("group") or category) == sg]
+            if not sg_rows:
+                continue
+            if show_sub:
+                _sub_header(sg)
+            for rr in sg_rows:
+                emit(None, BAND_FILL if band % 2 else WHITE_FILL, BODY_FONT,
+                     [rr["security_name"], rr["purchase_amount"], rr["sale_date"],
+                      rr["sale_amount"], rr["pnl"], rr["return_pct"]])
+                band += 1
+
         pa = sum(r["purchase_amount"] for r in grp if r["purchase_amount"] is not None) or None
         sa = sum(r["sale_amount"] for r in grp if r["sale_amount"] is not None) or None
         pl = sum(r["pnl"] for r in grp if r["pnl"] is not None) or None
         ret = (pl / pa) if (pl is not None and pa) else None
-        emit(None, YELLOW_FILL, GTOT_FONT, [f"Total {group}", pa, None, sa, pl, ret])
+        emit(None, YELLOW_FILL, GTOT_FONT, [f"Total {category}", pa, None, sa, pl, ret])
 
     if any_rows:
         pa = sum(r["purchase_amount"] for r in rows if r["purchase_amount"] is not None) or None
@@ -2176,7 +2405,7 @@ def build_master_workbook(conn, as_of: date):
     benchmarks = _fetch_benchmarks(conn, as_of)
 
     def _emit(label, ids):
-        bundle   = _bundle_for(conn, ids)
+        bundle   = _bundle_for(conn, ids, as_of)
         realised = _fetch_realised_gains(conn, ids, as_of)
         rtotal   = sum(r["pnl"] for r in realised if r["pnl"] is not None) if realised else None
         build_weekly_sheet(wb, f"{label} Weekly Report", label, bundle, as_of, benchmarks, rtotal)

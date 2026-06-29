@@ -4230,6 +4230,7 @@ def get_realised_gains(
             ):
                 out.append({
                     "entity":          e["entity_name"],
+                    "category":        r.get("category", r["group"]),
                     "group":           r["group"],
                     "security_name":   r["security_name"],
                     "purchase_amount": r["purchase_amount"],
