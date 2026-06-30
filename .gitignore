@@ -71,6 +71,10 @@ mis-portal/equity/feeds/
 # IBKR Flex statement disk cache — holds account positions + cash; local fallback only
 mis-portal/.ibkr_statements/
 
+# ICICI Prudential PMS scraper — browser profile holds live auth cookies (secrets);
+# local runtime artifact, NEVER commit.
+mis-portal/.icici_pms_browser_profile/
+
 motion-audits/
 mis-portal/.isin_symbol_map.json
 ICICI-PRUDENTIAL-IMAGES
