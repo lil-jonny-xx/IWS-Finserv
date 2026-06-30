@@ -240,7 +240,20 @@ def fetch_cash_balance(entity_code: str) -> Decimal:
     dhan = _dhan_client(entity_code)
     resp = dhan.get_fund_limits() or {}
     if resp.get("status") == "failure":
-        raise RuntimeError(f"[{entity_code}] Dhan fund limits failed: {resp.get('remarks')}")
+        remarks = resp.get("remarks")
+        code = remarks.get("error_code") if isinstance(remarks, dict) else ""
+        msg  = remarks.get("error_message", "") if isinstance(remarks, dict) else str(remarks)
+        # DH-906 "Incorrect request ... cannot be processed" is how Dhan's fund-limit
+        # endpoint reports that funds aren't computed yet — routine before market open
+        # (the cash-side twin of DH-1111 on holdings). The caller isolates the failure
+        # and keeps the last-known cash; the 10:00 IST catch-up sync then refreshes it.
+        # Raise with a clear, non-alarming message so it doesn't read as a hard failure.
+        if code == "DH-906" or "cannot be processed" in str(msg).lower():
+            raise RuntimeError(
+                f"[{entity_code}] Dhan fund limits not ready (DH-906, common pre-market) "
+                f"— keeping last-known cash"
+            )
+        raise RuntimeError(f"[{entity_code}] Dhan fund limits failed: {remarks}")
     data = resp.get("data") or {}
 
     raw = data.get("availabelBalance")
