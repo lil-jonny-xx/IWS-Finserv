@@ -490,13 +490,24 @@ def collect_holdings(page, cfg: PmsConfig) -> list[dict]:
     n = page.locator(PORT_SEL).count()
     logger.info(f"[{cfg.code}] {n} strategy portfolio link(s) found")
 
+    failures = 0
     for idx in range(n):
         try:
             if idx > 0:
-                # Reload the dashboard list before opening the next strategy.
-                page.goto(dashboard_url, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
-                page.wait_for_selector(PORT_SEL, timeout=ACTION_TIMEOUT)
-                page.wait_for_timeout(1200)
+                # Reload the dashboard list before opening the next strategy. The
+                # list is fetched client-side AFTER the document loads, so wait
+                # generously (NAV_TIMEOUT, with one retry) for the Portfolio links
+                # to re-appear — a short wait here is the main cause of a strategy
+                # being missed.
+                for attempt in range(2):
+                    page.goto(dashboard_url, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
+                    try:
+                        page.wait_for_selector(PORT_SEL, state="visible", timeout=NAV_TIMEOUT)
+                        break
+                    except Exception:
+                        if attempt == 1:
+                            raise
+                page.wait_for_timeout(1500)
             page.locator(PORT_SEL).nth(idx).click(timeout=ACTION_TIMEOUT, force=True)
             page.wait_for_timeout(1800)
             # Land on Strategy Details → View Portfolio → Allocation (Allocation is
@@ -509,10 +520,20 @@ def collect_holdings(page, cfg: PmsConfig) -> list[dict]:
                    "Allocation tab", optional=True)
             page.wait_for_timeout(1200)
             _shot(page, f"icici_strategy{idx}_{cfg.prefix}.png")
-            all_rows.extend(_parse_security_allocation(page, cfg, f"strategy[{idx}]"))
+            srows = _parse_security_allocation(page, cfg, f"strategy[{idx}]")
+            if not srows:
+                raise PmsPartialScrape(f"strategy[{idx}] yielded 0 rows")
+            all_rows.extend(srows)
         except Exception as e:
+            failures += 1
             logger.warning(f"[{cfg.code}] strategy[{idx}] parse failed: {e}")
 
+    # A source-scoped full-replace means a partial scrape (one strategy missed)
+    # would overwrite the good snapshot with an undercount. Reject it instead and
+    # keep the previous snapshot — the next run self-heals.
+    if failures:
+        raise PmsPartialScrape(
+            f"{failures}/{n} strategies failed to parse — keeping previous snapshot")
     return all_rows
 
 
