@@ -200,7 +200,10 @@ def fetch_otp(after_ts: int) -> str | None:
     """Poll the central inbox for an ICICI OTP mail newer than `after_ts` and
     return the extracted code, or None on timeout."""
     service = gmail_worker._get_service(GMAIL_TOKEN_CENTRAL)
-    query = f"from:{OTP_FROM_FILTER} after:{after_ts}"
+    # in:anywhere is REQUIRED: the ICICI OTP mail (alternates@icicipruamc.com)
+    # forwards into the collector and Gmail files it under SPAM, which the default
+    # search scope excludes. Without this the poll never sees it.
+    query = f"in:anywhere from:{OTP_FROM_FILTER} after:{after_ts}"
     if OTP_SUBJECT_HINT:
         query += f' subject:"{OTP_SUBJECT_HINT}"'
     deadline = time.time() + OTP_WAIT_S
@@ -329,6 +332,7 @@ def _login(page, cfg: PmsConfig):
     ], cfg.pan.upper(), "PAN")
     page.wait_for_timeout(random.randint(300, 700))
     _click(page, [
+        'input[class*="nextBtnLogin"]', 'input[type="submit"]',
         'button:has-text("Next")', 'button:has-text("NEXT")',
         'button[type="submit"]',
     ], "PAN Next")
@@ -343,6 +347,7 @@ def _login(page, cfg: PmsConfig):
     ], cfg.password, "password")
     page.wait_for_timeout(random.randint(300, 700))
     _click(page, [
+        'input[class*="nextBtnLogin"]', 'input[type="submit"]',
         'button:has-text("Next")', 'button:has-text("NEXT")',
         'button:has-text("Login")', 'button[type="submit"]',
     ], "password Next")
@@ -358,7 +363,8 @@ def _login(page, cfg: PmsConfig):
     otp_request_ts = int(time.time())
     _click(page, [
         'button:has-text("Generate OTP")', 'button:has-text("GENERATE OTP")',
-        'button:has-text("Send OTP")', 'button[type="submit"]',
+        'button:has-text("Send OTP")',
+        'input[type="submit"]', 'button[type="submit"]',
     ], "Generate OTP")
     page.wait_for_timeout(random.randint(1500, 2500))
 
@@ -369,25 +375,32 @@ def _login(page, cfg: PmsConfig):
             f"[{cfg.code}] No OTP received in the central inbox — confirm the "
             f"registered email autoforwards ICICI OTP mails to the collector.")
 
-    # OTP entry: a single box or 4-8 separate digit inputs.
-    if not _fill(page, [
-        'input[formcontrolname="otp"]',
-        'input[placeholder*="OTP" i]',
+    # OTP entry: ICICI renders 6 separate single-digit boxes (class OTP_inputOtp)
+    # and AUTO-SUBMITS on the final keystroke — there is no Verify/Submit button.
+    # Type with real key events (.press) so the component's auto-advance/submit
+    # handler fires; .fill() would set the value without triggering it. A single
+    # combined OTP box is handled as a fallback for other layouts.
+    _shot(page, f"icici_otpentry_{cfg.prefix}.png")
+    boxes = page.locator('input[class*="OTP_inputOtp"], input[maxlength="1"]')
+    nb = boxes.count()
+    if nb >= len(code):
+        for i, ch in enumerate(code):
+            b = boxes.nth(i)
+            b.click()
+            b.press(ch)
+            page.wait_for_timeout(random.randint(80, 180))
+    elif not _fill(page, [
+        'input[formcontrolname="otp"]', 'input[placeholder*="OTP" i]',
         'input[name*="otp" i]',
     ], code, "OTP single box", optional=True):
-        boxes = page.locator('input[maxlength="1"]')
-        n = boxes.count()
-        if n and n >= len(code):
-            for i, ch in enumerate(code):
-                boxes.nth(i).fill(ch)
-        else:
-            raise RuntimeError(f"[{cfg.code}] Could not locate OTP input field(s)")
-    page.wait_for_timeout(random.randint(300, 700))
+        raise RuntimeError(f"[{cfg.code}] Could not locate OTP input field(s)")
+    page.wait_for_timeout(random.randint(700, 1200))
+    # Most layouts auto-submit; click a verify/submit button only if one exists.
     _click(page, [
         'button:has-text("Verify")', 'button:has-text("Submit")',
         'button:has-text("Login")', 'button:has-text("Confirm")',
-        'button[type="submit"]',
-    ], "OTP submit")
+        'input[type="submit"]',
+    ], "OTP submit", optional=True)
 
     # Logged in when the Dashboard chrome appears.
     try:
@@ -463,47 +476,42 @@ def collect_holdings(page, cfg: PmsConfig) -> list[dict]:
     """From the Dashboard, open each PMS strategy's portfolio and aggregate the
     security-allocation rows across strategies into one entity holdings set."""
     all_rows: list[dict] = []
-    _click(page, ['a:has-text("Dashboard")', 'span:has-text("Dashboard")'],
-           "Dashboard", optional=True)
+    # We're on the dashboard right after login. Capture its URL so we can return
+    # to the strategy list reliably between strategies — drilling into a strategy's
+    # tabs makes SPA back-navigation flaky, so we just reload the dashboard.
     page.wait_for_timeout(1500)
+    dashboard_url = page.url
 
-    # Ensure the PMS tab (not AIF) is active on the strategy list.
-    _click(page, ['button:has-text("PMS")', 'a:has-text("PMS")'], "PMS tab", optional=True)
-    page.wait_for_timeout(800)
-
-    # Each strategy row exposes a "Portfolio" action. Count them up-front because
-    # navigating into a strategy re-renders the list.
-    portfolio_btns = page.locator(
-        'button:has-text("Portfolio"), a:has-text("Portfolio")')
-    n = portfolio_btns.count()
-    logger.info(f"[{cfg.code}] {n} strategy portfolio link(s) found")
-    if n == 0:
+    PORT_SEL = 'button:has-text("Portfolio"), a:has-text("Portfolio")'
+    try:
+        page.wait_for_selector(PORT_SEL, timeout=ACTION_TIMEOUT)
+    except Exception:
         _shot(page, f"icici_nostrategies_{cfg.prefix}.png")
+    n = page.locator(PORT_SEL).count()
+    logger.info(f"[{cfg.code}] {n} strategy portfolio link(s) found")
 
     for idx in range(n):
         try:
-            page.locator('button:has-text("Portfolio"), a:has-text("Portfolio")'
-                         ).nth(idx).click(timeout=ACTION_TIMEOUT, force=True)
+            if idx > 0:
+                # Reload the dashboard list before opening the next strategy.
+                page.goto(dashboard_url, timeout=NAV_TIMEOUT, wait_until="domcontentloaded")
+                page.wait_for_selector(PORT_SEL, timeout=ACTION_TIMEOUT)
+                page.wait_for_timeout(1200)
+            page.locator(PORT_SEL).nth(idx).click(timeout=ACTION_TIMEOUT, force=True)
             page.wait_for_timeout(1800)
-            # Land on Strategy Details → View Portfolio → Allocation.
+            # Land on Strategy Details → View Portfolio → Allocation (Allocation is
+            # the default tab, so these clicks are best-effort).
             _click(page, ['button:has-text("View Portfolio")',
                           'a:has-text("View Portfolio")'], "View Portfolio", optional=True)
             page.wait_for_timeout(1000)
-            _click(page, ['button:has-text("Allocation")', 'a:has-text("Allocation")',
-                          'div:has-text("Allocation")'], "Allocation tab", optional=True)
+            _click(page, ['[role="tab"]:has-text("Allocation")',
+                          'a:has-text("Allocation")', 'button:has-text("Allocation")'],
+                   "Allocation tab", optional=True)
             page.wait_for_timeout(1200)
             _shot(page, f"icici_strategy{idx}_{cfg.prefix}.png")
             all_rows.extend(_parse_security_allocation(page, cfg, f"strategy[{idx}]"))
         except Exception as e:
             logger.warning(f"[{cfg.code}] strategy[{idx}] parse failed: {e}")
-        finally:
-            # Back to the dashboard list for the next strategy.
-            _click(page, ['a:has-text("Dashboard")', 'span:has-text("Dashboard")',
-                          'button:has-text("Back")'], "back to Dashboard", optional=True)
-            page.wait_for_timeout(1500)
-            _click(page, ['button:has-text("PMS")', 'a:has-text("PMS")'],
-                   "PMS tab", optional=True)
-            page.wait_for_timeout(600)
 
     return all_rows
 
@@ -519,6 +527,36 @@ def _validate(rows: list[dict]):
         raise PmsPartialScrape(f"non-positive total market value ({total})")
 
 
+def _aggregate_rows(rows: list[dict]) -> list[dict]:
+    """Merge rows that share (holding_type, security_name) — the pms_holding
+    unique key. Each strategy carries its own 'Cash' line, and a security may be
+    held in more than one strategy, so we sum value/cost/qty into one entity-level
+    row. avg_cost is recomputed from the merged cost/qty when both are present."""
+    from collections import OrderedDict
+
+    def _add(a, b):
+        if a is None and b is None:
+            return None
+        return (a or Decimal(0)) + (b or Decimal(0))
+
+    merged: "OrderedDict[tuple, dict]" = OrderedDict()
+    for r in rows:
+        key = (r["holding_type"], r["security_name"])
+        if key not in merged:
+            merged[key] = dict(r)
+            continue
+        m = merged[key]
+        m["market_value"] = _add(m.get("market_value"), r.get("market_value"))
+        m["cost"]         = _add(m.get("cost"), r.get("cost"))
+        m["quantity"]     = _add(m.get("quantity"), r.get("quantity"))
+        if not m.get("isin"):
+            m["isin"] = r.get("isin")
+    for m in merged.values():
+        if m.get("cost") and m.get("quantity"):
+            m["avg_cost"] = m["cost"] / m["quantity"]
+    return list(merged.values())
+
+
 def upsert(conn, entity_id: int, rows: list[dict], as_on: date | None = None) -> int:
     """Source-scoped full-replace of this entity's ICICI PMS holdings.
 
@@ -527,6 +565,7 @@ def upsert(conn, entity_id: int, rows: list[dict], as_on: date | None = None) ->
     the combined total across strategies so they sum to 100% on the PMS page.
     """
     as_on = as_on or date.today()
+    rows = _aggregate_rows(rows)   # collapse duplicate (holding_type, security_name)
     total = sum((r["market_value"] for r in rows), Decimal(0)) or Decimal(1)
     cur = conn.cursor()
     cur.execute("DELETE FROM pms_holding WHERE entity_id = %s AND source = %s",
