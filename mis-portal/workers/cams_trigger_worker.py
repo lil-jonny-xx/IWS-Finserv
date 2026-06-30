@@ -16,6 +16,8 @@ Register via CAMS GoGreen service or CAMServ chatbot before running automation.
 import logging
 import os
 import random
+import shutil
+import tempfile
 import time
 from datetime import date
 from pathlib import Path
@@ -56,20 +58,32 @@ class CamsRateLimited(Exception):
     unregistered email (not retryable)."""
 
 
-def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
+def trigger_cas_request(pan_number: str, email: str, pdf_password: str,
+                        fresh_profile: bool = False) -> bool:
     """
     Open CAMS CAS page, fill the form, and submit.
     Returns True on detected success, False on failure.
     The pdf_password is the password used to protect the emailed PDF.
+
+    fresh_profile=True launches from a throwaway browser profile instead of the
+    persistent one. Used on retries: a whole-form reset means the persistent
+    profile's reCAPTCHA v3 trust has degraded over the run, so re-submitting from
+    the same profile would just hit the same reset. A clean profile gives the
+    retry an unpoisoned session to be scored against.
     """
     logger.info("Triggering CAMS CAS request")
 
-    BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    for stale in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
-        p = BROWSER_PROFILE_DIR / stale
-        if p.exists() or p.is_symlink():
-            p.unlink()
-            logger.warning("Removed stale browser lock: %s", stale)
+    if fresh_profile:
+        profile_dir = Path(tempfile.mkdtemp(prefix="cams_profile_"))
+        logger.info("Using a fresh throwaway browser profile: %s", profile_dir)
+    else:
+        profile_dir = BROWSER_PROFILE_DIR
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        for stale in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            p = profile_dir / stale
+            if p.exists() or p.is_symlink():
+                p.unlink()
+                logger.warning("Removed stale browser lock: %s", stale)
 
     display = Display(visible=False, size=(1366, 768))
     display.start()
@@ -78,7 +92,7 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
     try:
         with sync_playwright() as pw:
             ctx = pw.chromium.launch_persistent_context(
-                user_data_dir=str(BROWSER_PROFILE_DIR),
+                user_data_dir=str(profile_dir),
                 headless=False,
                 args=[
                     "--disable-blink-features=AutomationControlled",
@@ -244,6 +258,8 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str) -> bool:
     finally:
         display.stop()
         logger.debug("Xvfb display stopped")
+        if fresh_profile:
+            shutil.rmtree(profile_dir, ignore_errors=True)
 
 
 def trigger_cas_request_with_retry(
@@ -262,7 +278,13 @@ def trigger_cas_request_with_retry(
     """
     for attempt in range(1, max_attempts + 1):
         try:
-            return trigger_cas_request(pan_number, email, pdf_password)
+            # First attempt uses the persistent profile (accumulated reCAPTCHA
+            # trust); retries use a throwaway profile to escape the degraded
+            # session that triggered the rate-limit / form reset.
+            return trigger_cas_request(
+                pan_number, email, pdf_password,
+                fresh_profile=(attempt > 1),
+            )
         except CamsRateLimited:
             if attempt >= max_attempts:
                 logger.error(
@@ -472,30 +494,46 @@ def _check_submit_result(page) -> bool:
             return True
 
         # Form-reset detection: CAMS navigates back to a blank form on certain
-        # submission failures (invalid password chars, session issues). The fields
-        # are cleared and Angular shows inline "required" validation errors.
-        # This is a definitive hard failure — do NOT treat as submitted.
-        form_reset_signals = [
+        # submission failures. Two distinct causes, handled differently:
+        #
+        #  • Whole-form reset — the email field is cleared too ("please enter the
+        #    email" / "email is required"). The form we filled correctly was wiped:
+        #    the hallmark of a transient reCAPTCHA/session reset, which accumulates
+        #    over a long run (entities triggered late score worse on reCAPTCHA v3).
+        #    Retryable — raise CamsRateLimited so the wrapper backs off and
+        #    re-submits on a fresh browser profile.
+        #
+        #  • Password-only rejection — password signals WITHOUT any email-required
+        #    signal: the other fields kept their values and only the password was
+        #    flagged, i.e. a genuinely bad password. _random_pdf_password generates
+        #    a CAMS-compliant password (≥2 digits, alnum only) so this should never
+        #    happen; if it does, retrying won't help — hard failure.
+        email_reset_signals = [
             "please enter the email",
             "email is required",
+        ]
+        password_reset_signals = [
             "password is required",
             "confirm password is required",
             "password should contain atleast",
             "password may contain only",
         ]
-        matched = [s for s in form_reset_signals if s in content]
+        matched = [s for s in (email_reset_signals + password_reset_signals)
+                   if s in content]
         if matched:
-            # Report the ACTUAL validation message(s) the page showed. The password
-            # is generated CAMS-compliant (_random_pdf_password: ≥2 digits, alnum
-            # only), so a password-specific signal is rare — an email/required-field
-            # reset usually means a transient reCAPTCHA/session reset, which the
-            # retry wrapper backs off and re-attempts.
-            pw_related = any("password" in s for s in matched)
-            cause = ("invalid PDF password" if pw_related
-                     else "transient reCAPTCHA/session reset (fields cleared)")
+            whole_form_reset = any(s in content for s in email_reset_signals)
+            if whole_form_reset:
+                logger.error(
+                    f"CAMS form was reset after Submit — validation errors {matched}. "
+                    "Whole form cleared: transient reCAPTCHA/session reset. "
+                    "Will back off and retry on a fresh browser profile."
+                )
+                raise CamsRateLimited(
+                    "CAMS form reset (transient reCAPTCHA/session reset)"
+                )
             logger.error(
                 f"CAMS form was reset after Submit — validation errors {matched}. "
-                f"Likely cause: {cause}. Hard failure — will not wait for PDF."
+                "Likely cause: invalid PDF password. Hard failure — will not wait for PDF."
             )
             return False
 
