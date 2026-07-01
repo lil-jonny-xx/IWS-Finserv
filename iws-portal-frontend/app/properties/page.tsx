@@ -137,6 +137,7 @@ const NAV = [
   { href: '/manual-data', label: 'Manual Data' },
   { href: '/reports', label: 'Reports' },
   { href: '/assistant', label: 'Assistant' },
+  { href: '/account', label: 'Account' },
 ];
 
 export default function PropertiesPage() {

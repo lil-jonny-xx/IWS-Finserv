@@ -34,6 +34,7 @@ const NAV = [
   { href: '/manual-data', label: 'Manual Data' },
   { href: '/reports', label: 'Reports' },
   { href: '/assistant', label: 'Assistant', active: true },
+  { href: '/account', label: 'Account' },
 ];
 
 const EMPTY_STREAM: StreamingState = {

@@ -117,6 +117,11 @@ export default function LoginPage() {
             {submitting ? 'Signing in...' : 'Sign in'}
           </button>
         </form>
+        <p className="text-center mt-4">
+          <a href="/forgot-password" className="text-xs text-dim hover:text-ink underline underline-offset-2 transition-colors">
+            Forgot password?
+          </a>
+        </p>
         <p className="text-center text-xs text-ghost mt-6">
           IWS Finserv &copy; {new Date().getFullYear()}
         </p>

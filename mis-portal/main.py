@@ -369,6 +369,180 @@ def login(request: Request, login_request: LoginRequest, response: Response):
     """Login - 5 attempts per minute per IP."""
     return _login_impl(request, login_request, response)
 
+# ---------------------------------------------------------------------------
+# Password management — self-service change + admin-mediated reset (no email)
+# ---------------------------------------------------------------------------
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=72)
+    new_password: str = Field(min_length=8, max_length=72)
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class AdminResetPasswordRequest(BaseModel):
+    email: EmailStr
+    new_password: str = Field(min_length=8, max_length=72)
+
+
+def _hash_password(pw: str) -> str:
+    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
+
+
+def _validate_password_strength(pw: str) -> None:
+    if not (8 <= len(pw) <= 72):
+        raise HTTPException(status_code=400, detail="Password must be 8–72 characters.")
+    if not (any(c.isupper() for c in pw) and any(c.islower() for c in pw) and any(c.isdigit() for c in pw)):
+        raise HTTPException(status_code=400,
+                            detail="Password must include an uppercase letter, a lowercase letter, and a digit.")
+
+
+_GENERIC_FORGOT_MSG = ("If an account exists for that email, your administrator has been "
+                       "notified and will reset the password.")
+
+
+@app.post("/api/v1/auth/change-password")
+def change_password(request: Request, body: ChangePasswordRequest,
+                    authorization: Optional[str] = Header(None)):
+    """Authenticated self-service password change: verify the current password, set a new one."""
+    payload = _require_auth(request, authorization)
+    _validate_password_strength(body.new_password)
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, password_hash FROM users WHERE email = %s AND is_active = TRUE",
+                    (payload["email"],))
+        row = cur.fetchone()
+        if not row or not verify_password(body.current_password, row["password_hash"]):
+            raise HTTPException(status_code=401, detail="Current password is incorrect.")
+        if verify_password(body.new_password, row["password_hash"]):
+            raise HTTPException(status_code=400,
+                                detail="New password must be different from the current one.")
+        cur.execute("UPDATE users SET password_hash = %s WHERE id = %s",
+                    (_hash_password(body.new_password), row["id"]))
+        write_audit_log(conn, row["id"], "CHANGE_PASSWORD", "users", row["id"],
+                        f"Password changed by {payload['email']}")
+        conn.commit()
+        return {"message": "Password changed successfully."}
+    except HTTPException:
+        conn.rollback(); raise
+    except Exception as e:
+        conn.rollback(); logger.error(f"change-password error: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/auth/forgot-password")
+@limiter.limit("5/minute")
+def forgot_password(request: Request, body: ForgotPasswordRequest):
+    """Public: record a reset request for an admin to action. Always returns a generic
+    message so it never reveals whether an email is registered."""
+    email = body.email.lower()
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM users WHERE email = %s AND is_active = TRUE", (email,))
+        row = cur.fetchone()
+        if row:
+            # Don't pile up duplicates — one pending request per user is enough.
+            cur.execute("SELECT id FROM password_reset_request WHERE user_id = %s AND status = 'pending'",
+                        (row["id"],))
+            if not cur.fetchone():
+                cur.execute("INSERT INTO password_reset_request (email, user_id, status) "
+                            "VALUES (%s, %s, 'pending')", (email, row["id"]))
+                write_audit_log(conn, row["id"], "FORGOT_PASSWORD_REQUEST", "users", row["id"],
+                                f"Reset requested for {email}")
+                conn.commit()
+        return {"message": _GENERIC_FORGOT_MSG}
+    except Exception as e:
+        conn.rollback(); logger.error(f"forgot-password error: {e}")
+        return {"message": _GENERIC_FORGOT_MSG}   # never leak errors to the client
+    finally:
+        release_db_connection(conn)
+
+
+@app.get("/api/v1/auth/users")
+def list_users(request: Request, authorization: Optional[str] = Header(None)):
+    """Admin: active login accounts (for the reset dropdown). No password data."""
+    payload = _require_auth(request, authorization)
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+        cur.execute("SELECT email, full_name, role FROM users WHERE is_active = TRUE "
+                    "ORDER BY role DESC, email")
+        return {"users": [dict(r) for r in cur.fetchall()]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"list-users error: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.get("/api/v1/auth/reset-requests")
+def list_reset_requests(request: Request, authorization: Optional[str] = Header(None)):
+    """Admin: pending 'forgot password' requests."""
+    payload = _require_auth(request, authorization)
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+        cur.execute("""SELECT r.id, r.email, r.requested_at, u.full_name
+                       FROM password_reset_request r LEFT JOIN users u ON u.id = r.user_id
+                       WHERE r.status = 'pending' ORDER BY r.requested_at DESC""")
+        return {"requests": [{"id": r["id"], "email": r["email"], "full_name": r["full_name"],
+                              "requested_at": r["requested_at"].isoformat() if r["requested_at"] else None}
+                             for r in cur.fetchall()]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"reset-requests error: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/auth/admin-reset-password")
+def admin_reset_password(request: Request, body: AdminResetPasswordRequest,
+                         authorization: Optional[str] = Header(None)):
+    """Admin: set a new password for any active user and resolve their pending requests."""
+    payload = _require_auth(request, authorization)
+    _validate_password_strength(body.new_password)
+    target = body.email.lower()
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        if _live_role(cur, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin access required")
+        cur.execute("SELECT id FROM users WHERE email = %s AND is_active = TRUE", (target,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="No active user with that email.")
+        cur.execute("UPDATE users SET password_hash = %s, failed_attempts = 0, locked_until = NULL "
+                    "WHERE id = %s", (_hash_password(body.new_password), row["id"]))
+        cur.execute("UPDATE password_reset_request SET status = 'resolved', resolved_at = NOW(), "
+                    "resolved_by = %s WHERE user_id = %s AND status = 'pending'",
+                    (payload.get("user_id"), row["id"]))
+        write_audit_log(conn, payload.get("user_id"), "ADMIN_RESET_PASSWORD", "users", row["id"],
+                        f"Admin {payload['email']} reset password for {target}")
+        conn.commit()
+        return {"message": f"Password reset for {target}."}
+    except HTTPException:
+        conn.rollback(); raise
+    except Exception as e:
+        conn.rollback(); logger.error(f"admin-reset-password error: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
 @app.post("/api/v1/auth/logout")
 def logout(request: Request, response: Response, authorization: Optional[str] = Header(None)):
     """Logout - revokes JWT token and clears cookie."""

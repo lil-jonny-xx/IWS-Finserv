@@ -156,6 +156,7 @@ export default function ForeignEquityPage() {
               { href: '/manual-data', label: 'Manual Data' },
               { href: '/reports', label: 'Reports' },
               { href: '/assistant', label: 'Assistant' },
+              { href: '/account', label: 'Account' },
             ].map(({ href, label, active }) => (
               <a
                 key={href}
