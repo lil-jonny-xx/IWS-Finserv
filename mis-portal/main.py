@@ -1443,6 +1443,22 @@ def get_foreign_equity_holdings(
             cash_params,
         )
         cash_rows = cur.fetchall()
+
+        # Per-currency breakdown behind each broker's consolidated cash (e.g. SDR's IBKR
+        # cash split into AED / GBP margin / USD). Additive detail — the totals above still
+        # come from the single broker_cash row, so nothing double-counts.
+        cur.execute(
+            f"""
+            SELECT d.entity_id, e.entity_name, d.broker, d.currency,
+                   d.balance_native, d.balance_inr, d.fx_rate, d.updated_at
+            FROM   broker_cash_currency d
+            JOIN   entity e ON e.id = d.entity_id
+            WHERE  {" AND ".join(c.replace("bc.", "d.") for c in cash_conditions)}
+            ORDER BY e.entity_name, d.broker, ABS(d.balance_inr) DESC
+            """,
+            cash_params,
+        )
+        ccy_rows  = cur.fetchall()
         fx_rates  = _latest_fx_rates(conn)
         cur.close()
 
@@ -1487,6 +1503,19 @@ def get_foreign_equity_holdings(
                     "updated_at":  c["updated_at"].isoformat() if c["updated_at"] else None,
                 }
                 for c in cash_rows
+            ],
+            "cash_currency_breakdown": [
+                {
+                    "entity_id":      c["entity_id"],
+                    "entity_name":    c["entity_name"],
+                    "broker":         c["broker"],
+                    "currency":       c["currency"],
+                    "balance_native": float(c["balance_native"]) if c["balance_native"] is not None else None,
+                    "balance":        float(c["balance_inr"] or 0),
+                    "fx_rate":        float(c["fx_rate"]) if c["fx_rate"] is not None else None,
+                    "updated_at":     c["updated_at"].isoformat() if c["updated_at"] else None,
+                }
+                for c in ccy_rows
             ],
         }
 

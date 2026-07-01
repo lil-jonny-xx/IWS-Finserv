@@ -402,6 +402,65 @@ def _cash_from_root(root: ET.Element) -> Decimal:
     return total
 
 
+def _cash_by_ccy_from_root(root: ET.Element) -> "dict[str, Decimal]":
+    """Ending cash per NATIVE currency (AED / USD / GBP …) from the Cash Report.
+
+    The report carries two levels of detail per (sub)account: levelOfDetail='Currency'
+    rows hold the native per-currency balances, while 'BaseCurrency' rows hold the
+    BASE_SUMMARY rollup that _cash_from_root sums. We keep ONLY the 'Currency' rows so
+    the per-currency breakdown never double-counts the base rollup, and we skip zero
+    balances (a currency swept to 0 simply isn't reported)."""
+    out: "dict[str, Decimal]" = {}
+    for el in root.iter("CashReportCurrency"):
+        ccy = el.attrib.get("currency")
+        if not ccy or ccy == "BASE_SUMMARY":
+            continue
+        if el.attrib.get("levelOfDetail") != "Currency":
+            continue
+        try:
+            amt = Decimal(str(el.attrib.get("endingCash") or "0"))
+        except Exception:
+            continue
+        if amt == 0:
+            continue
+        out[ccy] = out.get(ccy, Decimal("0")) + amt
+    return out
+
+
+def cash_by_currency(entity_code: str) -> "dict[str, Decimal]":
+    """Per-currency ending cash for an entity, summed across all its logins.
+
+    Reuses the statement already fetched by fetch_all/fetch_positions_and_cash (the
+    in-process + disk cache), so this adds NO extra Flex request when called right
+    after the daily fetch.
+
+    Not every login's Flex query has the Cash Report's per-currency ('Currency') level
+    of detail enabled — some emit only the 'BaseCurrency' rollup (BASE_SUMMARY). For
+    such a login we fall back to attributing its base-summary total to that login's own
+    base currency (IBKR_<prefix>_BASE_CURRENCY, default USD), so the breakdown still sums
+    to the same figure as the consolidated broker_cash row. Logins that DO emit per-
+    currency rows use them verbatim."""
+    out: "dict[str, Decimal]" = {}
+    for p in _account_prefixes(entity_code):
+        try:
+            root = _fetch_statement_xml(p)
+        except Exception as e:
+            logger.error(f"[{p}] IBKR per-currency cash read failed — {e}")
+            continue
+        per = _cash_by_ccy_from_root(root)
+        if not per:
+            # No per-currency detail in this login's query → book the base total under
+            # the login's base currency (exact for single-currency accounts).
+            base_total = _cash_from_root(root)
+            if base_total != 0:
+                ccy = (_get(p, "BASE_CURRENCY", required=False, default=CURRENCY)
+                       or CURRENCY).upper()
+                per = {ccy: base_total}
+        for ccy, amt in per.items():
+            out[ccy] = out.get(ccy, Decimal("0")) + amt
+    return out
+
+
 def _trades_from_root(root: ET.Element) -> list[dict]:
     return [el.attrib for el in root.iter("Trade")]
 

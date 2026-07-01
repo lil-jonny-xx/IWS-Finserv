@@ -116,6 +116,98 @@ def upsert_cash(conn, entity_id: int, entity_code: str, bal: Decimal, commit: bo
     return inr_bal
 
 
+def sync_cash_currencies(conn, entity_id: int, entity_code: str, commit: bool):
+    """Persist the per-currency cash breakdown behind the consolidated broker_cash row.
+
+    Reads the native per-currency balances from the SAME statement fetch_all just pulled
+    (ibkr.cash_by_currency reuses the cache — no extra Flex hit), converts each to INR,
+    upserts one broker_cash_currency row per currency, and DELETES any currency for this
+    (entity, ibkr) that is no longer present — so a swept / closed currency drops off the
+    portal. Called only on a FULL successful fetch (see main's partial guard)."""
+    breakdown = ibkr.cash_by_currency(entity_code)   # {ccy: native Decimal}
+    today = date.today()
+    kept: list[str] = []
+    for ccy, native in sorted(breakdown.items(), key=lambda kv: -abs(kv[1])):
+        ccy = ccy.upper()
+        if ccy == "INR":
+            inr, rate = native, Decimal("1")
+        else:
+            rate = fx.get_rate(conn, ccy, today)
+            if rate is None:
+                logger.warning(f"  [{entity_code}/ibkr] {ccy} breakdown skip — no FX rate")
+                continue
+            inr = (native * rate).quantize(TWO, ROUND_HALF_UP)
+        kept.append(ccy)
+        logger.info(f"    [{entity_code}/ibkr] {ccy} {native} → ₹{inr}")
+        if commit:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO broker_cash_currency
+                    (entity_id, broker, currency, balance_native, balance_inr, fx_rate,
+                     as_of_date, updated_at)
+                VALUES (%s, 'ibkr', %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (entity_id, broker, currency) DO UPDATE SET
+                    balance_native = EXCLUDED.balance_native,
+                    balance_inr    = EXCLUDED.balance_inr,
+                    fx_rate        = EXCLUDED.fx_rate,
+                    as_of_date     = EXCLUDED.as_of_date,
+                    updated_at     = NOW()
+                """,
+                (entity_id, ccy, float(native), float(inr), float(rate), today),
+            )
+            conn.commit(); cur.close()
+
+    # Snapshot semantics: drop any currency this entity no longer holds.
+    if commit:
+        cur = conn.cursor()
+        if kept:
+            cur.execute(
+                "DELETE FROM broker_cash_currency "
+                "WHERE entity_id=%s AND broker='ibkr' AND currency <> ALL(%s) RETURNING currency",
+                (entity_id, kept),
+            )
+        else:
+            cur.execute(
+                "DELETE FROM broker_cash_currency "
+                "WHERE entity_id=%s AND broker='ibkr' RETURNING currency",
+                (entity_id,),
+            )
+        dropped = [r["currency"] for r in cur.fetchall()]
+        conn.commit(); cur.close()
+        if dropped:
+            logger.info(f"  [{entity_code}/ibkr] dropped stale cash currencies: {dropped}")
+    logger.info(f"  [{entity_code}/ibkr] cash currencies: {kept or 'none'}")
+
+
+def prune_stale_holdings(conn, entity_id: int, entity_code: str, snap: date, commit: bool):
+    """Remove IBKR holdings that were NOT in today's snapshot (i.e. sold / closed).
+
+    sync_entity_broker upserts every current position with as_of_date = snap, but never
+    deletes positions that vanished from the statement, so a sold-off stock (e.g. URNU)
+    lingers. On a FULL successful fetch we delete any ibkr row for this entity whose
+    as_of_date is older than today's snapshot — but ONLY if the snapshot actually wrote
+    rows today, so a zero-holding fetch never wipes the last good set by mistake."""
+    if not commit:
+        return
+    cur = conn.cursor()
+    cur.execute(
+        """
+        DELETE FROM foreign_equity_holding h
+        WHERE h.entity_id=%s AND h.broker='ibkr' AND h.as_of_date < %s
+          AND EXISTS (SELECT 1 FROM foreign_equity_holding h2
+                      WHERE h2.entity_id=h.entity_id AND h2.broker='ibkr'
+                        AND h2.as_of_date=%s)
+        RETURNING symbol
+        """,
+        (entity_id, snap, snap),
+    )
+    gone = [r["symbol"] for r in cur.fetchall()]
+    conn.commit(); cur.close()
+    if gone:
+        logger.info(f"  [{entity_code}/ibkr] pruned sold/closed holdings: {gone}")
+
+
 def upsert_trades(conn, entity_id: int, entity_code: str, trades: list, commit: bool) -> int:
     """Parse the statement's Trade rows into ledger rows and upsert them into
     equity_trade_ledger (deduped by IBKR tradeID). Done BEFORE the holdings sync so
@@ -173,6 +265,7 @@ def main():
         if not args.commit:
             upsert_trades(conn, eid, code, trades, commit=False)
             upsert_cash(conn, eid, code, cash, commit=False)   # logs the would-be INR value
+            sync_cash_currencies(conn, eid, code, commit=False)  # logs the per-currency split
             continue
 
         # Trades FIRST: refresh the ledger so the holdings sync's ledger_metrics() picks up
@@ -184,15 +277,19 @@ def main():
 
         # Holdings upsert reuses the full sync path (FX, ledger metrics, history snapshot)
         # but is fed the positions we ALREADY pulled — no second fetch, no extra Flex hit.
+        snap = date.today()
         try:
-            n = sync_entity_broker(conn, eid, code, ibkr, "ibkr", date.today(),
+            n = sync_entity_broker(conn, eid, code, ibkr, "ibkr", snap,
                                    foreign=True, raw=positions)
             logger.info(f"  [{code}/ibkr] holdings upserted: {n}")
+            # Snapshot semantics: drop holdings that vanished from the statement (sold).
+            prune_stale_holdings(conn, eid, code, snap, commit=True)
         except Exception as e:
             logger.error(f"  [{code}/ibkr] HOLDINGS upsert failed — {e}")
         # Cash comes straight from the statement we already parsed — no extra call.
         try:
             upsert_cash(conn, eid, code, cash, commit=True)
+            sync_cash_currencies(conn, eid, code, commit=True)
         except Exception as e:
             logger.error(f"  [{code}/ibkr] CASH upsert failed — {e}")
 

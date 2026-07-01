@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import ForeignEquityTable, { type EquityHoldingRow, type EquityTotals } from './components/ForeignEquityTable';
+import ForeignEquityTable, { type EquityHoldingRow, type EquityTotals, type CashCurrencyRow } from './components/ForeignEquityTable';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -17,6 +17,7 @@ interface ForeignEquityResponse {
   fx_rates: Record<string, number>;
   as_of_date: string | null;
   last_updated: string | null;
+  cash_currency_breakdown?: CashCurrencyRow[];
 }
 
 function EntitySwitcher({
@@ -212,6 +213,7 @@ export default function ForeignEquityPage() {
               fxRates={data.fx_rates}
               showEntityCol={showEntityCol}
               lastUpdated={data.last_updated}
+              cashByCurrency={data.cash_currency_breakdown ?? []}
             />
           </div>
         )}

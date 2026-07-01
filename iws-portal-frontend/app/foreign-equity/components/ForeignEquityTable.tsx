@@ -43,12 +43,24 @@ export interface EquityTotals {
   value_plus_cash?: number;
 }
 
+export interface CashCurrencyRow {
+  entity_id: number;
+  entity_name?: string;
+  broker: string;
+  currency: string;
+  balance_native?: number | null;
+  balance: number;          // INR
+  fx_rate?: number | null;
+  updated_at?: string | null;
+}
+
 interface Props {
   holdings: EquityHoldingRow[];
   totals: EquityTotals;
   fxRates: Record<string, number>;
   showEntityCol: boolean;
   lastUpdated?: string | null;
+  cashByCurrency?: CashCurrencyRow[];
 }
 
 // ── currency ────────────────────────────────────────────────────────────────
@@ -155,7 +167,7 @@ function BrokerBadge({ broker }: { broker: string }) {
 
 // ── main component ────────────────────────────────────────────────────────────
 
-export default function ForeignEquityTable({ holdings, totals, fxRates, showEntityCol, lastUpdated }: Props) {
+export default function ForeignEquityTable({ holdings, totals, fxRates, showEntityCol, lastUpdated, cashByCurrency = [] }: Props) {
   const [sortKey, setSortKey]           = useState<SortKey>('current_market_value');
   const [sortDir, setSortDir]           = useState<SortDir>('desc');
   const [search, setSearch]             = useState('');
@@ -283,6 +295,32 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
               <p className="text-sm font-semibold text-ink tabular-nums">{fmtMoney(convTotal(totals.cash_balance), totalsCcy)}</p>
             </div>
           )}
+          {cashByCurrency.length > 0 && (() => {
+            // Sum native balances per currency across the entities in scope. A negative
+            // (e.g. a GBP margin loan funding a GBP ETF) shows in the peril colour.
+            const agg = new Map<string, number>();
+            for (const c of cashByCurrency)
+              agg.set(c.currency, (agg.get(c.currency) ?? 0) + (c.balance_native ?? 0));
+            const items = [...agg.entries()].filter(([, v]) => v !== 0)
+              .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+            if (!items.length) return null;
+            return (
+              <div className="basis-full">
+                <p className="text-xs text-ghost mb-1">Cash by currency</p>
+                <div className="flex flex-wrap gap-2">
+                  {items.map(([ccy, v]) => (
+                    <span key={ccy} className="inline-flex items-baseline gap-1.5 rounded border border-rule bg-page px-2 py-1">
+                      <span className="text-[10px] font-medium text-ghost">{ccy}</span>
+                      <span className={`text-xs font-semibold tabular-nums ${v < 0 ? '' : 'text-ink'}`}
+                        style={v < 0 ? { color: 'var(--peril)' } : undefined}>
+                        {fmtMoney(v, ccy)}
+                      </span>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            );
+          })()}
           {totals.total_pnl_inception != null && totals.total_pnl_inception !== 0 && (
             <div>
               <p className="text-xs text-ghost mb-0.5">P&amp;L (Inception)</p>
