@@ -1,0 +1,17 @@
+[Unit]
+Description=IWS MIS Portal — Foreign (Vested) Snapshot Worker
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=SAdmin
+WorkingDirectory=/var/www/mis-portal
+Environment=HOME=/home/SAdmin
+# Snapshots Vested positions (native USD), diffs vs the previous tick, and writes detected
+# buys/sells into equity_trade_ledger (source='snapshot') so they feed Foreign Realised
+# Gains + the Foreign Equity "Traded today" panel. Quantities come from the scrape feed;
+# price/avg from the synced foreign_equity_holding row. IBKR is NOT snapshotted — its exact
+# Flex trades come via mis-portal-ibkr-flex.
+ExecStart=/var/www/.venv/bin/python /var/www/mis-portal/workers/foreign_snapshot_worker.py
+StandardOutput=append:/var/log/mis-portal-foreign-snapshot.log
+StandardError=append:/var/log/mis-portal-foreign-snapshot.log

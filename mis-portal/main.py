@@ -1519,6 +1519,116 @@ def get_equity_holdings(
         release_db_connection(conn)
 
 
+@app.get("/api/v1/equity/activity")
+def get_equity_activity(
+    request: Request,
+    entity_id: Optional[int] = None,
+    day: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """Equity trades detected today by the intraday snapshot worker (source='snapshot').
+
+    Powers the Equity page's "Traded today" panel. Buys/sells are diffed from hourly
+    position snapshots, so the price is the snapshot LTP at detection, not the exact
+    fill. Realised P&L on a sell is qty × (sale price − latest snapshot avg cost).
+
+    Admin: optional ?entity_id=N (default all). Member: own entity only.
+    ?day=YYYY-MM-DD overrides today (defaults to the current date).
+    """
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        eid  = _resolve_entity(cur, payload, entity_id)
+
+        try:
+            as_of = date.fromisoformat(day) if day else date.today()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid day (expected YYYY-MM-DD).")
+
+        conditions = ["st.source = 'snapshot'", "st.transaction_date = %s"]
+        params     = [as_of]
+        if eid is not None:
+            conditions.append("st.entity_id = %s")
+            params.append(eid)
+        where = " AND ".join(conditions)
+
+        # avg_cost comes from the most recent position snapshot for the security
+        # (matched by ISIN when present, else by trading symbol == security_name).
+        cur.execute(
+            f"""
+            SELECT st.entity_id, e.entity_name, sm.security_name, sm.isin,
+                   st.transaction_type, st.quantity, st.price, st.amount,
+                   st.exchange, st.created_at, ac.avg_cost
+            FROM   stock_transaction st
+            JOIN   entity e ON e.id = st.entity_id
+            JOIN   security_master sm ON sm.id = st.security_id
+            LEFT JOIN LATERAL (
+                SELECT ps.avg_cost
+                FROM   equity_position_snapshot ps
+                WHERE  ps.entity_id = st.entity_id
+                  AND  (ps.isin = sm.isin OR ps.symbol = sm.security_name)
+                ORDER  BY ps.captured_at DESC
+                LIMIT  1
+            ) ac ON TRUE
+            WHERE  {where}
+            ORDER  BY st.created_at DESC, e.entity_name, sm.security_name
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+        cur.close()
+
+        trades = []
+        buy_count = sell_count = 0
+        realized_total = 0.0
+        for r in rows:
+            side  = (r["transaction_type"] or "").upper()
+            qty   = float(r["quantity"] or 0)
+            price = float(r["price"] or 0)
+            avg   = float(r["avg_cost"]) if r["avg_cost"] is not None else None
+            pnl   = None
+            if side == "SELL" and avg is not None:
+                pnl = round(qty * (price - avg), 2)
+                realized_total += pnl
+            if side == "BUY":
+                buy_count += 1
+            elif side == "SELL":
+                sell_count += 1
+            trades.append({
+                "entity_id":     r["entity_id"],
+                "entity_name":   r["entity_name"],
+                "security_name": r["security_name"],
+                "isin":          r["isin"],
+                "side":          side,
+                "quantity":      qty,
+                "price":         price,
+                "amount":        float(r["amount"] or 0),
+                "avg_cost":      round(avg, 4) if avg is not None else None,
+                "realized_pnl":  pnl,
+                "exchange":      r["exchange"],
+                "detected_at":   r["created_at"].isoformat() if r["created_at"] else None,
+            })
+
+        return {
+            "date":               str(as_of),
+            "entity_id":          eid or 0,
+            "buy_count":          buy_count,
+            "sell_count":         sell_count,
+            "realized_pnl_total": round(realized_total, 2),
+            "trades":             trades,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/v1/equity/activity: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
 # ---------------------------------------------------------------------------
 # Foreign equity holdings — multi-currency (IBKR/Vested USD, DBS SGD), shown on
 # the Foreign Equity page in native currency with a currency switcher.
@@ -1697,6 +1807,125 @@ def get_foreign_equity_holdings(
         raise
     except Exception as e:
         logger.error(f"Error in /api/v1/foreign-equity/holdings: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.get("/api/v1/foreign-equity/activity")
+def get_foreign_equity_activity(
+    request: Request,
+    entity_id: Optional[int] = None,
+    day: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """Foreign-equity trades booked today, from equity_trade_ledger.
+
+    Two sources feed this: IBKR's exact Flex fills (source='ibkr_flex') and Vested
+    positions diffed by the foreign snapshot worker (source='snapshot'). Native
+    amounts are converted to INR at the trade-date FX; realised P&L on sells reuses
+    the Foreign-Equity realised-gains engine (avg cost on native flows).
+
+    Admin: optional ?entity_id=N (default all). Member: own entity only.
+    """
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        eid  = _resolve_entity(cur, payload, entity_id)
+
+        try:
+            as_of = date.fromisoformat(day) if day else date.today()
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid day (expected YYYY-MM-DD).")
+
+        # snapshot_open rows are opening cost-basis seeds, not trades — never list them.
+        conditions = ["etl.trade_date = %s", "etl.source <> 'snapshot_open'"]
+        params     = [as_of]
+        if eid is not None:
+            conditions.append("etl.entity_id = %s")
+            params.append(eid)
+        where = " AND ".join(conditions)
+        cur.execute(
+            f"""
+            SELECT etl.entity_id, e.entity_name, etl.broker, etl.symbol, etl.side,
+                   etl.quantity, etl.price_native, etl.currency, etl.cash_flow_native,
+                   etl.source
+            FROM   equity_trade_ledger etl
+            JOIN   entity e ON e.id = etl.entity_id
+            WHERE  {where}
+            ORDER  BY etl.broker, etl.symbol
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+
+        # Which entities are in scope for the realised-gains recompute.
+        if eid is not None:
+            entity_ids = [eid]
+        else:
+            cur.execute("SELECT id FROM entity ORDER BY id")
+            entity_ids = [r["id"] for r in cur.fetchall()]
+
+        from workers.report_generator import _fetch_realised_gains, _fx_rate_on
+        pnl_by_symbol: dict = {}
+        realized_total = 0.0
+        for r in _fetch_realised_gains(conn, entity_ids, as_of, since_inception=True):
+            if r.get("category") == "Foreign Equity" and str(r.get("sale_date")) == str(as_of):
+                p = float(r.get("pnl") or 0)
+                pnl_by_symbol[r["security_name"]] = pnl_by_symbol.get(r["security_name"], 0.0) + p
+                realized_total += p
+
+        fx_cache: dict = {}
+        def _fx(ccy: str) -> float:
+            if ccy not in fx_cache:
+                fx_cache[ccy] = _fx_rate_on(conn, ccy, as_of) or 0.0
+            return fx_cache[ccy]
+
+        trades = []
+        buy_count = sell_count = 0
+        for r in rows:
+            side  = (r["side"] or "").upper()
+            qty   = float(r["quantity"] or 0)
+            pnat  = float(r["price_native"] or 0)
+            ccy   = (r["currency"] or "USD").upper()
+            fx    = _fx(ccy)
+            val_native = abs(float(r["cash_flow_native"] or 0))
+            if side == "BUY":
+                buy_count += 1
+            elif side == "SELL":
+                sell_count += 1
+            trades.append({
+                "entity_id":     r["entity_id"],
+                "entity_name":   r["entity_name"],
+                "broker":        r["broker"],
+                "security_name": r["symbol"],
+                "side":          side,
+                "quantity":      qty,
+                "price_native":  pnat,
+                "currency":      ccy,
+                "value_native":  round(val_native, 2),
+                "value_inr":     round(val_native * fx, 2) if fx else None,
+                "realized_pnl":  (round(pnl_by_symbol.get(r["symbol"]), 2)
+                                  if side == "SELL" and r["symbol"] in pnl_by_symbol else None),
+                "source":        r["source"],
+            })
+        cur.close()
+
+        return {
+            "date":               str(as_of),
+            "entity_id":          eid or 0,
+            "buy_count":          buy_count,
+            "sell_count":         sell_count,
+            "realized_pnl_total": round(realized_total, 2),
+            "trades":             trades,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/v1/foreign-equity/activity: {e}")
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
     finally:
         release_db_connection(conn)

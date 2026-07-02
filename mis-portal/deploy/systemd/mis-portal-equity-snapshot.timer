@@ -1,0 +1,18 @@
+[Unit]
+Description=IWS MIS Portal — Equity Snapshot Worker (open + hourly + close, IST market)
+Requires=mis-portal-equity-snapshot.service
+
+[Timer]
+# Server clock is UTC; IST = UTC+5:30. NSE session 09:15–15:30 IST = 03:45–10:00 UTC.
+#   03:45 UTC = 09:15 IST  → the "open" snapshot
+#   04:45..09:45 UTC       → hourly snapshots (10:15..15:15 IST)
+#   10:00 UTC = 15:30 IST  → the "close" snapshot
+# The worker tags each tick (open/hourly/close) from the IST time and self-guards, so
+# exact firing is not required.
+OnCalendar=Mon..Fri *-*-* 03,04,05,06,07,08,09:45:00
+OnCalendar=Mon..Fri *-*-* 10:00:00
+AccuracySec=30
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -350,6 +350,8 @@ def import_file(cur, broker, ent_id, kind, path, commit, recon, isin_map=None):
     parser = PARSERS[broker]
     inserted = skipped = dupes = 0
     net = {}  # symbol -> net qty, for reconciliation
+    touched_secs: set = set()   # security_ids covered by this real import
+    max_tdate = None            # latest real trade date imported
     for r in parser(path):
         if r.get("skipped_reason"):
             skipped += 1
@@ -380,9 +382,25 @@ def import_file(cur, broker, ent_id, kind, path, commit, recon, isin_map=None):
             """, (ent_id, sec_id, r["date"], r["side"], r["qty"], r["price"], amount,
                   r["brokerage"], r["stt"], r["other"], total_cost, r["currency"],
                   r["exchange"], broker, sref))
+            touched_secs.add(sec_id)
+            if max_tdate is None or r["date"] > max_tdate:
+                max_tdate = r["date"]
         inserted += 1
+    # Real trades are authoritative: supersede snapshot-derived rows they cover.
+    # Opening seeds go unconditionally; detected trades only up to the last import date.
+    superseded = 0
+    if commit and touched_secs:
+        secs = list(touched_secs)
+        cur.execute("DELETE FROM stock_transaction WHERE source = 'snapshot_open' "
+                    "AND entity_id = %s AND security_id = ANY(%s)", (ent_id, secs))
+        superseded += cur.rowcount
+        cur.execute("DELETE FROM stock_transaction WHERE source = 'snapshot' "
+                    "AND entity_id = %s AND security_id = ANY(%s) AND transaction_date <= %s",
+                    (ent_id, secs, max_tdate))
+        superseded += cur.rowcount
     verb = "inserted" if commit else "would insert"
-    print(f"  {verb} {inserted}, skipped {skipped} (incomplete/F&O), {dupes} dupes")
+    extra = f", superseded {superseded} snapshot row(s)" if superseded else ""
+    print(f"  {verb} {inserted}, skipped {skipped} (incomplete/F&O), {dupes} dupes{extra}")
     if recon:
         reconcile(cur, broker, ent_id, net)
 

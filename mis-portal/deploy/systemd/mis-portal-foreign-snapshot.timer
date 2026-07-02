@@ -1,0 +1,14 @@
+[Unit]
+Description=IWS MIS Portal — Foreign (Vested) Snapshot (every 2h, weekdays)
+Requires=mis-portal-foreign-snapshot.service
+
+[Timer]
+# Vested holdings are scraped (no live broker API cost), so snapshot every 2 hours on
+# weekdays and diff whatever the latest scrape produced. The worker self-guards to
+# weekdays; an off-hours tick with an unchanged cache is a cheap no-op.
+OnCalendar=Mon..Fri *-*-* 00/2:00:00
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

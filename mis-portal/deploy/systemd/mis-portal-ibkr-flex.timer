@@ -1,0 +1,18 @@
+[Unit]
+Description=IWS MIS Portal — IBKR Flex (pre-market + post-market US)
+Requires=mis-portal-ibkr-flex.service
+
+[Timer]
+# US Eastern, DST-safe via the timezone suffix. Two pulls a day:
+#   09:00 ET — pre-market: picks up overnight-settled activity before the open
+#   16:45 ET — post-market: picks up the day's executed fills after the close
+# One Flex call per run (positions+cash+trades in a single statement), well within
+# IBKR's 1/sec + 10/min limits. Replaces the old once-daily 02:30 UTC cron entry —
+# remove that crontab line so IBKR isn't hit a third time.
+OnCalendar=Mon..Fri *-*-* 09:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 16:45 America/New_York
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

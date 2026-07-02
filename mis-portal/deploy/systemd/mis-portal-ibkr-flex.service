@@ -1,0 +1,18 @@
+[Unit]
+Description=IWS MIS Portal — IBKR Flex holdings+cash+trades (one call/run)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=SAdmin
+WorkingDirectory=/var/www/mis-portal
+Environment=HOME=/home/SAdmin
+# IBKR Flex is heavily throttled (1 req/s, 10/min); a single SendRetry keeps a transient
+# 1001 from escalating into a token-wide lockout. Matches the original cron invocation.
+Environment=IBKR_FLEX_SEND_RETRIES=1
+# One Flex statement per login → open positions + cash + 365d of executed trades, upserted
+# into equity_trade_ledger (deduped by tradeID). Runs even while IBKR_SYNC_PAUSED is set —
+# it is the deliberate paced path. cron_wrapper emails an alert on non-zero exit.
+ExecStart=/var/www/.venv/bin/python /var/www/mis-portal/workers/cron_wrapper.py workers/ibkr_holdings_cash_worker.py --commit
+StandardOutput=append:/var/log/mis-portal-ibkr.log
+StandardError=append:/var/log/mis-portal-ibkr.log

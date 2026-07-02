@@ -131,6 +131,8 @@ def main():
     entity_id = ent["id"]
 
     inserted = skipped = dupes = 0
+    touched_secs: set = set()   # security_ids covered by this real import
+    max_tdate = None            # latest real trade date imported
     for _, r in df.iterrows():
         symbol = str(r[cols["symbol"]]).strip() if cols.get("symbol") else None
         isin   = str(r[cols["isin"]]).strip() if cols.get("isin") and not pd.isna(r[cols["isin"]]) else None
@@ -167,12 +169,35 @@ def main():
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'INR',%s,%s,%s,NOW())
         """, (entity_id, sec_id, tdate, side, qty, price, amount, amount, exch, args.broker, source_ref))
         inserted += 1
+        touched_secs.add(sec_id)
+        if max_tdate is None or tdate > max_tdate:
+            max_tdate = tdate
+
+    # Real trades are authoritative: supersede any snapshot-derived rows they cover.
+    # Opening seeds go unconditionally (real buy history now supplies cost basis);
+    # detected trades only up to the last imported date (later live sells still stand).
+    superseded = 0
+    if not args.dry_run and touched_secs:
+        secs = list(touched_secs)
+        cur.execute(
+            "DELETE FROM stock_transaction WHERE source = 'snapshot_open' "
+            "AND entity_id = %s AND security_id = ANY(%s)",
+            (entity_id, secs),
+        )
+        superseded += cur.rowcount
+        cur.execute(
+            "DELETE FROM stock_transaction WHERE source = 'snapshot' "
+            "AND entity_id = %s AND security_id = ANY(%s) AND transaction_date <= %s",
+            (entity_id, secs, max_tdate),
+        )
+        superseded += cur.rowcount
 
     if not args.dry_run:
         conn.commit()
     cur.close(); conn.close()
     verb = "would insert" if args.dry_run else "inserted"
-    print(f"\nDone: {verb} {inserted}, skipped {skipped} (incomplete rows), {dupes} duplicates.")
+    extra = f", superseded {superseded} snapshot row(s)" if superseded else ""
+    print(f"\nDone: {verb} {inserted}, skipped {skipped} (incomplete rows), {dupes} duplicates{extra}.")
 
 
 if __name__ == "__main__":

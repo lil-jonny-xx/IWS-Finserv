@@ -16,6 +16,107 @@ interface EquityResponse {
   totals: EquityTotals;
 }
 
+interface ActivityTrade {
+  entity_name: string;
+  security_name: string;
+  side: 'BUY' | 'SELL';
+  quantity: number;
+  price: number;
+  amount: number;
+  realized_pnl: number | null;
+}
+interface ActivityResponse {
+  date: string;
+  buy_count: number;
+  sell_count: number;
+  realized_pnl_total: number;
+  trades: ActivityTrade[];
+}
+
+// Buys/sells detected today by the intraday snapshot worker (source='snapshot').
+// Prices are the snapshot LTP at detection, not the exact fill — see the API docstring.
+function TradedToday({ data, showEntityCol }: { data: ActivityResponse; showEntityCol: boolean }) {
+  const [open, setOpen] = useState(true);
+  if (!data.trades.length) return null;
+  const inr = (v: number) => v.toLocaleString('en-IN', { maximumFractionDigits: 2 });
+  const signed = (v: number) => (v < 0 ? '−₹' : '₹') + inr(Math.abs(v));
+
+  return (
+    <div className="bg-card rounded-lg border border-rule overflow-hidden mb-5">
+      <button
+        onClick={() => setOpen(o => !o)}
+        aria-expanded={open}
+        className="w-full flex items-center justify-between px-5 py-3 text-left hover:bg-page transition-colors"
+      >
+        <div className="flex items-center gap-3">
+          <span className="text-sm font-semibold text-ink">Traded today</span>
+          <span className="text-xs text-ghost">
+            {data.buy_count} buy{data.buy_count === 1 ? '' : 's'} · {data.sell_count} sell{data.sell_count === 1 ? '' : 's'}
+          </span>
+        </div>
+        <div className="flex items-center gap-3">
+          {data.sell_count > 0 && (
+            <span className="text-xs text-ghost">
+              Realised P&amp;L{' '}
+              <span className="font-semibold" style={{ color: data.realized_pnl_total >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
+                {signed(data.realized_pnl_total)}
+              </span>
+            </span>
+          )}
+          <span className="text-xs text-dim">{open ? '▲' : '▼'}</span>
+        </div>
+      </button>
+      {open && (
+        <div className="overflow-x-auto border-t border-rule">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="bg-page text-dim">
+                {showEntityCol && <th className="px-3 py-2 text-left font-semibold">Entity</th>}
+                <th className="px-3 py-2 text-left font-semibold">Security</th>
+                <th className="px-3 py-2 text-left font-semibold">Side</th>
+                <th className="px-3 py-2 text-right font-semibold">Qty</th>
+                <th className="px-3 py-2 text-right font-semibold">Rate</th>
+                <th className="px-3 py-2 text-right font-semibold">Value</th>
+                <th className="px-3 py-2 text-right font-semibold">Realised P&amp;L</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.trades.map((t, i) => {
+                const sell = t.side === 'SELL';
+                return (
+                  <tr key={i} className="border-t border-rule">
+                    {showEntityCol && <td className="px-3 py-2 text-dim">{t.entity_name}</td>}
+                    <td className="px-3 py-2 text-ink">{t.security_name}</td>
+                    <td className="px-3 py-2">
+                      <span
+                        className="px-1.5 py-0.5 rounded text-[10px] font-semibold"
+                        style={{ color: sell ? 'var(--peril)' : 'var(--gain)',
+                                 border: `1px solid ${sell ? 'var(--peril)' : 'var(--gain)'}` }}
+                      >
+                        {t.side}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2 text-right text-dim">{t.quantity.toLocaleString('en-IN')}</td>
+                    <td className="px-3 py-2 text-right text-dim">₹{inr(t.price)}</td>
+                    <td className="px-3 py-2 text-right text-dim">₹{inr(t.amount)}</td>
+                    <td
+                      className="px-3 py-2 text-right font-medium"
+                      style={{ color: t.realized_pnl == null ? 'var(--ghost)'
+                                     : t.realized_pnl >= 0 ? 'var(--gain)' : 'var(--peril)' }}
+                    >
+                      {t.realized_pnl == null ? '—' : signed(t.realized_pnl)}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function EntitySwitcher({
   entities, selectedId, onSelect,
 }: {
@@ -76,6 +177,7 @@ export default function EquityPage() {
   const [entities, setEntities]           = useState<Entity[]>([]);
   const [selectedId, setSelectedId]       = useState<number | null>(null);
   const [data, setData]                   = useState<EquityResponse | null>(null);
+  const [activity, setActivity]           = useState<ActivityResponse | null>(null);
   const [loading, setLoading]             = useState(true);
   const [error, setError]                 = useState<string | null>(null);
   const [retryCount, setRetryCount]       = useState(0);
@@ -118,6 +220,18 @@ export default function EquityPage() {
       .catch(err => { if (err.name !== 'AbortError') { setError(err.message); setLoading(false); } });
     return () => controller.abort();
   }, [router, selectedId, retryCount]);
+
+  // Today's detected buys/sells (snapshot worker). Same scope + refresh cadence as
+  // holdings; failures are silent so they never disturb the main table.
+  useEffect(() => {
+    const controller = new AbortController();
+    const qs = selectedId !== null ? `?entity_id=${selectedId}` : '';
+    fetch(`${API_URL}/api/v1/equity/activity${qs}`, { credentials: 'include', signal: controller.signal })
+      .then(r => (r.ok ? r.json() : null))
+      .then((d: ActivityResponse | null) => { if (d) setActivity(d); })
+      .catch(() => {});
+    return () => controller.abort();
+  }, [selectedId, retryCount]);
 
   // Auto-refresh every 60 s during market hours (09:15–15:30 IST Mon–Fri)
   useEffect(() => {
@@ -240,6 +354,7 @@ export default function EquityPage() {
                 </button>
               </div>
             )}
+            {activity && <TradedToday data={activity} showEntityCol={showEntityCol} />}
             <EquityTable
               holdings={data.holdings}
               totals={data.totals}

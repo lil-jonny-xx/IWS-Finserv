@@ -151,7 +151,8 @@ export default function RealisedGainsPage() {
               Realised Gains ({period === 'inception' ? 'since inception' : 'FY to date'})
             </h1>
             <p className="text-xs mt-0.5" style={{ color: 'var(--ghost)' }}>
-              MF realised auto-computed from CAS transactions. Equity appears once broker trades are imported.
+              MF realised auto-computed from CAS transactions. Equity sells are detected live from hourly
+              holdings snapshots (refined when broker tradebooks are imported).
               {' '}Switches are {switches === 'exclude' ? 'excluded' : 'included'}.
             </p>
           </div>
