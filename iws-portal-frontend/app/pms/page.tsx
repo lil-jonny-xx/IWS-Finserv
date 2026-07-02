@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
+import { navFor } from '@/app/lib/nav';
 import { useDragScroll } from '@/app/components/DragScroll';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
@@ -206,7 +207,7 @@ export default function PmsPage() {
       .then((u: User | null) => {
         if (!u) return;
         setUser(u);
-        if (u.role === 'admin') {
+        if (u) {
           fetch(`${API_URL}/api/v1/entities`, { credentials: 'include' })
             .then(r => r.ok ? r.json() : [])
             .then((ents: Entity[]) => setEntities(ents))
@@ -228,7 +229,7 @@ export default function PmsPage() {
     return () => controller.abort();
   }, [router, selectedId, retryCount]);
 
-  const isAdmin       = user?.role === 'admin';
+  const isAdmin       = !!user;  // members have admin-level view access (only Manual Data + user mgmt are admin-only)
   const showEntityCol = isAdmin && selectedId === null;
   const handleRetry   = useCallback(() => setRetryCount(c => c + 1), []);
   const t = data?.totals;
@@ -245,7 +246,7 @@ export default function PmsPage() {
             </p>
           </div>
           <nav className="flex gap-1.5" aria-label="Sections">
-            {[
+            {navFor([
               { href: '/dashboard', label: 'Overview' },
               { href: '/mutual-funds', label: 'Mutual Funds' },
               { href: '/equity', label: 'Equity' },
@@ -261,7 +262,7 @@ export default function PmsPage() {
               { href: '/reports', label: 'Reports' },
               { href: '/assistant', label: 'Assistant' },
               { href: '/account', label: 'Account' },
-            ].map(({ href, label, active }) => (
+            ], user?.role).map(({ href, label, active }) => (
               <a
                 key={href}
                 href={href}

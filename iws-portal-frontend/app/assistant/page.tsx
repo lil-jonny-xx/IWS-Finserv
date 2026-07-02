@@ -1,6 +1,7 @@
 'use client';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { navFor } from '@/app/lib/nav';
 import type {
   Citation,
   ChartSpec,
@@ -63,7 +64,7 @@ export default function AssistantPage() {
   const [showScopeModal, setShowScopeModal] = useState(false);
 
   const abortRef = useRef<AbortController | null>(null);
-  const isAdmin = user?.role === 'admin';
+  const isAdmin = !!user;  // members have admin-level view access (only Manual Data + user mgmt are admin-only)
 
   // ── Auth + entities ──────────────────────────────
   useEffect(() => {
@@ -72,7 +73,7 @@ export default function AssistantPage() {
       .then((u: User | null) => {
         if (!u) return;
         setUser(u);
-        if (u.role === 'admin') {
+        if (u) {
           fetch(`${API_URL}/api/v1/entities`, { credentials: 'include' })
             .then(r => (r.ok ? r.json() : []))
             .then((ents: Entity[]) => setEntities(ents))
@@ -236,7 +237,7 @@ export default function AssistantPage() {
             <span className="text-xs text-ghost">Read-only portfolio advisor</span>
           </div>
           <nav className="flex gap-1.5" aria-label="Sections">
-            {NAV.map(({ href, label, active }) => (
+            {navFor(NAV, user?.role).map(({ href, label, active }) => (
               <a
                 key={href}
                 href={href}

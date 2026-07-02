@@ -622,14 +622,12 @@ def get_current_user(request: Request, authorization: Optional[str] = Header(Non
 
 @app.get("/api/v1/entities")
 def get_entities(request: Request, authorization: Optional[str] = Header(None)):
-    """Get all entities - admin only."""
+    """Get all entities — available to any authenticated user (drives the entity switcher)."""
     conn = None
     try:
-        payload = _require_auth(request, authorization)
+        _require_auth(request, authorization)
         conn = get_db_connection()
         cursor = conn.cursor()
-        if _live_role(cursor, payload["email"]) != "admin":
-            raise HTTPException(status_code=403, detail="Admin access required")
         cursor.execute(
             """SELECT e.id, e.entity_name, p.pan_name
                FROM entity e
@@ -820,26 +818,12 @@ def get_holdings(
 
         conn = get_db_connection()
         cursor = conn.cursor()
-        user_role = _live_role(cursor, payload["email"])
+        # Any authenticated user may view every entity (see _resolve_entity):
+        # explicit ?entity_id=N → that entity; no param → all entities.
+        eid = _resolve_entity(cursor, payload, entity_id)
 
-        # Resolve the entity_id to query
-        if user_role == "admin":
-            # Admin with explicit entity_id param → single entity; no param → all entities.
-            # Do NOT fall back to the admin's own users.entity_id — that would hide other
-            # entities when the admin account happens to be linked to one.
-            eid = entity_id  # None when no param was given
-        else:
-            cursor.execute(
-                "SELECT entity_id FROM users WHERE email = %s AND is_active = TRUE",
-                (payload["email"],)
-            )
-            row = cursor.fetchone()
-            if not row or not row["entity_id"]:
-                raise HTTPException(status_code=404, detail="No entity linked to this user")
-            eid = row["entity_id"]
-
-        # Admin with no entity filter → return all holdings across all entities
-        if eid is None and user_role == "admin":
+        # No entity filter → return all holdings across all entities
+        if eid is None:
             cursor.execute("""
                 SELECT
                     h.id,
@@ -1068,9 +1052,6 @@ def get_combined_holdings(
         payload   = _require_auth(request, authorization)
         conn      = get_db_connection()
         cursor    = conn.cursor()
-        user_role = _live_role(cursor, payload["email"])
-        if user_role != "admin":
-            raise HTTPException(status_code=403, detail="Admin access required")
 
         cursor.execute("""
             SELECT
@@ -1263,23 +1244,14 @@ def get_combined_holdings(
 
 def _resolve_entity(cursor, payload: dict, entity_id_param: Optional[int]) -> Optional[int]:
     """
-    Returns the entity_id to query.
-    - Admin + entity_id_param  → use the param
-    - Admin + no param         → None (all entities)
-    - Member                   → their own entity_id from users table
-    Uses live DB role to prevent stale JWT role from persisting after revocation.
+    Returns the entity_id to query. Every authenticated user (admin AND member)
+    may view all entities — the only member restrictions are the Manual Data page
+    and user management, which are gated separately. So entity scoping is uniform:
+      - entity_id_param given → that entity
+      - no param              → None (all entities)
+    (cursor/payload retained for signature compatibility with existing callers.)
     """
-    role = _live_role(cursor, payload["email"])
-    if role == "admin":
-        return entity_id_param  # None → all entities, int → filtered
-    cursor.execute(
-        "SELECT entity_id FROM users WHERE email = %s AND is_active = TRUE",
-        (payload["email"],),
-    )
-    row = cursor.fetchone()
-    if row and row["entity_id"]:
-        return row["entity_id"]
-    raise HTTPException(status_code=404, detail="No entity linked to this user")
+    return entity_id_param
 
 
 # ---------------------------------------------------------------------------
@@ -2502,7 +2474,9 @@ def get_overview(
     authorization: Optional[str] = Header(None),
 ):
     """
-    Aggregate portfolio overview across ALL entities, all asset classes.
+    Aggregate portfolio overview across all asset classes.
+    - Admin  → all entities (per-entity breakdown).
+    - Member → scoped to their own entity only (a member never sees other entities).
     Returns:
       - summary: totals across MF + equity
       - asset_class_breakdown: combined allocation
@@ -2513,10 +2487,13 @@ def get_overview(
         payload   = _require_auth(request, authorization)
         conn      = get_db_connection()
         cursor    = conn.cursor()
-        if _live_role(cursor, payload["email"]) != "admin":
-            raise HTTPException(status_code=403, detail="Admin access required.")
+        # Admin → None (all entities); member → their own entity_id. This makes the
+        # Overview available to individual-entity logins, scoped to just themselves.
+        eid = _resolve_entity(cursor, payload, None)
 
-        cursor.execute("""
+        mf_where  = "WHERE h.entity_id = %s"  if eid is not None else ""
+        mf_params = [eid] if eid is not None else []
+        cursor.execute(f"""
             SELECT
                 h.entity_id,
                 e.entity_name,
@@ -2532,10 +2509,13 @@ def get_overview(
             FROM holding h
             JOIN entity e ON e.id = h.entity_id
             JOIN security_master sm ON sm.id = h.security_id
-        """)
+            {mf_where}
+        """, mf_params)
         mf_rows = cursor.fetchall()
 
-        cursor.execute("""
+        eq_where  = "WHERE eh.entity_id = %s" if eid is not None else ""
+        eq_params = ([eid, eid] if eid is not None else [])
+        cursor.execute(f"""
             SELECT
                 eh.entity_id,
                 e.entity_name,
@@ -2554,6 +2534,7 @@ def get_overview(
                 COALESCE(eh.current_market_value, 0)  AS weight
             FROM equity_holding eh
             JOIN entity e ON e.id = eh.entity_id
+            {eq_where}
             UNION ALL
             SELECT
                 eh.entity_id,
@@ -2573,24 +2554,25 @@ def get_overview(
                 COALESCE(eh.current_market_value, 0)  AS weight
             FROM foreign_equity_holding eh
             JOIN entity e ON e.id = eh.entity_id
-        """)
+            {eq_where}
+        """, eq_params)
         eq_rows = cursor.fetchall()
         cursor.close()
 
         # Manual inputs (PPF, PMS/AIF, unlisted equity, startups, overseas,
         # cash balances, …) folded into the same asset-class buckets so the
         # dashboard portfolio matches the generated reports.
-        manual_rows = _fetch_manual_overview_rows(conn)
+        manual_rows = _fetch_manual_overview_rows(conn, eid)
 
         # Nuvama PMS holdings (equity → EQUITY bucket, cash → CASH) so the
         # dashboard totals and allocation include the PMS portfolio.
-        pms_rows = _fetch_pms_overview_rows(conn)
+        pms_rows = _fetch_pms_overview_rows(conn, eid)
 
         # Broker-account cash (Zerodha / Angel One / Dhan) → CASH bucket.
-        broker_cash_rows = _fetch_broker_cash_overview_rows(conn)
+        broker_cash_rows = _fetch_broker_cash_overview_rows(conn, eid)
 
         # Bank-account cash (HSBC / DBS / FAB / …), native ccy → INR → CASH bucket.
-        bank_cash_rows = _fetch_bank_cash_overview_rows(conn)
+        bank_cash_rows = _fetch_bank_cash_overview_rows(conn, eid)
 
         all_rows = (list(mf_rows) + list(eq_rows) + manual_rows + pms_rows
                     + broker_cash_rows + bank_cash_rows)
@@ -2732,23 +2714,9 @@ def get_transactions(
 
         conn = get_db_connection()
         cursor = conn.cursor()
-        user_role = _live_role(cursor, payload["email"])
-
-        if entity_id is not None and user_role == "admin":
-            eid = entity_id
-        else:
-            cursor.execute(
-                "SELECT entity_id FROM users WHERE email = %s AND is_active = TRUE",
-                (payload["email"],)
-            )
-            row = cursor.fetchone()
-            if not row or not row["entity_id"]:
-                if user_role == "admin":
-                    eid = None  # all-entities view
-                else:
-                    raise HTTPException(status_code=404, detail="No entity linked to this user")
-            else:
-                eid = row["entity_id"]
+        # Any authenticated user may view every entity: ?entity_id=N → that entity,
+        # no param → all entities.
+        eid = _resolve_entity(cursor, payload, entity_id)
 
         limit  = max(1, min(limit, 500))
         offset = max(0, offset)
@@ -4174,17 +4142,18 @@ def list_bank_accounts(
     entity_id: Optional[int] = None,
     authorization: Optional[str] = Header(None),
 ):
-    """List bank accounts with native balance + INR equivalent. Admin only."""
+    """List bank accounts with native balance + INR equivalent.
+    Admin sees all (optionally ?entity_id=N); a member sees only their own entity."""
     conn = None
     try:
         payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
-        if _live_role(cur, payload["email"]) != "admin":
-            raise HTTPException(status_code=403, detail="Admin access required")
+        # Admin + param → that entity; admin no param → all; member → own (param ignored).
+        eid = _resolve_entity(cur, payload, entity_id)
 
-        where  = "WHERE b.entity_id = %s" if entity_id else ""
-        params = [entity_id] if entity_id else []
+        where  = "WHERE b.entity_id = %s" if eid is not None else ""
+        params = [eid] if eid is not None else []
         cur.execute(f"""
             SELECT b.id, b.entity_id, e.entity_name, b.bank_name, b.account_type,
                    b.currency, b.balance, b.balance_as_of, b.notes, b.updated_at,
@@ -4247,8 +4216,6 @@ def create_bank_account(
         payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
-        if _live_role(cur, payload["email"]) != "admin":
-            raise HTTPException(status_code=403, detail="Admin access required")
 
         if body.account_type not in VALID_BANK_ACCOUNT_TYPES:
             raise HTTPException(status_code=422, detail=f"Invalid account_type: {body.account_type}")
@@ -4303,8 +4270,6 @@ def list_bank_statements(
         payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
-        if _live_role(cur, payload["email"]) != "admin":
-            raise HTTPException(status_code=403, detail="Admin access required")
         cur.execute("""
             SELECT s.id, s.filename, s.file_kind, s.parsed_balance, s.parsed_as_of,
                    s.parse_status, s.parse_note, s.committed, s.uploaded_at,
@@ -4358,8 +4323,6 @@ async def upload_bank_statement(
         payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
-        if _live_role(cur, payload["email"]) != "admin":
-            raise HTTPException(status_code=403, detail="Admin access required")
 
         cur.execute("SELECT id FROM bank_account WHERE id = %s", (account_id,))
         if not cur.fetchone():
@@ -4440,8 +4403,6 @@ def commit_bank_balance(
         payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
-        if _live_role(cur, payload["email"]) != "admin":
-            raise HTTPException(status_code=403, detail="Admin access required")
 
         cur.execute("SELECT id FROM bank_account WHERE id = %s", (account_id,))
         if not cur.fetchone():
@@ -4501,8 +4462,6 @@ def delete_bank_account(
         payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
-        if _live_role(cur, payload["email"]) != "admin":
-            raise HTTPException(status_code=403, detail="Admin access required")
         cur.execute("SELECT id FROM users WHERE email = %s", (payload["email"],))
         user_id = cur.fetchone()["id"]
         cur.execute("DELETE FROM bank_account WHERE id = %s RETURNING bank_name", (account_id,))
@@ -4578,8 +4537,6 @@ def save_benchmarks(
         payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
-        if _live_role(cur, payload["email"]) != "admin":
-            raise HTTPException(status_code=403, detail="Admin access required")
 
         cur.execute("SELECT id, password_hash FROM users WHERE email = %s AND is_active = TRUE",
                     (payload["email"],))
@@ -4633,7 +4590,7 @@ def get_realised_gains(
     switches: str = "include",
     authorization: Optional[str] = Header(None),
 ):
-    """Realised gains across all entities (admin).
+    """Realised gains — admin sees all entities; a member sees only their own.
 
     period   — "fy" (default, FY-to-date) or "inception" (whole history).
     switches — "include" (default) or "exclude" (drop SWITCH_IN/SWITCH_OUT).
@@ -4643,11 +4600,14 @@ def get_realised_gains(
         payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
-        if _live_role(cur, payload["email"]) != "admin":
-            raise HTTPException(status_code=403, detail="Admin access required")
+        # Admin → None (all entities); member → their own entity_id only.
+        eid = _resolve_entity(cur, payload, None)
 
         from workers.report_generator import _fetch_realised_gains
-        cur.execute("SELECT id, entity_name FROM entity ORDER BY id")
+        if eid is None:
+            cur.execute("SELECT id, entity_name FROM entity ORDER BY id")
+        else:
+            cur.execute("SELECT id, entity_name FROM entity WHERE id = %s", (eid,))
         entities = cur.fetchall()
         cur.close()
 
@@ -4695,17 +4655,21 @@ def list_reports(
         payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
-        if _live_role(cur, payload["email"]) != "admin":
-            raise HTTPException(status_code=403, detail="Admin access required")
-
-        cur.execute("""
+        # Admin → all reports; member → only their own entity's reports. Combined /
+        # master workbooks span every entity and have entity_id NULL, so filtering
+        # by entity_id also keeps those firm-wide files out of a member's list.
+        eid = _resolve_entity(cur, payload, None)
+        where  = "WHERE r.entity_id = %s" if eid is not None else ""
+        params = [eid] if eid is not None else []
+        cur.execute(f"""
             SELECT r.id, r.report_type, r.entity_name, r.filename,
                    r.as_of_date, r.generated_at, u.full_name AS generated_by_name
             FROM generated_report r
             LEFT JOIN users u ON u.id = r.generated_by
+            {where}
             ORDER BY r.generated_at DESC
             LIMIT 100
-        """)
+        """, params)
         rows = cur.fetchall()
         cur.close()
 
@@ -4742,8 +4706,6 @@ def generate_reports_endpoint(
         payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
-        if _live_role(cur, payload["email"]) != "admin":
-            raise HTTPException(status_code=403, detail="Admin access required")
         cur.execute("SELECT id FROM users WHERE email = %s", (payload["email"],))
         user_id = cur.fetchone()["id"]
         cur.close()
@@ -4779,10 +4741,15 @@ def download_report(
         payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
-        if _live_role(cur, payload["email"]) != "admin":
-            raise HTTPException(status_code=403, detail="Admin access required")
-
-        cur.execute("SELECT filepath, filename FROM generated_report WHERE id = %s", (report_id,))
+        # A member may only download their own entity's report; admin downloads any.
+        # Combined/master files have entity_id NULL, so a member's entity_id filter
+        # returns no row (404) for them — no cross-entity leak.
+        eid = _resolve_entity(cur, payload, None)
+        if eid is None:
+            cur.execute("SELECT filepath, filename FROM generated_report WHERE id = %s", (report_id,))
+        else:
+            cur.execute("SELECT filepath, filename FROM generated_report WHERE id = %s AND entity_id = %s",
+                        (report_id, eid))
         row = cur.fetchone()
         cur.close()
 
@@ -4878,21 +4845,11 @@ def _assistant_user_id(cursor, email: str) -> int:
 
 def _resolve_assistant_scope(cursor, payload: dict, requested_entity_id: Optional[int]) -> Optional[int]:
     """
-    Scope rules for the assistant (stricter than _resolve_entity for the admin all-entities
-    case): admins may scope to a specific entity OR to all entities (None); members are always
-    pinned to their own entity regardless of what was requested. Uses the live DB role.
+    Assistant scope: every authenticated user (admin and member) may scope to a
+    specific entity OR to all entities (None) — matching the uniform data-access
+    model (the only member restrictions are Manual Data + user management).
     """
-    role = _live_role(cursor, payload["email"])
-    if role == "admin":
-        return requested_entity_id  # None = whole family, N = single entity
-    cursor.execute(
-        "SELECT entity_id FROM users WHERE email = %s AND is_active = TRUE",
-        (payload["email"],),
-    )
-    row = cursor.fetchone()
-    if not row or not row["entity_id"]:
-        raise HTTPException(status_code=404, detail="No entity linked to this user")
-    return row["entity_id"]
+    return requested_entity_id  # None = whole family, N = single entity
 
 
 @app.post("/api/v1/assistant/conversations")

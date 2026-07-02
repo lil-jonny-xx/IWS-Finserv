@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
+import { navFor } from '@/app/lib/nav';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -119,7 +120,7 @@ export default function AccountPage() {
             <p className="text-sm text-ghost mt-0.5">Signed in as {me?.email} · {me?.role}</p>
           </div>
           <nav className="flex flex-wrap gap-1.5" aria-label="Sections">
-            {NAV.map(({ href, label, active }) => (
+            {navFor(NAV, me?.role).map(({ href, label, active }) => (
               <a key={href} href={href} aria-current={active ? 'page' : undefined}
                 className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
                   active ? 'bg-prime text-prime-fg'

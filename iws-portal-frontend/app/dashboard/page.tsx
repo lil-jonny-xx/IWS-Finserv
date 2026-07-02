@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
+import { navFor } from '@/app/lib/nav';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 const IDLE_TIMEOUT = 30 * 60 * 1000;
@@ -391,7 +392,7 @@ export default function DashboardPage() {
           <div className="flex items-center gap-3">
             <span className="text-sm font-semibold text-ink">IWS Finserv</span>
             <nav className="hidden sm:flex items-center gap-0.5 ml-4">
-              {[
+              {navFor([
                 { href: '/dashboard', label: 'Overview', active: true },
                 { href: '/mutual-funds', label: 'Mutual Funds' },
                 { href: '/equity', label: 'Equity' },
@@ -407,7 +408,7 @@ export default function DashboardPage() {
                 { href: '/reports', label: 'Reports' },
                 { href: '/assistant', label: 'Assistant' },
                 { href: '/account', label: 'Account' },
-              ].map(link => (
+              ], user?.role).map(link => (
                 <a key={link.href} href={link.href}
                   className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
                     link.active

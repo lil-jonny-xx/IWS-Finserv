@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
+import { navFor } from '@/app/lib/nav';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -158,7 +159,7 @@ export default function PropertiesPage() {
       .then((u: User | null) => {
         if (!u) return;
         setUser(u);
-        if (u.role === 'admin') {
+        if (u) {
           fetch(`${API_URL}/api/v1/entities`, { credentials: 'include' })
             .then(r => r.ok ? r.json() : []).then((e: Entity[]) => setEntities(e)).catch(() => {});
         }
@@ -178,7 +179,7 @@ export default function PropertiesPage() {
     return () => controller.abort();
   }, [router, selectedId, retryCount]);
 
-  const isAdmin       = user?.role === 'admin';
+  const isAdmin       = !!user;  // members have admin-level view access (only Manual Data + user mgmt are admin-only)
   const showEntity    = isAdmin && selectedId === null;
   const handleRetry   = useCallback(() => setRetryCount(c => c + 1), []);
 
@@ -191,7 +192,7 @@ export default function PropertiesPage() {
             <span className="text-sm text-ghost">Real estate — valuations with deeds, plans and related documents</span>
           </div>
           <nav className="flex gap-1.5 flex-wrap" aria-label="Sections">
-            {NAV.map(({ href, label }) => (
+            {navFor(NAV, user?.role).map(({ href, label }) => (
               <a key={href} href={href} aria-current={href === '/properties' ? 'page' : undefined}
                  className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
                    href === '/properties' ? 'bg-prime text-prime-fg' : 'bg-card border border-rule text-dim hover:border-dim hover:text-ink'}`}>

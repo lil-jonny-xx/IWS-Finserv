@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useState, useMemo, Fragment } from 'react';
 import { useRouter } from 'next/navigation';
+import { navFor } from '@/app/lib/nav';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -84,6 +85,18 @@ export default function RealisedGainsPage() {
   const [loading, setLoading] = useState(true);
   const [period, setPeriod] = useState<Period>('fy');
   const [switches, setSwitches] = useState<Switches>('include');
+  const [role, setRole] = useState<string | undefined>(undefined);
+
+  // Role only decides which nav tabs show (Manual Data is admin-only); the report
+  // data itself is available to every authenticated user.
+  useEffect(() => {
+    const c = new AbortController();
+    fetch(`${API_URL}/api/v1/me`, { credentials: 'include', signal: c.signal })
+      .then(r => r.ok ? r.json() : null)
+      .then((u: { role?: string } | null) => { if (!u) { router.replace('/'); return; } setRole(u.role); })
+      .catch(err => { if (err.name !== 'AbortError') router.replace('/'); });
+    return () => c.abort();
+  }, [router]);
 
   useEffect(() => {
     let cancelled = false;
@@ -136,7 +149,7 @@ export default function RealisedGainsPage() {
         <div className="flex items-center gap-6">
           <span className="font-bold text-sm" style={{ color: 'var(--ink)' }}>IWS MIS</span>
           <nav className="flex gap-4">
-            {NAV.map(link => (
+            {navFor(NAV, role).map(link => (
               <a key={link.href} href={link.href} className="text-xs font-medium transition-colors"
                  style={{ color: link.active ? 'var(--prime)' : 'var(--dim)' }}>{link.label}</a>
             ))}

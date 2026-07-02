@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
+import { navFor } from '@/app/lib/nav';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -33,12 +34,25 @@ export default function ReportsPage() {
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
+  const [isAdmin, setIsAdmin] = useState(false);
 
   const fetchReports = useCallback(async () => {
     const res = await fetch(`${API_URL}/api/v1/reports`, { credentials: 'include' });
     if (res.status === 401) { router.push('/'); return; }
     if (res.ok) setReports(await res.json());
     setLoading(false);
+  }, [router]);
+
+  // Reports are scoped by the backend — a member sees & downloads only their own
+  // entity's files. Only report *generation* is admin-only, so track role to gate
+  // that one action (and the admin-only Manual Data nav tab).
+  useEffect(() => {
+    const c = new AbortController();
+    fetch(`${API_URL}/api/v1/me`, { credentials: 'include', signal: c.signal })
+      .then(r => r.ok ? r.json() : null)
+      .then((u: { role?: string } | null) => { if (!u) { router.replace('/'); return; } setIsAdmin(u.role === 'admin'); })
+      .catch(err => { if (err.name !== 'AbortError') router.replace('/'); });
+    return () => c.abort();
   }, [router]);
 
   useEffect(() => { fetchReports(); }, [fetchReports]);
@@ -88,7 +102,7 @@ export default function ReportsPage() {
         <div className="flex items-center gap-6">
           <span className="font-bold text-sm" style={{ color: 'var(--ink)' }}>IWS MIS</span>
           <nav className="flex gap-4">
-            {[
+            {navFor([
               { href: '/dashboard', label: 'Overview' },
               { href: '/mutual-funds', label: 'Mutual Funds' },
               { href: '/equity', label: 'Equity' },
@@ -104,7 +118,7 @@ export default function ReportsPage() {
               { href: '/reports', label: 'Reports', active: true },
               { href: '/assistant', label: 'Assistant' },
               { href: '/account', label: 'Account' },
-            ].map(link => (
+            ], isAdmin ? 'admin' : 'member').map(link => (
               <a key={link.href} href={link.href}
                  className="text-xs font-medium transition-colors"
                  style={{ color: link.active ? 'var(--prime)' : 'var(--dim)' }}>
