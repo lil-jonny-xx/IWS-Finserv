@@ -128,6 +128,128 @@ def load_holdings(conn) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Intraday holdings refresh (quantity / avg cost / new positions)
+# ---------------------------------------------------------------------------
+def refresh_holdings_light(conn):
+    """Refresh quantity / avg cost and pick up new positions for Indian brokers.
+
+    The 60s price loop only reprices EXISTING quantities, so a same-day buy or sell
+    doesn't reach `equity_holding` until the twice-daily full sync. This closes that
+    gap cheaply: it re-pulls live holdings (same `fetch_holdings`+`normalise` path as
+    the full sync) and writes ONLY the columns that move when you trade —
+    `quantity`, `avg_cost`, `cost` — plus inserts genuinely new positions. The heavy
+    per-holding recompute (history lookups, ledger XIRR/CAGR, FX, daily snapshot)
+    stays on the full sync; price / market value / P&L are refreshed immediately
+    after by the normal price loop, now on the current quantities.
+
+    Deliberately does NOT delete positions absent from the feed — same as the full
+    sync — so a flaky/empty broker read can never wipe holdings (empty feed = skip).
+    Domestic (INR) brokers only; foreign holdings have their own path. Disable via
+    HOLDINGS_LIGHT_REFRESH_DISABLED=1 if a broker gets unhappy with the extra calls.
+    """
+    if os.getenv("HOLDINGS_LIGHT_REFRESH_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        return
+
+    try:
+        from equity.equity_sync_worker import (
+            load_entity_map, BROKER_ENTITY_MAP, _asset_class_for, classify_sector,
+        )
+    except Exception as e:
+        logger.warning(f"holdings light-refresh: import failed — {e}")
+        return
+
+    try:
+        emap = load_entity_map(conn)
+        _asset_class_for(conn, "", "")   # prime the override cache once (no per-row DB hit)
+    except Exception as e:
+        logger.warning(f"holdings light-refresh: setup failed — {e}")
+        return
+
+    today = date.today()
+    total_new = total_upd = 0
+
+    for entity_code, broker_module, broker_label in BROKER_ENTITY_MAP:
+        eid = emap.get(entity_code)
+        if eid is None:
+            continue
+        try:
+            raw      = broker_module.fetch_holdings(entity_code)
+            holdings = broker_module.normalise(eid, entity_code, raw)
+        except NotImplementedError:
+            continue
+        except Exception as e:
+            logger.warning(f"[{entity_code}/{broker_label}] holdings light-refresh fetch failed — {e}")
+            conn.rollback()
+            continue
+        if not holdings:
+            continue   # empty / flaky read — never wipe on a blank
+
+        cur = conn.cursor()
+        try:
+            for h in holdings:
+                qty, avg, cost = float(h.quantity), float(h.avg_cost), float(h.cost)
+                isin = (h.isin or "").strip() or None
+
+                updated = 0
+                if isin:
+                    # Natural key (entity, broker, ISIN); adopt any relabelled symbol.
+                    cur.execute(
+                        """
+                        UPDATE equity_holding
+                           SET quantity=%s, avg_cost=%s, cost=%s, symbol=%s,
+                               exchange=COALESCE(%s, exchange), updated_at=NOW()
+                         WHERE entity_id=%s AND broker=%s AND isin=%s
+                        """,
+                        (qty, avg, cost, h.symbol, h.exchange, eid, broker_label, isin),
+                    )
+                    updated = cur.rowcount
+                if not updated:
+                    # Legacy / null-ISIN rows: match on symbol, backfill the ISIN.
+                    cur.execute(
+                        """
+                        UPDATE equity_holding
+                           SET quantity=%s, avg_cost=%s, cost=%s,
+                               isin=COALESCE(isin, %s), updated_at=NOW()
+                         WHERE entity_id=%s AND broker=%s AND symbol=%s
+                        """,
+                        (qty, avg, cost, isin, eid, broker_label, h.symbol),
+                    )
+                    updated = cur.rowcount
+                if updated:
+                    total_upd += updated
+                    continue
+
+                # Genuinely new position — minimal INR row; the full sync enriches
+                # metrics/FX later, the price loop sets live price/MV this same tick.
+                price = float(h.current_price) if h.current_price is not None else None
+                mv    = (qty * price) if price is not None else None
+                cur.execute(
+                    """
+                    INSERT INTO equity_holding
+                        (entity_id, broker, symbol, isin, exchange, sector, asset_class,
+                         quantity, avg_cost, cost, current_price, current_market_value,
+                         currency, fx_rate, as_of_date, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'INR',1,%s,NOW())
+                    ON CONFLICT (entity_id, broker, isin) DO NOTHING
+                    """,
+                    (eid, broker_label, h.symbol, isin, h.exchange,
+                     classify_sector(h.symbol, isin or ""),
+                     _asset_class_for(conn, h.symbol, isin or ""),
+                     qty, avg, cost, price, mv, today),
+                )
+                total_new += cur.rowcount
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.warning(f"[{entity_code}/{broker_label}] holdings light-refresh upsert failed — {e}")
+        finally:
+            cur.close()
+
+    if total_new or total_upd:
+        logger.info(f"Holdings light-refresh: {total_upd} updated, {total_new} new position(s)")
+
+
+# ---------------------------------------------------------------------------
 # Broker adapters
 # ---------------------------------------------------------------------------
 class ZerodhaAdapter:
@@ -603,6 +725,12 @@ def run():
     conn = get_db()
     try:
         creds    = load_credentials(conn)
+
+        # Pull live quantities / avg cost / new positions first, so the price loop
+        # below values the CURRENT holdings (a same-day buy/sell shows immediately
+        # instead of waiting for the twice-daily full sync).
+        refresh_holdings_light(conn)
+
         holdings = load_holdings(conn)
 
         if not holdings:
