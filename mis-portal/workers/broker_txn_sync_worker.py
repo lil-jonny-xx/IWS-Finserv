@@ -77,11 +77,18 @@ def norm_zerodha(t):
 
 
 def norm_angel(t):
+    # Angel's trade book is the CURRENT trading day only, and the fill timestamp it
+    # returns is a bare time ("12:10:37") with no date — so a date parse yields None
+    # and the row would be wrongly dropped as "missing date". Fall back to today (its
+    # real trade date). Also: the per-fill id is `fillid`, not `tradeid` (which is
+    # absent), so keying on tradeid produced empty ids that collapsed distinct fills
+    # via the content-hash fallback.
     return {"symbol": t.get("tradingsymbol"), "isin": None,
-            "date": _date(t.get("filltime") or t.get("exchangetime") or t.get("filldate")),
+            "date": _date(t.get("filltime") or t.get("exchangetime") or t.get("filldate")) or TODAY,
             "side": _side(t.get("transactiontype")),
             "qty": _f(t.get("fillsize") or t.get("filledshares")),
-            "price": _f(t.get("fillprice")), "trade_id": str(t.get("tradeid") or ""),
+            "price": _f(t.get("fillprice")),
+            "trade_id": str(t.get("fillid") or t.get("tradeid") or ""),
             "exchange": t.get("exchange")}
 
 
