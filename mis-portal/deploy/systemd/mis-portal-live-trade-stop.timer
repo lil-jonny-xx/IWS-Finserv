@@ -1,0 +1,12 @@
+[Unit]
+Description=IWS MIS Portal — stop Live Trade Daemons after market close (weekdays)
+Requires=mis-portal-live-trade-stop.service
+
+[Timer]
+# 10:05 UTC = 15:35 IST — a few minutes after the 15:30 NSE close.
+OnCalendar=Mon..Fri *-*-* 10:05:00
+AccuracySec=30
+Persistent=false
+
+[Install]
+WantedBy=timers.target

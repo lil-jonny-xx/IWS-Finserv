@@ -1,0 +1,23 @@
+[Unit]
+Description=IWS MIS Portal — Live Trade Daemon (%i)
+After=network.target postgresql.service redis-server.service
+# %i is the account slug (e.g. zerodha-dhr); the daemon maps it to broker+entity.
+
+[Service]
+Type=simple
+User=SAdmin
+WorkingDirectory=/var/www/mis-portal
+Environment=HOME=/home/SAdmin
+# Long-running: holds the broker's order-update WebSocket and, on every fill, writes
+# it to stock_transaction (real price+time) and PUBLISHes to Redis 'live_trades' for
+# the /api/v1/live/trades SSE stream. Restart on failure so a dropped socket or a
+# transient broker error self-heals within the session; the start/stop timers bound it
+# to market hours (so the daily token, refreshed 06:30 IST, is always fresh at start).
+ExecStart=/var/www/.venv/bin/python -m workers.live_trade_daemon --account %i
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/mis-portal-live-trade.log
+StandardError=append:/var/log/mis-portal-live-trade.log
+
+# No [Install] on purpose: instances are not enabled at boot (the daily token would be
+# stale overnight). The start/stop timers manage their lifecycle instead.

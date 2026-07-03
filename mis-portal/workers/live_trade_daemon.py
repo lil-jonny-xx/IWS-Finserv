@@ -283,13 +283,34 @@ def run_dhan(ctx):
 
 RUNNERS = {"zerodha": run_zerodha, "angel_one": run_angel, "dhan": run_dhan}
 
+# systemd addresses one daemon per account by a filesystem-safe slug (the
+# `mis-portal-live-trade@<slug>` template instance), resolved here to (broker, entity)
+# so multi-word entity codes like "Rajani Corp" never touch a unit-instance string.
+ACCOUNTS = {
+    "zerodha-dhr":    ("zerodha",   "DHR"),
+    "zerodha-hhr":    ("zerodha",   "HHR"),
+    "zerodha-sdr":    ("zerodha",   "SDR"),
+    "zerodha-rajani": ("zerodha",   "Rajani Corp"),
+    "angel-dhr":      ("angel_one", "DHR"),
+    "angel-hhr":      ("angel_one", "HHR"),
+    "dhan-hhr":       ("dhan",      "HHR"),
+    "dhan-rajani":    ("dhan",      "Rajani Corp"),
+}
+
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--broker", required=True, choices=list(RUNNERS))
-    ap.add_argument("--entity", required=True, help="entity code, e.g. DHR")
+    ap.add_argument("--account", choices=list(ACCOUNTS),
+                    help="account slug (resolves to broker+entity); used by systemd")
+    ap.add_argument("--broker", choices=list(RUNNERS))
+    ap.add_argument("--entity", help="entity code, e.g. DHR")
     ap.add_argument("--dry-run", action="store_true", help="log + publish but don't write to DB")
     args = ap.parse_args()
+
+    if args.account:
+        args.broker, args.entity = ACCOUNTS[args.account]
+    if not (args.broker and args.entity):
+        ap.error("provide --account, or both --broker and --entity")
 
     conn = get_conn()
     ctx = {

@@ -1,0 +1,14 @@
+[Unit]
+Description=IWS MIS Portal — start Live Trade Daemons at market open (weekdays)
+Requires=mis-portal-live-trade-start.service
+
+[Timer]
+# 03:35 UTC = 09:05 IST — after the 06:30 IST token refresh, just before the 09:15
+# NSE open, so every daemon connects with a fresh daily token.
+OnCalendar=Mon..Fri *-*-* 03:35:00
+AccuracySec=30
+# Persistent so a reboot during market hours re-launches the daemons on next start.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

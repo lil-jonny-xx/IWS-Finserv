@@ -1,0 +1,14 @@
+[Unit]
+Description=IWS MIS Portal — start Live Trade Daemons for the session
+After=network.target
+
+[Service]
+Type=oneshot
+# Starts one daemon instance per ACTIVE account. Zerodha is verified end-to-end; add
+# the Angel/Dhan instances here once their order-update WS is confirmed against a live
+# session (angel-dhr angel-hhr dhan-hhr dhan-rajani).
+ExecStart=/usr/bin/systemctl start \
+    mis-portal-live-trade@zerodha-dhr.service \
+    mis-portal-live-trade@zerodha-hhr.service \
+    mis-portal-live-trade@zerodha-sdr.service \
+    mis-portal-live-trade@zerodha-rajani.service
