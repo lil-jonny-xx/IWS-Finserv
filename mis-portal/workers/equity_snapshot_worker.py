@@ -31,7 +31,7 @@ import logging
 import os
 import sys
 import zoneinfo
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -134,6 +134,27 @@ def write_snapshot(cur, entity_id, broker, holdings, captured_at, kind):
 
 def _synthetic_exists(cur, source_ref: str) -> bool:
     cur.execute("SELECT 1 FROM stock_transaction WHERE source_ref = %s", (source_ref,))
+    return cur.fetchone() is not None
+
+
+# Snapshot detection is a FALLBACK. The authoritative record is the real broker fill
+# pulled by broker_txn_sync_worker (correct trade date + fill price). A delivery trade
+# settles T+1, so the snapshot only sees it the next morning — by which point the real
+# fill (recorded the evening it executed) already exists. Detecting it again here would
+# duplicate that fill (and at the wrong LTP-priced date), so if a real fill for this
+# security exists within the recent window we skip the snapshot row. When the real sync
+# is down (token/cron outage), no recent real fill exists and detection resumes.
+REAL_TRADE_LOOKBACK_DAYS = 6
+
+
+def _real_trade_recent(cur, entity_id, security_id, today) -> bool:
+    cur.execute(
+        "SELECT 1 FROM stock_transaction "
+        "WHERE entity_id = %s AND security_id = %s "
+        "AND source NOT IN ('snapshot', 'snapshot_open') "
+        "AND transaction_date >= %s LIMIT 1",
+        (entity_id, security_id, today - timedelta(days=REAL_TRADE_LOOKBACK_DAYS)),
+    )
     return cur.fetchone() is not None
 
 
@@ -272,6 +293,11 @@ def detect_trades(cur, entity_id, broker, holdings, prev, captured_at, today):
         if _synthetic_exists(cur, source_ref):
             continue
         sec_id = _get_or_create_security(cur, isin, symbol, exch, False)
+        # Fallback only: if the real broker feed already recorded a fill for this
+        # security recently, it's the authoritative source — don't duplicate it with
+        # an approximate snapshot row (see _real_trade_recent).
+        if _real_trade_recent(cur, entity_id, sec_id, today):
+            continue
         _insert_trade(cur, entity_id, sec_id, today, side, qty, price,
                       "snapshot", source_ref, exch)
         if side == "BUY":

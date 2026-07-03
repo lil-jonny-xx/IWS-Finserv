@@ -153,6 +153,7 @@ def sync_trades(cur, broker_module, broker, entity_id, entity_code, commit, stat
 
     isin_map = holdings_isin_map(broker_module, entity_code)
     ins = dup = skip = 0
+    touched_secs, max_tdate = set(), None   # for snapshot supersede after the loop
     for t in raw:
         r = norm(t)
         if not r["isin"] and r["symbol"]:
@@ -178,9 +179,31 @@ def sync_trades(cur, broker_module, broker, entity_id, entity_code, commit, stat
                 VALUES (%s,%s,%s,%s,%s,%s,%s,'INR',%s,%s,%s,NOW())""",
                 (entity_id, sec_id, r["date"], r["side"], r["qty"], r["price"], amount,
                  r["exchange"], broker, sref))
+            touched_secs.add(sec_id)
+            if max_tdate is None or r["date"] > max_tdate:
+                max_tdate = r["date"]
         ins += 1
+
+    # Real fills are authoritative: supersede the approximate snapshot-derived rows
+    # they cover (the snapshot worker prices at LTP and dates by settlement-detection,
+    # so a real fill has the correct date + price). Same policy as the manual
+    # tradebook importers: opening seeds go unconditionally; detected trades only up
+    # to the last real trade date, so a snapshot placeholder for a fill not yet
+    # returned by the API survives until it is.
+    superseded = 0
+    if commit and touched_secs:
+        secs = list(touched_secs)
+        cur.execute("DELETE FROM stock_transaction WHERE source = 'snapshot_open' "
+                    "AND entity_id = %s AND security_id = ANY(%s)", (entity_id, secs))
+        superseded += cur.rowcount
+        cur.execute("DELETE FROM stock_transaction WHERE source = 'snapshot' "
+                    "AND entity_id = %s AND security_id = ANY(%s) AND transaction_date <= %s",
+                    (entity_id, secs, max_tdate))
+        superseded += cur.rowcount
+
     stats["trades"] += ins
-    print(f"    trades: +{ins} new, {dup} dup, {skip} skipped (of {len(raw)})")
+    extra = f", superseded {superseded} snapshot row(s)" if superseded else ""
+    print(f"    trades: +{ins} new, {dup} dup, {skip} skipped (of {len(raw)}){extra}")
 
 
 def sync_dhan_ledger(cur, broker_module, entity_id, entity_code, commit, stats):
