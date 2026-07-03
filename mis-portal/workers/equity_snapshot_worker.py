@@ -192,40 +192,83 @@ def seed_opening_buys(cur, entity_id, holdings, today):
     return seeded
 
 
+def _identity(isin, symbol) -> str:
+    """Stable position identity for the diff: ISIN when the broker provides one,
+    else the (upper-cased) symbol string.
+
+    Keying the tick-to-tick diff on this — NOT on the raw symbol string — means an
+    overnight symbol relabel that keeps the same ISIN nets to zero instead of being
+    misread as a full exit + fresh entry (a phantom SELL + BUY that fabricates a
+    realised gain). Seen in the wild: SGBAUG28V -> SGBAUG28V-GB (sovereign gold bond
+    suffix appearing) and TRANSWORLD -> TRANSWORLD-BE (trade-to-trade segment
+    reclassification). Both are pure relabels — same ISIN, same quantity, no trade."""
+    isin = (isin or "").strip()
+    return f"ISIN:{isin}" if isin else f"SYM:{(symbol or '').strip().upper()}"
+
+
 def detect_trades(cur, entity_id, broker, holdings, prev, captured_at, today):
     """Diff current holdings vs the previous tick; write BUY/SELL rows. Returns
-    (buys, sells)."""
-    curr = {h.symbol: h for h in holdings}
+    (buys, sells).
+
+    Positions are matched by ISIN-first identity (see _identity), so a symbol
+    relabel of an unchanged holding produces no trade. Quantities are aggregated per
+    identity, which also nets a dual-listed same-ISIN position reported on two
+    broker lines."""
     ts_iso = captured_at.isoformat()
     buys = sells = 0
 
-    for symbol in set(curr) | set(prev):
-        h = curr.get(symbol)
-        curr_qty = _d(h.quantity) if h else Decimal("0")
-        prev_qty = prev.get(symbol, {}).get("qty", Decimal("0"))
+    # Aggregate current holdings by stable identity; keep a representative holding
+    # per identity for price / symbol / exchange attribution of any trade row.
+    curr: dict = {}
+    for h in holdings:
+        key = _identity(getattr(h, "isin", None), h.symbol)
+        slot = curr.get(key)
+        if slot is None:
+            curr[key] = {"qty": _d(h.quantity), "h": h}
+        else:
+            slot["qty"] += _d(h.quantity)
+
+    # Aggregate the previous snapshot (keyed by symbol on disk) the same way.
+    prevk: dict = {}
+    for sym, d in prev.items():
+        key = _identity(d.get("isin"), sym)
+        slot = prevk.get(key)
+        if slot is None:
+            prevk[key] = {"qty": d["qty"], "price": d.get("price"),
+                          "isin": d.get("isin"), "symbol": sym}
+        else:
+            slot["qty"] += d["qty"]
+
+    for key in set(curr) | set(prevk):
+        c = curr.get(key)
+        p = prevk.get(key)
+        curr_qty = c["qty"] if c else Decimal("0")
+        prev_qty = p["qty"] if p else Decimal("0")
         delta = curr_qty - prev_qty
         if abs(delta) <= QTY_EPS:
             continue
 
+        h = c["h"] if c else None
         if delta > 0:
             side, qty = "BUY", delta
-            price = _d(h.current_price) if getattr(h, "current_price", None) is not None else None
-            exch  = getattr(h, "exchange", None) or None
-            isin  = getattr(h, "isin", None) or None
+            price = _d(h.current_price) if (h and getattr(h, "current_price", None) is not None) else None
         else:
             side, qty = "SELL", -delta
-            # Still-held reductions price at this tick; a fully-exited symbol has no
+            # Still-held reductions price at this tick; a fully-exited position has no
             # fresh price, so fall back to its last snapshot price.
             price = _d(h.current_price) if (h and getattr(h, "current_price", None) is not None) \
-                else _d(prev.get(symbol, {}).get("price"))
-            exch  = getattr(h, "exchange", None) or None if h else None
-            isin  = (getattr(h, "isin", None) if h else None) or prev.get(symbol, {}).get("isin") or None
+                else _d(p.get("price") if p else None)
+        exch   = (getattr(h, "exchange", None) or None) if h else None
+        isin   = (getattr(h, "isin", None) if h else None) or (p["isin"] if p else None) or None
+        symbol = (h.symbol if h else None) or (p["symbol"] if p else key)
 
         if price is None or price <= 0:
             logger.warning(f"[{entity_id}/{broker}] {symbol}: no price for {side} — skipping trade row")
             continue
 
-        source_ref = f"snapshot:{entity_id}|{symbol}|{ts_iso}|{side}"
+        # source_ref is keyed on the stable identity (not the symbol) so a later
+        # relabel cannot re-open an already-recorded trade under a new string.
+        source_ref = f"snapshot:{entity_id}|{key}|{ts_iso}|{side}"
         if _synthetic_exists(cur, source_ref):
             continue
         sec_id = _get_or_create_security(cur, isin, symbol, exch, False)
