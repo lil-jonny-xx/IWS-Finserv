@@ -34,6 +34,20 @@ interface ActivityResponse {
   trades: ActivityTrade[];
 }
 
+// A fill pushed live over SSE by the live_trade_daemon (via /api/v1/live/trades).
+interface LiveFill {
+  entity: string;
+  entity_id: number;
+  broker: string;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  qty: number;
+  price: number;
+  amount: number;
+  date: string;
+  order_id: string;
+}
+
 // Buys/sells detected today by the intraday snapshot worker (source='snapshot').
 // Prices are the snapshot LTP at detection, not the exact fill — see the API docstring.
 function TradedToday({ data, showEntityCol }: { data: ActivityResponse; showEntityCol: boolean }) {
@@ -184,7 +198,9 @@ export default function EquityPage() {
   const [retryCount, setRetryCount]       = useState(0);
   const [lastUpdated, setLastUpdated]     = useState<Date | null>(null);
   const [liveActive, setLiveActive]       = useState(false);
+  const [sseLive, setSseLive]             = useState(false);
   const intervalRef                       = useRef<ReturnType<typeof setInterval> | null>(null);
+  const refetchTimer                      = useRef<ReturnType<typeof setTimeout> | null>(null);
   const didInitialLoad                    = useRef(false);
 
   useEffect(() => {
@@ -258,6 +274,49 @@ export default function EquityPage() {
     return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
   }, [selectedId]);
 
+  // Sub-second live fills via SSE (live_trade_daemon → Redis → /api/v1/live/trades).
+  // Each fill is shown in "Traded today" instantly (optimistic), then a debounced
+  // refetch pulls the authoritative holdings + activity (real realised P&L, updated
+  // quantities). EventSource auto-reconnects on drop; events for other entities are
+  // filtered out client-side when a single entity is selected.
+  useEffect(() => {
+    if (!user) return;
+    const es = new EventSource(`${API_URL}/api/v1/live/trades`, { withCredentials: true });
+    es.onopen = () => setSseLive(true);
+    es.onerror = () => setSseLive(false);  // browser retries automatically
+    es.onmessage = (e) => {
+      let ev: LiveFill;
+      try { ev = JSON.parse(e.data); } catch { return; }
+      if (!ev || !ev.symbol) return;
+      if (selectedId !== null && ev.entity_id !== selectedId) return;
+      setActivity(prev => {
+        const trade: ActivityTrade = {
+          entity_name: ev.entity, security_name: ev.symbol, side: ev.side,
+          quantity: ev.qty, price: ev.price, amount: ev.amount, realized_pnl: null,
+        };
+        const isBuy = ev.side === 'BUY';
+        if (!prev) return {
+          date: ev.date, buy_count: isBuy ? 1 : 0, sell_count: isBuy ? 0 : 1,
+          realized_pnl_total: 0, trades: [trade],
+        };
+        return {
+          ...prev,
+          buy_count: prev.buy_count + (isBuy ? 1 : 0),
+          sell_count: prev.sell_count + (isBuy ? 0 : 1),
+          trades: [trade, ...prev.trades],
+        };
+      });
+      // Debounced authoritative reconcile (real realised P&L + quantities from the API).
+      if (refetchTimer.current) clearTimeout(refetchTimer.current);
+      refetchTimer.current = setTimeout(() => setRetryCount(c => c + 1), 1500);
+    };
+    return () => {
+      es.close();
+      setSseLive(false);
+      if (refetchTimer.current) clearTimeout(refetchTimer.current);
+    };
+  }, [user, selectedId]);
+
   const isAdmin       = !!user;  // members have admin-level view access (only Manual Data + user mgmt are admin-only)
   const showEntityCol = isAdmin && selectedId === null;
   const handleRetry   = useCallback(() => setRetryCount(c => c + 1), []);
@@ -270,7 +329,12 @@ export default function EquityPage() {
           <div>
             <h1 className="text-2xl sm:text-3xl font-bold text-ink">Equity Portfolio</h1>
             <div className="flex items-center gap-2 mt-0.5">
-              {liveActive ? (
+              {sseLive ? (
+                <span className="flex items-center gap-1.5 text-xs text-gain font-medium">
+                  <span className="w-1.5 h-1.5 rounded-full bg-gain animate-pulse inline-block" />
+                  Live · real-time fills
+                </span>
+              ) : liveActive ? (
                 <span className="flex items-center gap-1.5 text-xs text-gain font-medium">
                   <span className="w-1.5 h-1.5 rounded-full bg-gain animate-pulse inline-block" />
                   Live · updates every minute
