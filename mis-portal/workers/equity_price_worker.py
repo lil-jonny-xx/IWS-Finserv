@@ -221,6 +221,10 @@ def refresh_holdings_light(conn):
 
                 # Genuinely new position — minimal INR row; the full sync enriches
                 # metrics/FX later, the price loop sets live price/MV this same tick.
+                # A stock first seen today was bought today, so its "Since" date
+                # (first_invested_date) is today. The full sync preserves it
+                # (fetch_first_invested_date reads it back), and CAGR stays NULL until
+                # 1yr elapses (compute_metrics' ≥1yr guard), so no bogus 0-year figure.
                 price = float(h.current_price) if h.current_price is not None else None
                 mv    = (qty * price) if price is not None else None
                 cur.execute(
@@ -228,14 +232,14 @@ def refresh_holdings_light(conn):
                     INSERT INTO equity_holding
                         (entity_id, broker, symbol, isin, exchange, sector, asset_class,
                          quantity, avg_cost, cost, current_price, current_market_value,
-                         currency, fx_rate, as_of_date, updated_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'INR',1,%s,NOW())
+                         currency, fx_rate, as_of_date, first_invested_date, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'INR',1,%s,%s,NOW())
                     ON CONFLICT (entity_id, broker, isin) DO NOTHING
                     """,
                     (eid, broker_label, h.symbol, isin, h.exchange,
                      classify_sector(h.symbol, isin or ""),
                      _asset_class_for(conn, h.symbol, isin or ""),
-                     qty, avg, cost, price, mv, today),
+                     qty, avg, cost, price, mv, today, today),
                 )
                 total_new += cur.rowcount
             conn.commit()
