@@ -5084,3 +5084,60 @@ def assistant_chat(
             release_db_connection(conn)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
+# Live trades — SSE stream of real-time broker fills (published by live_trade_daemon)
+# ---------------------------------------------------------------------------
+LIVE_TRADES_CHANNEL = "live_trades"
+
+
+@app.get("/api/v1/live/trades")
+def stream_live_trades(request: Request, authorization: Optional[str] = Header(None)):
+    """Server-Sent Events stream of live order fills.
+
+    The live_trade_daemon publishes each fill (the instant the broker's order-update
+    WebSocket reports it) to the Redis `live_trades` channel; this relays them to the
+    browser's EventSource with sub-second latency. Auth is the normal token — an
+    EventSource sends the httponly cookie same-origin. Members see all entities (role
+    model), so there is no server-side entity filter; the UI narrows to the selected
+    entity itself.
+    """
+    _require_auth(request, authorization)
+
+    def event_stream():
+        if redis_client is None:
+            yield f"data: {json.dumps({'type': 'error', 'message': 'live feed unavailable'})}\n\n"
+            return
+        pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
+        pubsub.subscribe(LIVE_TRADES_CHANNEL)
+        try:
+            # Open the stream immediately so the client's onopen fires without waiting
+            # for the first fill; SSE comment lines (":" prefix) are ignored by clients.
+            yield ": connected\n\n"
+            while True:
+                # Blocking read in a threadpool (sync generator) — does not stall the
+                # event loop. The 15s timeout doubles as the keepalive cadence.
+                msg = pubsub.get_message(timeout=15.0)
+                if msg and msg.get("type") == "message":
+                    yield f"data: {msg['data']}\n\n"
+                else:
+                    yield ": keepalive\n\n"
+        except GeneratorExit:
+            pass  # client disconnected — Starlette closes the generator
+        finally:
+            try:
+                pubsub.unsubscribe(LIVE_TRADES_CHANNEL)
+                pubsub.close()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # tell nginx not to buffer the stream
+            "Connection": "keep-alive",
+        },
+    )
