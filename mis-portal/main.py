@@ -274,7 +274,7 @@ def _login_impl(request: Request, login_request: LoginRequest, response: Respons
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, email, password_hash, role, failed_attempts, locked_until FROM users WHERE email = %s AND is_active = TRUE",
+            "SELECT id, email, password_hash, role, failed_attempts, locked_until, token_version FROM users WHERE email = %s AND is_active = TRUE",
             (email,)
         )
         user_row = cursor.fetchone()
@@ -330,6 +330,11 @@ def _login_impl(request: Request, login_request: LoginRequest, response: Respons
             "user_id": user_row["id"],
             "email": email,
             "role": user_row["role"],
+            # Session-revocation counter — must match users.token_version on every
+            # request (see _require_auth). A password change / admin reset bumps the
+            # column, instantly invalidating tokens minted before the bump.
+            "token_version": user_row.get("token_version", 0),
+            "iat": datetime.utcnow(),
             "exp": datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         }
         token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
@@ -404,7 +409,7 @@ _GENERIC_FORGOT_MSG = ("If an account exists for that email, your administrator 
 
 
 @app.post("/api/v1/auth/change-password")
-def change_password(request: Request, body: ChangePasswordRequest,
+def change_password(request: Request, body: ChangePasswordRequest, response: Response,
                     authorization: Optional[str] = Header(None)):
     """Authenticated self-service password change: verify the current password, set a new one."""
     payload = _require_auth(request, authorization)
@@ -412,7 +417,7 @@ def change_password(request: Request, body: ChangePasswordRequest,
     conn = get_db_connection()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT id, password_hash FROM users WHERE email = %s AND is_active = TRUE",
+        cur.execute("SELECT id, password_hash, role FROM users WHERE email = %s AND is_active = TRUE",
                     (payload["email"],))
         row = cur.fetchone()
         if not row or not verify_password(body.current_password, row["password_hash"]):
@@ -420,11 +425,26 @@ def change_password(request: Request, body: ChangePasswordRequest,
         if verify_password(body.new_password, row["password_hash"]):
             raise HTTPException(status_code=400,
                                 detail="New password must be different from the current one.")
-        cur.execute("UPDATE users SET password_hash = %s WHERE id = %s",
+        # Bump token_version so every OTHER live session for this user is revoked on
+        # its next request (a password change should log out sessions the user no
+        # longer controls). RETURNING gives us the new value to re-mint this caller's
+        # own token below, so the session that made the change stays logged in.
+        cur.execute("UPDATE users SET password_hash = %s, token_version = token_version + 1 "
+                    "WHERE id = %s RETURNING token_version",
                     (_hash_password(body.new_password), row["id"]))
+        new_version = cur.fetchone()["token_version"]
         write_audit_log(conn, row["id"], "CHANGE_PASSWORD", "users", row["id"],
                         f"Password changed by {payload['email']}")
         conn.commit()
+        # Re-issue this session's cookie with the new token_version so it isn't caught
+        # by the revocation above. Header/Bearer clients must re-authenticate.
+        new_token = jwt.encode(
+            {"user_id": row["id"], "email": payload["email"], "role": row["role"],
+             "token_version": new_version, "iat": datetime.utcnow(),
+             "exp": datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)},
+            SECRET_KEY, algorithm="HS256")
+        response.set_cookie(key="access_token", value=new_token,
+                            httponly=True, secure=True, samesite="strict")
         return {"message": "Password changed successfully."}
     except HTTPException:
         conn.rollback(); raise
@@ -525,7 +545,10 @@ def admin_reset_password(request: Request, body: AdminResetPasswordRequest,
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="No active user with that email.")
-        cur.execute("UPDATE users SET password_hash = %s, failed_attempts = 0, locked_until = NULL "
+        # Bump token_version too: a reset is often incident response, so every
+        # outstanding session for the target (e.g. an attacker's) must die at once.
+        cur.execute("UPDATE users SET password_hash = %s, failed_attempts = 0, locked_until = NULL, "
+                    "token_version = token_version + 1 "
                     "WHERE id = %s", (_hash_password(body.new_password), row["id"]))
         cur.execute("UPDATE password_reset_request SET status = 'resolved', resolved_at = NOW(), "
                     "resolved_by = %s WHERE user_id = %s AND status = 'pending'",
@@ -654,17 +677,56 @@ def get_entities(request: Request, authorization: Optional[str] = Header(None)):
     finally:
         release_db_connection(conn)
 
+def _assert_session_current(payload: dict) -> None:
+    """
+    Live server-side session check, run on every authenticated request. Rejects a
+    token whose owner has since been deactivated (is_active=FALSE) or whose sessions
+    were revoked (users.token_version bumped by a password change / admin reset).
+
+    Without this a valid signed JWT stays usable until its 8-hour expiry even after
+    the credential is rotated or the account disabled. Fails CLOSED: any lookup error
+    denies the request rather than letting it through.
+
+    Uses its own short-lived pooled connection and releases it before returning, so it
+    does not raise peak concurrency (the endpoint acquires its connection afterwards).
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT is_active, token_version FROM users WHERE email = %s",
+            (payload.get("email"),),
+        )
+        row = cur.fetchone()
+        cur.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"session validation failed: {e}")
+        raise HTTPException(status_code=401, detail="Could not validate session.")
+    finally:
+        release_db_connection(conn)
+
+    if not row or not row["is_active"]:
+        raise HTTPException(status_code=401, detail="Account is inactive. Please log in again.")
+    if int(row["token_version"]) != int(payload.get("token_version", 0)):
+        raise HTTPException(status_code=401, detail="Session has been revoked. Please log in again.")
+
+
 def _require_auth(request: Request, authorization: Optional[str]) -> dict:
     """Validate token and return JWT payload. Raises 401 on failure."""
     token = get_token_from_request(request, authorization)
     if is_token_blacklisted(token):
         raise HTTPException(status_code=401, detail="Token has been revoked")
     try:
-        return jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token has expired. Please log in again.")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+    _assert_session_current(payload)
+    return payload
 
 
 def _live_role(cursor, email: str) -> str:
