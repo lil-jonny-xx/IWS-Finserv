@@ -7,7 +7,7 @@ import os
 import re
 from datetime import date, datetime
 from typing import Optional
-from collections import defaultdict
+from collections import defaultdict, deque
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import openpyxl
@@ -1841,6 +1841,102 @@ def _avg_cost_realised_grouped(seq: list, fy_start: date) -> list:
     return out
 
 
+def _is_long_term_equity(buy_dt: date, sell_dt: date) -> bool:
+    """Indian listed-equity long-term test: held for MORE than 12 months.
+
+    The 12-month anniversary of the purchase is the boundary — a sale strictly
+    after it is long-term (LTCG); on/before it is short-term (STCG). Computed on
+    calendar months (not a flat 365 days) so leap years don't misclassify; a
+    Feb-29 purchase rolls to Feb-28 of the anniversary year.
+    """
+    try:
+        anniversary = buy_dt.replace(year=buy_dt.year + 1)
+    except ValueError:  # Feb 29 → Feb 28 next year
+        anniversary = buy_dt.replace(year=buy_dt.year + 1, day=28)
+    return sell_dt > anniversary
+
+
+def _fifo_realised_grouped(seq: list, fy_start: date) -> list:
+    """
+    FIFO realised P&L for ONE entity's chronological Indian-equity trade stream.
+
+    Each sell is matched against the OLDEST open buy lots first (FIFO), mirroring
+    broker-console realised P&L and Indian capital-gains reporting — so the number
+    finally agrees with the client's own broker statement. This replaces the old
+    average-cost method (_avg_cost_realised_grouped) for Indian equity only.
+
+    Gross, price-to-price: gain on a matched slice = qty * (sell_price - buy_price),
+    using fill prices only (brokerage/STT/other charges are NOT deducted). Each
+    matched slice is split into short-term vs long-term via the lot's own buy date
+    (see _is_long_term_equity), so every emitted sell carries st_pnl / lt_pnl.
+
+    Buys before fy_start still establish lot basis; only sells on/after fy_start
+    emit a row. One row per qualifying sell (aggregation into per-symbol subtotals,
+    if wanted, is a display concern for the caller).
+
+    If a sell cannot be fully covered by known lots (purchase history is
+    incomplete), the whole row is flagged unknown — purchase_amount / pnl / st_pnl /
+    lt_pnl are left None rather than overstating the gain, matching the
+    non-overstatement policy of the average-cost engine.
+
+    seq items: {date, kind:'buy'|'sell', units, price, name, sec}. Prices are the
+    per-share INR fill price (already INR — the caller scopes to currency='INR').
+    Emits: {group, security_name, purchase_amount, sale_date, sale_amount,
+            pnl, st_pnl, lt_pnl, return_pct}.
+    """
+    lots: dict = defaultdict(deque)   # sec -> deque([[buy_date, qty, price], ...])
+    out: list = []
+
+    for t in seq:
+        sec = t["sec"]
+        qty = abs(float(t["units"] or 0))
+        px  = float(t["price"] or 0)
+        if qty <= 1e-9:
+            continue
+
+        if t["kind"] == "buy":
+            lots[sec].append([t["date"], qty, px])
+            continue
+
+        # sell — consume FIFO lots for this security
+        remaining       = qty
+        sale_amount     = qty * px
+        purchase_amount = 0.0
+        st_pnl          = 0.0
+        lt_pnl          = 0.0
+        dq              = lots[sec]
+        while remaining > 1e-9 and dq:
+            lot   = dq[0]
+            take  = min(remaining, lot[1])
+            gain  = take * (px - lot[2])
+            purchase_amount += take * lot[2]
+            if _is_long_term_equity(lot[0], t["date"]):
+                lt_pnl += gain
+            else:
+                st_pnl += gain
+            lot[1]    -= take
+            remaining -= take
+            if lot[1] <= 1e-9:
+                dq.popleft()
+
+        if t["date"] < fy_start:
+            continue
+
+        if remaining > 1e-9:                       # not enough basis to cover the sell
+            out.append({"group": "Equity", "security_name": t["name"],
+                        "purchase_amount": None, "sale_date": t["date"],
+                        "sale_amount": sale_amount, "pnl": None,
+                        "st_pnl": None, "lt_pnl": None, "return_pct": None})
+        else:
+            pnl = st_pnl + lt_pnl
+            ret = (pnl / purchase_amount) if purchase_amount else None
+            out.append({"group": "Equity", "security_name": t["name"],
+                        "purchase_amount": purchase_amount, "sale_date": t["date"],
+                        "sale_amount": sale_amount, "pnl": pnl,
+                        "st_pnl": st_pnl, "lt_pnl": lt_pnl, "return_pct": ret})
+    return out
+
+
 def _fx_rate_on(conn, currency: str, on_date: date) -> Optional[float]:
     """Currency→INR rate as of a date (nearest rate on/before; else earliest available).
 
@@ -1919,19 +2015,22 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
                         "amount": r["amount"], "name": r["security_name"], "group": grp})
         _add(_avg_cost_realised(seq, fy), "Mutual Funds")
 
-    # ---- Equity (stock_transaction; empty until tradebooks imported) ----
-    # Processed per entity as one chronological stream across all stocks, so that
-    # consecutive sells of the same stock collapse into a single realised event.
-    # Any interleaving trade (a buy, or a sell of a different stock) breaks the run —
-    # the next same-stock sell then becomes its own discontinuous row. See
-    # _avg_cost_realised_grouped. Ordering within a date falls back to insert order (id).
+    # ---- Indian equity (stock_transaction, currency='INR'; empty until imports) ----
+    # FIFO lot-matching per entity as one chronological stream across all stocks:
+    # each sell consumes the oldest open buy lots, so realised P&L mirrors the broker
+    # console and Indian capital-gains reporting, and each sell splits into short- vs
+    # long-term (see _fifo_realised_grouped). Gross, price-to-price (per-share `price`;
+    # charges not deducted). Scoped to currency='INR' so Vested (USD) rows that also
+    # live in stock_transaction are excluded here and handled by the foreign branch /
+    # equity_trade_ledger. Ordering within a date falls back to insert order (id).
     try:
         cur.execute(f"""
             SELECT t.entity_id, t.security_id, sm.security_name,
                    t.transaction_date AS d, t.transaction_type AS tt,
-                   COALESCE(t.amount_inr, t.amount) AS amount, t.quantity AS units
+                   t.price, t.quantity AS units
             FROM stock_transaction t JOIN security_master sm ON sm.id = t.security_id
             WHERE t.entity_id IN ({ph})
+              AND COALESCE(t.currency, 'INR') = 'INR'
             ORDER BY t.entity_id, t.transaction_date, t.id
         """, entity_ids)
         srows = cur.fetchall()
@@ -1948,9 +2047,9 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
             if not kind:
                 continue
             seq.append({"date": r["d"], "kind": kind, "units": r["units"],
-                        "amount": r["amount"], "name": r["security_name"],
+                        "price": r["price"], "name": r["security_name"],
                         "group": "Equity", "sec": r["security_id"]})
-        _add(_avg_cost_realised_grouped(seq, fy), "Equity")
+        _add(_fifo_realised_grouped(seq, fy), "Equity")
 
     # ---- Foreign equity (equity_trade_ledger; native cash flows → INR at trade-date FX) ----
     # Switches do not exist for brokers, so include_switches is irrelevant here.

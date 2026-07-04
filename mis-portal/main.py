@@ -4691,6 +4691,8 @@ def get_realised_gains(
                     "sale_date":       str(r["sale_date"]),
                     "sale_amount":     r["sale_amount"],
                     "pnl":             r["pnl"],
+                    "st_pnl":          r.get("st_pnl"),
+                    "lt_pnl":          r.get("lt_pnl"),
                     "return_pct":      r["return_pct"],
                 })
         return out

@@ -14,6 +14,8 @@ interface RealisedRow {
   sale_date: string;
   sale_amount: number | null;
   pnl: number | null;
+  st_pnl: number | null;   // Indian equity only: short-term slice (held ≤ 12 months)
+  lt_pnl: number | null;   // Indian equity only: long-term slice (held > 12 months)
   return_pct: number | null;
 }
 
@@ -118,6 +120,11 @@ export default function RealisedGainsPage() {
   const changeSwitches = (s: Switches) => { setLoading(true); setSwitches(s); };
 
   const totalPnl = rows.reduce((s, r) => s + (r.pnl ?? 0), 0);
+  // Short/long-term totals only exist for Indian equity (FIFO-split); other
+  // categories carry null, so they don't contribute.
+  const totalSt = rows.reduce((s, r) => s + (r.st_pnl ?? 0), 0);
+  const totalLt = rows.reduce((s, r) => s + (r.lt_pnl ?? 0), 0);
+  const hasStLt = rows.some(r => r.st_pnl != null || r.lt_pnl != null);
 
   // Split rows into asset sections (Equity / Mutual Funds / …). In "since inception"
   // mode each section is ordered latest sale first; FY-to-date keeps the backend's
@@ -164,8 +171,8 @@ export default function RealisedGainsPage() {
               Realised Gains ({period === 'inception' ? 'since inception' : 'FY to date'})
             </h1>
             <p className="text-xs mt-0.5" style={{ color: 'var(--ghost)' }}>
-              MF realised auto-computed from CAS transactions. Equity sells are detected live from hourly
-              holdings snapshots (refined when broker tradebooks are imported).
+              MF realised auto-computed from CAS transactions. Indian equity is FIFO-matched (broker/tax
+              basis), gross of charges, split into short-term (held ≤ 12 months) and long-term (&gt; 12 months).
               {' '}Switches are {switches === 'exclude' ? 'excluded' : 'included'}.
             </p>
           </div>
@@ -174,6 +181,13 @@ export default function RealisedGainsPage() {
             <div className="text-base font-bold" style={{ color: totalPnl >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
               ₹{inr(totalPnl)}
             </div>
+            {hasStLt && (
+              <div className="text-xs mt-0.5" style={{ color: 'var(--ghost)' }}>
+                <span style={{ color: totalSt >= 0 ? 'var(--gain)' : 'var(--peril)' }}>ST ₹{inr(totalSt)}</span>
+                {' · '}
+                <span style={{ color: totalLt >= 0 ? 'var(--gain)' : 'var(--peril)' }}>LT ₹{inr(totalLt)}</span>
+              </div>
+            )}
           </div>
         </div>
 
@@ -206,7 +220,7 @@ export default function RealisedGainsPage() {
             <table className="w-full text-xs">
               <thead>
                 <tr style={{ background: 'var(--page)', color: 'var(--dim)' }}>
-                  {['Entity', 'Group', 'Security', 'Purchase Amt', 'Sale Date', 'Sale Amt', 'P&L', 'Return %'].map(h => (
+                  {['Entity', 'Group', 'Security', 'Purchase Amt', 'Sale Date', 'Sale Amt', 'P&L', 'Short-term', 'Long-term', 'Return %'].map(h => (
                     <th key={h} className="px-3 py-2 text-left font-semibold">{h}</th>
                   ))}
                 </tr>
@@ -214,6 +228,11 @@ export default function RealisedGainsPage() {
               <tbody>
                 {sections.map(sec => {
                   const secPnl = sec.rows.reduce((s, r) => s + (r.pnl ?? 0), 0);
+                  // ST/LT subtotals are meaningful only for sections that carry them
+                  // (Indian equity). Elsewhere show a dash instead of a misleading ₹0.
+                  const secHasStLt = sec.rows.some(r => r.st_pnl != null || r.lt_pnl != null);
+                  const secSt = secHasStLt ? sec.rows.reduce((s, r) => s + (r.st_pnl ?? 0), 0) : null;
+                  const secLt = secHasStLt ? sec.rows.reduce((s, r) => s + (r.lt_pnl ?? 0), 0) : null;
                   return (
                     <Fragment key={sec.cat}>
                       <tr style={{ background: 'var(--page)', borderTop: '1px solid var(--rule)' }}>
@@ -223,6 +242,12 @@ export default function RealisedGainsPage() {
                         </td>
                         <td className="px-3 py-1.5 text-right font-semibold"
                             style={{ color: secPnl >= 0 ? 'var(--gain)' : 'var(--peril)' }}>₹{inr(secPnl)}</td>
+                        <td className="px-3 py-1.5 text-right font-semibold"
+                            style={{ color: secSt == null ? 'var(--ghost)' : secSt >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
+                          {secSt == null ? '—' : `₹${inr(secSt)}`}</td>
+                        <td className="px-3 py-1.5 text-right font-semibold"
+                            style={{ color: secLt == null ? 'var(--ghost)' : secLt >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
+                          {secLt == null ? '—' : `₹${inr(secLt)}`}</td>
                         <td className="px-3 py-1.5" />
                       </tr>
                       {sec.rows.map((r, i) => (
@@ -235,6 +260,10 @@ export default function RealisedGainsPage() {
                           <td className="px-3 py-2 text-right">{inr(r.sale_amount)}</td>
                           <td className="px-3 py-2 text-right font-medium"
                               style={{ color: (r.pnl ?? 0) >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{inr(r.pnl)}</td>
+                          <td className="px-3 py-2 text-right"
+                              style={{ color: r.st_pnl == null ? 'var(--ghost)' : r.st_pnl >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{inr(r.st_pnl)}</td>
+                          <td className="px-3 py-2 text-right"
+                              style={{ color: r.lt_pnl == null ? 'var(--ghost)' : r.lt_pnl >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{inr(r.lt_pnl)}</td>
                           <td className="px-3 py-2 text-right">{pct(r.return_pct)}</td>
                         </tr>
                       ))}
