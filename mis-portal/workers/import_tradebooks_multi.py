@@ -308,7 +308,7 @@ def get_or_create_security(cur, isin, symbol, exchange, currency, commit):
         return None
     cur.execute("""
         INSERT INTO security_master (isin, security_name, security_type, asset_class, currency, exchange, created_at)
-        VALUES (%s,%s,'EQUITY','Equity',%s,%s,NOW()) RETURNING id
+        VALUES (%s,%s,'EQUITY','EQUITY',%s,%s,NOW()) RETURNING id
     """, (isin or None, symbol, currency, exchange))
     return cur.fetchone()["id"]
 

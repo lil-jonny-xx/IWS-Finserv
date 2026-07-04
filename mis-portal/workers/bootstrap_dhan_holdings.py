@@ -51,7 +51,7 @@ def _get_or_create_security(cur, isin, symbol, exchange, dry):
         return f"<new:{symbol or isin}>"
     cur.execute("""
         INSERT INTO security_master (isin, security_name, security_type, asset_class, currency, exchange, created_at)
-        VALUES (%s, %s, 'EQUITY', 'Equity', 'INR', %s, NOW())
+        VALUES (%s, %s, 'EQUITY', 'EQUITY', 'INR', %s, NOW())
         RETURNING id
     """, (isin or None, symbol, exchange))
     return cur.fetchone()["id"]
