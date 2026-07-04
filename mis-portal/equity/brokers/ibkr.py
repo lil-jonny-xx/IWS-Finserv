@@ -62,9 +62,30 @@ _VERSION  = "3"
 # of retries with a LONG randomized wait: rapid sub-minute retries are precisely
 # what escalate a transient 1001 into a token-wide throttle and then a 1025
 # (learned the hard way — the cure for 1001 is silence, not more requests).
-_RETRYABLE_SEND_CODES = {"1001", "1009", "1018", "1019"}
+# Transient "try again shortly" codes: server busy (1009), rate (1018), still
+# generating (1019), and the various "data not ready yet" codes (1004 incomplete,
+# 1005 settlement, 1006 FIFO P/L, 1007 MTM P/L, 1008 MTM+FIFO) — the last group
+# shows up when we pull soon after the close, before IBKR's overnight batch has
+# baked realised/settlement sub-sections. All are safe to retry with a LONG wait.
+_RETRYABLE_SEND_CODES = {"1001", "1004", "1005", "1006", "1007", "1008", "1009", "1018", "1019"}
+# Persistent auth/config failures — a human must re-issue the token or fix the
+# query. NEVER retried (waiting can't fix them) and worth an ALERT: a dead token
+# silently freezes foreign holdings (this is exactly what happened to the DHR
+# tokens). 1010 legacy, 1011 inactive, 1012 expired, 1013 IP-restricted,
+# 1014 invalid query, 1015 invalid token, 1016 invalid account, 1020 invalid request.
+_AUTH_FAIL_CODES = {"1010", "1011", "1012", "1013", "1014", "1015", "1016", "1020"}
 _SEND_RETRIES = int(os.environ.get("IBKR_FLEX_SEND_RETRIES", "2"))           # total attempts (1 retry)
 _SEND_BACKOFF = float(os.environ.get("IBKR_FLEX_THROTTLE_WAIT_SEC", "90"))   # base s between throttle retries (× attempt)
+
+
+class FlexAuthError(RuntimeError):
+    """A persistent auth/config Flex failure (token expired/invalid/blocked, bad
+    query/account). Carries the numeric `.code` so callers can alert a human instead
+    of retrying — retrying never fixes these and only risks a 1025 cooldown."""
+    def __init__(self, code: str, msg: str):
+        super().__init__(f"IBKR Flex auth/config error {code}: {msg}")
+        self.code = code
+        self.flex_msg = msg
 
 # Randomized minimum gap between consecutive Flex requests. Defaults give a
 # 7–13s spacing (≈ 4.6–8.6 req/min, comfortably under the 10/min limit).
@@ -91,6 +112,15 @@ _STMT_CACHE_TTL = float(os.environ.get("IBKR_FLEX_STMT_CACHE_SEC", "600"))   # s
 _STMT_DISK_DIR = Path(os.environ.get(
     "IBKR_STMT_CACHE_DIR", "/var/www/mis-portal/.ibkr_statements"))
 _STMT_DISK_MAX_AGE = float(os.environ.get("IBKR_STMT_CACHE_MAX_AGE_DAYS", "7")) * 86400
+
+# Refetch FLOOR — the minimum age an on-disk daily statement must reach before we
+# regenerate it. A Flex activity statement is a once-daily post-EOD snapshot, so a
+# second pull within a few hours yields ~identical data; skipping it is both correct
+# and the single best defence against the rapid same-query regeneration that escalates
+# 1001 → token-wide throttle → 1025. The two scheduled runs (pre-open ET + post-close
+# ET) are ≥9h apart, so this never suppresses a legitimate run — only reruns, double
+# fires, holiday re-triggers, and ad-hoc manual pulls. Set to 0 to disable.
+_FLEX_MIN_REFETCH = float(os.environ.get("IBKR_FLEX_MIN_REFETCH_SEC", str(6 * 3600)))   # 6h
 
 
 def _disk_cache_path(acct_prefix: str, query_id: str) -> "Path":
@@ -212,6 +242,22 @@ def _fetch_statement_xml(
         return cached[1]
 
     daily = from_date is None and to_date is None   # only the daily query is disk-cached
+
+    # Proactive refetch floor: if we already have a recent on-disk daily statement,
+    # reuse it instead of regenerating. The data hasn't changed (daily snapshot), and
+    # this is what keeps double-fires / holiday re-triggers / manual pulls from turning
+    # into the rapid same-query regeneration that trips 1025. Date-ranged (backfill)
+    # queries are one-off and never reused. See _FLEX_MIN_REFETCH.
+    if daily and _FLEX_MIN_REFETCH > 0:
+        fresh = _load_statement_disk(acct_prefix, query_id)
+        if fresh is not None and fresh[1] < _FLEX_MIN_REFETCH:
+            stmt, age = fresh
+            logger.info(f"[{acct_prefix}] IBKR Flex: on-disk statement only {age/60:.0f} min old "
+                        f"(< {_FLEX_MIN_REFETCH/60:.0f} min refetch floor) — reusing, no SendRequest "
+                        f"(q={query_id})")
+            _STMT_CACHE[cache_key] = (time.monotonic(), stmt)
+            return stmt
+
     try:
         stmt = _fetch_statement_xml_live(acct_prefix, query_id, from_date, to_date)
     except Exception as e:
@@ -268,6 +314,10 @@ def _fetch_statement_xml_live(
             raise RuntimeError(
                 f"[{acct_prefix}] IBKR Flex 1025 (too many failed attempts): token is in a "
                 f"cooldown LOCKOUT — stop all requests and let it rest (do NOT retry). {msg}")
+        if code in _AUTH_FAIL_CODES:
+            # Dead/blocked token, or bad query/account — a human must fix it. Surface a
+            # typed error so the worker alerts instead of silently freezing holdings.
+            raise FlexAuthError(code, f"[{acct_prefix}] {msg}")
         retryable = code in _RETRYABLE_SEND_CODES or "try again" in msg.lower()
         if retryable and attempt < _SEND_RETRIES - 1:
             # Linear backoff with jitter, on top of the per-request pacing gap.
@@ -482,20 +532,27 @@ def fetch_all(entity_code: str) -> "tuple[list[dict], Decimal, list[dict], list[
     positions: list[dict] = []
     trades: list[dict] = []
     cash = Decimal("0")
-    failures: list[str] = []
+    # Each failure carries the login prefix and, when known, the numeric Flex code
+    # (auth_code set only for persistent auth/config failures) so the caller can tell a
+    # dead token apart from a transient throttle and alert accordingly.
+    failures: list[dict] = []
     for p in prefixes:
         try:
             root = _fetch_statement_xml(p)
+        except FlexAuthError as e:
+            logger.error(f"[{p}] IBKR fetch failed (auth/config) — {e}")
+            failures.append({"prefix": p, "auth_code": e.code, "msg": e.flex_msg})
+            continue
         except Exception as e:
             logger.error(f"[{p}] IBKR fetch failed — {e}")
-            failures.append(p)
+            failures.append({"prefix": p, "auth_code": None, "msg": str(e)})
             continue
         positions += _positions_from_root(root)
         cash      += _cash_from_root(root)
         trades    += _trades_from_root(root)
     logger.info(f"[{entity_code}] IBKR: {len(positions)} positions + cash {cash} + "
                 f"{len(trades)} trades from {len(prefixes) - len(failures)}/{len(prefixes)} "
-                f"login(s)" + (f"; FAILED: {failures}" if failures else ""))
+                f"login(s)" + (f"; FAILED: {[f['prefix'] for f in failures]}" if failures else ""))
     return positions, cash, trades, failures
 
 

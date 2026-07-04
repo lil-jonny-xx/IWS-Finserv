@@ -1,16 +1,22 @@
 [Unit]
-Description=IWS MIS Portal — IBKR Flex (pre-market + post-market US)
+Description=IWS MIS Portal — IBKR Flex (06:00 ET authoritative + 17:30 ET provisional)
 Requires=mis-portal-ibkr-flex.service
 
 [Timer]
-# US Eastern, DST-safe via the timezone suffix. Two pulls a day:
-#   09:00 ET — pre-market: picks up overnight-settled activity before the open
-#   16:45 ET — post-market: picks up the day's executed fills after the close
+# US Eastern, DST-safe via the timezone suffix. Two role-separated pulls a day:
+#   06:00 ET — AUTHORITATIVE: IBKR's overnight batch is done, so positions, cash and
+#              realised FIFO/settlement are fully baked. This is the source-of-truth
+#              pull. It also lands ≤11:00 UTC, i.e. before the 12:00 UTC staleness
+#              monitor, so a healthy morning run always reads fresh there.
+#   17:30 ET — PROVISIONAL: ~90 min after the close, to surface the day's fills the
+#              same evening; anything not-yet-settled is corrected by next morning's run.
 # One Flex call per run (positions+cash+trades in a single statement), well within
-# IBKR's 1/sec + 10/min limits. Replaces the old once-daily 02:30 UTC cron entry —
-# remove that crontab line so IBKR isn't hit a third time.
-OnCalendar=Mon..Fri *-*-* 09:00 America/New_York
-OnCalendar=Mon..Fri *-*-* 16:45 America/New_York
+# IBKR's 1/sec + 10/min limits. The worker's refetch floor (IBKR_FLEX_MIN_REFETCH_SEC,
+# 6h) means reruns / holiday re-triggers reuse the on-disk statement instead of
+# regenerating — no rapid same-query regeneration, no 1025. If an old once-daily
+# 02:30 UTC cron entry still exists, remove it so IBKR isn't hit a third time.
+OnCalendar=Mon..Fri *-*-* 06:00 America/New_York
+OnCalendar=Mon..Fri *-*-* 17:30 America/New_York
 AccuracySec=1min
 Persistent=false
 

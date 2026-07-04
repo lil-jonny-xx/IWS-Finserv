@@ -260,6 +260,23 @@ def main():
         if failures:
             logger.warning(f"  [{code}/ibkr] PARTIAL fetch (failed logins: {failures}) — "
                            f"NOT writing, to avoid corrupting the aggregate. Retry later.")
+            # A persistent auth/config failure (expired/blocked token, bad query) won't
+            # heal with time and silently freezes this entity's foreign holdings — alert a
+            # human. Transient throttles (auth_code None) are expected noise; stay quiet.
+            dead = [f for f in failures if f.get("auth_code")]
+            if dead:
+                try:
+                    from alert import send_alert
+                    body = "\n".join(
+                        f"  {f['prefix']}: Flex code {f['auth_code']} — {f.get('msg', '')}"
+                        for f in dead)
+                    send_alert(
+                        f"IBKR Flex token needs attention ({code})",
+                        f"IBKR Flex could not authenticate for entity {code}. These logins need a "
+                        f"re-issued token / fixed query — foreign holdings will stay frozen until "
+                        f"fixed:\n\n{body}")
+                except Exception as ae:
+                    logger.error(f"  [{code}/ibkr] could not send token-death alert — {ae}")
             continue
 
         if not args.commit:

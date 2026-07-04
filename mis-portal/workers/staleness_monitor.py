@@ -42,6 +42,12 @@ WATCHED = [
     {"name": "broker_txn_sync_worker", "log": "/var/log/mis-portal-broker-txn-sync.log", "max_age_h": 6},
     # equity_sync: daily 01:30 UTC + weekdays 04:30 UTC (holdings/quantities).
     {"name": "equity_sync_worker",     "log": "/var/log/mis-portal-equity-sync.log",     "max_age_h": 12},
+    # ibkr_flex: weekdays 06:00 ET (authoritative, ≤11:00 UTC) + 17:30 ET (provisional).
+    # The 06:00 ET run always precedes this 12:00 UTC check — even on Monday — so the log
+    # reads ~1-2h old on a healthy day; >8h means the timer never fired (weekend gaps are
+    # bridged by Monday's own morning run). A dead token is caught separately by the
+    # worker's auth-failure alert, not here.
+    {"name": "ibkr_flex_worker",       "log": "/var/log/mis-portal-ibkr.log",            "max_age_h": 8},
 ]
 
 
