@@ -17,6 +17,7 @@ interface BankAsset {
   cost: number | null; current_value: number | null; currency: string;
   inception_date: string | null; notes: string | null;
   attachments: Attachment[];
+  source?: 'bank' | 'forex';   // which Manual Data category this row came from
 }
 interface ManualAssetsResponse {
   category: string; entity_id: number; total_value: number; count: number; assets: BankAsset[];
@@ -151,9 +152,30 @@ export default function BanksPage() {
     if (!didInitialLoad.current) setLoading(true);
     setError(null);
     const qs = selectedId !== null ? `&entity_id=${selectedId}` : '';
-    fetch(`${API_URL}/api/v1/manual-assets?category=bank${qs}`, { credentials: 'include', signal: controller.signal })
-      .then(r => { if (r.status === 401) { router.push('/'); return null; } if (!r.ok) throw new Error('Failed to load bank balances.'); return r.json(); })
-      .then((d: ManualAssetsResponse | null) => { if (d) setData(d); setLoading(false); didInitialLoad.current = true; })
+    // Bank Balance + Forex/Foreign-cash rows both live in Manual Data; pull both and
+    // merge into one view. Forex balances roll into the headline total below.
+    const load = (cat: string) =>
+      fetch(`${API_URL}/api/v1/manual-assets?category=${cat}${qs}`, { credentials: 'include', signal: controller.signal })
+        .then(r => {
+          if (r.status === 401) { router.push('/'); return null; }
+          if (!r.ok) throw new Error('Failed to load bank balances.');
+          return r.json() as Promise<ManualAssetsResponse>;
+        });
+    Promise.all([load('bank'), load('forex')])
+      .then(([bank, forex]) => {
+        if (!bank && !forex) return;   // 401 already redirected
+        const tag = (resp: ManualAssetsResponse | null, source: 'bank' | 'forex'): BankAsset[] =>
+          (resp?.assets ?? []).map(a => ({ ...a, source }));
+        setData({
+          category:    'bank',
+          entity_id:   bank?.entity_id ?? forex?.entity_id ?? 0,
+          total_value: (bank?.total_value ?? 0) + (forex?.total_value ?? 0),
+          count:       (bank?.count ?? 0) + (forex?.count ?? 0),
+          assets:      [...tag(bank, 'bank'), ...tag(forex, 'forex')],
+        });
+        setLoading(false);
+        didInitialLoad.current = true;
+      })
       .catch(err => { if (err.name !== 'AbortError') { setError(err.message); setLoading(false); } });
     return () => controller.abort();
   }, [router, selectedId, retryCount]);
@@ -168,7 +190,7 @@ export default function BanksPage() {
         <div className="flex flex-wrap justify-between items-start gap-3 mb-6">
           <div>
             <h1 className="text-2xl sm:text-3xl font-bold text-ink">Bank Accounts</h1>
-            <span className="text-sm text-ghost">Cash balances — entered in Manual Data, with uploaded statements</span>
+            <span className="text-sm text-ghost">Bank &amp; forex balances — entered in Manual Data, with uploaded statements</span>
           </div>
           <nav className="flex gap-1.5 flex-wrap" aria-label="Sections">
             {navFor(NAV, user?.role).map(({ href, label }) => (
@@ -203,7 +225,7 @@ export default function BanksPage() {
           <div className="fade-in">
             <div className="bg-card rounded-lg border border-rule px-5 sm:px-6 py-4 mb-6 flex flex-wrap gap-8 items-end">
               <div>
-                <p className="text-[11px] uppercase tracking-wide text-ghost">Total Bank Balance</p>
+                <p className="text-[11px] uppercase tracking-wide text-ghost">Total Balance</p>
                 <p className="text-2xl font-bold text-ink tabular-nums">{fmtINR(data.total_value)}</p>
               </div>
               <div>
@@ -219,16 +241,45 @@ export default function BanksPage() {
 
             {data.count === 0 ? (
               <div className="bg-card rounded-lg border border-rule px-5 py-16 text-center text-sm text-ghost">
-                No bank balances yet. Add one from the{' '}
-                <a href="/manual-data" className="text-prime hover:underline">Manual Data</a> page (category “Bank Balance”).
+                No bank or forex balances yet. Add one from the{' '}
+                <a href="/manual-data" className="text-prime hover:underline">Manual Data</a> page (category “Bank Balance” or “Forex / Foreign Cash”).
               </div>
-            ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {data.assets.map(a => (
-                  <BankCard key={`${a.entity_id}-${a.label}`} a={a} showEntity={showEntity} onOpen={setLightbox} />
-                ))}
-              </div>
-            )}
+            ) : (() => {
+              const forex = data.assets.filter(a => a.source === 'forex');
+              // Keep the plain single grid when there are no forex rows; only split into
+              // labelled groups once both a bank and a forex bucket exist.
+              if (forex.length === 0) {
+                return (
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    {data.assets.map(a => (
+                      <BankCard key={`${a.entity_id}-${a.label}`} a={a} showEntity={showEntity} onOpen={setLightbox} />
+                    ))}
+                  </div>
+                );
+              }
+              const groups: { key: 'bank' | 'forex'; title: string }[] = [
+                { key: 'bank',  title: 'Bank balances' },
+                { key: 'forex', title: 'Forex / Foreign cash' },
+              ];
+              return (
+                <div className="flex flex-col gap-8">
+                  {groups.map(g => {
+                    const rows = data.assets.filter(a => (a.source ?? 'bank') === g.key);
+                    if (rows.length === 0) return null;
+                    return (
+                      <section key={g.key}>
+                        <h2 className="text-[11px] uppercase tracking-wide text-ghost mb-3">{g.title}</h2>
+                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                          {rows.map(a => (
+                            <BankCard key={`${g.key}-${a.entity_id}-${a.label}`} a={a} showEntity={showEntity} onOpen={setLightbox} />
+                          ))}
+                        </div>
+                      </section>
+                    );
+                  })}
+                </div>
+              );
+            })()}
           </div>
         )}
 

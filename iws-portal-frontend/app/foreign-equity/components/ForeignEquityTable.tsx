@@ -61,6 +61,9 @@ interface Props {
   showEntityCol: boolean;
   lastUpdated?: string | null;
   cashByCurrency?: CashCurrencyRow[];
+  // Manually-entered foreign equity (Manual Data → "Foreign Equity"). All INR.
+  // Folded into the summary-strip headline so the page total covers both sources.
+  extra?: { cost: number; value: number; pnl: number; count: number };
 }
 
 // ── currency ────────────────────────────────────────────────────────────────
@@ -167,7 +170,7 @@ function BrokerBadge({ broker }: { broker: string }) {
 
 // ── main component ────────────────────────────────────────────────────────────
 
-export default function ForeignEquityTable({ holdings, totals, fxRates, showEntityCol, lastUpdated, cashByCurrency = [] }: Props) {
+export default function ForeignEquityTable({ holdings, totals, fxRates, showEntityCol, lastUpdated, cashByCurrency = [], extra }: Props) {
   const [sortKey, setSortKey]           = useState<SortKey>('current_market_value');
   const [sortDir, setSortDir]           = useState<SortDir>('desc');
   const [search, setSearch]             = useState('');
@@ -222,7 +225,8 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
     return rows;
   }, [holdings, search, filterBroker, filterEntity]);
 
-  if (holdings.length === 0) {
+  const hasExtra = !!(extra && extra.count > 0);
+  if (holdings.length === 0 && !hasExtra) {
     return (
       <div className="bg-card rounded-lg border border-rule px-6 py-12 text-center">
         <p className="text-sm font-medium text-ink mb-1">No foreign equity holdings on record</p>
@@ -283,11 +287,11 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
         <div className="flex flex-wrap gap-x-8 gap-y-3">
           <div>
             <p className="text-xs text-ghost mb-0.5">Total Cost</p>
-            <p className="text-sm font-semibold text-ink tabular-nums">{fmtMoney(convTotal(totals.total_cost), totalsCcy)}</p>
+            <p className="text-sm font-semibold text-ink tabular-nums">{fmtMoney(convTotal((totals.total_cost ?? 0) + (extra?.cost ?? 0)), totalsCcy)}</p>
           </div>
           <div>
             <p className="text-xs text-ghost mb-0.5">Current Value</p>
-            <p className="text-sm font-semibold text-ink tabular-nums">{fmtMoney(convTotal(totals.total_current_market_value), totalsCcy)}</p>
+            <p className="text-sm font-semibold text-ink tabular-nums">{fmtMoney(convTotal((totals.total_current_market_value ?? 0) + (extra?.value ?? 0)), totalsCcy)}</p>
           </div>
           {totals.cash_balance != null && totals.cash_balance > 0 && (
             <div>
@@ -321,18 +325,22 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
               </div>
             );
           })()}
-          {totals.total_pnl_inception != null && totals.total_pnl_inception !== 0 && (
-            <div>
-              <p className="text-xs text-ghost mb-0.5">P&amp;L (Inception)</p>
-              <p className="text-sm font-semibold tabular-nums"
-                style={{ color: totals.total_pnl_inception >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
-                {totals.total_pnl_inception >= 0 ? '+' : ''}{fmtMoney(convTotal(totals.total_pnl_inception), totalsCcy)}
-              </p>
-            </div>
-          )}
+          {(() => {
+            const pnl = (totals.total_pnl_inception ?? 0) + (extra?.pnl ?? 0);
+            if (pnl === 0) return null;
+            return (
+              <div>
+                <p className="text-xs text-ghost mb-0.5">P&amp;L (Inception)</p>
+                <p className="text-sm font-semibold tabular-nums"
+                  style={{ color: pnl >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
+                  {pnl >= 0 ? '+' : ''}{fmtMoney(convTotal(pnl), totalsCcy)}
+                </p>
+              </div>
+            );
+          })()}
           <div>
             <p className="text-xs text-ghost mb-0.5">Holdings</p>
-            <p className="text-sm font-semibold text-ink tabular-nums">{holdings.length}</p>
+            <p className="text-sm font-semibold text-ink tabular-nums">{holdings.length + (extra?.count ?? 0)}</p>
           </div>
           {display === 'native' && (
             <div className="self-end">
@@ -342,6 +350,7 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
         </div>
       </div>
 
+      {holdings.length > 0 && (<>
       {/* Filters */}
       <div className="px-5 sm:px-6 py-3 border-b border-rule flex flex-wrap gap-x-6 gap-y-2 items-center">
         <input
@@ -451,6 +460,7 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
           </tbody>
         </table>
       </DragScroll>
+      </>)}
     </div>
   );
 }

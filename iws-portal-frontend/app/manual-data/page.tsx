@@ -53,7 +53,7 @@ const CATEGORIES: { value: string; label: string; group: string }[] = [
   { value: 'direct_equity',  label: 'Direct Equity (Aggregated)', group: 'Equity' },
   { value: 'aif',            label: 'AIF',                        group: 'Equity' },
   { value: 'overseas_fund',  label: 'Overseas Fund',              group: 'Alternates' },
-  { value: 'overseas_equity',label: 'Overseas Direct Equity',     group: 'Alternates' },
+  { value: 'overseas_equity',label: 'Foreign Equity',             group: 'Alternates' },
   { value: 'forex',          label: 'Forex / Foreign Cash',       group: 'Alternates' },
   { value: 'gold_etf',       label: 'Gold / Silver ETF',          group: 'Alternates' },
   { value: 'unlisted',       label: 'Unlisted Equity',            group: 'Alternates' },

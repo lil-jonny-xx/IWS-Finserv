@@ -40,6 +40,17 @@ interface ForeignActivityResponse {
   trades: ForeignActivityTrade[];
 }
 
+// Manually-entered foreign equity — Manual Data category "overseas_equity"
+// (labelled "Foreign Equity" in the form). Values are already in INR.
+interface ManualForeignAsset {
+  entity_id: number; entity_name: string; label: string;
+  cost: number | null; current_value: number | null; currency: string;
+  inception_date: string | null; notes: string | null;
+}
+interface ManualForeignResponse {
+  category: string; entity_id: number; total_value: number; count: number; assets: ManualForeignAsset[];
+}
+
 const BROKER_LABEL: Record<string, string> = { ibkr: 'IBKR', vested: 'Vested', dbs: 'DBS' };
 
 // Foreign trades booked today: IBKR exact Flex fills + Vested snapshot-diff (both from
@@ -188,6 +199,57 @@ function fmtAsOf(iso: string | null): string {
   return new Date(iso).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
 }
 
+function fmtINR(n: number | null | undefined): string {
+  if (n == null) return '—';
+  return (n < 0 ? '−₹' : '₹') + Math.round(Math.abs(n)).toLocaleString('en-IN');
+}
+
+// Manually-tracked foreign equity, entered in Manual Data. Broker-synced holdings
+// live in the table above; these are hand-entered positions (INR figures).
+function ManualForeignEquity({ assets, showEntityCol }: { assets: ManualForeignAsset[]; showEntityCol: boolean }) {
+  if (!assets.length) return null;
+  return (
+    <div className="bg-card rounded-lg border border-rule overflow-hidden mt-5">
+      <div className="px-5 sm:px-6 pt-4 pb-3 border-b border-rule flex items-center justify-between gap-3">
+        <h2 className="text-base font-semibold text-ink">Manually-tracked Foreign Equity</h2>
+        <a href="/manual-data" className="shrink-0 text-xs font-medium border border-rule text-dim px-3 py-1.5 rounded hover:border-dim hover:text-ink transition-colors">
+          + Add / edit in Manual Data
+        </a>
+      </div>
+      <div className="p-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        {assets.map(a => {
+          const pnl = a.cost != null && a.current_value != null ? a.current_value - a.cost : null;
+          return (
+            <div key={`${a.entity_id}-${a.label}`} className="bg-page rounded-lg border border-rule p-4 flex flex-col gap-2">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <h3 className="text-sm font-semibold text-ink leading-tight">{a.label}</h3>
+                  {showEntityCol && <p className="text-[11px] text-ghost mt-0.5">{a.entity_name}</p>}
+                  {a.inception_date && <p className="text-[11px] text-ghost">Since {a.inception_date}</p>}
+                </div>
+                <div className="text-right shrink-0">
+                  <p className="text-[11px] uppercase tracking-wide text-ghost">Value</p>
+                  <p className="text-base font-bold text-ink tabular-nums">{fmtINR(a.current_value)}</p>
+                  {a.currency && a.currency !== 'INR' && <p className="text-[11px] text-ghost">{a.currency}</p>}
+                </div>
+              </div>
+              <div className="flex items-center justify-between text-[11px] text-ghost">
+                <span>Cost {fmtINR(a.cost)}</span>
+                {pnl != null && (
+                  <span style={{ color: pnl >= 0 ? 'var(--gain)' : 'var(--peril)' }} className="font-medium tabular-nums">
+                    {pnl >= 0 ? '+' : ''}{fmtINR(pnl)}
+                  </span>
+                )}
+              </div>
+              {a.notes && <p className="text-[11px] text-ghost border-t border-rule pt-2">{a.notes}</p>}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export default function ForeignEquityPage() {
   const router = useRouter();
   const [user, setUser]             = useState<User | null>(null);
@@ -195,6 +257,7 @@ export default function ForeignEquityPage() {
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [data, setData]             = useState<ForeignEquityResponse | null>(null);
   const [activity, setActivity]     = useState<ForeignActivityResponse | null>(null);
+  const [manual, setManual]         = useState<ManualForeignResponse | null>(null);
   const [loading, setLoading]       = useState(true);
   const [error, setError]           = useState<string | null>(null);
   const [retryCount, setRetryCount] = useState(0);
@@ -243,9 +306,33 @@ export default function ForeignEquityPage() {
     return () => controller.abort();
   }, [selectedId, retryCount]);
 
+  // Manually-entered foreign equity (Manual Data → "Foreign Equity" / overseas_equity).
+  // Rolled into the headline totals and listed in its own section. Silent on failure.
+  useEffect(() => {
+    const controller = new AbortController();
+    const qs = selectedId !== null ? `&entity_id=${selectedId}` : '';
+    fetch(`${API_URL}/api/v1/manual-assets?category=overseas_equity${qs}`, { credentials: 'include', signal: controller.signal })
+      .then(r => (r.ok ? r.json() : null))
+      .then((d: ManualForeignResponse | null) => { if (d) setManual(d); })
+      .catch(() => {});
+    return () => controller.abort();
+  }, [selectedId, retryCount]);
+
   const isAdmin       = !!user;  // members have admin-level view access (only Manual Data + user mgmt are admin-only)
   const showEntityCol = isAdmin && selectedId === null;
   const handleRetry   = useCallback(() => setRetryCount(c => c + 1), []);
+
+  // Fold manual foreign-equity entries into the headline totals (all INR).
+  const manualAssets = manual?.assets ?? [];
+  const manualExtra = manualAssets.length ? (() => {
+    let cost = 0, value = 0, pnl = 0;
+    for (const a of manualAssets) {
+      cost  += a.cost ?? 0;
+      value += a.current_value ?? 0;
+      if (a.cost != null && a.current_value != null) pnl += a.current_value - a.cost;
+    }
+    return { cost, value, pnl, count: manualAssets.length };
+  })() : undefined;
 
   return (
     <main id="main-content" className="min-h-screen bg-page p-4 sm:p-8">
@@ -337,7 +424,9 @@ export default function ForeignEquityPage() {
               showEntityCol={showEntityCol}
               lastUpdated={data.last_updated}
               cashByCurrency={data.cash_currency_breakdown ?? []}
+              extra={manualExtra}
             />
+            <ManualForeignEquity assets={manualAssets} showEntityCol={showEntityCol} />
           </div>
         )}
 
