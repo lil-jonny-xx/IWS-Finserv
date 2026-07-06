@@ -2,6 +2,10 @@
 Description=IWS MIS Portal — Live Trade Daemon (%i)
 After=network.target postgresql.service redis-server.service
 # %i is the account slug (e.g. zerodha-dhr); the daemon maps it to broker+entity.
+# Cap restart storms: if a daemon exits >20 times in 5 min (e.g. a dead token), back
+# off instead of tight-looping. Well clear of normal reconnects.
+StartLimitIntervalSec=300
+StartLimitBurst=20
 
 [Service]
 Type=simple
@@ -10,11 +14,15 @@ WorkingDirectory=/var/www/mis-portal
 Environment=HOME=/home/SAdmin
 # Long-running: holds the broker's order-update WebSocket and, on every fill, writes
 # it to stock_transaction (real price+time) and PUBLISHes to Redis 'live_trades' for
-# the /api/v1/live/trades SSE stream. Restart on failure so a dropped socket or a
-# transient broker error self-heals within the session; the start/stop timers bound it
-# to market hours (so the daily token, refreshed 06:30 IST, is always fresh at start).
+# the /api/v1/live/trades SSE stream. The start/stop timers bound it to market hours
+# (so the daily token, refreshed 06:30 IST, is always fresh at start).
 ExecStart=/var/www/.venv/bin/python -m workers.live_trade_daemon --account %i
-Restart=on-failure
+# Restart=always, NOT on-failure: Angel and Dhan exit cleanly (code 0) when their
+# socket closes (KiteTicker self-reconnects, but the Angel/Dhan libs just return), so
+# on-failure would NOT restart them — silently ending capture for the rest of the day.
+# 'always' makes systemd the reconnect for every broker. An explicit `systemctl stop`
+# (the stop timer) is not a restart trigger, so market-hours bounding still holds.
+Restart=always
 RestartSec=5
 StandardOutput=append:/var/log/mis-portal-live-trade.log
 StandardError=append:/var/log/mis-portal-live-trade.log

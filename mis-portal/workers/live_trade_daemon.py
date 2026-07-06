@@ -53,12 +53,15 @@ LIVE_CHANNEL = "live_trades"
 # Shared infrastructure
 # ---------------------------------------------------------------------------
 def get_conn():
+    # keepalives so an idle-for-hours daemon connection isn't silently dropped by a
+    # NAT/firewall between fills (record_fill also reconnects on a dead connection).
     return psycopg2.connect(
         host=os.getenv("DB_HOST", "localhost"),
         dbname=os.getenv("DB_NAME", "mis_portal"),
         user=os.getenv("DB_USER", "postgres"),
         password=os.getenv("DB_PASS") or os.getenv("DB_PASSWORD", ""),
         cursor_factory=psycopg2.extras.RealDictCursor,
+        keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
     )
 
 
@@ -95,31 +98,61 @@ def record_fill(ctx, fill: dict):
     tdate = ts.date() if isinstance(ts, datetime) else date.today()
     sref = f"{ctx['broker']}:live:{order_id}"
 
-    conn = ctx["conn"]
-    cur  = conn.cursor()
-    try:
-        cur.execute("SELECT 1 FROM stock_transaction WHERE source_ref = %s", (sref,))
-        if cur.fetchone():
-            logger.info(f"dup fill {sref} — skip")
+    def _do_db():
+        conn = ctx["conn"]           # re-read each call so a reconnect is picked up
+        cur  = conn.cursor()
+        try:
+            cur.execute("SELECT 1 FROM stock_transaction WHERE source_ref = %s", (sref,))
+            if cur.fetchone():
+                return "dup"
+            amount = qty * price
+            if not ctx["dry_run"]:
+                sec_id = get_or_create_security(cur, fill.get("isin"), fill.get("symbol"),
+                                                fill.get("exchange"), "INR", True)
+                cur.execute(
+                    """INSERT INTO stock_transaction
+                       (entity_id, security_id, transaction_date, transaction_type, quantity,
+                        price, amount, amount_inr, currency, exchange, source, source_ref, created_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'INR',%s,%s,%s,NOW())""",
+                    (ctx["entity_id"], sec_id, tdate, side, qty, price, amount, amount,
+                     fill.get("exchange"), ctx["broker"], sref),
+                )
+                conn.commit()
+            return "inserted"
+        finally:
             cur.close()
+
+    # A daemon holds ONE connection for hours; without this a single idle drop / DB
+    # restart would make every future fill fail silently. Reconnect once and retry on a
+    # connection-level error; a real data error still rolls back and logs.
+    outcome = None
+    for attempt in (1, 2):
+        try:
+            outcome = _do_db()
+            break
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            logger.warning(f"DB connection lost on {sref} ({e}); reconnecting (attempt {attempt})")
+            try:
+                ctx["conn"].close()
+            except Exception:
+                pass
+            try:
+                ctx["conn"] = get_conn()
+            except Exception as ce:
+                logger.error(f"record_fill reconnect failed for {sref}: {ce}")
+                return
+        except Exception as e:
+            try:
+                ctx["conn"].rollback()
+            except Exception:
+                pass
+            logger.error(f"record_fill DB error for {sref}: {e}")
             return
-        amount = qty * price
-        if not ctx["dry_run"]:
-            sec_id = get_or_create_security(cur, fill.get("isin"), fill.get("symbol"),
-                                            fill.get("exchange"), "INR", True)
-            cur.execute(
-                """INSERT INTO stock_transaction
-                   (entity_id, security_id, transaction_date, transaction_type, quantity,
-                    price, amount, amount_inr, currency, exchange, source, source_ref, created_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'INR',%s,%s,%s,NOW())""",
-                (ctx["entity_id"], sec_id, tdate, side, qty, price, amount, amount,
-                 fill.get("exchange"), ctx["broker"], sref),
-            )
-            conn.commit()
-        cur.close()
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"record_fill DB error for {sref}: {e}")
+    if outcome is None:
+        logger.error(f"record_fill: gave up persisting {sref} after reconnect")
+        return
+    if outcome == "dup":
+        logger.info(f"dup fill {sref} — skip")
         return
 
     event = {
@@ -219,6 +252,14 @@ def run_angel(ctx):
     # stored token has the prefix stripped (REST uses it raw), so add it back here.
     auth_hdr = auth_token if auth_token.startswith("Bearer ") else f"Bearer {auth_token}"
     sws = SmartWebSocketOrderUpdate(auth_hdr, api_key, client_code, feed_token)
+    # The Angel lib's __init__ calls logzero.logfile(logs/<date>/app.log) and, on any REST
+    # error, writes the FULL auth JWT + refresh token there — stop persisting secrets to
+    # disk (console logging is unaffected).
+    try:
+        import logzero
+        logzero.logfile(None)
+    except Exception:
+        pass
 
     def on_data(wsapp, message, *_):
         # websocket-client calls on_data(ws, msg, opcode, cont) — 4 args; accept the extras.

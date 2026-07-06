@@ -5007,6 +5007,13 @@ async def zerodha_postback(request: Request):
         conn.commit()
     except HTTPException:
         raise
+    except psycopg2.errors.UniqueViolation:
+        # Benign: the WS daemon won the race and already wrote this exact fill (the
+        # composite unique index rejects the duplicate). Not an error.
+        if conn:
+            conn.rollback()
+        logger.info(f"Zerodha postback {sref} already recorded (dedup race with WS) — ok")
+        return {"status": "ok"}
     except Exception as e:
         if conn:
             conn.rollback()
