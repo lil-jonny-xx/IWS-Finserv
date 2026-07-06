@@ -4882,6 +4882,157 @@ async def dhan_postback(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# Zerodha order-update postback (webhook) — a second, fill-capturing path that
+# complements the KiteTicker WS in live_trade_daemon. Both write the SAME
+# source_ref (`zerodha:live:{order_id}`), so whichever arrives first wins and the
+# other dedupes to a no-op — belt-and-suspenders with no double counting.
+# ---------------------------------------------------------------------------
+
+# Entity names whose Zerodha creds live in .env (ZERODHA_<prefix>_*). Resolved via
+# zerodha._env so the same _ENV_PREFIX mapping the daemon uses applies here too.
+_ZERODHA_PB_ENTITIES = ["DHR", "HHR", "SDR", "Rajani Corp"]
+_zerodha_pb_routes_cache: Optional[dict] = None
+
+
+def _zerodha_pb_routes() -> dict:
+    """Map Zerodha user_id (client_id) -> {entity_name, api_secret}, built once from
+    env. Kite postbacks carry user_id but not api_key, so we route by user_id and
+    verify each with that account's own api_secret (per-account signing)."""
+    global _zerodha_pb_routes_cache
+    if _zerodha_pb_routes_cache is not None:
+        return _zerodha_pb_routes_cache
+    from equity.brokers import zerodha as z
+    routes = {}
+    for name in _ZERODHA_PB_ENTITIES:
+        try:
+            uid = z._env(name, "CLIENT_ID")
+            sec = z._env(name, "API_SECRET")
+        except KeyError:
+            continue  # entity not configured for Zerodha — skip
+        routes[uid] = {"entity_name": name, "api_secret": sec}
+    _zerodha_pb_routes_cache = routes
+    return routes
+
+
+@app.post("/api/v1/zerodha/postback")
+@limiter.limit("300/minute")
+async def zerodha_postback(request: Request):
+    """
+    Kite Connect order-update postback. Kite POSTs a JSON order object on every
+    status change, signed with checksum = SHA-256(order_id + order_timestamp +
+    api_secret). We route by user_id, verify the checksum with that account's
+    secret, and on a COMPLETE fill write it to stock_transaction (deduped with the
+    KiteTicker WS path on source_ref) and publish it to the live_trades SSE channel.
+
+    Public by necessity — Kite sends no auth header, so the per-account checksum IS
+    the authentication. An unroutable user_id or a bad checksum is rejected before
+    any DB work.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        return {"status": "ignored"}
+
+    user_id  = str(body.get("user_id") or "")
+    order_id = str(body.get("order_id") or "")
+    ots      = str(body.get("order_timestamp") or "")
+    checksum = str(body.get("checksum") or "")
+    status   = (body.get("status") or "").upper()
+
+    route = _zerodha_pb_routes().get(user_id)
+    if not route:
+        logger.warning(f"Zerodha postback: unknown user_id (order {order_id}) — ignored")
+        return {"status": "ignored"}  # 200 so Kite doesn't retry a mis-routed event
+
+    expected = hashlib.sha256(f"{order_id}{ots}{route['api_secret']}".encode()).hexdigest()
+    if not hmac.compare_digest(expected, checksum):
+        logger.warning(f"Zerodha postback checksum mismatch for {route['entity_name']} order {order_id}")
+        raise HTTPException(status_code=401, detail="bad checksum")
+
+    if status != "COMPLETE":
+        logger.info(f"Zerodha postback {route['entity_name']} order {order_id} status={status} — no fill to record")
+        return {"status": "ok"}
+
+    symbol   = body.get("tradingsymbol")
+    side     = (body.get("transaction_type") or "").upper()
+    qty      = float(body.get("filled_quantity") or 0)
+    price    = float(body.get("average_price") or 0)
+    exchange = body.get("exchange")
+    if side not in ("BUY", "SELL") or qty <= 0 or price <= 0 or not order_id:
+        logger.warning(f"Zerodha postback incomplete fill {route['entity_name']} order {order_id}: "
+                       f"side={side} qty={qty} price={price}")
+        return {"status": "ok"}
+
+    # Trade date from the exchange (fall back to order) timestamp, else today.
+    ex_ts = body.get("exchange_timestamp") or ots
+    tdate = None
+    if isinstance(ex_ts, str) and len(ex_ts) >= 10:
+        try:
+            tdate = datetime.strptime(ex_ts[:19], "%Y-%m-%d %H:%M:%S").date()
+        except ValueError:
+            tdate = None
+    if tdate is None:
+        tdate = date.today()
+
+    sref = f"zerodha:live:{order_id}"
+    conn = None
+    entity_id = None
+    amount = qty * price
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM entity WHERE entity_name = %s", (route["entity_name"],))
+        erow = cur.fetchone()
+        if not erow:
+            logger.error(f"Zerodha postback: entity '{route['entity_name']}' not found")
+            return {"status": "ok"}
+        entity_id = erow["id"]
+
+        cur.execute("SELECT 1 FROM stock_transaction WHERE source_ref = %s", (sref,))
+        if cur.fetchone():
+            logger.info(f"Zerodha postback dup {sref} — already recorded (WS or replay)")
+            return {"status": "ok"}
+
+        from workers.import_tradebooks_multi import get_or_create_security
+        sec_id = get_or_create_security(cur, None, symbol, exchange, "INR", True)
+        cur.execute(
+            """INSERT INTO stock_transaction
+               (entity_id, security_id, transaction_date, transaction_type, quantity,
+                price, amount, amount_inr, currency, exchange, source, source_ref, created_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'INR',%s,'zerodha',%s,NOW())""",
+            (entity_id, sec_id, tdate, side, qty, price, amount, amount, exchange, sref),
+        )
+        conn.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Zerodha postback DB error for {sref}: {e}")
+        return {"status": "ok"}  # logged; 200 so Kite doesn't hammer retries
+    finally:
+        release_db_connection(conn)
+
+    # Publish to the live SSE channel in the same shape live_trade_daemon uses.
+    if redis_client is not None:
+        try:
+            redis_client.publish(LIVE_TRADES_CHANNEL, json.dumps({
+                "entity": route["entity_name"], "entity_id": entity_id, "broker": "zerodha",
+                "symbol": symbol, "side": side, "qty": qty, "price": price,
+                "amount": round(amount, 2), "date": str(tdate),
+                "ts": ex_ts if isinstance(ex_ts, str) else None, "order_id": order_id,
+            }))
+        except Exception as e:
+            logger.error(f"Zerodha postback redis publish failed for {sref}: {e}")
+
+    logger.info(f"Zerodha postback FILL {route['entity_name']} {side} {symbol} {qty} @ {price} "
+                f"(order {order_id})  [recorded + published]")
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
 # Jarvis — read-only portfolio advisory assistant
 # ---------------------------------------------------------------------------
 
