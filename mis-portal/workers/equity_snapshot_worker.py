@@ -42,6 +42,7 @@ load_dotenv("/var/www/mis-portal/.env", override=True)
 from equity.equity_sync_worker import (  # noqa: E402
     get_conn, load_entity_map, BROKER_ENTITY_MAP,
 )
+from equity.holdings_source import cached_fetch_holdings  # noqa: E402
 from workers.import_tradebook import _get_or_create_security  # noqa: E402
 
 logging.basicConfig(
@@ -330,7 +331,9 @@ def run():
                 logger.error(f"Entity '{entity_code}' not in DB — skipping")
                 continue
             try:
-                raw = broker_module.fetch_holdings(entity_code)
+                # Reuse the price worker's recent pull (<=90s) instead of re-hitting the
+                # broker; falls through to a direct fetch if the cache is stale/unavailable.
+                raw = cached_fetch_holdings(broker_module, broker_label, entity_code, max_age=90)
                 holdings = broker_module.normalise(entity_id, entity_code, raw)
             except NotImplementedError:
                 continue

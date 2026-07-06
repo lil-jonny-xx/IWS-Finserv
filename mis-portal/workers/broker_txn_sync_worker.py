@@ -29,6 +29,7 @@ sys.path.insert(0, "/var/www/mis-portal")
 load_dotenv("/var/www/mis-portal/.env", override=True)
 
 from equity.equity_sync_worker import BROKER_ENTITY_MAP
+from equity.holdings_source import cached_fetch_holdings
 from workers.import_tradebooks_multi import get_or_create_security
 from workers.import_ledgers import classify
 
@@ -128,10 +129,11 @@ def last_trade_date(cur, entity_id, broker):
     return r["d"] if r and r["d"] else None
 
 
-def holdings_isin_map(broker_module, entity_code):
-    """tradingsymbol → isin from the broker's current holdings (for trades lacking ISIN)."""
+def holdings_isin_map(broker_module, broker, entity_code):
+    """tradingsymbol → isin from current holdings (for trades lacking ISIN). Uses the
+    shared cached fetch so a recent price-worker pull is reused rather than a new call."""
     try:
-        raw = broker_module.fetch_holdings(entity_code)
+        raw = cached_fetch_holdings(broker_module, broker, entity_code, max_age=300)
     except Exception as e:
         logger.warning(f"    holdings fetch failed (isin map unavailable): {e}")
         return {}
@@ -158,7 +160,7 @@ def sync_trades(cur, broker_module, broker, entity_id, entity_code, commit, stat
     else:
         raw = broker_module.fetch_trades(entity_code)
 
-    isin_map = holdings_isin_map(broker_module, entity_code)
+    isin_map = holdings_isin_map(broker_module, broker, entity_code)
     ins = dup = skip = 0
     touched_secs, max_tdate = set(), None   # for snapshot supersede after the loop
     for t in raw:

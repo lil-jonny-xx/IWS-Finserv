@@ -154,6 +154,7 @@ def refresh_holdings_light(conn):
         from equity.equity_sync_worker import (
             load_entity_map, BROKER_ENTITY_MAP, _asset_class_for, classify_sector,
         )
+        from equity.holdings_source import cached_fetch_holdings
     except Exception as e:
         logger.warning(f"holdings light-refresh: import failed — {e}")
         return
@@ -173,7 +174,10 @@ def refresh_holdings_light(conn):
         if eid is None:
             continue
         try:
-            raw      = broker_module.fetch_holdings(entity_code)
+            # Authoritative fetcher: fetch fresh AND repopulate the shared cache so the
+            # hourly snapshot and daily reconcile can reuse this pull instead of re-hitting
+            # the broker.
+            raw      = cached_fetch_holdings(broker_module, broker_label, entity_code, refresh=True)
             holdings = broker_module.normalise(eid, entity_code, raw)
         except NotImplementedError:
             continue
