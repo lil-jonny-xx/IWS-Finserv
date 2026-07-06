@@ -207,9 +207,18 @@ def sync_trades(cur, broker_module, broker, entity_id, entity_code, commit, stat
                     "AND entity_id = %s AND security_id = ANY(%s) AND transaction_date <= %s",
                     (entity_id, secs, max_tdate))
         superseded += cur.rowcount
+        # Also supersede the real-time LIVE rows (WS + postback, source_ref '{broker}:live:{order_id}')
+        # for the same securities/dates: the authoritative trade_id fill is the truth (exact price,
+        # settled qty, correct date), and live + reconcile use different source_refs so they would
+        # otherwise double-count. Bounded by max_tdate, so a live fill for a trade the API hasn't
+        # returned yet (e.g. Dhan same-day, T+1 tradebook) survives until the reconcile catches it.
+        cur.execute("DELETE FROM stock_transaction WHERE source_ref LIKE %s "
+                    "AND entity_id = %s AND security_id = ANY(%s) AND transaction_date <= %s",
+                    (f"{broker}:live:%", entity_id, secs, max_tdate))
+        superseded += cur.rowcount
 
     stats["trades"] += ins
-    extra = f", superseded {superseded} snapshot row(s)" if superseded else ""
+    extra = f", superseded {superseded} snapshot/live row(s)" if superseded else ""
     print(f"    trades: +{ins} new, {dup} dup, {skip} skipped (of {len(raw)}){extra}")
 
 
