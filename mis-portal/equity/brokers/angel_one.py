@@ -87,8 +87,14 @@ def refresh_access_token(entity_code: str) -> str:
 
     access_token  = resp["data"]["jwtToken"].removeprefix("Bearer ")
     refresh_token = resp["data"].get("refreshToken", "")
+    feed_token    = resp["data"].get("feedToken", "") or obj.getfeedToken()
 
     tokens.save(f"angel_one_{entity_code}", access_token)
+    # The order-update WS (live_trade_daemon) needs the feed token from THIS SAME
+    # session — a separate login there would invalidate the shared token and re-trigger
+    # the AB1007 cash/holdings freeze — so persist it here for the daemon to read.
+    if feed_token:
+        tokens.save(f"angel_one_{entity_code}_feed", feed_token)
     # Keep the live process env in sync too, so the .env fallback in _smart_client
     # never serves a stale token after a refresh (mirrors the Dhan token flow).
     os.environ[f"ANGEL_{entity_code}_ACCESS_TOKEN"] = access_token

@@ -206,16 +206,24 @@ def run_angel(ctx):
     client_code = a._env(ctx["entity_code"], "CLIENT_ID")
     auth_token  = (_tok.get(f"angel_one_{ctx['entity_code']}")
                    or os.environ.get(f"ANGEL_{ctx['entity_code']}_ACCESS_TOKEN"))
-    if not auth_token:
-        raise SystemExit(f"No Angel token for {ctx['entity_code']} — run token_refresh_worker")
-    # feed_token isn't stored; fetch it from an authed SmartConnect.
-    obj = a._smart_client(ctx["entity_code"])
-    feed_token = obj.getfeedToken()
+    # feed_token MUST come from the same shared session as auth_token — persisted by
+    # angel_one.refresh_access_token. A fresh login here would invalidate the token the
+    # cash/holdings workers share (the AB1007 freeze); and getfeedToken() on a
+    # session-less _smart_client returns None -> 403 handshake. So read the stored feed.
+    feed_token  = _tok.get(f"angel_one_{ctx['entity_code']}_feed")
+    if not (auth_token and feed_token):
+        raise SystemExit(f"No Angel auth/feed token for {ctx['entity_code']} — run the "
+                         f"feed-token-persisting refresh_access_token first")
 
-    sws = SmartWebSocketOrderUpdate(auth_token, api_key, client_code, feed_token)
+    # Angel's order-update WS requires a Bearer-prefixed JWT in Authorization; the
+    # stored token has the prefix stripped (REST uses it raw), so add it back here.
+    auth_hdr = auth_token if auth_token.startswith("Bearer ") else f"Bearer {auth_token}"
+    sws = SmartWebSocketOrderUpdate(auth_hdr, api_key, client_code, feed_token)
 
-    def on_data(wsapp, message):
+    def on_data(wsapp, message, *_):
+        # websocket-client calls on_data(ws, msg, opcode, cont) — 4 args; accept the extras.
         try:
+            logger.info(f"angel raw order msg {ctx['entity_code']}: {str(message)[:800]}")
             data = json.loads(message) if isinstance(message, str) else message
             payload = data.get("orderData", data) if isinstance(data, dict) else {}
             if (payload.get("orderstatus") or payload.get("status") or "").lower() not in ("complete", "filled"):
@@ -248,37 +256,42 @@ def run_dhan(ctx):
     from dhanhq.orderupdate import OrderUpdate
     from equity.brokers import dhan as d
 
-    client_id, access_token = d._creds(ctx["entity_code"]) if hasattr(d, "_creds") else (
-        os.environ.get(f"DHAN_{ctx['entity_code']}_CLIENT_ID"),
-        os.environ.get(f"DHAN_{ctx['entity_code']}_ACCESS_TOKEN"),
-    )
+    # Route through dhan._env so the _ENV_PREFIX ("Rajani Corp" -> RAJANIRCORP) applies —
+    # the old raw os.environ fallback missed it. Dhan reads creds from env, not the token store.
+    client_id    = d._env(ctx["entity_code"], "CLIENT_ID", required=False)
+    access_token = d._env(ctx["entity_code"], "ACCESS_TOKEN", required=False)
     if not (client_id and access_token):
         raise SystemExit(f"No Dhan credentials for {ctx['entity_code']}")
 
     from dhanhq.dhan_context import DhanContext
     ou = OrderUpdate(DhanContext(client_id, access_token))
 
-    async def handler(msg):
+    _SIDE = {"B": "BUY", "S": "SELL", "BUY": "BUY", "SELL": "SELL"}
+
+    def handler(order_update):   # dhanhq invokes on_update SYNCHRONOUSLY — must NOT be async
         try:
-            data = msg.get("Data", msg) if isinstance(msg, dict) else {}
-            if (data.get("status") or "").lower() not in ("traded", "complete", "filled", "executed"):
+            logger.info(f"dhan raw order msg {ctx['entity_code']}: {str(order_update)[:800]}")
+            data = order_update.get("Data", order_update) if isinstance(order_update, dict) else {}
+            # Dhan v2 order-alert Data keys are PascalCase; Status 'TRADED' == filled;
+            # TxnType is 'B'/'S'; ids OrderNo (Dhan) / ExchOrderNo (exchange).
+            if (data.get("Status") or "").upper() != "TRADED":
                 return
             record_fill(ctx, {
-                "symbol":   data.get("tradingSymbol") or data.get("customSymbol"),
-                "isin":     data.get("isin"),
-                "side":     data.get("transactionType"),
-                "qty":      data.get("tradedQuantity") or data.get("filledQty"),
-                "price":    data.get("tradedPrice") or data.get("avgPrice"),
-                "order_id": data.get("orderId"),
+                "symbol":   data.get("Symbol"),
+                "isin":     data.get("Isin"),
+                "side":     _SIDE.get((data.get("TxnType") or "").upper()),
+                "qty":      data.get("TradedQty"),
+                "price":    data.get("AvgTradedPrice"),
+                "order_id": data.get("OrderNo") or data.get("ExchOrderNo"),
                 "ts":       None,
-                "exchange": data.get("exchangeSegment"),
+                "exchange": data.get("Segment"),
             })
         except Exception as e:
             logger.error(f"dhan handler error: {e}")
 
-    ou.on_update = handler          # callback name confirmed against dhanhq at wire-up
+    ou.on_update = handler   # sync callback (dhanhq calls it without await)
     logger.info(f"connecting: dhan/{ctx['entity_code']}")
-    asyncio.get_event_loop().run_until_complete(ou.connect_order_update())
+    asyncio.run(ou.connect_order_update())
 
 
 RUNNERS = {"zerodha": run_zerodha, "angel_one": run_angel, "dhan": run_dhan}
