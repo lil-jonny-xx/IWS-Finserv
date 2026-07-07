@@ -1,0 +1,27 @@
+[Unit]
+Description=IWS MIS Portal — IBKR real-time streaming daemon (login %i)
+After=network.target postgresql.service redis-server.service
+# %i is the login slug (sdr | dhr | dhr_2 | hhr) — one IB Gateway session per IBKR login
+# (a session = one login and sees only that login's accounts). Unlike the Indian-broker
+# live daemons (bounded to market hours because their tokens are daily), these run
+# PERSISTENTLY: ib_async's Watchdog+IBC relaunch/relogin the Gateway across IBKR's forced
+# daily restart, so nothing goes stale overnight. Hence enabled at boot (see [Install]).
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Service]
+Type=simple
+User=SAdmin
+WorkingDirectory=/var/www/mis-portal
+Environment=HOME=/home/SAdmin
+# IB Gateway is a GUI Java app; each instance gets its OWN xvfb-run display so the four
+# Gateways don't share/clobber one X server. The daemon (Watchdog+IBC) owns the Gateway
+# process lifecycle for this login. --login expects UPPERCASE (systemd %i is the slug).
+ExecStart=/bin/sh -c '/usr/bin/xvfb-run -a /var/www/.venv/bin/python -m workers.ibkr_stream_daemon --login "$(echo %i | tr a-z A-Z)"'
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/mis-portal-ibkr-stream.log
+StandardError=append:/var/log/mis-portal-ibkr-stream.log
+
+[Install]
+WantedBy=multi-user.target
