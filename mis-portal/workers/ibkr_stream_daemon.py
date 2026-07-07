@@ -22,11 +22,14 @@ The Gateway is a GUI Java app; ib_async's Watchdog+IBC launch and babysit it (au
 on IBKR's forced daily restart, auto-reconnect on drop). Each instance runs under its own
 Xvfb display, its own API port, and its own IBC ini. See deploy/ibkr/README.md.
 
-STATUS: connectivity + streaming scaffold. Event handlers currently LOG only. The DB/SSE
-integration (foreign_equity_holding upserts, fills -> stock_transaction +
-'live_trades' channel with source_ref 'ibkr:live:{execId}', quote fan-out) is the next
-milestone and is marked TODO at each handler. Run `--login X --smoke` first to prove the
-pipe once Gateway+IBC are installed.
+STATUS: connectivity + streaming + persistence wired (equity/ibkr_stream_sink):
+  • positions -> foreign_equity_holding (quantity + cost basis; partial upsert)
+  • quotes    -> foreign_equity_holding (live price/value/pnl; --quotes, throttled)
+  • fills     -> 'live_trades' SSE channel (durable ledger stays with the daily Flex
+                 Trades reconcile; positionEvent moves the holding on the fill)
+DB writes are skipped for --smoke and can be killed with IBKR_STREAM_DB_DISABLED=1.
+The market scanner (--scanner) still only logs (needs a screening table/endpoint).
+Run `--login X --smoke` first to prove the pipe once Gateway+IBC are installed.
 
 Env (loaded from /var/www/mis-portal/.env):
   # per-login (X in {SDR,DHR,DHR_2,HHR}) — an API-only Client Portal user per login:
@@ -46,6 +49,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 
 from dotenv import load_dotenv
 
@@ -91,6 +95,33 @@ def _env(name, default=None, required=False):
     return v
 
 
+# --- persistence context ---------------------------------------------------
+# Handlers run inside ib_async's asyncio loop; DB writes are short and fail-soft
+# (see equity/ibkr_stream_sink). _CTX is populated in run() unless --smoke.
+_CTX = {"conn": None, "redis": None, "db": False}
+_QUOTE_MIN_GAP = 3.0                 # seconds; throttle per-symbol quote DB writes
+_last_quote: dict[str, float] = {}   # symbol -> last write monotonic time
+
+
+def get_conn():
+    import psycopg2
+    c = psycopg2.connect(
+        host=os.getenv("DB_HOST", "localhost"),
+        dbname=os.getenv("DB_NAME", "mis_portal"),
+        user=os.getenv("DB_USER", "postgres"),
+        password=os.getenv("DB_PASS") or os.getenv("DB_PASSWORD", ""),
+        keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
+    )
+    c.autocommit = False
+    return c
+
+
+def get_redis():
+    import redis
+    return redis.Redis(host="localhost", port=6379, db=0,
+                       password=os.getenv("REDIS_PASSWORD", ""), decode_responses=True)
+
+
 def _login_env(login, suffix, default=None, required=False):
     """Per-login env var IBKR_{LOGIN}_{SUFFIX}."""
     return _env(f"IBKR_{login}_{suffix}", default=default, required=required)
@@ -115,52 +146,80 @@ def build_ibc(login):
     )
 
 
-# --- event handlers (LOG-only scaffold; DB/SSE wiring is the next milestone) --
+# --- event handlers ---------------------------------------------------------
+# Each is fail-soft: the sink swallows DB/redis errors so nothing propagates into
+# ib_async's event loop. DB writes are skipped entirely unless _CTX["db"] is on.
 def on_position(pos):
     ent = ACCOUNT_ENTITY.get(pos.account)
     if ent is None:
         log.warning("position for unmapped account %s (%s) — skipping",
                     pos.account, getattr(pos.contract, "symbol", "?"))
         return
-    log.info("POSITION [%s] %s %s qty=%s avgCost=%s", ent[1], pos.account,
+    entity_id, entity_code = ent
+    log.info("POSITION [%s] %s %s qty=%s avgCost=%s", entity_code, pos.account,
              pos.contract.localSymbol or pos.contract.symbol, pos.position, pos.avgCost)
-    # TODO(next): upsert foreign_equity_holding(entity, contract, qty, avgCost) + SSE
+    if _CTX["db"]:
+        from equity import ibkr_stream_sink as sink
+        sink.upsert_position(_CTX["conn"], entity_id, pos.contract,
+                             pos.position, pos.avgCost)
 
 
 def on_pnl(pnl):
     log.info("PNL acct=%s daily=%s unreal=%s real=%s",
              pnl.account, pnl.dailyPnL, pnl.unrealizedPnL, pnl.realizedPnL)
-    # TODO(next): account-level P&L into UI
+    # Account-level P&L is derivable from the per-holding rows the position/quote
+    # streams already write, so no separate DB write here (avoids a cost-basis mismatch
+    # between IB's unrealizedPnL and our inception cost). Logged for observability.
 
 
 def on_pnl_single(p):
     log.info("PNL1 acct=%s conId=%s pos=%s daily=%s unreal=%s value=%s",
              p.account, p.conId, p.position, p.dailyPnL, p.unrealizedPnL, p.value)
-    # TODO(next): per-position live P&L into foreign_equity_holding row
+    # Market value/price come from the quote stream (update_quote); pnlSingle is kept
+    # for observability + a future live-P&L channel, not a DB write.
 
 
 def on_exec(trade, fill):
     ex = fill.execution
+    contract = trade.contract
     log.info("FILL acct=%s %s %s %s @ %s execId=%s",
              ex.acctNumber, ex.side, ex.shares,
-             trade.contract.localSymbol or trade.contract.symbol, ex.price, ex.execId)
-    # TODO(next): write stock_transaction source='ibkr'
-    #   source_ref=f"ibkr:live:{ex.execId}"  -> Tier-1; Flex Trades query (Tier-2)
-    #   supersedes via ibkr:{tradeId}. Publish to LIVE_TRADES_CHANNEL for the SSE UI.
+             contract.localSymbol or contract.symbol, ex.price, ex.execId)
+    ent = ACCOUNT_ENTITY.get(ex.acctNumber)
+    if ent is None:
+        log.warning("fill for unmapped account %s — SSE skipped", ex.acctNumber)
+        return
+    if _CTX["db"]:
+        from equity import ibkr_stream_sink as sink
+        # Publish to the live SSE channel (Tier-1 immediacy). The durable trade ledger
+        # stays with the daily Flex Trades reconcile (Tier-2); positionEvent moves the
+        # holding on the fill. source_ref convention for the future reconcile:
+        # ibkr:live:{execId}.
+        sink.publish_fill(_CTX["redis"], ent[1], ent[0], contract,
+                          ex.side, ex.shares, ex.price, ex.execId, ex.time)
 
 
 def on_ticks(tickers):
+    if not _CTX["db"]:
+        return
+    from equity import ibkr_stream_sink as sink
+    now = time.monotonic()
     for t in tickers:
-        log.info("QUOTE %s last=%s bid=%s ask=%s",
-                 t.contract.localSymbol or t.contract.symbol, t.last, t.bid, t.ask)
-    # TODO(next): fan out to Redis + SSE; demote the 60s foreign_price_worker to fallback
+        px = t.last if t.last == t.last else t.close   # last, fallback close (NaN-safe)
+        sym = t.contract.localSymbol or t.contract.symbol
+        if px in (None, 0) or px != px:
+            continue
+        if now - _last_quote.get(sym, 0) < _QUOTE_MIN_GAP:   # per-symbol throttle
+            continue
+        _last_quote[sym] = now
+        sink.update_quote(_CTX["conn"], t.contract, px)
 
 
 def on_scan(data):
     log.info("SCAN %d rows", len(data))
     for row in data[:10]:
         log.info("  #%s %s", row.rank, row.contractDetails.contract.symbol)
-    # TODO(next): surface scanner hits to the screening UI
+    # TODO(next): surface scanner hits to the screening UI (needs a screening table/endpoint)
 
 
 def wire(ib):
@@ -215,6 +274,19 @@ def run(login, smoke=False, quotes=False, scanner=False):
     port = int(_login_env(login, "API_PORT", str(LOGINS[login]["default_port"])))
     client_id = int(_login_env(login, "API_CLIENT_ID", "17"))
     readonly = _env("IBKR_READONLY", "true").lower() != "false"
+
+    # Persistence context: skip DB/redis entirely for --smoke (pure connectivity test)
+    # and honour a kill-switch. Fail-soft — if the DB/redis is down we still stream+log.
+    db_on = (not smoke) and _env("IBKR_STREAM_DB_DISABLED", "").lower() not in ("1", "true", "yes")
+    if db_on:
+        try:
+            _CTX["conn"] = get_conn()
+            _CTX["redis"] = get_redis()
+            _CTX["db"] = True
+            log.info("[%s] persistence enabled (foreign_equity_holding + live_trades SSE)", login)
+        except Exception as e:
+            log.error("[%s] persistence init failed (%s) — streaming log-only", login, e)
+            _CTX["db"] = False
 
     ibc = build_ibc(login)
     dog = Watchdog(ibc, ib, port=port, clientId=client_id,

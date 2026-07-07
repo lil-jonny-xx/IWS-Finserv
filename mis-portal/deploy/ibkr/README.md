@@ -106,10 +106,18 @@ market-data-line quota); `--scanner` runs a starter US top-gainers scan. Both ar
 default; add them to the unit's `ExecStart` once the smoke test is green.
 
 ## Current status of the daemon
-Connectivity + streaming **scaffold**: every stream is subscribed and its events are
-LOGGED. The DB/SSE integration — position/P&L → `foreign_equity_holding`, fills →
-`stock_transaction` (`source_ref=ibkr:live:{execId}`) + the `live_trades` SSE channel,
-quote fan-out — is the **next milestone** (marked `TODO(next)` in the handlers). Get a
-smoke test green and the log showing live POSITION/FILL/QUOTE lines, then I wire the
-handlers into the DB and the existing live-trade UI, with the Flex **Trades query** as the
-Tier-2 reconcile that supersedes `ibkr:live:` rows.
+Connectivity + streaming + **persistence wired** (`equity/ibkr_stream_sink.py`):
+- **positions → `foreign_equity_holding`** — live quantity + cost basis (partial upsert on
+  `(entity_id,'ibkr',symbol)`; qty 0 removes the row). Owns only the "book" columns, so it
+  never clobbers the daily Flex sync or `foreign_price_worker`.
+- **quotes → `foreign_equity_holding`** — live price/value/pnl (`--quotes`, throttled ~3s
+  per symbol). Makes the 60s `foreign_price_worker` a fallback.
+- **fills → `live_trades` SSE channel** — real-time to the existing `/api/v1/live/trades`
+  UI. The durable trade **ledger** stays with the daily Flex **Trades query** reconcile
+  (Tier-2; `source_ref` convention `ibkr:live:{execId}`); `positionEvent` moves the holding
+  on the fill, so nothing is lost.
+
+DB writes are skipped for `--smoke` and killable with `IBKR_STREAM_DB_DISABLED=1`. Still
+open: the **market scanner** (`--scanner`) only logs — surfacing hits needs a screening
+table/endpoint. Once a smoke test is green and the log shows live POSITION/FILL lines,
+this streams straight into holdings + the live-trade UI.
