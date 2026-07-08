@@ -75,8 +75,8 @@ systemctl daemon-reload
 # --- detect Gateway build for IBKR_GATEWAY_VERSION -------------------------
 echo
 echo "==> DONE. Server-side install complete."
-GW_VER="$(grep -hoE '10[0-9]{2}' "$GW_DIR"/.install4j/i4jparams.conf 2>/dev/null | head -1 || true)"
-[ -z "$GW_VER" ] && GW_VER="$(ls -d "$GW_DIR"/*/ 2>/dev/null | grep -oE '10[0-9]{2}' | head -1 || true)"
+# read the authoritative <variable name="majorVersion" value="1045"/> line
+GW_VER="$(grep -oE 'name="majorVersion" value="[0-9]+"' "$GW_DIR"/.install4j/i4jparams.conf 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)"
 echo
 echo "NEXT (needs your IBKR credentials — do these last):"
 if [ -n "$GW_VER" ]; then
