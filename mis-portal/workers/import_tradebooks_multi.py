@@ -70,7 +70,56 @@ def _date(v):
 #   symbol, isin, date, side(BUY/SELL), qty, price, brokerage, stt, other,
 #   currency, exchange, trade_id, skipped_reason(None|str)
 
+def _parse_zerodha_console_xlsx(path):
+    """Zerodha Console 'Query Report' XLSX export (the only format available for
+    closed/converted accounts, e.g. pre-NRI-conversion history): Trade Date /
+    Trading Symbol / Trade Type / Quantity / Price headers, no ISIN column
+    (bridge resolves symbols to ISIN via holdings). The F&O variant adds a
+    Segment column and signed quantities; F&O rows are skipped."""
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    rows = [tuple(r) for r in wb.worksheets[0].iter_rows(values_only=True)]
+    wb.close()
+    h = _find_header(rows, ["trade date", "trading symbol", "trade type"])
+    if h is None:
+        raise ValueError("Zerodha xlsx: could not locate Trade Date/Trading Symbol header")
+    idx = {str(c).strip(): i for i, c in enumerate(rows[h]) if c is not None}
+
+    def g(row, col):
+        i = idx.get(col)
+        return row[i] if (i is not None and i < len(row)) else None
+
+    for row in rows[h + 1:]:
+        if row is None or all(c is None for c in row):
+            continue
+        symbol = str(g(row, "Trading Symbol") or "").strip()
+        if not symbol:
+            continue
+        seg = str(g(row, "Segment") or "").strip().upper()
+        if seg and seg not in ("EQ", "EQUITY"):
+            yield {"symbol": symbol, "skipped_reason": f"non-equity segment {seg}", **_blank()}
+            continue
+        tt = str(g(row, "Trade Type") or "").strip().lower()
+        side = "BUY" if tt.startswith("b") else "SELL" if tt.startswith("s") else None
+        qty = _f(g(row, "Quantity"))
+        yield {
+            "symbol": symbol,
+            "isin": None,
+            "date": _date(g(row, "Trade Date")),
+            "side": side,
+            "qty": abs(qty) if qty is not None else None,
+            "price": _f(g(row, "Price")),
+            "brokerage": None, "stt": None, "other": None,
+            "currency": "INR",
+            "exchange": str(g(row, "Exchange") or "").strip() or None,
+            "trade_id": str(g(row, "Trade ID") or "").strip() or None,
+            "skipped_reason": None,
+        }
+
+
 def parse_zerodha_tradebook(path):
+    if str(path).lower().endswith((".xlsx", ".xlsm")):
+        yield from _parse_zerodha_console_xlsx(path)
+        return
     with open(path, newline="") as fh:
         for r in csv.DictReader(fh):
             side = "BUY" if str(r.get("trade_type", "")).lower().startswith("b") else \
@@ -456,7 +505,10 @@ def main():
     # aggregating across all that group's tradebook files.
     bridges = {}
     for broker, ent_code, kind, path in jobs:
-        if broker in ("angel_one", "dhan") and kind == "tradebook":
+        needs_bridge = broker in ("angel_one", "dhan") or (
+            # Zerodha Console xlsx exports carry no ISIN column (CSV exports do)
+            broker == "zerodha" and path.lower().endswith((".xlsx", ".xlsm")))
+        if needs_bridge and kind == "tradebook":
             bridges.setdefault((ent_code, broker), []).append(path)
     bridge_maps = {}
     for (ent_code, broker), paths in bridges.items():
