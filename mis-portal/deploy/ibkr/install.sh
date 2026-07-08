@@ -44,7 +44,12 @@ else
   curl -fL --retry 3 -o "$STAGE/ibc.zip" "$IBC_URL"
   mkdir -p "$IBC_DIR"
   echo "==> unzipping IBC -> $IBC_DIR"
-  unzip -o "$STAGE/ibc.zip" -d "$IBC_DIR" >/dev/null
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -o "$STAGE/ibc.zip" -d "$IBC_DIR" >/dev/null
+  else
+    # unzip not installed — use the venv's Python stdlib zip extractor
+    /var/www/.venv/bin/python -m zipfile -e "$STAGE/ibc.zip" "$IBC_DIR"
+  fi
   chmod +x "$IBC_DIR"/*.sh "$IBC_DIR"/scripts/*.sh 2>/dev/null || true
 fi
 
