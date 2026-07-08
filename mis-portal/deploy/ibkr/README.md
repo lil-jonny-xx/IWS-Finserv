@@ -29,6 +29,19 @@ The account→entity map is baked into `ACCOUNT_ENTITY` in the daemon.
 - `deploy/tmpfiles/mis-portal-logs.conf` — provisions `/var/log/mis-portal-ibkr-stream.log`
 - `ib_async` installed in `/var/www/.venv`
 
+## Fast path — one script for all the server-side install
+
+Everything that does **not** need IBKR credentials (Gateway + IBC + inis + log +
+systemd unit) is bundled in `install.sh`. It is idempotent and pins IBC + verified
+download URLs:
+
+```bash
+sudo bash /var/www/mis-portal/deploy/ibkr/install.sh
+```
+
+It does **not** touch `.env`, enable/start services, or smoke-test — those come after
+you fill the per-login credentials (below). Prefer the manual steps? They follow.
+
 ## What YOU install (one time; needs IBKR logins / downloads)
 
 ### 1. An API user per login
