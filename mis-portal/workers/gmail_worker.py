@@ -17,7 +17,14 @@ from googleapiclient.discovery import build
 
 logger = logging.getLogger(__name__)
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+# Must match the full grant on the shared central token (see oauth_setup.py).
+# Refreshing with a narrower list makes Google issue a DOWN-SCOPED access token,
+# which _get_service then writes back to the shared file — breaking alert.py's
+# gmail.send until the next full-scope refresh.
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+]
 CREDENTIALS_FILE = Path(__file__).parent / "gmail_credentials.json"
 
 # CAMS sends CAS from this address
