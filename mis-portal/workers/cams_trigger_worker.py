@@ -544,6 +544,10 @@ def _check_submit_result(page) -> bool:
         )
         return True
 
+    except CamsRateLimited:
+        # Must escape the catch-all below — the retry wrapper needs this to
+        # back off and re-submit on a fresh browser profile.
+        raise
     except Exception as e:
         logger.warning(f"Could not check submit result: {e}")
         return True
