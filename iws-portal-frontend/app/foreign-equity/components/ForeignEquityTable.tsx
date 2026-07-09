@@ -25,6 +25,7 @@ export interface EquityHoldingRow {
   exposure_pct?: number;
   pnl_ytd?: number;
   pnl_inception?: number;
+  pnl_daily?: number;          // today vs prior close (INR); foreign brokers only
   returns_ytd_pct?: number;
   returns_inception_pct?: number;
   cagr_inception_pct?: number;
@@ -38,6 +39,7 @@ export interface EquityTotals {
   total_cost?: number;
   total_current_market_value?: number;
   total_pnl_inception?: number;
+  total_pnl_daily?: number;
   total_pnl_ytd?: number;
   cash_balance?: number;
   value_plus_cash?: number;
@@ -236,7 +238,7 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
   }
 
   const rows     = sortRows(filtered, sortKey, sortDir);
-  const colCount = 3 + (showEntityCol ? 1 : 0) + 9;
+  const colCount = 3 + (showEntityCol ? 1 : 0) + 10;
 
   const base = 'px-3 py-2.5 text-xs font-medium text-ghost bg-card border-b border-rule whitespace-nowrap sticky top-0 z-10';
   // Render helper (not a component) so header cells share the sort closure without
@@ -326,6 +328,19 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
             );
           })()}
           {(() => {
+            const day = totals.total_pnl_daily ?? 0;
+            if (day === 0) return null;
+            return (
+              <div>
+                <p className="text-xs text-ghost mb-0.5">P&amp;L (Today)</p>
+                <p className="text-sm font-semibold tabular-nums"
+                  style={{ color: day >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
+                  {day >= 0 ? '+' : ''}{fmtMoney(convTotal(day), totalsCcy)}
+                </p>
+              </div>
+            );
+          })()}
+          {(() => {
             const pnl = (totals.total_pnl_inception ?? 0) + (extra?.pnl ?? 0);
             if (pnl === 0) return null;
             return (
@@ -379,6 +394,7 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
               {th('first_invested_date', 'Since')}
               {th('current_market_value', 'Cur Value')}
               {th('exposure_pct', 'Exp %')}
+              {th('pnl_daily', 'Day P&L')}
               {th('pnl_inception', 'P&L (Inc)')}
               {th('xirr_inception_pct', 'XIRR')}
               <th scope="col" className={`${base} text-left pr-5 sm:pr-6`}>Remarks</th>
@@ -414,6 +430,13 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
                     {h.exposure_pct != null ? h.exposure_pct.toFixed(2) + '%' : '—'}
                   </td>
                   <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top">
+                    {h.pnl_daily == null
+                      ? <span className="text-ghost">—</span>
+                      : <span style={{ color: h.pnl_daily >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
+                          {h.pnl_daily >= 0 ? '+' : ''}{fmtMoney(conv(h.pnl_daily, h.fx_rate), rowCcy)}
+                        </span>}
+                  </td>
+                  <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top">
                     {h.pnl_inception == null
                       ? <span className="text-ghost">—</span>
                       : <span style={{ color: h.pnl_inception >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
@@ -447,6 +470,13 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
                   {fmtMoney(convTotal(rows.reduce((s, h) => s + (h.current_market_value ?? 0), 0)), totalsCcy)}
                 </td>
                 <td />
+                <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap">
+                  {(() => {
+                    const v = rows.reduce((s, h) => s + (h.pnl_daily ?? 0), 0);
+                    if (v === 0) return null;
+                    return <span style={{ color: v >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{v >= 0 ? '+' : ''}{fmtMoney(convTotal(v), totalsCcy)}</span>;
+                  })()}
+                </td>
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap">
                   {(() => {
                     const v = rows.reduce((s, h) => s + (h.pnl_inception ?? 0), 0);

@@ -1391,6 +1391,7 @@ def _row_to_holding(r: dict) -> dict:
         "weekly_change":         _fmt(r["weekly_change"]),
         "pnl_ytd":               _fmt(r["pnl_ytd"]),
         "pnl_inception":         _fmt(r["pnl_inception"]),
+        "pnl_daily":             _fmt(r.get("pnl_daily")),   # foreign only (None for India)
         "pnl_weekly_change":     _fmt(r["pnl_weekly_change"]),
         "returns_ytd_pct":       _fmt(r["returns_ytd_pct"]),
         "returns_inception_pct": _fmt(r["returns_inception_pct"]),
@@ -1406,13 +1407,14 @@ def _row_to_holding(r: dict) -> dict:
 
 def _equity_totals(rows: list[dict]) -> dict:
     def s(key):
-        return round(sum(r[key] or 0 for r in rows), 2)
+        return round(sum((r.get(key) or 0) for r in rows), 2)
     return {
         "total_cost":             s("cost"),
         "total_current_market_value": s("current_market_value"),
         "total_prev_week_value":  s("prev_week_value"),
         "total_weekly_change":    s("weekly_change"),
         "total_pnl_inception":    s("pnl_inception"),
+        "total_pnl_daily":        s("pnl_daily"),   # foreign only; 0 where absent
         "total_pnl_ytd":          s("pnl_ytd"),
         "total_pnl_weekly_change":s("pnl_weekly_change"),
     }
@@ -1730,7 +1732,7 @@ def get_foreign_equity_holdings(
 
         cur.execute(
             f"""
-            SELECT {_EQUITY_HOLDING_COLS}
+            SELECT {_EQUITY_HOLDING_COLS}, eh.pnl_daily
             FROM   foreign_equity_holding eh
             JOIN   entity e ON e.id = eh.entity_id
             {where}
