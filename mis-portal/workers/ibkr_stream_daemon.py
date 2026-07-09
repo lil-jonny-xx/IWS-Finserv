@@ -23,10 +23,15 @@ on IBKR's forced daily restart, auto-reconnect on drop). Each instance runs unde
 Xvfb display, its own API port, and its own IBC ini. See deploy/ibkr/README.md.
 
 STATUS: connectivity + streaming + persistence wired (equity/ibkr_stream_sink):
-  • positions -> foreign_equity_holding (quantity + cost basis; partial upsert)
-  • quotes    -> foreign_equity_holding (live price/value/pnl; --quotes, throttled)
-  • fills     -> 'live_trades' SSE channel (durable ledger stays with the daily Flex
-                 Trades reconcile; positionEvent moves the holding on the fill)
+  • positions  -> foreign_equity_holding (quantity + cost basis; partial upsert)
+  • daily P&L  -> foreign_equity_holding.pnl_daily (reqPnLSingle.dailyPnL, INR; computed
+                  by IBKR server-side with NO market-data subscription — free)
+  • fills      -> 'live_trades' SSE channel (durable ledger stays with the daily Flex
+                  Trades reconcile; positionEvent moves the holding on the fill)
+  • quotes     -> OFF by design (--quotes). Live top-of-book needs a paid per-user
+                  exchange subscription; the portal already sources prices + inception
+                  P&L independently (foreign_price_worker: Finnhub/TwelveData/yfinance),
+                  so the stream deliberately does not subscribe market data.
 DB writes are skipped for --smoke and can be killed with IBKR_STREAM_DB_DISABLED=1.
 The market scanner (--scanner) still only logs (needs a screening table/endpoint).
 Run `--login X --smoke` first to prove the pipe once Gateway+IBC are installed.
@@ -98,9 +103,12 @@ def _env(name, default=None, required=False):
 # --- persistence context ---------------------------------------------------
 # Handlers run inside ib_async's asyncio loop; DB writes are short and fail-soft
 # (see equity/ibkr_stream_sink). _CTX is populated in run() unless --smoke.
-_CTX = {"conn": None, "redis": None, "db": False}
+_CTX = {"conn": None, "redis": None, "db": False, "ib": None}
 _QUOTE_MIN_GAP = 3.0                 # seconds; throttle per-symbol quote DB writes
 _last_quote: dict[str, float] = {}   # symbol -> last write monotonic time
+# conId -> {"entity_id", "symbol", "ccy"}: reqPnLSingle events carry only (account, conId),
+# not the contract, so we remember each held name's meta when we open its P&L stream.
+_CON_META: dict[int, dict] = {}
 
 
 def get_conn():
@@ -149,6 +157,25 @@ def build_ibc(login):
 # --- event handlers ---------------------------------------------------------
 # Each is fail-soft: the sink swallows DB/redis errors so nothing propagates into
 # ib_async's event loop. DB writes are skipped entirely unless _CTX["db"] is on.
+def _track_pnl_single(account, contract, entity_id):
+    """Open (once) IBKR's per-position daily-P&L stream for a held name and remember its
+    meta so on_pnl_single (which gets only account+conId) can resolve symbol+ccy+entity.
+    Idempotent per conId; covers both the initial snapshot and intraday new buys."""
+    ib = _CTX.get("ib")
+    con_id = getattr(contract, "conId", None)
+    if ib is None or not con_id or con_id in _CON_META:
+        return
+    _CON_META[con_id] = {
+        "entity_id": entity_id,
+        "symbol": (contract.localSymbol or contract.symbol or "").strip(),
+        "ccy": (getattr(contract, "currency", None) or "USD").upper(),
+    }
+    try:
+        ib.reqPnLSingle(account, "", con_id)   # per-position realtime P&L (no market data)
+    except Exception as e:
+        log.warning("reqPnLSingle failed for %s conId=%s: %s", account, con_id, e)
+
+
 def on_position(pos):
     ent = ACCOUNT_ENTITY.get(pos.account)
     if ent is None:
@@ -162,6 +189,8 @@ def on_position(pos):
         from equity import ibkr_stream_sink as sink
         sink.upsert_position(_CTX["conn"], entity_id, pos.contract,
                              pos.position, pos.avgCost)
+    if pos.position:                       # open the per-position daily-P&L stream
+        _track_pnl_single(pos.account, pos.contract, entity_id)
 
 
 def on_pnl(pnl):
@@ -173,10 +202,16 @@ def on_pnl(pnl):
 
 
 def on_pnl_single(p):
+    meta = _CON_META.get(p.conId)
     log.info("PNL1 acct=%s conId=%s pos=%s daily=%s unreal=%s value=%s",
              p.account, p.conId, p.position, p.dailyPnL, p.unrealizedPnL, p.value)
-    # Market value/price come from the quote stream (update_quote); pnlSingle is kept
-    # for observability + a future live-P&L channel, not a DB write.
+    # Persist ONLY today's P&L (pnl_daily) — the one column the stream owns. Market
+    # value + inception P&L stay with foreign_price_worker (no two-writer conflict).
+    if not _CTX["db"] or meta is None:
+        return
+    from equity import ibkr_stream_sink as sink
+    sink.update_daily_pnl(_CTX["conn"], meta["entity_id"], meta["symbol"],
+                          meta["ccy"], p.dailyPnL)
 
 
 def on_exec(trade, fill):
@@ -239,17 +274,24 @@ def subscribe(ib, quotes=False, scanner=False):
     if unmapped:
         log.warning("accounts not in ACCOUNT_ENTITY map: %s", unmapped)
 
-    # (1) LIVE BOOK — <50 subaccounts per login so plain reqPositions streams them all
+    # (1) LIVE BOOK — <50 subaccounts per login so plain reqPositions streams them all.
+    # reqPositions also fires positionEvent per row, and on_position opens each name's
+    # per-position daily-P&L stream (_track_pnl_single); we also sweep the returned list
+    # here so P&L still starts even if those events fired before wiring.
     positions = ib.reqPositions()
     log.info("initial positions: %d rows", len(positions))
     for acct in accts:
-        ib.reqPnL(acct)                          # account-level realtime P&L
-    for p in positions:                          # per-position P&L needs (acct, conId)
+        ib.reqPnL(acct)                          # account-level realtime P&L (observability)
+    for p in positions:
         if p.position:
-            ib.reqPnLSingle(p.account, "", p.contract.conId)
+            ent = ACCOUNT_ENTITY.get(p.account)
+            if ent is not None:
+                _track_pnl_single(p.account, p.contract, ent[0])
 
-    # (3) STREAMING QUOTES — off by default (each line counts against the ~100
-    #     market-data-line quota and needs an exchange subscription on the user)
+    # (3) STREAMING QUOTES — OFF by design. Live top-of-book needs a paid per-user
+    #     exchange subscription and burns the ~100 market-data-line quota; the portal
+    #     already sources prices + inception P&L from foreign_price_worker. The flag is
+    #     kept only as an explicit, deliberate opt-in.
     if quotes:
         for p in positions:
             if p.position:
@@ -269,6 +311,7 @@ def run(login, smoke=False, quotes=False, scanner=False):
     from ib_async import IB, Watchdog
 
     ib = IB()
+    _CTX["ib"] = ib                      # handlers use this to open P&L streams for new buys
     wire(ib)
 
     port = int(_login_env(login, "API_PORT", str(LOGINS[login]["default_port"])))

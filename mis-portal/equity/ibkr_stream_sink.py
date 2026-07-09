@@ -7,10 +7,15 @@ foreign_equity_holding (keyed on (entity_id, broker='ibkr', symbol)):
   • foreign_price_worker owns current_price* / current_market_value* / pnl_inception
 
 The stream therefore does PARTIAL updates only:
-  • upsert_position  -> quantity, avg_cost*, cost*, currency, exchange  (the "book")
-  • update_quote     -> current_price*, current_market_value*, pnl_inception  (live price)
-  • publish_fill     -> SSE only (the durable trade LEDGER stays with the daily Flex Trades
-                        reconcile; positionEvent already moves the holding on a fill)
+  • upsert_position   -> quantity, avg_cost*, cost*, currency, exchange  (the "book")
+  • update_quote      -> current_price*, current_market_value*, pnl_inception  (live price;
+                         OFF by default — quotes need a paid market-data subscription)
+  • update_daily_pnl  -> pnl_daily  (today-vs-prior-close P&L, INR; the stream owns this
+                         column for its ibkr rows — foreign_price_worker fills it for the
+                         other foreign brokers and skips ibkr, so no two-writer clash; from
+                         reqPnLSingle, which IBKR computes server-side with NO market data)
+  • publish_fill      -> SSE only (the durable trade LEDGER stays with the daily Flex Trades
+                         reconcile; positionEvent already moves the holding on a fill)
 
 All functions are fail-soft: a DB/redis error is logged, never raised into the asyncio
 event loop. Currency->INR uses equity.fx.get_rate (same source as the price worker).
@@ -123,6 +128,38 @@ def update_quote(conn, contract, price_native) -> None:
         try: conn.rollback()
         except Exception: pass
         logger.error("update_quote failed (%s): %s", sym, e)
+
+
+def update_daily_pnl(conn, entity_id: int, symbol: str, ccy: str, daily_native) -> None:
+    """Today's P&L (vs prior close) for one held name, from reqPnLSingle.dailyPnL.
+    IBKR computes this server-side without any market-data subscription. Stored in INR
+    in pnl_daily — the only column the stream owns outright, so no writer conflict.
+
+    IB sends an unset dailyPnL as NaN or a Double.MAX_VALUE sentinel; both are dropped."""
+    sym = (symbol or "").strip()
+    if not sym or daily_native is None:
+        return
+    try:
+        d_native = float(daily_native)
+    except (TypeError, ValueError):
+        return
+    if d_native != d_native or abs(d_native) > 1e12:   # NaN or unset sentinel
+        return
+    try:
+        fxr = _fx_rate(conn, ccy)
+        d = (Decimal(str(d_native)) * fxr).quantize(TWO, ROUND_HALF_UP)
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE foreign_equity_holding SET
+                pnl_daily  = %s,
+                updated_at = NOW()
+            WHERE entity_id=%s AND broker=%s AND symbol=%s
+        """, (d, entity_id, BROKER, sym))
+        conn.commit(); cur.close()
+    except Exception as e:
+        try: conn.rollback()
+        except Exception: pass
+        logger.error("update_daily_pnl failed (%s/%s): %s", entity_id, sym, e)
 
 
 def publish_fill(redis_client, entity_code: str, entity_id: int, contract,
