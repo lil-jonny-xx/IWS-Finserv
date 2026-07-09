@@ -23,6 +23,11 @@ Metrics follow the same conventions as equity_sync_worker (INR-based; CAGR only
 once held ≥1 year — sub-year holdings show the absolute return instead). pnl_ytd /
 returns_ytd_pct are left untouched (owned by equity_txn_metrics_worker).
 
+pnl_daily (today vs prior close, INR) is computed here from the feed's previous
+close for the NON-ibkr foreign brokers (Vested/DBS). ibkr rows are skipped — their
+daily P&L is owned by the realtime stream (equity/ibkr_stream_sink) — so the two
+writers never touch the same row.
+
 Dry-run by default; --commit to write. --snapshot also writes today's EOD row to
 foreign_equity_holding_history (auto-written anyway in the last 5 min before US close).
 --force runs even when the US market is closed.
@@ -92,6 +97,9 @@ def connect():
 # ---------------------------------------------------------------------------
 # Price sources — each returns a positive float price or None
 # ---------------------------------------------------------------------------
+# Each source returns (price, prev_close) — prev_close is the previous session's
+# close, used for daily P&L, or None when the source doesn't carry it (Twelve Data's
+# /price endpoint). Both come from the SAME request, so daily P&L costs no extra quota.
 def _finnhub(symbol: str, key: str, session: requests.Session):
     # Don't use raise_for_status(): its message echoes the full URL incl. the token
     # into the worker log. Raise a clean status-only error instead.
@@ -99,8 +107,10 @@ def _finnhub(symbol: str, key: str, session: requests.Session):
                     params={"symbol": symbol, "token": key}, timeout=10)
     if r.status_code != 200:
         raise RuntimeError(f"HTTP {r.status_code}")
-    c = r.json().get("c")          # current price; 0 == no data for the symbol
-    return float(c) if c else None
+    j = r.json()
+    c  = j.get("c")                # current price; 0 == no data for the symbol
+    pc = j.get("pc")              # previous close
+    return (float(c) if c else None, float(pc) if pc else None)
 
 
 def _twelvedata(symbol: str, key: str, session: requests.Session):
@@ -109,18 +119,20 @@ def _twelvedata(symbol: str, key: str, session: requests.Session):
     if r.status_code != 200:
         raise RuntimeError(f"HTTP {r.status_code}")
     p = r.json().get("price")
-    return float(p) if p else None
+    return (float(p) if p else None, None)   # /price has no prev-close (daily P&L via others)
 
 
 def _yfinance(symbol: str):
     import yfinance as yf
     fi = yf.Ticker(symbol).fast_info
-    p = fi.get("lastPrice") or fi.get("last_price")
-    return float(p) if p else None
+    p  = fi.get("lastPrice") or fi.get("last_price")
+    pc = fi.get("previousClose") or fi.get("previous_close")
+    return (float(p) if p else None, float(pc) if pc else None)
 
 
 def fetch_price(symbol: str, finnhub_key, td_key, session):
-    """Try each source in priority order; return (price, source_name) or (None, None)."""
+    """Try each source in priority order; return (price, prev_close, source_name).
+    prev_close may be None even on a price hit (source doesn't carry it)."""
     sources = []
     if finnhub_key:
         sources.append(("finnhub",    lambda: _finnhub(symbol, finnhub_key, session)))
@@ -130,9 +142,9 @@ def fetch_price(symbol: str, finnhub_key, td_key, session):
 
     for name, fn in sources:
         try:
-            p = fn()
+            p, pc = fn()
             if p and p > 0:
-                return p, name
+                return p, pc, name
         except Exception as e:
             # Scrub keys: a network-level exception embeds the full request URL (incl.
             # the token) in its message, which would otherwise land in the worker log.
@@ -141,13 +153,14 @@ def fetch_price(symbol: str, finnhub_key, td_key, session):
                 if k:
                     msg = msg.replace(k, "***")
             logger.warning(f"  [{symbol}] {name} failed: {msg}")
-    return None, None
+    return None, None, None
 
 
 # ---------------------------------------------------------------------------
 # Metric recompute (INR-based, mirrors equity_sync_worker)
 # ---------------------------------------------------------------------------
-def recompute(h: dict, price_native: Decimal, fx_rate: Decimal) -> dict:
+def recompute(h: dict, price_native: Decimal, fx_rate: Decimal,
+              prev_close_native: Decimal | None = None) -> dict:
     qty  = Decimal(str(h["quantity"]))
     cost = Decimal(str(h["cost"] or 0))                 # cost is stored in INR
     cmv_native = (qty * price_native).quantize(TWO, ROUND_HALF_UP)
@@ -155,12 +168,19 @@ def recompute(h: dict, price_native: Decimal, fx_rate: Decimal) -> dict:
     cmv_inr    = (cmv_native * fx_rate).quantize(TWO, ROUND_HALF_UP)
     pnl_inc    = (cmv_inr - cost).quantize(TWO, ROUND_HALF_UP)
 
+    # Daily P&L (today vs prior close), in INR. None when no prev-close is available
+    # this run — the caller COALESCEs so the last good value is preserved, not wiped.
+    pnl_daily = None
+    if prev_close_native is not None and prev_close_native > 0:
+        pnl_daily = (qty * (price_native - prev_close_native) * fx_rate).quantize(TWO, ROUND_HALF_UP)
+
     out = {
         "current_price_native":        price_native,
         "current_market_value_native": cmv_native,
         "current_price":               price_inr,
         "current_market_value":        cmv_inr,
         "pnl_inception":               pnl_inc,
+        "pnl_daily":                   pnl_daily,
         "fx_rate":                     fx_rate,
         "returns_inception_pct":       None,
         "cagr_inception_pct":          None,
@@ -220,11 +240,12 @@ def main():
     fx_cache: dict[str, Decimal] = {}
     updated = sources_used = 0
     print(f"{'COMMIT' if args.commit else 'DRY-RUN'} — {len(rows)} foreign holding(s)\n")
-    print(f"{'ENT':6}{'SYMBOL':10}{'SRC':11}{'PX(nat)':>11}{'VALUE(INR)':>15}{'INC%':>9}{'CAGR%':>9}")
+    print(f"{'ENT':6}{'SYMBOL':10}{'SRC':11}{'PX(nat)':>11}{'VALUE(INR)':>15}"
+          f"{'DAY(INR)':>13}{'INC%':>9}{'CAGR%':>9}")
 
     for h in rows:
         ticker = (h.get("symbol_override") or h["symbol"]).strip()
-        price, src = fetch_price(ticker, finnhub_key, td_key, session)
+        price, prev_close, src = fetch_price(ticker, finnhub_key, td_key, session)
         if price is None:
             logger.warning(f"  [{h['symbol']}] no price from any source — keeping last value")
             continue
@@ -236,7 +257,12 @@ def main():
             fx_cache[ccy] = r if r is not None else Decimal(str(h["fx_rate"] or 1))
         fx_rate = fx_cache[ccy]
 
-        m = recompute(h, Decimal(str(price)), fx_rate)
+        m = recompute(h, Decimal(str(price)), fx_rate,
+                      Decimal(str(prev_close)) if prev_close else None)
+        # Daily P&L for ibkr rows is owned by the realtime stream (ibkr_stream_sink);
+        # leave it to the stream so the two writers never fight (COALESCE keeps it).
+        if h["broker"] == "ibkr":
+            m["pnl_daily"] = None
         if args.commit:
             cur.execute("""UPDATE foreign_equity_holding SET
                              current_price_native=%(current_price_native)s,
@@ -244,6 +270,7 @@ def main():
                              current_price=%(current_price)s,
                              current_market_value=%(current_market_value)s,
                              pnl_inception=%(pnl_inception)s,
+                             pnl_daily=COALESCE(%(pnl_daily)s, pnl_daily),
                              returns_inception_pct=%(returns_inception_pct)s,
                              cagr_inception_pct=%(cagr_inception_pct)s,
                              fx_rate=%(fx_rate)s, updated_at=NOW()
@@ -251,8 +278,10 @@ def main():
             if do_snapshot:
                 write_snapshot(cur, h, m)
         updated += 1
+        day = m["pnl_daily"]
         print(f"{h['entity_name'][:5]:6}{h['symbol'][:9]:10}{src:11}{price:>11,.2f}"
               f"{float(m['current_market_value']):>15,.0f}"
+              f"{(float(day) if day is not None else 0):>13,.0f}"
               f"{float(m['returns_inception_pct'] or 0):>9.1f}"
               f"{float(m['cagr_inception_pct'] or 0):>9.1f}")
 
