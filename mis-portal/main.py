@@ -25,6 +25,7 @@ import atexit
 
 from assistant import engine as assistant_engine
 from assistant import persistence as assistant_persistence
+from equity.finmath import xirr as _xirr
 
 # Load .env file
 load_dotenv('/var/www/mis-portal/.env')
@@ -2205,8 +2206,87 @@ def get_gold_silver_holdings(
 
 
 # ---------------------------------------------------------------------------
-# Nuvama PMS holdings — broken-out holdings with equity / cash / combined totals
+# PMS holdings — segmented by source (Nuvama / Zerodha / ICICI Pru), with
+# equity / cash / combined totals and P&L metrics at every level
 # ---------------------------------------------------------------------------
+
+# Display names for pms_holding.source values.
+PMS_SOURCE_LABELS = {
+    "nuvama_pms":  "Nuvama",
+    "zerodha_pms": "Zerodha",
+    "icici_pms":   "ICICI Prudential",
+}
+
+# PMS sources whose funding deposits/withdrawals flow through a broker ledger
+# already imported into external_cashflow, keyed to that ledger's broker code.
+# zerodha_pms runs INSIDE the client's own Zerodha account, so its deposits ARE
+# the Zerodha ledger flows — a true money-weighted XIRR is computable. Nuvama
+# and ICICI are separately managed accounts whose deposit history isn't
+# ingested, so they only get absolute return (same rule as equity: annualised
+# metrics only where the dated flows exist).
+PMS_SOURCE_FLOW_BROKER = {"zerodha_pms": "zerodha"}
+
+
+def _pms_aggregate(holdings: list[dict]) -> dict:
+    """Totals + P&L metrics over a group of pms_holding rows.
+
+    P&L / return are computed ONLY over equity holdings that carry a cost
+    (ICICI Pru reports market value but no cost basis); `cost_complete` tells
+    the UI whether the metrics cover the whole group or a costed subset.
+    Counting a cost-less holding's full market value as profit — what the old
+    single-total endpoint did — is exactly the distortion this avoids.
+    """
+    equity = [h for h in holdings if h["holding_type"] == "equity"]
+    cash   = [h for h in holdings if h["holding_type"] == "cash"]
+
+    equity_total = sum(h["market_value"] for h in equity)
+    cash_total   = sum(h["market_value"] for h in cash)
+
+    costed       = [h for h in equity if h["cost"] is not None]
+    equity_cost  = sum(h["cost"] for h in costed)
+    costed_value = sum(h["market_value"] for h in costed)
+    pnl          = round(costed_value - equity_cost, 2) if costed else None
+    returns_pct  = round((costed_value - equity_cost) / equity_cost * 100, 2) if equity_cost > 0 else None
+
+    return {
+        "equity_total":  round(equity_total, 2),
+        "cash_total":    round(cash_total, 2),
+        "total":         round(equity_total + cash_total, 2),
+        "equity_cost":   round(equity_cost, 2),
+        # Capital put in = cost of equity holdings + cash parked in the account
+        # (cash is uninvested principal, so it counts toward invested).
+        "invested_cost": round(equity_cost + cash_total, 2),
+        "equity_pnl":    pnl,
+        "returns_pct":   returns_pct,
+        "cost_complete": len(costed) == len(equity),
+        "equity_count":  len(equity),
+        "cash_count":    len(cash),
+    }
+
+
+def _pms_source_xirr(cur, entity_id: int, source: str, current_value: float) -> Optional[float]:
+    """Money-weighted return (%) for one (entity, PMS source), from the broker
+    ledger flows in external_cashflow plus the current value as final inflow.
+    None when the source has no ledger mapping, no flows, or <1yr of history
+    (annualising shorter periods exaggerates the rate)."""
+    broker = PMS_SOURCE_FLOW_BROKER.get(source)
+    if broker is None or current_value <= 0:
+        return None
+    cur.execute(
+        """SELECT flow_date, amount_native, currency FROM external_cashflow
+           WHERE entity_id = %s AND broker = %s ORDER BY flow_date""",
+        (entity_id, broker),
+    )
+    rows = cur.fetchall()
+    if not rows or (date.today() - rows[0]["flow_date"]).days < 365:
+        return None
+    # Flows are stored investor-signed (deposits negative, withdrawals/income
+    # positive); INR is the only ledger currency for Indian brokers.
+    flows = [(r["flow_date"], float(r["amount_native"])) for r in rows]
+    flows.append((date.today(), current_value))
+    rate = _xirr(flows)
+    return round(rate * 100, 2) if rate is not None else None
+
 
 @app.get("/api/v1/pms/holdings")
 def get_pms_holdings(
@@ -2215,8 +2295,9 @@ def get_pms_holdings(
     authorization: Optional[str] = Header(None),
 ):
     """
-    Nuvama PMS holdings parsed from the WealthSpectrum report, with an equity
-    total, a cash total, and a combined total.
+    All PMS holdings segmented by source (Nuvama WealthSpectrum, Zerodha PMS,
+    ICICI Prudential PMS), with totals + P&L metrics overall, per entity, and
+    per (entity, source) — plus XIRR where the source's ledger flows exist.
     Admin: optional ?entity_id=N to filter. Member: own entity only.
     """
     conn = None
@@ -2236,94 +2317,106 @@ def get_pms_holdings(
 
         cur.execute(
             f"""
-            SELECT p.entity_id, e.entity_name, p.holding_type, p.security_name,
-                   p.isin, p.quantity, p.avg_cost, p.cost, p.current_price,
-                   p.market_value, p.weight_pct, p.as_on_date
+            SELECT p.entity_id, e.entity_name, p.source, p.holding_type,
+                   p.security_name, p.isin, p.quantity, p.avg_cost, p.cost,
+                   p.current_price, p.market_value, p.weight_pct, p.as_on_date
             FROM   pms_holding p
             JOIN   entity e ON e.id = p.entity_id
             {where}
-            ORDER BY e.entity_name, p.holding_type, p.market_value DESC
+            ORDER BY e.entity_name, p.source, p.holding_type, p.market_value DESC
             """,
             params,
         )
         rows = cur.fetchall()
-        cur.close()
 
         def _f(v):
             return float(v) if v is not None else None
 
-        holdings = [{
-            "entity_id":     r["entity_id"],
-            "entity_name":   r["entity_name"],
-            "holding_type":  r["holding_type"],
-            "security_name": r["security_name"],
-            "isin":          r["isin"],
-            "quantity":      _f(r["quantity"]),
-            "avg_cost":      _f(r["avg_cost"]),
-            "cost":          _f(r["cost"]),
-            "current_price": _f(r["current_price"]),
-            "market_value":  _f(r["market_value"]) or 0.0,
-            "weight_pct":    _f(r["weight_pct"]),
-        } for r in rows]
-
-        equity_total = sum(h["market_value"] for h in holdings if h["holding_type"] == "equity")
-        cash_total   = sum(h["market_value"] for h in holdings if h["holding_type"] == "cash")
-        equity_cost  = sum((h["cost"] or 0.0) for h in holdings if h["holding_type"] == "equity")
-        # Total capital put into PMS = cost of equity holdings + cash parked in
-        # the account. Cash is uninvested principal, so it counts toward invested.
-        invested_cost = equity_cost + cash_total
-
-        # Per-entity breakdown of invested cost, so the admin "All Entities" view
-        # can show each user individually alongside the combined grand total.
-        by_entity: dict[int, dict] = {}
-        for h in holdings:
-            e = by_entity.setdefault(h["entity_id"], {
-                "entity_id":    h["entity_id"],
-                "entity_name":  h["entity_name"],
-                "equity_cost":  0.0,
-                "cash_total":   0.0,
-                "equity_total": 0.0,
+        holdings = []
+        for r in rows:
+            cost = _f(r["cost"])
+            mv   = _f(r["market_value"]) or 0.0
+            has_pnl = cost is not None and r["holding_type"] == "equity"
+            holdings.append({
+                "entity_id":     r["entity_id"],
+                "entity_name":   r["entity_name"],
+                "source":        r["source"],
+                "source_label":  PMS_SOURCE_LABELS.get(r["source"], r["source"]),
+                "holding_type":  r["holding_type"],
+                "security_name": r["security_name"],
+                "isin":          r["isin"],
+                "quantity":      _f(r["quantity"]),
+                "avg_cost":      _f(r["avg_cost"]),
+                "cost":          cost,
+                "current_price": _f(r["current_price"]),
+                "market_value":  mv,
+                "weight_pct":    _f(r["weight_pct"]),
+                "pnl":           round(mv - cost, 2) if has_pnl else None,
+                "returns_pct":   round((mv - cost) / cost * 100, 2) if has_pnl and cost > 0 else None,
             })
-            if h["holding_type"] == "equity":
-                e["equity_cost"]  += h["cost"] or 0.0
-                e["equity_total"] += h["market_value"] or 0.0
-            elif h["holding_type"] == "cash":
-                e["cash_total"]   += h["market_value"] or 0.0
-        by_entity_list = sorted(
-            (
-                {
-                    "entity_id":     e["entity_id"],
-                    "entity_name":   e["entity_name"],
-                    "equity_cost":   round(e["equity_cost"], 2),
-                    "cash_total":    round(e["cash_total"], 2),
-                    "equity_total":  round(e["equity_total"], 2),
-                    "invested_cost": round(e["equity_cost"] + e["cash_total"], 2),
-                    "total":         round(e["equity_total"] + e["cash_total"], 2),
-                }
-                for e in by_entity.values()
-            ),
-            key=lambda x: x["entity_name"],
-        )
+
+        # Per-(entity, source) sections — one PMS account each.
+        source_keys: list[tuple[int, str]] = []
+        source_groups: dict[tuple[int, str], list[dict]] = {}
+        for h in holdings:
+            key = (h["entity_id"], h["source"])
+            if key not in source_groups:
+                source_groups[key] = []
+                source_keys.append(key)
+            source_groups[key].append(h)
+
+        as_on_by_key = {}
+        for r in rows:
+            key = (r["entity_id"], r["source"])
+            if r["as_on_date"] and (key not in as_on_by_key or r["as_on_date"] > as_on_by_key[key]):
+                as_on_by_key[key] = r["as_on_date"]
+
+        by_source = []
+        for key in source_keys:
+            group = source_groups[key]
+            agg   = _pms_aggregate(group)
+            by_source.append({
+                "entity_id":    key[0],
+                "entity_name":  group[0]["entity_name"],
+                "source":       key[1],
+                "source_label": PMS_SOURCE_LABELS.get(key[1], key[1]),
+                "as_on_date":   as_on_by_key.get(key).isoformat() if as_on_by_key.get(key) else None,
+                "xirr_pct":     _pms_source_xirr(cur, key[0], key[1], agg["total"]),
+                **agg,
+            })
+
+        # Per-entity rollup (an entity can hold several PMS accounts).
+        entity_keys: list[int] = []
+        entity_groups: dict[int, list[dict]] = {}
+        for h in holdings:
+            if h["entity_id"] not in entity_groups:
+                entity_groups[h["entity_id"]] = []
+                entity_keys.append(h["entity_id"])
+            entity_groups[h["entity_id"]].append(h)
+
+        by_entity = []
+        for ek in entity_keys:
+            group = entity_groups[ek]
+            by_entity.append({
+                "entity_id":   ek,
+                "entity_name": group[0]["entity_name"],
+                "pms_count":   sum(1 for k in source_keys if k[0] == ek),
+                **_pms_aggregate(group),
+            })
+
+        cur.close()
 
         entity_name = "All Entities" if eid is None else (rows[0]["entity_name"] if rows else "")
-        as_on = rows[0]["as_on_date"].isoformat() if rows and rows[0]["as_on_date"] else None
+        as_on = max(as_on_by_key.values()).isoformat() if as_on_by_key else None
 
         return {
             "entity_id":   eid or 0,
             "entity_name": entity_name,
             "as_on_date":  as_on,
-            "totals": {
-                "equity_total":  round(equity_total, 2),
-                "cash_total":    round(cash_total, 2),
-                "total":         round(equity_total + cash_total, 2),
-                "equity_cost":   round(equity_cost, 2),
-                "invested_cost": round(invested_cost, 2),
-                "equity_pnl":    round(equity_total - equity_cost, 2),
-                "equity_count":  sum(1 for h in holdings if h["holding_type"] == "equity"),
-                "cash_count":    sum(1 for h in holdings if h["holding_type"] == "cash"),
-            },
-            "by_entity": by_entity_list,
-            "holdings":  holdings,
+            "totals":      _pms_aggregate(holdings),
+            "by_entity":   by_entity,
+            "by_source":   by_source,
+            "holdings":    holdings,
         }
 
     except HTTPException:
