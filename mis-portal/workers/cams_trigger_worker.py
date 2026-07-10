@@ -309,15 +309,22 @@ def _dismiss_tnc(page):
     try:
         # Detect which kind of dialog is present
         has_mat    = page.locator("mat-dialog-container").count() > 0
-        # Plain modal: look for a visible element whose text contains "Disclaimer"
-        # paired with a radio or proceed button — catches bootstrap / custom modals
+        # Plain modal: only match real dialog containers. The page footer always
+        # contains a "Disclaimer" quick-link, so matching any div whose text
+        # includes "Disclaimer" fires on every page — and the fallback clicks
+        # below then reset the form and submit it empty.
         has_plain  = page.evaluate("""
             (() => {
-                const candidates = [...document.querySelectorAll('div,section,article')];
-                return candidates.some(el => {
+                const sels = '[role="dialog"], .modal.show, .modal.in, .modal-dialog, .swal2-container';
+                for (const el of document.querySelectorAll(sels)) {
+                    if (el.closest('mat-dialog-container')) continue;
+                    const style = getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') continue;
+                    if (el.offsetParent === null && style.position !== 'fixed') continue;
                     const txt = (el.innerText || '').trim();
-                    return txt.includes('Disclaimer') && el.querySelector('input[type="radio"], button');
-                });
+                    if (txt.includes('Disclaimer') && el.querySelector('input[type="radio"], button')) return true;
+                }
+                return false;
             })()
         """)
 
@@ -327,42 +334,53 @@ def _dismiss_tnc(page):
 
         logger.info(f"Disclaimer modal detected (mat={has_mat}, plain={has_plain})")
 
-        # Step 1: Click ACCEPT — works for both mat-radio-button and plain inputs
+        # Step 1: Click ACCEPT — works for both mat-radio-button and plain inputs.
+        # Search ONLY inside the dialog: the CAS form's own radios (statement
+        # type, folio listing) live outside it, and clicking one re-renders the
+        # Angular form and wipes every filled field.
         page.evaluate("""
             (() => {
-                // Try Angular Material radio first
-                const matBtns = [...document.querySelectorAll('mat-radio-button')];
-                for (const b of matBtns) {
-                    if ((b.textContent || '').toUpperCase().includes('ACCEPT')) {
-                        b.click(); return;
+                const dialogSel = 'mat-dialog-container, [role="dialog"], .modal.show, .modal.in, .modal-dialog, .swal2-container';
+                const dialogs = [...document.querySelectorAll(dialogSel)];
+                if (!dialogs.length) return;
+                for (const dlg of dialogs) {
+                    // Try Angular Material radio first
+                    const matBtns = [...dlg.querySelectorAll('mat-radio-button')];
+                    for (const b of matBtns) {
+                        if ((b.textContent || '').toUpperCase().includes('ACCEPT')) {
+                            b.click(); return;
+                        }
+                    }
+                    // Plain HTML radio inputs
+                    const inputs = [...dlg.querySelectorAll('input[type="radio"]')];
+                    for (const inp of inputs) {
+                        const val = (inp.value || '').toUpperCase();
+                        const lbl = inp.closest('label') || inp.parentElement;
+                        const txt = (lbl?.textContent || '').trim().toUpperCase();
+                        if (val === 'ACCEPT' || txt.startsWith('ACCEPT')) {
+                            inp.checked = true;
+                            inp.click();
+                            inp.dispatchEvent(new Event('change', {bubbles: true}));
+                            inp.dispatchEvent(new Event('input',  {bubbles: true}));
+                            return;
+                        }
                     }
                 }
-                // Plain HTML radio inputs
-                const inputs = [...document.querySelectorAll('input[type="radio"]')];
-                for (const inp of inputs) {
-                    const val = (inp.value || '').toUpperCase();
-                    const lbl = inp.closest('label') || inp.parentElement;
-                    const txt = (lbl?.textContent || '').trim().toUpperCase();
-                    if (val === 'ACCEPT' || txt.startsWith('ACCEPT')) {
-                        inp.checked = true;
-                        inp.click();
-                        inp.dispatchEvent(new Event('change', {bubbles: true}));
-                        inp.dispatchEvent(new Event('input',  {bubbles: true}));
-                        return;
-                    }
-                }
-                // Last resort: first radio on page
-                const first = document.querySelector('mat-radio-button, input[type="radio"]');
+                // Last resort: first radio inside a dialog only — never a form radio
+                const first = document.querySelector(dialogSel + ' mat-radio-button, ' +
+                    dialogSel.split(', ').map(s => s + ' input[type="radio"]').join(', '));
                 if (first) first.click();
             })()
         """)
         page.wait_for_timeout(700)
 
-        # Step 2: Click PROCEED / Accept button
+        # Step 2: Click PROCEED / Accept button — scoped to the dialog so we never
+        # hit the CAS form's own Submit button.
+        _dialog_sel = ('mat-dialog-container, [role="dialog"], .modal.show, '
+                       '.modal.in, .modal-dialog, .swal2-container')
         button_clicked = False
         for btn_text in ["PROCEED", "Proceed", "Accept", "Submit", "OK", "Continue"]:
-            # Search page-wide (covers both mat and plain modals)
-            btn = page.locator(f'button:has-text("{btn_text}")')
+            btn = page.locator(_dialog_sel).locator(f'button:has-text("{btn_text}")')
             if btn.count() > 0:
                 try:
                     btn.first.click(timeout=6_000, force=True)
@@ -379,10 +397,14 @@ def _dismiss_tnc(page):
                     () => {
                         const mat = document.querySelector('mat-dialog-container');
                         if (mat) return false;
-                        const plain = [...document.querySelectorAll('div,section')].some(el =>
-                            (el.innerText || '').includes('Disclaimer') &&
-                            el.querySelector('input[type="radio"]')
-                        );
+                        const sels = '[role="dialog"], .modal.show, .modal.in, .modal-dialog, .swal2-container';
+                        const plain = [...document.querySelectorAll(sels)].some(el => {
+                            const style = getComputedStyle(el);
+                            if (style.display === 'none' || style.visibility === 'hidden') return false;
+                            if (el.offsetParent === null && style.position !== 'fixed') return false;
+                            return (el.innerText || '').includes('Disclaimer') &&
+                                   el.querySelector('input[type="radio"]');
+                        });
                         return !plain;
                     }
                 """, timeout=10_000)
