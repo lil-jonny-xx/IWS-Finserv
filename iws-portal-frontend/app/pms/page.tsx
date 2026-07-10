@@ -263,7 +263,7 @@ function SourceSection({ s, holdings, showEntity }: {
           <p className="text-xs text-ghost mt-0.5">
             {s.equity_count} holding{s.equity_count === 1 ? '' : 's'}
             {s.as_on_date ? ` · as on ${s.as_on_date}` : ''}
-            {s.deposit_total != null && ` · cost basis from total deposited ₹${inr(s.deposit_total)} (cash counted as uninvested)`}
+            {s.deposit_total != null && ` · return on invested ₹${inr(s.equity_cost)} (₹${inr(s.deposit_total)} deposited − ₹${inr(s.cash_total)} cash leftover)`}
             {!s.cost_complete && ' · cost basis not reported by provider — P&L unavailable'}
           </p>
         </div>
