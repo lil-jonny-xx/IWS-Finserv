@@ -109,6 +109,15 @@ def _tail_lines(path: str, n: int):
         return list(deque(f, maxlen=n))
 
 
+def _in_market_hours(now_utc) -> bool:
+    """True Mon–Fri 09:30–15:30 IST (IST is a fixed +5:30, no DST)."""
+    ist = now_utc + timedelta(hours=5, minutes=30)
+    if ist.weekday() >= 5:
+        return False
+    mins = ist.hour * 60 + ist.minute
+    return (9 * 60 + 30) <= mins <= (15 * 60 + 30)
+
+
 def check_token_health():
     """(entity/broker, detail) for every broker token still failing auth right now.
 
@@ -140,9 +149,15 @@ def check_token_health():
     if newest is None:
         return [("equity_price_worker", "no timestamped lines in price log — cannot assess tokens")]
     if newest < now - timedelta(minutes=TOKEN_WINDOW_MIN):
-        age = (now - newest).total_seconds() / 60.0
-        return [("equity_price_worker",
-                 f"price log last wrote {age:.0f} min ago — worker stalled; token health unknown")]
+        if _in_market_hours(now):
+            age = (now - newest).total_seconds() / 60.0
+            return [("equity_price_worker",
+                     f"price log last wrote {age:.0f} min ago — worker stalled; token health unknown")]
+        # Outside market hours the price worker is idle by design (last write is
+        # ~15:30 IST close), so a quiet log is not a stall. Assess the final
+        # window before it went quiet so a token that died late in the day is
+        # still caught.
+        cutoff = newest - timedelta(minutes=TOKEN_WINDOW_MIN)
 
     # Tally recent auth failures per entity/broker.
     fails, last_reason = {}, {}
