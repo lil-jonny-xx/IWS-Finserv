@@ -102,13 +102,19 @@ def _generate_token(entity_code: str, max_attempts: int = 3) -> str:
     totp_gen   = pyotp.TOTP(_env(entity_code, "TOTP_SECRET"))
 
     last_data = None
+    last_totp = None
     for attempt in range(1, max_attempts + 1):
-        # On a retry, roll into the next window so we send a fresh, full-life code.
-        secs_into_window = time.time() % 30
-        if attempt > 1 and secs_into_window > 5:
+        # On a retry, always roll into the next window: a rejected code is spent,
+        # and an immediate retry lands in the same window and resubmits it.
+        if attempt > 1:
+            secs_into_window = time.time() % 30
             time.sleep(30 - secs_into_window + 0.5)
 
         totp = totp_gen.now()
+        if totp == last_totp:  # paranoia: never resubmit a rejected code
+            time.sleep(30 - (time.time() % 30) + 0.5)
+            totp = totp_gen.now()
+        last_totp = totp
         # SDK's generate_token() omits app_id/app_secret headers — call directly.
         resp = requests.post(
             "https://auth.dhan.co/app/generateAccessToken",
