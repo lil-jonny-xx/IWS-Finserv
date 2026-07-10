@@ -2226,6 +2226,17 @@ PMS_SOURCE_LABELS = {
 # metrics only where the dated flows exist).
 PMS_SOURCE_FLOW_BROKER = {"zerodha_pms": "zerodha"}
 
+# User-supplied total capital deposited into a PMS whose provider doesn't
+# report per-holding cost (ICICI Pru gives market value only). Keyed
+# "<entity_name>/<source>". The account's cash is the uninvested part of the
+# deposit, so equity cost = deposit − cash and net return is measured on that.
+try:
+    PMS_TOTAL_DEPOSITS = {k: float(v) for k, v in
+                          json.loads(os.getenv("PMS_TOTAL_DEPOSITS", "{}")).items()}
+except (ValueError, TypeError) as _e:
+    logger.error(f"PMS_TOTAL_DEPOSITS is not valid JSON — ignoring: {_e}")
+    PMS_TOTAL_DEPOSITS = {}
+
 
 def _pms_aggregate(holdings: list[dict]) -> dict:
     """Totals + P&L metrics over a group of pms_holding rows.
@@ -2261,6 +2272,47 @@ def _pms_aggregate(holdings: list[dict]) -> dict:
         "cost_complete": len(costed) == len(equity),
         "equity_count":  len(equity),
         "cash_count":    len(cash),
+    }
+
+
+def _apply_deposit_override(agg: dict, entity_name: str, source: str) -> dict:
+    """Replace a source aggregate's cost basis with the user-supplied total
+    deposit when the provider reports no per-holding cost. Cash is the
+    uninvested part of the deposit, so equity cost = deposit − cash."""
+    deposit = PMS_TOTAL_DEPOSITS.get(f"{entity_name}/{source}")
+    if deposit is None or agg["cost_complete"]:
+        return {**agg, "deposit_total": None}
+    equity_cost = max(deposit - agg["cash_total"], 0.0)
+    pnl         = round(agg["equity_total"] - equity_cost, 2)
+    return {
+        **agg,
+        "equity_cost":   round(equity_cost, 2),
+        "invested_cost": round(deposit, 2),
+        "equity_pnl":    pnl,
+        "returns_pct":   round(pnl / equity_cost * 100, 2) if equity_cost > 0 else None,
+        "cost_complete": True,
+        "deposit_total": round(deposit, 2),
+    }
+
+
+def _pms_combine(aggs: list[dict]) -> dict:
+    """Roll source-level aggregates up to an entity or the grand total, so
+    deposit-derived cost bases flow into the higher levels consistently.
+    P&L / return cover only the sources that have a cost basis."""
+    pnls = [a["equity_pnl"] for a in aggs if a["equity_pnl"] is not None]
+    pnl  = round(sum(pnls), 2) if pnls else None
+    cost = sum(a["equity_cost"] for a in aggs)
+    return {
+        "equity_total":  round(sum(a["equity_total"] for a in aggs), 2),
+        "cash_total":    round(sum(a["cash_total"] for a in aggs), 2),
+        "total":         round(sum(a["total"] for a in aggs), 2),
+        "equity_cost":   round(cost, 2),
+        "invested_cost": round(sum(a["invested_cost"] for a in aggs), 2),
+        "equity_pnl":    pnl,
+        "returns_pct":   round(pnl / cost * 100, 2) if pnl is not None and cost > 0 else None,
+        "cost_complete": all(a["cost_complete"] for a in aggs),
+        "equity_count":  sum(a["equity_count"] for a in aggs),
+        "cash_count":    sum(a["cash_count"] for a in aggs),
     }
 
 
@@ -2372,9 +2424,11 @@ def get_pms_holdings(
                 as_on_by_key[key] = r["as_on_date"]
 
         by_source = []
+        source_aggs: dict[tuple[int, str], dict] = {}
         for key in source_keys:
             group = source_groups[key]
-            agg   = _pms_aggregate(group)
+            agg   = _apply_deposit_override(_pms_aggregate(group), group[0]["entity_name"], key[1])
+            source_aggs[key] = agg
             by_source.append({
                 "entity_id":    key[0],
                 "entity_name":  group[0]["entity_name"],
@@ -2385,23 +2439,21 @@ def get_pms_holdings(
                 **agg,
             })
 
-        # Per-entity rollup (an entity can hold several PMS accounts).
+        # Per-entity rollup (an entity can hold several PMS accounts) — combined
+        # from the source aggregates so deposit-derived cost bases carry through.
         entity_keys: list[int] = []
-        entity_groups: dict[int, list[dict]] = {}
-        for h in holdings:
-            if h["entity_id"] not in entity_groups:
-                entity_groups[h["entity_id"]] = []
-                entity_keys.append(h["entity_id"])
-            entity_groups[h["entity_id"]].append(h)
+        for key in source_keys:
+            if key[0] not in entity_keys:
+                entity_keys.append(key[0])
 
         by_entity = []
         for ek in entity_keys:
-            group = entity_groups[ek]
+            ek_aggs = [source_aggs[k] for k in source_keys if k[0] == ek]
             by_entity.append({
                 "entity_id":   ek,
-                "entity_name": group[0]["entity_name"],
-                "pms_count":   sum(1 for k in source_keys if k[0] == ek),
-                **_pms_aggregate(group),
+                "entity_name": next(g[0]["entity_name"] for k, g in source_groups.items() if k[0] == ek),
+                "pms_count":   len(ek_aggs),
+                **_pms_combine(ek_aggs),
             })
 
         cur.close()
@@ -2413,7 +2465,7 @@ def get_pms_holdings(
             "entity_id":   eid or 0,
             "entity_name": entity_name,
             "as_on_date":  as_on,
-            "totals":      _pms_aggregate(holdings),
+            "totals":      _pms_combine(list(source_aggs.values())),
             "by_entity":   by_entity,
             "by_source":   by_source,
             "holdings":    holdings,
