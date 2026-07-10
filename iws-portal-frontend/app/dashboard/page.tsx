@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import { navFor } from '@/app/lib/nav';
+import NavTabs from '@/app/components/NavTabs';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 const IDLE_TIMEOUT = 30 * 60 * 1000;
@@ -389,37 +389,9 @@ export default function DashboardPage() {
       {/* Header */}
       <header className="sticky top-0 z-30 bg-card border-b border-rule">
         <div className="max-w-screen-xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 min-w-0 flex-1">
             <span className="text-sm font-semibold text-ink">IWS Finserv</span>
-            <nav className="hidden sm:flex items-center gap-0.5 ml-4">
-              {navFor([
-                { href: '/dashboard', label: 'Overview', active: true },
-                { href: '/mutual-funds', label: 'Mutual Funds' },
-                { href: '/equity', label: 'Equity' },
-                { href: '/foreign-equity', label: 'Foreign Equity' },
-                { href: '/bank-accounts', label: 'Banks' },
-                { href: '/pms', label: 'PMS' },
-                { href: '/gold-silver', label: 'Commodities' },
-                { href: '/unlisted', label: 'Unlisted' },
-                { href: '/properties', label: 'Properties' },
-                { href: '/art', label: 'Art' },
-                { href: '/realised-gains', label: 'Realised Gains' },
-                { href: '/manual-data', label: 'Manual Data' },
-                { href: '/reports', label: 'Reports' },
-                { href: '/assistant', label: 'Assistant' },
-                { href: '/account', label: 'Account' },
-              ], user?.role).map(link => (
-                <a key={link.href} href={link.href}
-                  className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
-                    link.active
-                      ? 'bg-prime/10 text-prime'
-                      : 'text-dim hover:text-ink hover:bg-page'
-                  }`}
-                >
-                  {link.label}
-                </a>
-              ))}
-            </nav>
+            <NavTabs active="/dashboard" role={user?.role} variant="links" className="hidden sm:flex ml-4" />
           </div>
           <div className="flex items-center gap-3">
             {user && (

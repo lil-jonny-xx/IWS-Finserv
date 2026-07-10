@@ -152,6 +152,17 @@ button:not(:disabled):active {
 }
 .fade-in { animation: fade-in 220ms ease-out both; }
 
+/* Section-tab strip (NavTabs): one scrollable row, no visible scrollbar.
+   Momentum/precision scrolling stays native; overscroll is contained so a
+   horizontal fling at either end doesn't turn into a browser back/forward
+   swipe. */
+.nav-scroll {
+  scrollbar-width: none;               /* Firefox */
+  -webkit-overflow-scrolling: touch;   /* iOS momentum */
+  overscroll-behavior-x: contain;
+}
+.nav-scroll::-webkit-scrollbar { display: none; }
+
 @keyframes rise-in {
   from { opacity: 0; transform: translateY(8px); }
   to   { opacity: 1; transform: translateY(0);   }

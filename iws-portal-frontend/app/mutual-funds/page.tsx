@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import { navFor } from '@/app/lib/nav';
+import NavTabs from '@/app/components/NavTabs';
 import MFTable, { type MFHoldingRow, type MFTotals, type CombinedHolding } from './components/MFTable';
 import DragScroll from '@/app/components/DragScroll';
 
@@ -228,38 +228,7 @@ export default function MutualFundsPage() {
             <h1 className="text-2xl sm:text-3xl font-bold text-ink">Mutual Fund Holdings</h1>
             <p className="text-sm text-ghost mt-0.5">All MF folios with weekly metrics</p>
           </div>
-          <nav className="flex gap-1.5" aria-label="Sections">
-            {navFor([
-              { href: '/dashboard', label: 'Overview' },
-              { href: '/mutual-funds', label: 'Mutual Funds', active: true },
-              { href: '/equity', label: 'Equity' },
-              { href: '/foreign-equity', label: 'Foreign Equity' },
-              { href: '/bank-accounts', label: 'Banks' },
-              { href: '/pms', label: 'PMS' },
-              { href: '/gold-silver', label: 'Commodities' },
-              { href: '/unlisted', label: 'Unlisted' },
-              { href: '/properties', label: 'Properties' },
-              { href: '/art', label: 'Art' },
-              { href: '/realised-gains', label: 'Realised Gains' },
-              { href: '/manual-data', label: 'Manual Data' },
-              { href: '/reports', label: 'Reports' },
-              { href: '/assistant', label: 'Assistant' },
-              { href: '/account', label: 'Account' },
-            ], user?.role).map(({ href, label, active }) => (
-              <a
-                key={href}
-                href={href}
-                aria-current={active ? 'page' : undefined}
-                className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
-                  active
-                    ? 'bg-prime text-prime-fg'
-                    : 'bg-card border border-rule text-dim hover:border-dim hover:text-ink'
-                }`}
-              >
-                {label}
-              </a>
-            ))}
-          </nav>
+          <NavTabs active="/mutual-funds" role={user?.role} />
         </div>
 
         {isAdmin && entities.length > 0 && (

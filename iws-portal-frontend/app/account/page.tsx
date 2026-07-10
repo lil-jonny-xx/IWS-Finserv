@@ -1,31 +1,13 @@
 'use client';
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import { navFor } from '@/app/lib/nav';
+import NavTabs from '@/app/components/NavTabs';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
 interface Me { id: number; email: string; full_name?: string; role: string; }
 interface UserRow { email: string; full_name?: string; role: string; }
 interface ResetReq { id: number; email: string; full_name?: string; requested_at?: string | null; }
-
-const NAV = [
-  { href: '/dashboard', label: 'Overview' },
-  { href: '/mutual-funds', label: 'Mutual Funds' },
-  { href: '/equity', label: 'Equity' },
-  { href: '/foreign-equity', label: 'Foreign Equity' },
-  { href: '/bank-accounts', label: 'Banks' },
-  { href: '/pms', label: 'PMS' },
-  { href: '/gold-silver', label: 'Commodities' },
-  { href: '/unlisted', label: 'Unlisted' },
-  { href: '/properties', label: 'Properties' },
-  { href: '/art', label: 'Art' },
-  { href: '/realised-gains', label: 'Realised Gains' },
-  { href: '/manual-data', label: 'Manual Data' },
-  { href: '/reports', label: 'Reports' },
-  { href: '/assistant', label: 'Assistant' },
-  { href: '/account', label: 'Account', active: true },
-];
 
 export default function AccountPage() {
   const router = useRouter();
@@ -119,16 +101,7 @@ export default function AccountPage() {
             <h1 className="text-2xl sm:text-3xl font-bold text-ink">Account</h1>
             <p className="text-sm text-ghost mt-0.5">Signed in as {me?.email} · {me?.role}</p>
           </div>
-          <nav className="flex flex-wrap gap-1.5" aria-label="Sections">
-            {navFor(NAV, me?.role).map(({ href, label, active }) => (
-              <a key={href} href={href} aria-current={active ? 'page' : undefined}
-                className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
-                  active ? 'bg-prime text-prime-fg'
-                    : 'bg-card border border-rule text-dim hover:border-dim hover:text-ink'}`}>
-                {label}
-              </a>
-            ))}
-          </nav>
+          <NavTabs active="/account" role={me?.role} />
         </div>
 
         <div className="grid gap-6 md:grid-cols-2 max-w-4xl">

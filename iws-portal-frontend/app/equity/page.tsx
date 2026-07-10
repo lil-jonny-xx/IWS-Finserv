@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import { navFor } from '@/app/lib/nav';
+import NavTabs from '@/app/components/NavTabs';
 import EquityTable, { type EquityHoldingRow, type EquityTotals } from './components/EquityTable';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
@@ -349,38 +349,7 @@ export default function EquityPage() {
               )}
             </div>
           </div>
-          <nav className="flex gap-1.5" aria-label="Sections">
-            {navFor([
-              { href: '/dashboard', label: 'Overview' },
-              { href: '/mutual-funds', label: 'Mutual Funds' },
-              { href: '/equity', label: 'Equity', active: true },
-              { href: '/foreign-equity', label: 'Foreign Equity' },
-              { href: '/bank-accounts', label: 'Banks' },
-              { href: '/pms', label: 'PMS' },
-              { href: '/gold-silver', label: 'Commodities' },
-              { href: '/unlisted', label: 'Unlisted' },
-              { href: '/properties', label: 'Properties' },
-              { href: '/art', label: 'Art' },
-              { href: '/realised-gains', label: 'Realised Gains' },
-              { href: '/manual-data', label: 'Manual Data' },
-              { href: '/reports', label: 'Reports' },
-              { href: '/assistant', label: 'Assistant' },
-              { href: '/account', label: 'Account' },
-            ], user?.role).map(({ href, label, active }) => (
-              <a
-                key={href}
-                href={href}
-                aria-current={active ? 'page' : undefined}
-                className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
-                  active
-                    ? 'bg-prime text-prime-fg'
-                    : 'bg-card border border-rule text-dim hover:border-dim hover:text-ink'
-                }`}
-              >
-                {label}
-              </a>
-            ))}
-          </nav>
+          <NavTabs active="/equity" role={user?.role} />
         </div>
 
         {isAdmin && entities.length > 0 && (

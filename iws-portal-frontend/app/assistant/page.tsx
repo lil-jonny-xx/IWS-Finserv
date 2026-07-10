@@ -1,7 +1,7 @@
 'use client';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { navFor } from '@/app/lib/nav';
+import NavTabs from '@/app/components/NavTabs';
 import type {
   Citation,
   ChartSpec,
@@ -19,24 +19,6 @@ import ScopeSelector from './components/ScopeSelector';
 import ContextCard from './components/ContextCard';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
-
-const NAV = [
-  { href: '/dashboard', label: 'Overview' },
-  { href: '/mutual-funds', label: 'Mutual Funds' },
-  { href: '/equity', label: 'Equity' },
-  { href: '/foreign-equity', label: 'Foreign Equity' },
-  { href: '/bank-accounts', label: 'Banks' },
-  { href: '/pms', label: 'PMS' },
-  { href: '/gold-silver', label: 'Commodities' },
-  { href: '/unlisted', label: 'Unlisted' },
-  { href: '/properties', label: 'Properties' },
-  { href: '/art', label: 'Art' },
-  { href: '/realised-gains', label: 'Realised Gains' },
-  { href: '/manual-data', label: 'Manual Data' },
-  { href: '/reports', label: 'Reports' },
-  { href: '/assistant', label: 'Assistant', active: true },
-  { href: '/account', label: 'Account' },
-];
 
 const EMPTY_STREAM: StreamingState = {
   active: false,
@@ -236,22 +218,7 @@ export default function AssistantPage() {
             <h1 className="text-xl font-bold text-ink">Assistant</h1>
             <span className="text-xs text-ghost">Read-only portfolio advisor</span>
           </div>
-          <nav className="flex gap-1.5" aria-label="Sections">
-            {navFor(NAV, user?.role).map(({ href, label, active }) => (
-              <a
-                key={href}
-                href={href}
-                aria-current={active ? 'page' : undefined}
-                className={`rounded px-3 py-1.5 text-xs font-medium transition-colors ${
-                  active
-                    ? 'bg-prime text-prime-fg'
-                    : 'border border-rule bg-card text-dim hover:border-dim hover:text-ink'
-                }`}
-              >
-                {label}
-              </a>
-            ))}
-          </nav>
+          <NavTabs active="/assistant" role={user?.role} />
         </div>
       </header>
 

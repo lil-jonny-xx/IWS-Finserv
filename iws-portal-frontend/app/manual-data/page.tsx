@@ -1,4 +1,5 @@
 'use client';
+import NavTabs from '@/app/components/NavTabs';
 import { useEffect, useState, useCallback, Fragment } from 'react';
 import { useRouter } from 'next/navigation';
 import DragScroll from '@/app/components/DragScroll';
@@ -827,33 +828,9 @@ export default function ManualDataPage() {
       {/* Nav bar */}
       <header style={{ background: 'var(--card)', borderBottom: '1px solid var(--rule)' }}
               className="px-6 py-3 flex items-center justify-between">
-        <div className="flex items-center gap-6">
+        <div className="flex items-center gap-6 min-w-0 flex-1">
           <span className="font-bold text-sm" style={{ color: 'var(--ink)' }}>IWS MIS</span>
-          <nav className="flex gap-4">
-            {[
-              { href: '/dashboard', label: 'Overview' },
-              { href: '/mutual-funds', label: 'Mutual Funds' },
-              { href: '/equity', label: 'Equity' },
-              { href: '/foreign-equity', label: 'Foreign Equity' },
-              { href: '/bank-accounts', label: 'Banks' },
-              { href: '/pms', label: 'PMS' },
-              { href: '/gold-silver', label: 'Commodities' },
-              { href: '/unlisted', label: 'Unlisted' },
-              { href: '/properties', label: 'Properties' },
-              { href: '/art', label: 'Art' },
-              { href: '/realised-gains', label: 'Realised Gains' },
-              { href: '/manual-data', label: 'Manual Data', active: true },
-              { href: '/reports', label: 'Reports' },
-              { href: '/assistant', label: 'Assistant' },
-              { href: '/account', label: 'Account' },
-            ].map(link => (
-              <a key={link.href} href={link.href}
-                 className="text-xs font-medium transition-colors"
-                 style={{ color: link.active ? 'var(--prime)' : 'var(--dim)' }}>
-                {link.label}
-              </a>
-            ))}
-          </nav>
+          <NavTabs active="/manual-data" role={'admin'} variant="links" />
         </div>
       </header>
 

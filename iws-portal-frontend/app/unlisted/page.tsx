@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useState, useCallback, useRef, Fragment } from 'react';
 import { useRouter } from 'next/navigation';
-import { navFor } from '@/app/lib/nav';
+import NavTabs from '@/app/components/NavTabs';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -233,24 +233,6 @@ function CompanyRow({ c, showEntity, expanded, onToggle }: {
   );
 }
 
-const NAV = [
-  { href: '/dashboard', label: 'Overview' },
-  { href: '/mutual-funds', label: 'Mutual Funds' },
-  { href: '/equity', label: 'Equity' },
-  { href: '/foreign-equity', label: 'Foreign Equity' },
-  { href: '/bank-accounts', label: 'Banks' },
-  { href: '/pms', label: 'PMS' },
-  { href: '/gold-silver', label: 'Commodities' },
-  { href: '/unlisted', label: 'Unlisted' },
-  { href: '/properties', label: 'Properties' },
-  { href: '/art', label: 'Art' },
-  { href: '/realised-gains', label: 'Realised Gains' },
-  { href: '/manual-data', label: 'Manual Data' },
-  { href: '/reports', label: 'Reports' },
-  { href: '/assistant', label: 'Assistant' },
-  { href: '/account', label: 'Account' },
-];
-
 export default function UnlistedPage() {
   const router = useRouter();
   const [user, setUser]             = useState<User | null>(null);
@@ -317,15 +299,7 @@ export default function UnlistedPage() {
             <h1 className="text-2xl sm:text-3xl font-bold text-ink">Unlisted &amp; Startups</h1>
             <span className="text-sm text-ghost">Private holdings valued from funding rounds, splits &amp; bonuses</span>
           </div>
-          <nav className="flex gap-1.5 flex-wrap" aria-label="Sections">
-            {navFor(NAV, user?.role).map(({ href, label }) => (
-              <a key={href} href={href} aria-current={href === '/unlisted' ? 'page' : undefined}
-                 className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
-                   href === '/unlisted' ? 'bg-prime text-prime-fg' : 'bg-card border border-rule text-dim hover:border-dim hover:text-ink'}`}>
-                {label}
-              </a>
-            ))}
-          </nav>
+          <NavTabs active="/unlisted" role={user?.role} />
         </div>
 
         {isAdmin && entities.length > 0 && (

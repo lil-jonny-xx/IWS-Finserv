@@ -1,7 +1,7 @@
 'use client';
 import { useEffect, useState, useMemo, Fragment } from 'react';
 import { useRouter } from 'next/navigation';
-import { navFor } from '@/app/lib/nav';
+import NavTabs from '@/app/components/NavTabs';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -21,24 +21,6 @@ interface RealisedRow {
 
 // Section order on the page; any category not listed falls in after these, sorted.
 const CATEGORY_ORDER = ['Equity', 'Mutual Funds', 'Foreign Equity', 'PMS'];
-
-const NAV = [
-  { href: '/dashboard', label: 'Overview' },
-  { href: '/mutual-funds', label: 'Mutual Funds' },
-  { href: '/equity', label: 'Equity' },
-  { href: '/foreign-equity', label: 'Foreign Equity' },
-  { href: '/bank-accounts', label: 'Banks' },
-  { href: '/pms', label: 'PMS' },
-  { href: '/gold-silver', label: 'Commodities' },
-  { href: '/unlisted', label: 'Unlisted' },
-  { href: '/properties', label: 'Properties' },
-  { href: '/art', label: 'Art' },
-  { href: '/realised-gains', label: 'Realised Gains', active: true },
-  { href: '/manual-data', label: 'Manual Data' },
-  { href: '/reports', label: 'Reports' },
-  { href: '/assistant', label: 'Assistant' },
-  { href: '/account', label: 'Account' },
-];
 
 function inr(v: number | null): string {
   if (v == null) return '—';
@@ -153,14 +135,9 @@ export default function RealisedGainsPage() {
     <div className="min-h-screen" style={{ background: 'var(--page)' }}>
       <header style={{ background: 'var(--card)', borderBottom: '1px solid var(--rule)' }}
               className="px-6 py-3 flex items-center justify-between">
-        <div className="flex items-center gap-6">
+        <div className="flex items-center gap-6 min-w-0 flex-1">
           <span className="font-bold text-sm" style={{ color: 'var(--ink)' }}>IWS MIS</span>
-          <nav className="flex gap-4">
-            {navFor(NAV, role).map(link => (
-              <a key={link.href} href={link.href} className="text-xs font-medium transition-colors"
-                 style={{ color: link.active ? 'var(--prime)' : 'var(--dim)' }}>{link.label}</a>
-            ))}
-          </nav>
+          <NavTabs active="/realised-gains" role={role} variant="links" />
         </div>
       </header>
 
