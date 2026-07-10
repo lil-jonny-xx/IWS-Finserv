@@ -1968,6 +1968,152 @@ def get_foreign_equity_activity(
 
 
 # ---------------------------------------------------------------------------
+# FnO — open derivative positions scraped from the FnO broker portals
+# (Share India uTrade → HHR now; Orbis → DHR later). Positions live in
+# fno_position, per-account margin/P&L summaries in fno_account, both fed by
+# workers/shareindia_fno_worker.py.
+# ---------------------------------------------------------------------------
+
+FNO_SOURCE_LABEL = {"shareindia": "Share India", "orbis": "Orbis"}
+
+
+@app.get("/api/v1/fno/positions")
+def get_fno_positions(
+    request: Request,
+    entity_id: Optional[int] = None,
+    source: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Open FnO positions (net quantity; negative = short) plus per-account
+    margin / MTM summaries. All figures are INR. Admin sees all entities
+    (or ?entity_id=N); a member sees only their entity.
+    """
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        eid  = _resolve_entity(cur, payload, entity_id)
+
+        conds, params = [], []
+        if eid is not None:
+            conds.append("p.entity_id = %s")
+            params.append(eid)
+        if source:
+            conds.append("p.source = %s")
+            params.append(source)
+        where = ("WHERE " + " AND ".join(conds)) if conds else ""
+
+        cur.execute(
+            f"""
+            SELECT p.entity_id, e.entity_name, p.source, p.symbol, p.underlying,
+                   p.instrument, p.expiry, p.strike, p.product, p.quantity,
+                   p.lot_size, p.avg_price, p.ltp, p.mtm_pnl, p.realized_pnl,
+                   p.as_of_date, p.updated_at
+            FROM   fno_position p
+            JOIN   entity e ON e.id = p.entity_id
+            {where}
+            ORDER BY e.entity_name, p.source, p.underlying NULLS LAST, p.expiry NULLS LAST, p.symbol
+            """,
+            params,
+        )
+        rows = cur.fetchall()
+
+        acct_where = where.replace("p.entity_id", "a.entity_id").replace("p.source", "a.source")
+        cur.execute(
+            f"""
+            SELECT a.entity_id, e.entity_name, a.source, a.margin_available,
+                   a.margin_used, a.ledger_balance, a.day_realized_pnl,
+                   a.total_mtm_pnl, a.as_of_date, a.updated_at
+            FROM   fno_account a
+            JOIN   entity e ON e.id = a.entity_id
+            {acct_where}
+            ORDER BY e.entity_name, a.source
+            """,
+            params,
+        )
+        acct_rows = cur.fetchall()
+        cur.close()
+
+        def _f(v):
+            return float(v) if v is not None else None
+
+        positions = [
+            {
+                "entity_id":    r["entity_id"],
+                "entity_name":  r["entity_name"],
+                "source":       r["source"],
+                "source_label": FNO_SOURCE_LABEL.get(r["source"], r["source"]),
+                "symbol":       r["symbol"],
+                "underlying":   r["underlying"],
+                "instrument":   r["instrument"],
+                "expiry":       str(r["expiry"]) if r["expiry"] else None,
+                "strike":       _f(r["strike"]),
+                "product":      r["product"] or None,
+                "quantity":     _f(r["quantity"]) or 0.0,
+                "lot_size":     r["lot_size"],
+                "avg_price":    _f(r["avg_price"]),
+                "ltp":          _f(r["ltp"]),
+                "mtm_pnl":      _f(r["mtm_pnl"]),
+                "realized_pnl": _f(r["realized_pnl"]),
+            }
+            for r in rows
+        ]
+        accounts = [
+            {
+                "entity_id":        a["entity_id"],
+                "entity_name":      a["entity_name"],
+                "source":           a["source"],
+                "source_label":     FNO_SOURCE_LABEL.get(a["source"], a["source"]),
+                "margin_available": _f(a["margin_available"]),
+                "margin_used":      _f(a["margin_used"]),
+                "ledger_balance":   _f(a["ledger_balance"]),
+                "day_realized_pnl": _f(a["day_realized_pnl"]),
+                "total_mtm_pnl":    _f(a["total_mtm_pnl"]),
+                "as_of_date":       str(a["as_of_date"]) if a["as_of_date"] else None,
+            }
+            for a in acct_rows
+        ]
+
+        totals = {
+            "position_count": len(positions),
+            "mtm_pnl":        round(sum(p["mtm_pnl"] or 0 for p in positions), 2),
+            "realized_pnl":   round(sum(p["realized_pnl"] or 0 for p in positions), 2),
+            "margin_used":      round(sum(a["margin_used"] or 0 for a in accounts), 2),
+            "margin_available": round(sum(a["margin_available"] or 0 for a in accounts), 2),
+        }
+
+        as_of_dates = [r["as_of_date"] for r in rows if r["as_of_date"]]
+        updated_ats = [r["updated_at"] for r in rows if r["updated_at"]] + \
+                      [a["updated_at"] for a in acct_rows if a["updated_at"]]
+
+        entity_name = "All Entities" if eid is None else (
+            rows[0]["entity_name"] if rows else (acct_rows[0]["entity_name"] if acct_rows else "")
+        )
+
+        return {
+            "entity_id":    eid or 0,
+            "entity_name":  entity_name,
+            "source":       source,
+            "positions":    positions,
+            "accounts":     accounts,
+            "totals":       totals,
+            "as_of_date":   str(max(as_of_dates)) if as_of_dates else None,
+            "last_updated": max(updated_ats).isoformat() if updated_ats else None,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in /api/v1/fno/positions: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+# ---------------------------------------------------------------------------
 # Gold / Silver / Commodities — instruments split out of the Equity & Foreign
 # pages (asset_class in gold/silver/commodity), unioned across both holding
 # tables. New broker buys of a known instrument land here automatically via the

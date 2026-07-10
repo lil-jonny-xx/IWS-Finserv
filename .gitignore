@@ -79,3 +79,9 @@ motion-audits/
 mis-portal/.isin_symbol_map.json
 ICICI-PRUDENTIAL-IMAGES
 AFTERNRITRADEBOOKS
+# Share India uTrade scraper byproducts — session cookies & downloaded reports, never commit
+mis-portal/.shareindia_browser_profile/
+mis-portal/.shareindia_downloads/
+
+# Local scratch
+iws-portal-frontend/tmp/
