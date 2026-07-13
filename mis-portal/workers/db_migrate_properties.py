@@ -99,6 +99,14 @@ CREATE TABLE IF NOT EXISTS property_floor (
 ALTER TABLE property_document
     ADD COLUMN IF NOT EXISTS floor_id INTEGER REFERENCES property_floor(id) ON DELETE SET NULL;
 
+-- 2026-07-13: "deed no." renamed to the government's term, property number.
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+               WHERE table_name = 'property' AND column_name = 'deed_no') THEN
+        ALTER TABLE property RENAME COLUMN deed_no TO property_no;
+    END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS property_document (
     id            SERIAL PRIMARY KEY,
     property_id   INTEGER NOT NULL REFERENCES property(id) ON DELETE CASCADE,

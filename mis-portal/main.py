@@ -4133,7 +4133,7 @@ def _property_row(r: dict, docs: list, owners: list, floors: list) -> dict:
         "taluka":           r["taluka"],
         "area":             area,
         "area_unit":        r["area_unit"],
-        "deed_no":          r["deed_no"],
+        "property_no":      r["property_no"],
         "acquisition_date": r["acquisition_date"].isoformat() if r["acquisition_date"] else None,
         "ownership":        r["ownership"],
         "rrr":              rrr,
@@ -4246,7 +4246,7 @@ class PropertyRequest(BaseModel):
     taluka:           Optional[str]   = None
     area:             Optional[float] = None
     area_unit:        Optional[str]   = "sq m"
-    deed_no:          Optional[str]   = None
+    property_no:      Optional[str]   = None   # government-assigned property number
     acquisition_date: Optional[str]   = None   # YYYY-MM-DD
     ownership:        Optional[str]   = None
     purchase_price:   Optional[float] = None
@@ -4339,11 +4339,11 @@ def create_property(request: Request, body: PropertyRequest,
         cur.execute(
             """INSERT INTO property
                    (name, property_type, holder_id, location, taluka, area, area_unit,
-                    deed_no, acquisition_date, ownership, purchase_price, market_value,
+                    property_no, acquisition_date, ownership, purchase_price, market_value,
                     rrr, notes, created_by, updated_by)
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
             (body.name.strip(), body.property_type, body.holder_id, body.location,
-             body.taluka, body.area, body.area_unit, body.deed_no,
+             body.taluka, body.area, body.area_unit, body.property_no,
              body.acquisition_date or None, body.ownership, body.purchase_price,
              body.market_value, body.rrr, body.notes, user_id, user_id),
         )
@@ -4381,12 +4381,12 @@ def update_property(prop_id: int, request: Request, body: PropertyRequest,
         cur.execute(
             """UPDATE property SET
                    name=%s, property_type=%s, holder_id=%s, location=%s, taluka=%s,
-                   area=%s, area_unit=%s, deed_no=%s, acquisition_date=%s,
+                   area=%s, area_unit=%s, property_no=%s, acquisition_date=%s,
                    ownership=%s, purchase_price=%s, market_value=%s, rrr=%s, notes=%s,
                    updated_by=%s, updated_at=NOW()
                WHERE id=%s RETURNING id""",
             (body.name.strip(), body.property_type, body.holder_id, body.location,
-             body.taluka, body.area, body.area_unit, body.deed_no,
+             body.taluka, body.area, body.area_unit, body.property_no,
              body.acquisition_date or None, body.ownership, body.purchase_price,
              body.market_value, body.rrr, body.notes, user_id, prop_id),
         )

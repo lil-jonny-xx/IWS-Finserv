@@ -20,7 +20,7 @@ interface Property {
   holder_id: number; holder_name: string;
   owners: Owner[]; floors: Floor[];
   location: string | null; taluka: string | null;
-  area: number | null; area_unit: string | null; deed_no: string | null;
+  area: number | null; area_unit: string | null; property_no: string | null;
   acquisition_date: string | null; ownership: string | null;
   purchase_price: number | null; market_value: number | null;
   rrr: number | null; fair_value: number | null;
@@ -37,14 +37,14 @@ interface FloorForm { id: number | null; floor_label: string; area: string; }
 interface PropertyForm {
   id: number | null; name: string; property_type: 'land' | 'building';
   owners: OwnerForm[]; floors: FloorForm[];
-  location: string; taluka: string; area: string; area_unit: string; deed_no: string;
+  location: string; taluka: string; area: string; area_unit: string; property_no: string;
   acquisition_date: string; ownership: string;
   purchase_price: string; market_value: string; rrr: string; notes: string;
 }
 const EMPTY_FORM: PropertyForm = {
   id: null, name: '', property_type: 'land',
   owners: [{ holder_id: '', pct: '100' }], floors: [],
-  location: '', taluka: '', area: '', area_unit: 'sq m', deed_no: '',
+  location: '', taluka: '', area: '', area_unit: 'sq m', property_no: '',
   acquisition_date: '', ownership: '', purchase_price: '', market_value: '', rrr: '', notes: '',
 };
 
@@ -185,7 +185,7 @@ export default function PropertiesPage() {
                                  area: f.area ? Number(f.area) : null })),
       location: form.location || null, taluka: form.taluka || null,
       area: form.area ? Number(form.area) : null, area_unit: form.area_unit || 'sq m',
-      deed_no: form.deed_no || null, acquisition_date: form.acquisition_date || null,
+      property_no: form.property_no || null, acquisition_date: form.acquisition_date || null,
       ownership: form.ownership || null,
       purchase_price: form.purchase_price ? Number(form.purchase_price) : null,
       market_value: form.market_value ? Number(form.market_value) : null,
@@ -299,7 +299,7 @@ export default function PropertiesPage() {
                                          area: f.area != null ? String(f.area) : '' })),
     location: p.location ?? '', taluka: p.taluka ?? '',
     area: p.area != null ? String(p.area) : '', area_unit: p.area_unit ?? 'sq m',
-    deed_no: p.deed_no ?? '', acquisition_date: p.acquisition_date ?? '',
+    property_no: p.property_no ?? '', acquisition_date: p.acquisition_date ?? '',
     ownership: p.ownership ?? '',
     purchase_price: p.purchase_price != null ? String(p.purchase_price) : '',
     market_value: p.market_value != null ? String(p.market_value) : '',
@@ -410,7 +410,7 @@ export default function PropertiesPage() {
                     <th className="px-3 py-2.5">Location</th>
                     <th className="px-3 py-2.5">Taluka</th>
                     <th className="px-3 py-2.5 text-right">Area</th>
-                    <th className="px-3 py-2.5">Deed</th>
+                    <th className="px-3 py-2.5">Property No.</th>
                     <th className="px-3 py-2.5">Acquired</th>
                     <th className="px-3 py-2.5">Ownership</th>
                     <th className="px-3 py-2.5 text-right">Purchase</th>
@@ -622,8 +622,8 @@ export default function PropertiesPage() {
                 </div>
               </label>
               <label className="flex flex-col gap-1">
-                <span className="text-ghost">Deed no.</span>
-                <input value={form.deed_no} onChange={e => setForm({ ...form, deed_no: e.target.value })}
+                <span className="text-ghost">Property no. (as per government)</span>
+                <input value={form.property_no} onChange={e => setForm({ ...form, property_no: e.target.value })}
                        className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" />
               </label>
               <label className="flex flex-col gap-1">
@@ -853,7 +853,7 @@ function PropertyRows({ p, types, isOpen, isAdmin, requiredN, missingN, valRepor
         <td className="px-3 py-2.5 text-right tabular-nums text-dim">
           {p.area != null ? `${p.area.toLocaleString('en-IN')} ${p.area_unit || ''}` : '—'}
         </td>
-        <td className="px-3 py-2.5 text-dim">{p.deed_no || '—'}</td>
+        <td className="px-3 py-2.5 text-dim">{p.property_no || '—'}</td>
         <td className="px-3 py-2.5 text-dim whitespace-nowrap">{p.acquisition_date || '—'}</td>
         <td className="px-3 py-2.5 text-dim">{p.ownership || '—'}</td>
         <td className="px-3 py-2.5 text-right tabular-nums text-dim">{fmtINR(p.purchase_price)}</td>
