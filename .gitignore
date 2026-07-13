@@ -4,6 +4,11 @@ graphify-out/
 # Uploaded broker statements (tradebooks/ledgers) — financial PII, never commit
 mis-portal/data/
 
+# Canonical uploads tree (property deeds/plans, art images, bank statements) —
+# family financial documents & PII live on disk with paths in the DB. NEVER commit.
+uploads/
+mis-portal/bank_statements/
+
 # Python
 mis-portal/venv/
 mis-portal/__pycache__/
