@@ -221,7 +221,19 @@ export default function PropertiesPage() {
     fetch(`${API_URL}/api/v1/properties/${target.propId}/documents`, {
       method: 'POST', credentials: 'include', body: fd,
     })
-      .then(r => { if (!r.ok) return r.json().then((e: { detail?: string }) => { throw new Error(e.detail || 'Upload failed'); }); return r.json(); })
+      .then(async r => {
+        if (!r.ok) {
+          // Error bodies aren't always JSON — nginx serves an HTML page when a
+          // file exceeds its size limit (413), which used to surface as
+          // Safari's cryptic "string did not match the expected pattern".
+          let detail = '';
+          try { detail = (await r.json())?.detail || ''; } catch { /* non-JSON body */ }
+          throw new Error(detail || (r.status === 413
+            ? 'File too large for the server upload limit (max 25 MB).'
+            : `Upload failed (HTTP ${r.status})`));
+        }
+        return r.json();
+      })
       .then(() => loadProperties())
       .catch(e => alert(e.message))
       .finally(() => { setBusy(null); if (fileRef.current) fileRef.current.value = ''; });
