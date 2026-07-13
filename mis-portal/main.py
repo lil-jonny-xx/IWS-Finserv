@@ -4105,6 +4105,64 @@ def get_manual_assets(
         release_db_connection(conn)
 
 
+@app.get("/api/v1/nav-coverage")
+def get_nav_coverage(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+):
+    """Which entities have data in each nav section, plus every Manual Data
+    category with entries. Drives two things in the frontend:
+      - NavTabs hides section tabs whose entity list is empty, and shows a
+        dynamic tab for pageless manual categories (AIF, PPF, …);
+      - each asset page hides entity filter pills for entities with no data
+        in that section (e.g. ADR on Equity).
+    Global across entities for every authenticated role — all logins may view
+    all entities (see _resolve_entity)."""
+    conn = None
+    try:
+        _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+
+        def ids(sql: str, params: tuple = ()) -> list:
+            cur.execute(sql, params)
+            return sorted({r["entity_id"] for r in cur.fetchall()})
+
+        def manual(cats: list) -> list:
+            return ids("SELECT DISTINCT entity_id FROM manual_input WHERE category = ANY(%s)", (cats,))
+
+        # Same asset_class split the Equity and Commodities endpoints use.
+        non_commodity = "COALESCE(asset_class, 'equity') NOT IN ('gold','silver','commodity')"
+        commodity     = "COALESCE(asset_class, 'equity') IN ('gold','silver','commodity')"
+
+        sections = {
+            "/mutual-funds":   ids("SELECT DISTINCT entity_id FROM holding"),
+            "/equity":         ids(f"SELECT DISTINCT entity_id FROM equity_holding WHERE {non_commodity}"),
+            "/foreign-equity": sorted(set(ids(f"SELECT DISTINCT entity_id FROM foreign_equity_holding WHERE {non_commodity}"))
+                                      | set(manual(["overseas_equity"]))),
+            "/fno":            ids("SELECT DISTINCT entity_id FROM fno_position"),
+            "/bank-accounts":  manual(["bank", "forex"]),
+            "/pms":            ids("SELECT DISTINCT entity_id FROM pms_holding"),
+            "/gold-silver":    ids(f"""SELECT entity_id FROM equity_holding WHERE {commodity}
+                                       UNION SELECT entity_id FROM foreign_equity_holding WHERE {commodity}"""),
+            "/unlisted":       manual(["unlisted", "startup"]),
+            "/properties":     manual(["properties"]),
+            "/art":            manual(["art"]),
+        }
+
+        cur.execute("SELECT category, array_agg(DISTINCT entity_id) AS eids FROM manual_input GROUP BY category")
+        categories = {r["category"]: sorted(r["eids"]) for r in cur.fetchall()}
+        cur.close()
+        return {"sections": sections, "categories": categories}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/nav-coverage: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
 # ---------------------------------------------------------------------------
 # Unlisted / startup funding rounds + corporate events (Phase 3).
 # Each round records price-per-share, shares acquired and amount invested.

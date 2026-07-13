@@ -2,6 +2,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import NavTabs from '@/app/components/NavTabs';
+import EntitySwitcher from '@/app/components/EntitySwitcher';
 import { useDragScroll } from '@/app/components/DragScroll';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
@@ -73,34 +74,6 @@ const pct = (n: number | null | undefined) =>
 const pnlClass = (n: number | null | undefined) =>
   n == null ? 'text-ghost' : n >= 0 ? 'text-gain' : 'text-peril';
 
-function EntitySwitcher({
-  entities, selectedId, onSelect,
-}: {
-  entities: Entity[]; selectedId: number | null; onSelect: (id: number | null) => void;
-}) {
-  return (
-    <div className="flex flex-wrap gap-1.5 mb-5" role="tablist" aria-label="Entity filter">
-      {[{ id: null, name: 'All' }, ...entities.map(e => ({ id: e.id, name: e.name }))].map(tab => {
-        const active = tab.id === selectedId;
-        return (
-          <button
-            key={tab.id ?? 'all'}
-            role="tab"
-            aria-selected={active}
-            onClick={() => onSelect(tab.id ?? null)}
-            className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
-              active
-                ? 'bg-prime text-prime-fg'
-                : 'bg-card border border-rule text-dim hover:border-dim hover:text-ink'
-            }`}
-          >
-            {tab.name}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
 
 function TotalCard({ label, value, sub, subClass }: {
   label: string; value: string; sub?: string; subClass?: string;
@@ -341,7 +314,7 @@ export default function PmsPage() {
         </div>
 
         {isAdmin && entities.length > 0 && (
-          <EntitySwitcher entities={entities} selectedId={selectedId} onSelect={setSelectedId} />
+          <EntitySwitcher section="/pms" entities={entities} selectedId={selectedId} onSelect={setSelectedId} />
         )}
 
         {loading && !data && (

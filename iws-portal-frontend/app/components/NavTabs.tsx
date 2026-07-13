@@ -1,6 +1,8 @@
 'use client';
 import { useEffect } from 'react';
 import { navFor } from '@/app/lib/nav';
+import { DYNAMIC_CATEGORY_LABELS } from '@/app/lib/manualCategories';
+import { useNavCoverage } from '@/app/lib/navCoverage';
 import { useDragScroll } from './DragScroll';
 
 // The one section-tab strip, shared by every page (each page used to carry its
@@ -8,6 +10,14 @@ import { useDragScroll } from './DragScroll';
 // horizontally scrollable row: touchpad/wheel scrolls natively, press-and-drag
 // works via useDragScroll, the scrollbar is hidden (.nav-scroll) and the active
 // tab is centred into view on load.
+//
+// The list is data-driven via /api/v1/nav-coverage:
+//   - asset tabs in DATA_GATED hide while no entity has data in that section
+//     (the tab for the page being viewed always stays);
+//   - Manual Data categories without a dedicated page (AIF, PPF, …) get a tab
+//     automatically once their first entry exists anywhere — see
+//     DYNAMIC_CATEGORY_LABELS. They link to the generic /assets/<category>
+//     page and slot in after the asset tabs, before Realised Gains.
 //
 // Variants match the two existing looks:
 //   pills — standalone strip on the asset pages (bordered pill per tab)
@@ -42,6 +52,15 @@ const ITEM_CLASS = {
   },
 };
 
+type Tab = { href: string; label: string };
+
+// Section tabs hidden while empty; the rest (Overview, Realised Gains, Manual
+// Data, Reports, Assistant, Account) are utility pages that always show.
+const DATA_GATED = new Set([
+  '/mutual-funds', '/equity', '/foreign-equity', '/fno', '/bank-accounts',
+  '/pms', '/gold-silver', '/unlisted', '/properties', '/art',
+]);
+
 export default function NavTabs({
   active, role, variant = 'pills', className = '',
 }: {
@@ -51,13 +70,43 @@ export default function NavTabs({
   className?: string;
 }) {
   const { ref, bind } = useDragScroll();
+  const cov = useNavCoverage();
+
+  const dynTabs: Tab[] = cov
+    ? Object.keys(DYNAMIC_CATEGORY_LABELS)
+        .filter(c => (cov.categories[c]?.length ?? 0) > 0)
+        .map(c => ({ href: `/assets/${c}`, label: DYNAMIC_CATEGORY_LABELS[c] }))
+    : [];
 
   // Bring the active tab into view (centred) without animating on first paint.
   useEffect(() => {
     const c = ref.current;
     const el = c?.querySelector<HTMLElement>('[aria-current="page"]');
     if (c && el) c.scrollLeft = el.offsetLeft - (c.clientWidth - el.offsetWidth) / 2;
+  }, [ref, dynTabs]);
+
+  // Plain mouse wheel scrolls the strip horizontally (touchpads already send
+  // deltaX natively). Non-passive listener so we can stop the page from
+  // scrolling vertically underneath — but only while the strip overflows.
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.deltaY || Math.abs(e.deltaX) >= Math.abs(e.deltaY)) return;
+      if (el.scrollWidth <= el.clientWidth) return;
+      el.scrollLeft += e.deltaY;
+      e.preventDefault();
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
   }, [ref]);
+
+  const tabs: Tab[] = TABS.filter(t =>
+    t.href === active || !DATA_GATED.has(t.href) || !cov || (cov.sections[t.href]?.length ?? 0) > 0);
+  if (dynTabs.length) {
+    const at = tabs.findIndex(t => t.href === '/realised-gains');
+    tabs.splice(at === -1 ? tabs.length : at, 0, ...dynTabs);
+  }
 
   const item = ITEM_CLASS[variant];
   return (
@@ -69,7 +118,7 @@ export default function NavTabs({
         variant === 'pills' ? 'gap-1.5' : 'items-center gap-0.5'
       } ${className}`}
     >
-      {navFor(TABS, role).map(({ href, label }) => (
+      {navFor(tabs, role).map(({ href, label }) => (
         <a
           key={href}
           href={href}
