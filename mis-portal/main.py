@@ -3243,11 +3243,13 @@ def get_transactions(
 # Manual Inputs
 # ---------------------------------------------------------------------------
 
+# "properties" was removed 2026-07-13: real estate now lives in the dedicated
+# property register (see /api/v1/properties), not in manual inputs.
 VALID_CATEGORIES = {
     "liquid_fund", "debt_fund", "arbitrage_fund", "ppf",
     "pms", "direct_equity", "aif",
     "overseas_fund", "overseas_equity", "forex", "gold_etf",
-    "unlisted", "startup", "properties", "art",
+    "unlisted", "startup", "art",
     "funds_transit", "broker_balance", "bank",
 }
 
