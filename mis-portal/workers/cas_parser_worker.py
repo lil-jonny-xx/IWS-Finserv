@@ -61,6 +61,10 @@ NAME_PATTERNS: list[tuple[str, str]] = [
     ("stuti dhruv rajani",     "SDR"),
     ("rajani corp",            "Rajani Corp"),
     ("harish dhirajlal rajani", "HDR"),
+    # Fallback for folios registered as plain "Harish Rajani" (e.g. 8602154).
+    # Safe only because matching is first-match-wins and HHR's fuller pattern
+    # ("harsh harish rajani") is checked above — keep this entry LAST.
+    ("harish rajani",           "HDR"),
 ]
 
 
