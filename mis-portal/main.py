@@ -2989,11 +2989,12 @@ def get_overview(
         # Bank-account cash (HSBC / DBS / FAB / …), native ccy → INR → CASH bucket.
         bank_cash_rows = _fetch_bank_cash_overview_rows(conn, eid)
 
-        # Property register fair values (area x RRR x 1.75) → REAL_ESTATE bucket.
-        property_rows = _fetch_property_overview_rows(conn, eid)
-
+        # Property register values are deliberately NOT folded in here — the
+        # register is a standalone sheet and its fair values stay off the
+        # overview totals (owner decision 2026-07-13). To re-include, add
+        # _fetch_property_overview_rows(conn, eid) back into all_rows.
         all_rows = (list(mf_rows) + list(eq_rows) + manual_rows + pms_rows
-                    + broker_cash_rows + bank_cash_rows + property_rows)
+                    + broker_cash_rows + bank_cash_rows)
 
         def row_val(r, key):
             v = r[key]
