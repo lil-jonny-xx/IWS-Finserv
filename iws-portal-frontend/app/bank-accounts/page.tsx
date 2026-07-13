@@ -15,17 +15,43 @@ interface Attachment {
 interface BankAsset {
   entity_id: number; entity_name: string; label: string;
   cost: number | null; current_value: number | null; currency: string;
+  raw_amount?: number | null;   // balance as entered, in the account's own currency
+  fx_rate?: number | null;      // INR-per-unit rate used at entry time
   inception_date: string | null; notes: string | null;
   attachments: Attachment[];
   source?: 'bank' | 'forex';   // which Manual Data category this row came from
 }
 interface ManualAssetsResponse {
   category: string; entity_id: number; total_value: number; count: number; assets: BankAsset[];
+  fx_rates?: Record<string, number>;   // latest INR-per-unit rate per currency (INR = 1)
 }
 
 function fmtINR(n: number | null | undefined): string {
   if (n == null) return '—';
   return '₹' + Math.round(n).toLocaleString('en-IN');
+}
+
+const CCY_SYMBOL: Record<string, string> = {
+  INR: '₹', USD: '$', EUR: '€', GBP: '£', CHF: 'CHF ', SGD: 'S$', AED: 'AED ', HKD: 'HK$',
+};
+function fmtMoney(n: number | null | undefined, ccy: string): string {
+  if (n == null) return '—';
+  if (ccy === 'INR') return fmtINR(n);
+  const sym = CCY_SYMBOL[ccy] ?? ccy + ' ';
+  return (n < 0 ? '−' : '') + sym +
+    Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+// current_value is always stored in INR; raw_amount (when present) is the exact
+// figure entered in the account's own currency. Anything else is derived from
+// the latest fx rate and flagged approximate.
+function convert(a: BankAsset, ccy: string, fxRates: Record<string, number>):
+  { val: number | null; ccy: string; approx: boolean } {
+  if (ccy === 'INR') return { val: a.current_value, ccy, approx: false };
+  if (ccy === (a.currency || 'INR') && a.raw_amount != null) return { val: a.raw_amount, ccy, approx: false };
+  const rate = fxRates[ccy];
+  if (a.current_value != null && rate) return { val: a.current_value / rate, ccy, approx: true };
+  return { val: a.current_value, ccy: 'INR', approx: false };
 }
 function fileUrl(id: number)  { return `${API_URL}/api/v1/manual-attachments/${id}/file`; }
 function thumbUrl(id: number) { return `${API_URL}/api/v1/manual-attachments/${id}/thumb`; }
@@ -50,11 +76,17 @@ function EntitySwitcher({ entities, selectedId, onSelect }: {
   );
 }
 
-function BankCard({ a, showEntity, onOpen }: {
+
+function BankCard({ a, showEntity, onOpen, fxRates }: {
   a: BankAsset; showEntity: boolean; onOpen: (id: number) => void;
+  fxRates: Record<string, number>;
 }) {
   const images = a.attachments.filter(t => (t.mime || '').startsWith('image/'));
   const files  = a.attachments.filter(t => !(t.mime || '').startsWith('image/'));
+  const native = a.currency || 'INR';
+  const [ccy, setCcy] = useState(native);
+  const ccyOptions = [native, ...Object.keys(fxRates).filter(c => c !== native).sort()];
+  const { val, ccy: shownCcy, approx } = convert(a, ccy, fxRates);
   return (
     <div className="bg-card rounded-lg border border-rule overflow-hidden flex flex-col">
       <div className="px-5 pt-4 pb-3 border-b border-rule flex items-start justify-between gap-3">
@@ -65,10 +97,19 @@ function BankCard({ a, showEntity, onOpen }: {
         </div>
         <div className="text-right shrink-0">
           <p className="text-[11px] uppercase tracking-wide text-ghost">Balance</p>
-          <p className="text-base font-bold text-ink tabular-nums">{fmtINR(a.current_value)}</p>
-          {a.currency && a.currency !== 'INR' && (
-            <p className="text-[11px] text-ghost">{a.currency} account</p>
-          )}
+          <p className="text-base font-bold text-ink tabular-nums">
+            {approx && <span className="font-normal text-ghost">≈ </span>}{fmtMoney(val, shownCcy)}
+          </p>
+          {ccyOptions.length > 1 ? (
+            <select value={ccy} onChange={e => setCcy(e.target.value)} aria-label="Display currency"
+              className="mt-0.5 text-[11px] text-ghost bg-transparent border-0 p-0 cursor-pointer hover:text-ink focus:outline-none focus:text-ink transition-colors text-right">
+              {ccyOptions.map(c => (
+                <option key={c} value={c}>{c === native ? `${c} · native` : c}</option>
+              ))}
+            </select>
+          ) : native !== 'INR' ? (
+            <p className="text-[11px] text-ghost">{native} account</p>
+          ) : null}
         </div>
       </div>
       <div className="p-4 flex flex-col gap-3 flex-1">
@@ -154,6 +195,7 @@ export default function BanksPage() {
           total_value: (bank?.total_value ?? 0) + (forex?.total_value ?? 0),
           count:       (bank?.count ?? 0) + (forex?.count ?? 0),
           assets:      [...tag(bank, 'bank'), ...tag(forex, 'forex')],
+          fx_rates:    bank?.fx_rates ?? forex?.fx_rates,
         });
         setLoading(false);
         didInitialLoad.current = true;
@@ -226,7 +268,7 @@ export default function BanksPage() {
                 return (
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                     {data.assets.map(a => (
-                      <BankCard key={`${a.entity_id}-${a.label}`} a={a} showEntity={showEntity} onOpen={setLightbox} />
+                      <BankCard key={`${a.entity_id}-${a.label}`} a={a} showEntity={showEntity} onOpen={setLightbox} fxRates={data.fx_rates ?? {}} />
                     ))}
                   </div>
                 );
@@ -245,7 +287,7 @@ export default function BanksPage() {
                         <h2 className="text-[11px] uppercase tracking-wide text-ghost mb-3">{g.title}</h2>
                         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                           {rows.map(a => (
-                            <BankCard key={`${g.key}-${a.entity_id}-${a.label}`} a={a} showEntity={showEntity} onOpen={setLightbox} />
+                            <BankCard key={`${g.key}-${a.entity_id}-${a.label}`} a={a} showEntity={showEntity} onOpen={setLightbox} fxRates={data.fx_rates ?? {}} />
                           ))}
                         </div>
                       </section>

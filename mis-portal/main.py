@@ -3953,7 +3953,8 @@ def get_manual_assets(
             f"""
             SELECT DISTINCT ON (m.entity_id, m.label)
                 m.entity_id, e.entity_name, m.label, m.cost, m.current_value,
-                m.currency, m.inception_date, m.notes, m.updated_at
+                m.currency, m.raw_amount, m.fx_rate,
+                m.inception_date, m.notes, m.updated_at
             FROM   manual_input m
             JOIN   entity e ON e.id = m.entity_id
             {where}
@@ -4068,6 +4069,8 @@ def get_manual_assets(
                 "cost":          float(m["cost"])          if m["cost"]          is not None else None,
                 "current_value": float(m["current_value"]) if m["current_value"] is not None else None,
                 "currency":      m["currency"],
+                "raw_amount":    float(m["raw_amount"])    if m["raw_amount"]    is not None else None,
+                "fx_rate":       float(m["fx_rate"])       if m["fx_rate"]       is not None else None,
                 "inception_date": str(m["inception_date"]) if m["inception_date"] else None,
                 "notes":         m["notes"],
                 "updated_at":    m["updated_at"].isoformat() if m["updated_at"] else None,
@@ -4091,6 +4094,7 @@ def get_manual_assets(
             "total_value":   total_value,
             "count":         len(out),
             "assets":        out,
+            "fx_rates":      _latest_fx_rates(conn),
         }
     except HTTPException:
         raise
