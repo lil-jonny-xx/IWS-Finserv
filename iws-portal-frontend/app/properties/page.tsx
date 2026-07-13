@@ -60,6 +60,7 @@ export default function PropertiesPage() {
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const [form, setForm]         = useState<PropertyForm | null>(null);
   const [formErr, setFormErr]   = useState<string | null>(null);
+  const [formSaved, setFormSaved] = useState(false);
   const [newEntity, setNewEntity] = useState('');
   const [uploadSel, setUploadSel] = useState<Record<number, string>>({}); // propId -> doc slug
   const fileRef                 = useRef<HTMLInputElement | null>(null);
@@ -149,7 +150,14 @@ export default function PropertiesPage() {
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     })
       .then(r => { if (!r.ok) return r.json().then((e: { detail?: string }) => { throw new Error(e.detail || 'Save failed'); }); return r.json(); })
-      .then(() => { setForm(null); loadProperties(); })
+      .then((res: { id?: number }) => {
+        loadProperties();
+        // Keep the dialog open so documents can be added right away.
+        if (form.id == null && res?.id != null) {
+          setForm(f => (f ? { ...f, id: res.id! } : f));
+        }
+        setFormSaved(true);
+      })
       .catch(e => setFormErr(e.message))
       .finally(() => setBusy(null));
   };
@@ -287,7 +295,7 @@ export default function PropertiesPage() {
                 <p className="text-base font-semibold text-ink tabular-nums">{visible.length}</p>
               </div>
               {isAdmin && (
-                <button onClick={() => { setFormErr(null); setForm({ ...EMPTY_FORM }); }}
+                <button onClick={() => { setFormErr(null); setFormSaved(false); setForm({ ...EMPTY_FORM }); }}
                         className="ml-auto text-xs bg-prime text-prime-fg px-3 py-1.5 rounded font-medium hover:opacity-90 transition-opacity">
                   + Add Property
                 </button>
@@ -330,7 +338,7 @@ export default function PropertiesPage() {
                         requiredN={requiredN} missingN={missingN} valReports={valReports}
                         uploadSel={uploadSel[p.id] ?? ''} busy={busy === `upload-${p.id}`}
                         onToggle={() => toggleExpand(p.id)}
-                        onEdit={() => { setFormErr(null); editForm(p); }}
+                        onEdit={() => { setFormErr(null); setFormSaved(false); editForm(p); }}
                         onDelete={() => deleteProperty(p)}
                         onSelectDoc={slug => setUploadSel(s => ({ ...s, [p.id]: slug }))}
                         onUpload={slug => startUpload(p.id, slug)}
@@ -447,13 +455,42 @@ export default function PropertiesPage() {
                           rows={2} className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" />
               </label>
             </div>
+
+            {/* Documents — uploadable as soon as the property exists */}
+            <div className="mt-5 border-t border-rule pt-4">
+              <p className="text-[11px] uppercase tracking-wide text-ghost mb-2">
+                Documents — {form.property_type} checklist
+              </p>
+              {form.id == null ? (
+                <p className="text-xs text-ghost">
+                  Save the property first — the document checklist appears here right after,
+                  with an upload button next to every document.
+                </p>
+              ) : (
+                <div className="max-h-72 overflow-y-auto pr-1">
+                  <DocChecklist
+                    types={docTypesFor(form.property_type)}
+                    docs={data?.properties.find(x => x.id === form.id)?.documents ?? []}
+                    isAdmin={isAdmin} busy={busy === `upload-${form.id}`}
+                    columns="columns-1 sm:columns-2"
+                    onUpload={slug => startUpload(form.id!, slug)}
+                    onDeleteDoc={deleteDoc} />
+                </div>
+              )}
+            </div>
+
             {formErr && <p role="alert" className="text-xs text-red-500 mt-3">{formErr}</p>}
+            {formSaved && !formErr && (
+              <p className="text-xs text-emerald-500 mt-3">Saved. You can add documents above.</p>
+            )}
             <div className="flex justify-end gap-2 mt-5">
               <button onClick={() => setForm(null)}
-                      className="text-xs border border-wire text-dim px-3 py-1.5 rounded hover:border-dim hover:text-ink transition-colors">Cancel</button>
+                      className="text-xs border border-wire text-dim px-3 py-1.5 rounded hover:border-dim hover:text-ink transition-colors">
+                {formSaved ? 'Done' : 'Cancel'}
+              </button>
               <button onClick={saveProperty} disabled={busy === 'save'}
                       className="text-xs bg-prime text-prime-fg px-4 py-1.5 rounded font-medium hover:opacity-90 transition-opacity disabled:opacity-50">
-                {busy === 'save' ? 'Saving…' : 'Save'}
+                {busy === 'save' ? 'Saving…' : form.id == null ? 'Save & Add Documents' : 'Save'}
               </button>
             </div>
           </div>
@@ -463,21 +500,16 @@ export default function PropertiesPage() {
   );
 }
 
-// One property = the sheet row + (when expanded) the document checklist row.
-function PropertyRows({ p, types, isOpen, isAdmin, requiredN, missingN, valReports,
-                        uploadSel, busy, onToggle, onEdit, onDelete, onSelectDoc, onUpload, onDeleteDoc }: {
-  p: Property; types: DocType[]; isOpen: boolean; isAdmin: boolean;
-  requiredN: number; missingN: number; valReports: PropDoc[];
-  uploadSel: string; busy: boolean;
-  onToggle: () => void; onEdit: () => void; onDelete: () => void;
-  onSelectDoc: (slug: string) => void; onUpload: (slug: string) => void;
-  onDeleteDoc: (d: PropDoc) => void;
+// The per-type document checklist with uploaded/missing indicators — shared by
+// the expanded sheet row and the add/edit dialog.
+function DocChecklist({ types, docs, isAdmin, busy, columns, onUpload, onDeleteDoc }: {
+  types: DocType[]; docs: PropDoc[]; isAdmin: boolean; busy: boolean; columns: string;
+  onUpload: (slug: string) => void; onDeleteDoc: (d: PropDoc) => void;
 }) {
   const byType: Record<string, PropDoc[]> = {};
-  for (const d of p.documents) (byType[d.doc_type] ??= []).push(d);
+  for (const d of docs) (byType[d.doc_type] ??= []).push(d);
   const topLevel = types.filter(t => !t.parent);
   const children = (slug: string) => types.filter(t => t.parent === slug);
-  const complete = missingN === 0;
 
   const statusIcon = (t: DocType) => {
     if ((byType[t.slug]?.length ?? 0) > 0) return <span className="text-emerald-500" title="Uploaded">●</span>;
@@ -517,6 +549,36 @@ function PropertyRows({ p, types, isOpen, isAdmin, requiredN, missingN, valRepor
       )}
     </li>
   );
+
+  return (
+    <ul className={`${columns} gap-8 text-xs [&>li]:break-inside-avoid`}>
+      {topLevel.map(t => (
+        <li key={t.slug} className="mb-0.5">
+          <ul>
+            {checklistRow(t, 0)}
+            {children(t.slug).map(c => checklistRow(c, 1))}
+          </ul>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+// One property = the sheet row + (when expanded) the document checklist row.
+function PropertyRows({ p, types, isOpen, isAdmin, requiredN, missingN, valReports,
+                        uploadSel, busy, onToggle, onEdit, onDelete, onSelectDoc, onUpload, onDeleteDoc }: {
+  p: Property; types: DocType[]; isOpen: boolean; isAdmin: boolean;
+  requiredN: number; missingN: number; valReports: PropDoc[];
+  uploadSel: string; busy: boolean;
+  onToggle: () => void; onEdit: () => void; onDelete: () => void;
+  onSelectDoc: (slug: string) => void; onUpload: (slug: string) => void;
+  onDeleteDoc: (d: PropDoc) => void;
+}) {
+  const byType: Record<string, PropDoc[]> = {};
+  for (const d of p.documents) (byType[d.doc_type] ??= []).push(d);
+  const topLevel = types.filter(t => !t.parent);
+  const children = (slug: string) => types.filter(t => t.parent === slug);
+  const complete = missingN === 0;
 
   return (
     <>
@@ -603,16 +665,9 @@ function PropertyRows({ p, types, isOpen, isAdmin, requiredN, missingN, valRepor
                 </span>
               )}
             </div>
-            <ul className="columns-1 md:columns-2 xl:columns-3 gap-8 text-xs [&>li]:break-inside-avoid">
-              {topLevel.map(t => (
-                <li key={t.slug} className="mb-0.5">
-                  <ul>
-                    {checklistRow(t, 0)}
-                    {children(t.slug).map(c => checklistRow(c, 1))}
-                  </ul>
-                </li>
-              ))}
-            </ul>
+            <DocChecklist types={types} docs={p.documents} isAdmin={isAdmin} busy={busy}
+                          columns="columns-1 md:columns-2 xl:columns-3"
+                          onUpload={onUpload} onDeleteDoc={onDeleteDoc} />
           </td>
         </tr>
       )}
