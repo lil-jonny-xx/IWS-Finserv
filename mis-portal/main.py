@@ -26,6 +26,7 @@ import atexit
 from assistant import engine as assistant_engine
 from assistant import persistence as assistant_persistence
 from equity.finmath import xirr as _xirr
+import property_docs
 
 # Load .env file
 load_dotenv('/var/www/mis-portal/.env')
@@ -2823,6 +2824,52 @@ def _fetch_bank_cash_overview_rows(conn, entity_id: Optional[int] = None):
     return out
 
 
+def _fetch_property_overview_rows(conn, entity_id: Optional[int] = None):
+    """
+    Property register fair values (area x RRR x 1.75, computed like
+    /api/v1/properties) folded into the REAL_ESTATE bucket. Holders are
+    property_entity rows, not system entities: where a holder mirrors a system
+    entity (same name) its rows carry that entity id so member scoping and the
+    per-entity bars line up; other holders (LLPs, trusts, parent companies)
+    appear as their own synthetic entities with a negative id — the dashboard
+    only uses entity_id as a list key. No cost basis or ledger exists, so
+    invested is 0 and pnl/ytd/weekly stay 0.
+    """
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT pe.id AS holder_id, pe.name AS holder_name,
+               e.id AS sys_entity_id, SUM(p.area * p.rrr) AS base
+        FROM property p
+        JOIN property_entity pe ON pe.id = p.holder_id
+        LEFT JOIN entity e ON e.entity_name = pe.name
+        WHERE p.area IS NOT NULL AND p.rrr IS NOT NULL
+        GROUP BY pe.id, pe.name, e.id
+    """)
+    rows = cur.fetchall()
+    cur.close()
+
+    out = []
+    for r in rows:
+        sys_id = r["sys_entity_id"]
+        if entity_id is not None and sys_id != entity_id:
+            continue   # member scope: only properties held by their own entity
+        val = float(r["base"]) * property_docs.FAIR_VALUE_MULTIPLIER
+        out.append({
+            "entity_id":          sys_id if sys_id is not None else -r["holder_id"],
+            "entity_name":        r["holder_name"],
+            "asset_class":        "REAL_ESTATE",
+            "security_type":      "PROPERTY",
+            "invested":           0.0,
+            "mkt_value":          val,
+            "pnl_inception":      0.0,
+            "pnl_ytd":            0.0,
+            "weekly_change":      0.0,
+            "cagr_inception_pct": None,
+            "weight":             val,
+        })
+    return out
+
+
 @app.get("/api/v1/overview")
 def get_overview(
     request: Request,
@@ -2929,8 +2976,11 @@ def get_overview(
         # Bank-account cash (HSBC / DBS / FAB / …), native ccy → INR → CASH bucket.
         bank_cash_rows = _fetch_bank_cash_overview_rows(conn, eid)
 
+        # Property register fair values (area x RRR x 1.75) → REAL_ESTATE bucket.
+        property_rows = _fetch_property_overview_rows(conn, eid)
+
         all_rows = (list(mf_rows) + list(eq_rows) + manual_rows + pms_rows
-                    + broker_cash_rows + bank_cash_rows)
+                    + broker_cash_rows + bank_cash_rows + property_rows)
 
         def row_val(r, key):
             v = r[key]
@@ -3926,6 +3976,514 @@ def save_property_detail(request: Request, body: PropertyDetailRequest,
         release_db_connection(conn)
 
 
+# ---------------------------------------------------------------------------
+# Property register — dedicated land/building sheet with its own holder
+# universe (companies, LLPs, trusts — NOT the system entity table) and a
+# per-type document checklist. Uploads are converted to PDF where possible
+# (see property_docs.convert_to_pdf); the original is kept when conversion
+# changes or skips the file. All logins may view; only admin writes.
+# ---------------------------------------------------------------------------
+
+PROPERTY_UPLOAD_SUBDIR = "property"
+
+
+def _property_user_id(cur, payload) -> Optional[int]:
+    cur.execute("SELECT id FROM users WHERE email = %s", (payload["email"],))
+    row = cur.fetchone()
+    return row["id"] if row else None
+
+
+def _require_admin(cur, payload):
+    if _live_role(cur, payload["email"]) != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+
+@app.get("/api/v1/property-doc-types")
+def get_property_doc_types(request: Request,
+                           authorization: Optional[str] = Header(None)):
+    """The land/building document checklist that drives the upload dropdown."""
+    _require_auth(request, authorization)
+    return {"doc_types": property_docs.DOC_TYPES,
+            "fair_value_multiplier": property_docs.FAIR_VALUE_MULTIPLIER}
+
+
+@app.get("/api/v1/property-entities")
+def list_property_entities(request: Request,
+                           authorization: Optional[str] = Header(None)):
+    conn = None
+    try:
+        _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        cur.execute("""SELECT id, name, short_code, grp, is_custom
+                       FROM property_entity ORDER BY grp, sort_order, name""")
+        rows = cur.fetchall()
+        cur.close()
+        return [{"id": r["id"], "name": r["name"], "short_code": r["short_code"],
+                 "grp": r["grp"], "is_custom": r["is_custom"]} for r in rows]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/property-entities: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+class PropertyEntityRequest(BaseModel):
+    name:       str
+    short_code: Optional[str] = None
+    grp:        str = "parent"     # "Others" additions default under Parent Companies
+
+
+@app.post("/api/v1/property-entities")
+@limiter.limit("30/minute")
+def create_property_entity(request: Request, body: PropertyEntityRequest,
+                           authorization: Optional[str] = Header(None)):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        _require_admin(cur, payload)
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="name is required")
+        if body.grp not in ("main", "parent"):
+            raise HTTPException(status_code=422, detail="grp must be main or parent")
+        user_id = _property_user_id(cur, payload)
+        cur.execute(
+            """INSERT INTO property_entity (name, short_code, grp, is_custom, sort_order, created_by)
+               VALUES (%s,%s,%s,TRUE,900,%s)
+               ON CONFLICT (name) DO NOTHING RETURNING id""",
+            (name, (body.short_code or "").strip() or None, body.grp, user_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=409, detail="Entity already exists")
+        write_audit_log(conn, user_id, "PROPERTY_ENTITY_CREATE", "property_entity",
+                        row["id"], name)
+        conn.commit()
+        cur.close()
+        return {"id": row["id"], "name": name}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/property-entities: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+def _property_row(r: dict, docs: list) -> dict:
+    area = float(r["area"]) if r["area"] is not None else None
+    rrr  = float(r["rrr"]) if r["rrr"] is not None else None
+    fair = round(area * rrr * property_docs.FAIR_VALUE_MULTIPLIER, 2) \
+        if area is not None and rrr is not None else None
+    uploaded = {d["doc_type"] for d in docs}
+    required = [d["slug"] for d in property_docs.doc_types_for(r["property_type"])
+                if not d["optional"]]
+    return {
+        "id":               r["id"],
+        "name":             r["name"],
+        "property_type":    r["property_type"],
+        "holder_id":        r["holder_id"],
+        "holder_name":      r["holder_name"],
+        "location":         r["location"],
+        "taluka":           r["taluka"],
+        "area":             area,
+        "area_unit":        r["area_unit"],
+        "deed_no":          r["deed_no"],
+        "acquisition_date": r["acquisition_date"].isoformat() if r["acquisition_date"] else None,
+        "ownership":        r["ownership"],
+        "rrr":              rrr,
+        "fair_value":       fair,
+        "notes":            r["notes"],
+        "documents":        docs,
+        "missing_required": [s for s in required if s not in uploaded],
+    }
+
+
+@app.get("/api/v1/properties")
+def list_properties(request: Request, holder_id: Optional[int] = None,
+                    authorization: Optional[str] = Header(None)):
+    """The property sheet. Every authenticated login may view (holders are
+    companies/trusts that don't map onto member entity scoping)."""
+    conn = None
+    try:
+        _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        cond, params = "", []
+        if holder_id is not None:
+            cond, params = "WHERE p.holder_id = %s", [holder_id]
+        cur.execute(f"""
+            SELECT p.*, e.name AS holder_name
+            FROM   property p JOIN property_entity e ON e.id = p.holder_id
+            {cond} ORDER BY e.sort_order, e.name, p.name""", params)
+        props = cur.fetchall()
+        docs_by_pid = {}
+        if props:
+            cur.execute(
+                """SELECT id, property_id, doc_type, original_name, mime,
+                          size_bytes, converted, original_path IS NOT NULL AS has_original,
+                          uploaded_at
+                   FROM property_document WHERE property_id = ANY(%s)
+                   ORDER BY uploaded_at""",
+                ([p["id"] for p in props],),
+            )
+            for d in cur.fetchall():
+                docs_by_pid.setdefault(d["property_id"], []).append({
+                    "id":            d["id"],
+                    "doc_type":      d["doc_type"],
+                    "original_name": d["original_name"],
+                    "mime":          d["mime"],
+                    "size_bytes":    int(d["size_bytes"]) if d["size_bytes"] is not None else None,
+                    "converted":     d["converted"],
+                    "has_original":  d["has_original"],
+                    "uploaded_at":   d["uploaded_at"].isoformat() if d["uploaded_at"] else None,
+                })
+        cur.close()
+        rows = [_property_row(p, docs_by_pid.get(p["id"], [])) for p in props]
+        total = sum(r["fair_value"] for r in rows if r["fair_value"] is not None)
+        return {"count": len(rows), "total_fair_value": round(total, 2), "properties": rows}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/properties: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+class PropertyRequest(BaseModel):
+    name:             str
+    property_type:    str
+    holder_id:        int
+    location:         Optional[str]   = None
+    taluka:           Optional[str]   = None
+    area:             Optional[float] = None
+    area_unit:        Optional[str]   = "sq m"
+    deed_no:          Optional[str]   = None
+    acquisition_date: Optional[str]   = None   # YYYY-MM-DD
+    ownership:        Optional[str]   = None
+    rrr:              Optional[float] = None
+    notes:            Optional[str]   = None
+
+
+def _validate_property_body(cur, body: PropertyRequest):
+    if not body.name.strip():
+        raise HTTPException(status_code=422, detail="name is required")
+    if body.property_type not in ("land", "building"):
+        raise HTTPException(status_code=422, detail="property_type must be land or building")
+    cur.execute("SELECT id FROM property_entity WHERE id = %s", (body.holder_id,))
+    if not cur.fetchone():
+        raise HTTPException(status_code=422, detail="Unknown holder entity")
+    if body.acquisition_date:
+        try:
+            datetime.strptime(body.acquisition_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=422, detail="acquisition_date must be YYYY-MM-DD")
+
+
+@app.post("/api/v1/properties")
+@limiter.limit("30/minute")
+def create_property(request: Request, body: PropertyRequest,
+                    authorization: Optional[str] = Header(None)):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        _require_admin(cur, payload)
+        _validate_property_body(cur, body)
+        user_id = _property_user_id(cur, payload)
+        cur.execute(
+            """INSERT INTO property
+                   (name, property_type, holder_id, location, taluka, area, area_unit,
+                    deed_no, acquisition_date, ownership, rrr, notes, created_by, updated_by)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            (body.name.strip(), body.property_type, body.holder_id, body.location,
+             body.taluka, body.area, body.area_unit, body.deed_no,
+             body.acquisition_date or None, body.ownership, body.rrr, body.notes,
+             user_id, user_id),
+        )
+        pid = cur.fetchone()["id"]
+        write_audit_log(conn, user_id, "PROPERTY_CREATE", "property", pid, body.name.strip())
+        conn.commit()
+        cur.close()
+        return {"id": pid}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/properties: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.put("/api/v1/properties/{prop_id}")
+@limiter.limit("30/minute")
+def update_property(prop_id: int, request: Request, body: PropertyRequest,
+                    authorization: Optional[str] = Header(None)):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        _require_admin(cur, payload)
+        _validate_property_body(cur, body)
+        user_id = _property_user_id(cur, payload)
+        cur.execute(
+            """UPDATE property SET
+                   name=%s, property_type=%s, holder_id=%s, location=%s, taluka=%s,
+                   area=%s, area_unit=%s, deed_no=%s, acquisition_date=%s,
+                   ownership=%s, rrr=%s, notes=%s, updated_by=%s, updated_at=NOW()
+               WHERE id=%s RETURNING id""",
+            (body.name.strip(), body.property_type, body.holder_id, body.location,
+             body.taluka, body.area, body.area_unit, body.deed_no,
+             body.acquisition_date or None, body.ownership, body.rrr, body.notes,
+             user_id, prop_id),
+        )
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Property not found")
+        write_audit_log(conn, user_id, "PROPERTY_UPDATE", "property", prop_id, body.name.strip())
+        conn.commit()
+        cur.close()
+        return {"saved": True}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in PUT /api/v1/properties/{prop_id}: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.delete("/api/v1/properties/{prop_id}")
+def delete_property(prop_id: int, request: Request,
+                    authorization: Optional[str] = Header(None)):
+    """Delete a property + its document files (admin only)."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        _require_admin(cur, payload)
+        cur.execute("SELECT name FROM property WHERE id = %s", (prop_id,))
+        prow = cur.fetchone()
+        if not prow:
+            raise HTTPException(status_code=404, detail="Property not found")
+        cur.execute("SELECT stored_path, original_path FROM property_document WHERE property_id = %s",
+                    (prop_id,))
+        for r in cur.fetchall():
+            for rel in (r["stored_path"], r["original_path"]):
+                if not rel:
+                    continue
+                try:
+                    p = _uploads_abspath(rel)
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception as e:
+                    logger.warning(f"could not remove property file {rel}: {e}")
+        cur.execute("DELETE FROM property WHERE id = %s", (prop_id,))
+        user_id = _property_user_id(cur, payload)
+        write_audit_log(conn, user_id, "PROPERTY_DELETE", "property", prop_id, prow["name"])
+        conn.commit()
+        cur.close()
+        return {"deleted": prop_id}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in DELETE /api/v1/properties/{prop_id}: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/properties/{prop_id}/documents")
+@limiter.limit("60/minute")
+async def upload_property_document(
+    prop_id: int,
+    request: Request,
+    doc_type: str = Form(...),
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None),
+):
+    """Upload one checklist document (admin only). Converted to PDF when we
+    can (images always; office docs when LibreOffice is installed); the
+    original upload is kept alongside whenever it isn't already the PDF."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        _require_admin(cur, payload)
+        if doc_type not in property_docs.DOC_SLUGS:
+            raise HTTPException(status_code=422, detail=f"Unknown doc_type: {doc_type}")
+        cur.execute("SELECT id FROM property WHERE id = %s", (prop_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Property not found")
+
+        data = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="File too large (max 25 MB)")
+        if not data:
+            raise HTTPException(status_code=422, detail="Empty file")
+
+        mime = (file.content_type
+                or mimetypes.guess_type(file.filename or "")[0]
+                or "application/octet-stream")
+        ext  = os.path.splitext(file.filename or "")[1].lower()[:12]
+        uid  = uuid.uuid4().hex
+        rel_dir = os.path.join(PROPERTY_UPLOAD_SUBDIR, str(prop_id))
+        os.makedirs(os.path.join(UPLOADS_ROOT, rel_dir), exist_ok=True)
+
+        pdf = property_docs.convert_to_pdf(data, file.filename or "", mime)
+        original_rel = None
+        if pdf is not None:
+            stored_rel = os.path.join(rel_dir, uid + ".pdf")
+            with open(_uploads_abspath(stored_rel), "wb") as fh:
+                fh.write(pdf)
+            original_rel = os.path.join(rel_dir, uid + "_orig" + ext)
+            with open(_uploads_abspath(original_rel), "wb") as fh:
+                fh.write(data)
+            stored_mime, converted = "application/pdf", True
+        else:
+            stored_rel = os.path.join(rel_dir, uid + ext)
+            with open(_uploads_abspath(stored_rel), "wb") as fh:
+                fh.write(data)
+            stored_mime, converted = mime, False
+
+        user_id = _property_user_id(cur, payload)
+        cur.execute(
+            """INSERT INTO property_document
+                   (property_id, doc_type, original_name, stored_path, original_path,
+                    mime, size_bytes, converted, uploaded_by)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               RETURNING id, uploaded_at""",
+            (prop_id, doc_type, file.filename, stored_rel, original_rel,
+             stored_mime, len(data), converted, user_id),
+        )
+        row = cur.fetchone()
+        write_audit_log(conn, user_id, "PROPERTY_DOC_UPLOAD", "property_document",
+                        row["id"], f"{prop_id}/{doc_type} ({file.filename})")
+        conn.commit()
+        cur.close()
+        return {
+            "id":            row["id"],
+            "doc_type":      doc_type,
+            "original_name": file.filename,
+            "mime":          stored_mime,
+            "converted":     converted,
+            "has_original":  original_rel is not None,
+            "uploaded_at":   row["uploaded_at"].isoformat(),
+        }
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/properties/{prop_id}/documents: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.get("/api/v1/property-documents/{doc_id}/file")
+def serve_property_document(doc_id: int, request: Request, original: bool = False,
+                            authorization: Optional[str] = Header(None)):
+    """Serve a document inline (PDF/image renders in the browser). Pass
+    ?original=true for the pre-conversion upload (e.g. the AutoCAD source)."""
+    conn = None
+    try:
+        _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        cur.execute("""SELECT stored_path, original_path, mime, original_name
+                       FROM property_document WHERE id = %s""", (doc_id,))
+        r = cur.fetchone()
+        cur.close()
+        if not r:
+            raise HTTPException(status_code=404, detail="Document not found")
+        rel = r["original_path"] if (original and r["original_path"]) else r["stored_path"]
+        abs_path = _uploads_abspath(rel)
+        if not os.path.exists(abs_path):
+            raise HTTPException(status_code=404, detail="File missing on disk")
+        media = (mimetypes.guess_type(rel)[0] or "application/octet-stream") \
+            if original else (r["mime"] or "application/octet-stream")
+        return FileResponse(abs_path, media_type=media,
+                            headers={"Cache-Control": "private, max-age=86400"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error serving property document {doc_id}: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.delete("/api/v1/property-documents/{doc_id}")
+def delete_property_document(doc_id: int, request: Request,
+                             authorization: Optional[str] = Header(None)):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        _require_admin(cur, payload)
+        cur.execute("""SELECT property_id, doc_type, stored_path, original_path
+                       FROM property_document WHERE id = %s""", (doc_id,))
+        r = cur.fetchone()
+        if not r:
+            raise HTTPException(status_code=404, detail="Document not found")
+        for rel in (r["stored_path"], r["original_path"]):
+            if not rel:
+                continue
+            try:
+                p = _uploads_abspath(rel)
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception as e:
+                logger.warning(f"could not remove property document file {rel}: {e}")
+        cur.execute("DELETE FROM property_document WHERE id = %s", (doc_id,))
+        user_id = _property_user_id(cur, payload)
+        write_audit_log(conn, user_id, "PROPERTY_DOC_DELETE", "property_document",
+                        doc_id, f"{r['property_id']}/{r['doc_type']}")
+        conn.commit()
+        cur.close()
+        return {"deleted": doc_id}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in DELETE /api/v1/property-documents/{doc_id}: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
 @app.get("/api/v1/manual-assets")
 def get_manual_assets(
     request: Request,
@@ -4120,9 +4678,10 @@ def get_nav_coverage(
     all entities (see _resolve_entity)."""
     conn = None
     try:
-        _require_auth(request, authorization)
+        payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
+        is_admin = _live_role(cur, payload["email"]) == "admin"
 
         def ids(sql: str, params: tuple = ()) -> list:
             cur.execute(sql, params)
@@ -4146,7 +4705,12 @@ def get_nav_coverage(
             "/gold-silver":    ids(f"""SELECT entity_id FROM equity_holding WHERE {commodity}
                                        UNION SELECT entity_id FROM foreign_equity_holding WHERE {commodity}"""),
             "/unlisted":       manual(["unlisted", "startup"]),
-            "/properties":     manual(["properties"]),
+            # The property register has its own holder universe (companies /
+            # trusts), so the tab shows for everyone once any property exists —
+            # and always for admins, who need a way in to add the first one.
+            "/properties":     ids(f"""SELECT e.id AS entity_id FROM entity e
+                                       WHERE {'TRUE' if is_admin else
+                                              'EXISTS (SELECT 1 FROM property)'}"""),
             "/art":            manual(["art"]),
         }
 
