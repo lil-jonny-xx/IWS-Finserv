@@ -64,6 +64,13 @@ CREATE TABLE IF NOT EXISTS property (
 );
 CREATE INDEX IF NOT EXISTS idx_property_holder ON property(holder_id);
 
+-- Sale tracking (2026-07-13): a sold property moves to the page's "Sold"
+-- section, stops contributing fair value, and its sale price feeds the
+-- Realised Gains page + the overview instead.
+ALTER TABLE property ADD COLUMN IF NOT EXISTS sold       BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE property ADD COLUMN IF NOT EXISTS sale_price NUMERIC(16, 2);
+ALTER TABLE property ADD COLUMN IF NOT EXISTS sale_date  DATE;
+
 CREATE TABLE IF NOT EXISTS property_document (
     id            SERIAL PRIMARY KEY,
     property_id   INTEGER NOT NULL REFERENCES property(id) ON DELETE CASCADE,

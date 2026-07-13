@@ -18,10 +18,14 @@ interface Property {
   location: string | null; taluka: string | null;
   area: number | null; area_unit: string | null; deed_no: string | null;
   acquisition_date: string | null; ownership: string | null;
-  rrr: number | null; fair_value: number | null; notes: string | null;
+  rrr: number | null; fair_value: number | null;
+  sold: boolean; sale_price: number | null; sale_date: string | null;
+  notes: string | null;
   documents: PropDoc[]; missing_required: string[];
 }
-interface PropertiesResponse { count: number; total_fair_value: number; properties: Property[]; }
+interface PropertiesResponse {
+  count: number; total_fair_value: number; total_sold_value: number; properties: Property[];
+}
 
 interface PropertyForm {
   id: number | null; name: string; property_type: 'land' | 'building'; holder_id: number | '';
@@ -62,6 +66,10 @@ export default function PropertiesPage() {
   const [formErr, setFormErr]   = useState<string | null>(null);
   const [formSaved, setFormSaved] = useState(false);
   const [newEntity, setNewEntity] = useState('');
+  const [sellFor, setSellFor]     = useState<Property | null>(null);
+  const [sellPrice, setSellPrice] = useState('');
+  const [sellDate, setSellDate]   = useState('');
+  const [sellErr, setSellErr]     = useState<string | null>(null);
   const [uploadSel, setUploadSel] = useState<Record<number, string>>({}); // propId -> doc slug
   const fileRef                 = useRef<HTMLInputElement | null>(null);
   const pendingUpload           = useRef<{ propId: number; slug: string } | null>(null);
@@ -110,8 +118,12 @@ export default function PropertiesPage() {
     return all.filter(p => p.holder_id === tab);
   }, [data, tab, parentSub, parentIds]);
 
+  const active   = useMemo(() => visible.filter(p => !p.sold), [visible]);
+  const soldList = useMemo(() => visible.filter(p => p.sold), [visible]);
   const visibleTotal = useMemo(
-    () => visible.reduce((s, p) => s + (p.fair_value ?? 0), 0), [visible]);
+    () => active.reduce((s, p) => s + (p.fair_value ?? 0), 0), [active]);
+  const soldTotal = useMemo(
+    () => soldList.reduce((s, p) => s + (p.sale_price ?? 0), 0), [soldList]);
 
   const docTypesFor = useCallback((type: 'land' | 'building') =>
     type === 'building' ? docTypes : docTypes.filter(d => d.scope === 'land'), [docTypes]);
@@ -160,6 +172,29 @@ export default function PropertiesPage() {
       })
       .catch(e => setFormErr(e.message))
       .finally(() => setBusy(null));
+  };
+
+  const sellProperty = () => {
+    if (!sellFor) return;
+    const price = Number(sellPrice);
+    if (!price || price <= 0) { setSellErr('Enter the sale amount.'); return; }
+    setSellErr(null); setBusy('sell');
+    fetch(`${API_URL}/api/v1/properties/${sellFor.id}/sell`, {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sale_price: price, sale_date: sellDate || null }),
+    })
+      .then(r => { if (!r.ok) return r.json().then((e: { detail?: string }) => { throw new Error(e.detail || 'Could not mark sold'); }); return r.json(); })
+      .then(() => { setSellFor(null); setSellPrice(''); setSellDate(''); loadProperties(); })
+      .catch(e => setSellErr(e.message))
+      .finally(() => setBusy(null));
+  };
+
+  const unsellProperty = (p: Property) => {
+    if (!window.confirm(`Move "${p.name}" back to active (undo the sale)?`)) return;
+    fetch(`${API_URL}/api/v1/properties/${p.id}/unsell`, { method: 'POST', credentials: 'include' })
+      .then(r => { if (!r.ok) throw new Error('Undo failed'); loadProperties(); })
+      .catch(e => alert(e.message));
   };
 
   const deleteProperty = (p: Property) => {
@@ -292,8 +327,14 @@ export default function PropertiesPage() {
               </div>
               <div>
                 <p className="text-[11px] uppercase tracking-wide text-ghost">Properties</p>
-                <p className="text-base font-semibold text-ink tabular-nums">{visible.length}</p>
+                <p className="text-base font-semibold text-ink tabular-nums">{active.length}</p>
               </div>
+              {soldList.length > 0 && (
+                <div>
+                  <p className="text-[11px] uppercase tracking-wide text-ghost">Sold ({soldList.length})</p>
+                  <p className="text-base font-semibold text-ink tabular-nums">{fmtINR(soldTotal)}</p>
+                </div>
+              )}
               {isAdmin && (
                 <button onClick={() => { setFormErr(null); setFormSaved(false); setForm({ ...EMPTY_FORM }); }}
                         className="ml-auto text-xs bg-prime text-prime-fg px-3 py-1.5 rounded font-medium hover:opacity-90 transition-opacity">
@@ -322,12 +363,12 @@ export default function PropertiesPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {visible.length === 0 && (
+                  {active.length === 0 && (
                     <tr><td colSpan={isAdmin ? 13 : 12} className="px-3 py-12 text-center text-ghost">
                       No properties recorded{tab !== null ? ' for this entity' : ''} yet.
                     </td></tr>
                   )}
-                  {visible.map(p => {
+                  {active.map(p => {
                     const types      = docTypesFor(p.property_type);
                     const requiredN  = types.filter(t => !t.optional).length;
                     const missingN   = p.missing_required.length;
@@ -339,6 +380,7 @@ export default function PropertiesPage() {
                         uploadSel={uploadSel[p.id] ?? ''} busy={busy === `upload-${p.id}`}
                         onToggle={() => toggleExpand(p.id)}
                         onEdit={() => { setFormErr(null); setFormSaved(false); editForm(p); }}
+                        onSell={() => { setSellErr(null); setSellPrice(''); setSellDate(''); setSellFor(p); }}
                         onDelete={() => deleteProperty(p)}
                         onSelectDoc={slug => setUploadSel(s => ({ ...s, [p.id]: slug }))}
                         onUpload={slug => startUpload(p.id, slug)}
@@ -349,11 +391,90 @@ export default function PropertiesPage() {
                 </tbody>
               </table>
             </div>
+
+            {soldList.length > 0 && (
+              <div className="mt-8">
+                <h2 className="text-sm font-semibold text-ink mb-2 flex items-center gap-2">
+                  Sold
+                  <span className="text-[10px] uppercase tracking-wide px-1.5 py-px rounded border border-amber-500/40 text-amber-500">
+                    {soldList.length}
+                  </span>
+                </h2>
+                <div className="bg-card rounded-lg border border-rule overflow-x-auto">
+                  <table className="w-full text-xs min-w-[820px]">
+                    <thead>
+                      <tr className="border-b border-rule text-left text-[11px] uppercase tracking-wide text-ghost">
+                        <th className="px-3 py-2.5">Name</th>
+                        <th className="px-3 py-2.5">Entity</th>
+                        <th className="px-3 py-2.5">Location</th>
+                        <th className="px-3 py-2.5">Sold On</th>
+                        <th className="px-3 py-2.5 text-right">Sale Price</th>
+                        <th className="px-3 py-2.5">Documents</th>
+                        {isAdmin && <th className="px-3 py-2.5" />}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {soldList.map(p => {
+                        const types = docTypesFor(p.property_type);
+                        const isOpen = expanded.has(p.id);
+                        return (
+                          <SoldRows key={p.id} p={p} types={types} isOpen={isOpen} isAdmin={isAdmin}
+                            busy={busy === `upload-${p.id}`}
+                            onToggle={() => toggleExpand(p.id)}
+                            onUnsell={() => unsellProperty(p)}
+                            onDelete={() => deleteProperty(p)}
+                            onUpload={slug => startUpload(p.id, slug)}
+                            onDeleteDoc={deleteDoc} />
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="text-[11px] text-ghost mt-2">
+                  Sold properties no longer count in the fair-value total — their sale price shows
+                  here, on Realised Gains and in the overview.
+                </p>
+              </div>
+            )}
           </div>
         )}
 
         <p className="text-center text-xs text-ghost mt-8">IWS Finserv &copy; {new Date().getFullYear()}</p>
       </div>
+
+      {/* Mark-sold dialog */}
+      {sellFor && (
+        <div className="fixed inset-0 z-50 bg-ink/60 flex items-center justify-center p-4"
+             onClick={() => setSellFor(null)}>
+          <div className="bg-card rounded-lg border border-rule w-full max-w-sm p-5"
+               onClick={e => e.stopPropagation()} role="dialog" aria-label="Mark property sold">
+            <h2 className="text-base font-semibold text-ink mb-1">Mark as sold</h2>
+            <p className="text-xs text-ghost mb-4">{sellFor.name} — {sellFor.holder_name}</p>
+            <div className="flex flex-col gap-3 text-xs">
+              <label className="flex flex-col gap-1">
+                <span className="text-ghost">Sale amount (₹) *</span>
+                <input value={sellPrice} onChange={e => setSellPrice(e.target.value)}
+                       type="number" min="0" step="any" autoFocus
+                       className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" />
+              </label>
+              <label className="flex flex-col gap-1">
+                <span className="text-ghost">Sale date (defaults to today)</span>
+                <input value={sellDate} type="date" onChange={e => setSellDate(e.target.value)}
+                       className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" />
+              </label>
+            </div>
+            {sellErr && <p role="alert" className="text-xs text-red-500 mt-3">{sellErr}</p>}
+            <div className="flex justify-end gap-2 mt-5">
+              <button onClick={() => setSellFor(null)}
+                      className="text-xs border border-wire text-dim px-3 py-1.5 rounded hover:border-dim hover:text-ink transition-colors">Cancel</button>
+              <button onClick={sellProperty} disabled={busy === 'sell'}
+                      className="text-xs bg-prime text-prime-fg px-4 py-1.5 rounded font-medium hover:opacity-90 transition-opacity disabled:opacity-50">
+                {busy === 'sell' ? 'Saving…' : 'Mark Sold'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <input ref={fileRef} type="file" className="hidden" aria-hidden="true"
              accept=".pdf,.png,.jpg,.jpeg,.webp,.doc,.docx,.dwg,.dxf"
@@ -566,11 +687,11 @@ function DocChecklist({ types, docs, isAdmin, busy, columns, onUpload, onDeleteD
 
 // One property = the sheet row + (when expanded) the document checklist row.
 function PropertyRows({ p, types, isOpen, isAdmin, requiredN, missingN, valReports,
-                        uploadSel, busy, onToggle, onEdit, onDelete, onSelectDoc, onUpload, onDeleteDoc }: {
+                        uploadSel, busy, onToggle, onEdit, onSell, onDelete, onSelectDoc, onUpload, onDeleteDoc }: {
   p: Property; types: DocType[]; isOpen: boolean; isAdmin: boolean;
   requiredN: number; missingN: number; valReports: PropDoc[];
   uploadSel: string; busy: boolean;
-  onToggle: () => void; onEdit: () => void; onDelete: () => void;
+  onToggle: () => void; onEdit: () => void; onSell: () => void; onDelete: () => void;
   onSelectDoc: (slug: string) => void; onUpload: (slug: string) => void;
   onDeleteDoc: (d: PropDoc) => void;
 }) {
@@ -626,6 +747,7 @@ function PropertyRows({ p, types, isOpen, isAdmin, requiredN, missingN, valRepor
         {isAdmin && (
           <td className="px-3 py-2.5 whitespace-nowrap">
             <button onClick={onEdit} className="text-ghost hover:text-ink text-[11px] mr-2">Edit</button>
+            <button onClick={onSell} className="text-ghost hover:text-amber-500 text-[11px] mr-2">Sell</button>
             <button onClick={onDelete} className="text-ghost hover:text-red-500 text-[11px]">Delete</button>
           </td>
         )}
@@ -665,6 +787,53 @@ function PropertyRows({ p, types, isOpen, isAdmin, requiredN, missingN, valRepor
                 </span>
               )}
             </div>
+            <DocChecklist types={types} docs={p.documents} isAdmin={isAdmin} busy={busy}
+                          columns="columns-1 md:columns-2 xl:columns-3"
+                          onUpload={onUpload} onDeleteDoc={onDeleteDoc} />
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+// A sold property: compact row (sale date/price instead of valuation columns)
+// with the same expandable document checklist.
+function SoldRows({ p, types, isOpen, isAdmin, busy, onToggle, onUnsell, onDelete, onUpload, onDeleteDoc }: {
+  p: Property; types: DocType[]; isOpen: boolean; isAdmin: boolean; busy: boolean;
+  onToggle: () => void; onUnsell: () => void; onDelete: () => void;
+  onUpload: (slug: string) => void; onDeleteDoc: (d: PropDoc) => void;
+}) {
+  return (
+    <>
+      <tr className="border-b border-rule align-top hover:bg-page/50 transition-colors">
+        <td className="px-3 py-2.5">
+          <p className="font-medium text-dim">{p.name}</p>
+          <span className="inline-block mt-0.5 text-[10px] uppercase tracking-wide px-1.5 py-px rounded border border-amber-500/40 text-amber-500">
+            sold · {p.property_type}
+          </span>
+        </td>
+        <td className="px-3 py-2.5 text-dim">{p.holder_name}</td>
+        <td className="px-3 py-2.5 text-dim">{p.location || '—'}</td>
+        <td className="px-3 py-2.5 text-dim whitespace-nowrap">{p.sale_date || '—'}</td>
+        <td className="px-3 py-2.5 text-right tabular-nums font-semibold text-ink">{fmtINR(p.sale_price)}</td>
+        <td className="px-3 py-2.5">
+          <button onClick={onToggle} aria-expanded={isOpen}
+                  className="flex items-center gap-1.5 text-dim hover:text-ink transition-colors">
+            <span className="tabular-nums">{p.documents.length} file{p.documents.length === 1 ? '' : 's'}</span>
+            <span className="text-ghost">{isOpen ? '▾' : '▸'}</span>
+          </button>
+        </td>
+        {isAdmin && (
+          <td className="px-3 py-2.5 whitespace-nowrap">
+            <button onClick={onUnsell} className="text-ghost hover:text-ink text-[11px] mr-2">Undo sale</button>
+            <button onClick={onDelete} className="text-ghost hover:text-red-500 text-[11px]">Delete</button>
+          </td>
+        )}
+      </tr>
+      {isOpen && (
+        <tr className="border-b border-rule bg-page/40">
+          <td colSpan={isAdmin ? 7 : 6} className="px-4 sm:px-6 py-3">
             <DocChecklist types={types} docs={p.documents} isAdmin={isAdmin} busy={busy}
                           columns="columns-1 md:columns-2 xl:columns-3"
                           onUpload={onUpload} onDeleteDoc={onDeleteDoc} />

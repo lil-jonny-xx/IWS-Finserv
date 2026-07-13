@@ -2833,16 +2833,18 @@ def _fetch_property_overview_rows(conn, entity_id: Optional[int] = None):
     per-entity bars line up; other holders (LLPs, trusts, parent companies)
     appear as their own synthetic entities with a negative id — the dashboard
     only uses entity_id as a list key. No cost basis or ledger exists, so
-    invested is 0 and pnl/ytd/weekly stay 0.
+    invested is 0 and pnl/ytd/weekly stay 0. Sold properties contribute their
+    sale price instead of a fair value (the asset became realised proceeds).
     """
     cur = conn.cursor()
     cur.execute("""
-        SELECT pe.id AS holder_id, pe.name AS holder_name,
-               e.id AS sys_entity_id, SUM(p.area * p.rrr) AS base
+        SELECT pe.id AS holder_id, pe.name AS holder_name, e.id AS sys_entity_id,
+               SUM(CASE WHEN NOT p.sold THEN p.area * p.rrr END) AS base,
+               SUM(CASE WHEN p.sold THEN p.sale_price END)       AS sold_value
         FROM property p
         JOIN property_entity pe ON pe.id = p.holder_id
         LEFT JOIN entity e ON e.entity_name = pe.name
-        WHERE p.area IS NOT NULL AND p.rrr IS NOT NULL
+        WHERE (p.area IS NOT NULL AND p.rrr IS NOT NULL) OR p.sold
         GROUP BY pe.id, pe.name, e.id
     """)
     rows = cur.fetchall()
@@ -2853,7 +2855,11 @@ def _fetch_property_overview_rows(conn, entity_id: Optional[int] = None):
         sys_id = r["sys_entity_id"]
         if entity_id is not None and sys_id != entity_id:
             continue   # member scope: only properties held by their own entity
-        val = float(r["base"]) * property_docs.FAIR_VALUE_MULTIPLIER
+        fair = float(r["base"]) * property_docs.FAIR_VALUE_MULTIPLIER \
+            if r["base"] is not None else 0.0
+        val = fair + (float(r["sold_value"]) if r["sold_value"] is not None else 0.0)
+        if val <= 0:
+            continue
         out.append({
             "entity_id":          sys_id if sys_id is not None else -r["holder_id"],
             "entity_name":        r["holder_name"],
@@ -4104,6 +4110,9 @@ def _property_row(r: dict, docs: list) -> dict:
         "ownership":        r["ownership"],
         "rrr":              rrr,
         "fair_value":       fair,
+        "sold":             r["sold"],
+        "sale_price":       float(r["sale_price"]) if r["sale_price"] is not None else None,
+        "sale_date":        r["sale_date"].isoformat() if r["sale_date"] else None,
         "notes":            r["notes"],
         "documents":        docs,
         "missing_required": [s for s in required if s not in uploaded],
@@ -4150,9 +4159,11 @@ def list_properties(request: Request, holder_id: Optional[int] = None,
                     "uploaded_at":   d["uploaded_at"].isoformat() if d["uploaded_at"] else None,
                 })
         cur.close()
-        rows = [_property_row(p, docs_by_pid.get(p["id"], [])) for p in props]
-        total = sum(r["fair_value"] for r in rows if r["fair_value"] is not None)
-        return {"count": len(rows), "total_fair_value": round(total, 2), "properties": rows}
+        rows  = [_property_row(p, docs_by_pid.get(p["id"], [])) for p in props]
+        total = sum(r["fair_value"] for r in rows if r["fair_value"] is not None and not r["sold"])
+        sold  = sum(r["sale_price"] for r in rows if r["sold"] and r["sale_price"] is not None)
+        return {"count": len(rows), "total_fair_value": round(total, 2),
+                "total_sold_value": round(sold, 2), "properties": rows}
     except HTTPException:
         raise
     except Exception as e:
@@ -4314,6 +4325,97 @@ def delete_property(prop_id: int, request: Request,
         if conn:
             conn.rollback()
         logger.error(f"Error in DELETE /api/v1/properties/{prop_id}: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+class PropertySellRequest(BaseModel):
+    sale_price: float
+    sale_date:  Optional[str] = None   # YYYY-MM-DD, defaults to today
+
+
+@app.post("/api/v1/properties/{prop_id}/sell")
+@limiter.limit("30/minute")
+def sell_property(prop_id: int, request: Request, body: PropertySellRequest,
+                  authorization: Optional[str] = Header(None)):
+    """Mark a property sold (admin only). It moves to the page's Sold section,
+    stops contributing fair value, and the sale price feeds Realised Gains and
+    the overview instead."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        _require_admin(cur, payload)
+        if body.sale_price <= 0:
+            raise HTTPException(status_code=422, detail="sale_price must be positive")
+        sale_date = body.sale_date or date.today().isoformat()
+        try:
+            datetime.strptime(sale_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(status_code=422, detail="sale_date must be YYYY-MM-DD")
+        user_id = _property_user_id(cur, payload)
+        cur.execute(
+            """UPDATE property SET sold = TRUE, sale_price = %s, sale_date = %s,
+                   updated_by = %s, updated_at = NOW()
+               WHERE id = %s RETURNING name""",
+            (body.sale_price, sale_date, user_id, prop_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Property not found")
+        write_audit_log(conn, user_id, "PROPERTY_SELL", "property", prop_id,
+                        f"{row['name']} @ {body.sale_price}")
+        conn.commit()
+        cur.close()
+        return {"sold": True}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/properties/{prop_id}/sell: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/properties/{prop_id}/unsell")
+@limiter.limit("30/minute")
+def unsell_property(prop_id: int, request: Request,
+                    authorization: Optional[str] = Header(None)):
+    """Undo an accidental sale (admin only) — restores the property to active."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        _require_admin(cur, payload)
+        user_id = _property_user_id(cur, payload)
+        cur.execute(
+            """UPDATE property SET sold = FALSE, sale_price = NULL, sale_date = NULL,
+                   updated_by = %s, updated_at = NOW()
+               WHERE id = %s RETURNING name""",
+            (user_id, prop_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Property not found")
+        write_audit_log(conn, user_id, "PROPERTY_UNSELL", "property", prop_id, row["name"])
+        conn.commit()
+        cur.close()
+        return {"sold": False}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/properties/{prop_id}/unsell: {e}")
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
     finally:
         release_db_connection(conn)
@@ -5616,6 +5718,42 @@ def get_realised_gains(
                     "lt_pnl":          r.get("lt_pnl"),
                     "return_pct":      r["return_pct"],
                 })
+
+        # Sold properties from the register (own holder universe — companies /
+        # trusts). No cost basis exists, so only the sale proceeds are shown
+        # (pnl stays empty). Members see just the holders mapping to their
+        # entity; admins see every holder.
+        today = date.today()
+        fy_start = date(today.year if today.month >= 4 else today.year - 1, 4, 1)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT p.name, p.sale_date, p.sale_price,
+                   pe.name AS holder_name, e.id AS sys_entity_id
+            FROM property p
+            JOIN property_entity pe ON pe.id = p.holder_id
+            LEFT JOIN entity e ON e.entity_name = pe.name
+            WHERE p.sold
+            ORDER BY p.sale_date DESC NULLS LAST
+        """)
+        for r in cur.fetchall():
+            if eid is not None and r["sys_entity_id"] != eid:
+                continue
+            if not since_inception and (r["sale_date"] is None or r["sale_date"] < fy_start):
+                continue
+            out.append({
+                "entity":          r["holder_name"],
+                "category":        "Real Estate",
+                "group":           "Real Estate",
+                "security_name":   r["name"],
+                "purchase_amount": None,
+                "sale_date":       r["sale_date"].isoformat() if r["sale_date"] else "",
+                "sale_amount":     float(r["sale_price"]) if r["sale_price"] is not None else None,
+                "pnl":             None,
+                "st_pnl":          None,
+                "lt_pnl":          None,
+                "return_pct":      None,
+            })
+        cur.close()
         return out
     except HTTPException:
         raise
