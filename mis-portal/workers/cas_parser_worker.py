@@ -60,6 +60,7 @@ NAME_PATTERNS: list[tuple[str, str]] = [
     ("iws fincorp",            "IWS Fincorp"),
     ("stuti dhruv rajani",     "SDR"),
     ("rajani corp",            "Rajani Corp"),
+    ("harish dhirajlal rajani", "HDR"),
 ]
 
 

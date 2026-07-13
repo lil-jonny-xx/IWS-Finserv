@@ -715,6 +715,7 @@ BROKER_ENTITY_MAP = [
     ("HHR",         angel_one, "angel_one"),
     ("HHR",         dhan,      "dhan"),
     ("SDR",         zerodha,   "zerodha"),
+    ("HDR",         zerodha,   "zerodha"),
     ("Rajani Corp", dhan,      "dhan"),
 ]
 

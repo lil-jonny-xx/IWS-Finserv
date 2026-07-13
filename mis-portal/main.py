@@ -6081,7 +6081,7 @@ async def dhan_postback(request: Request):
 
 # Entity names whose Zerodha creds live in .env (ZERODHA_<prefix>_*). Resolved via
 # zerodha._env so the same _ENV_PREFIX mapping the daemon uses applies here too.
-_ZERODHA_PB_ENTITIES = ["DHR", "HHR", "SDR", "Rajani Corp"]
+_ZERODHA_PB_ENTITIES = ["DHR", "HHR", "SDR", "Rajani Corp", "HDR"]
 _zerodha_pb_routes_cache: Optional[dict] = None
 
 

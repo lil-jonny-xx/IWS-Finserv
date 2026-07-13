@@ -131,7 +131,8 @@ SEED = [
     ("Imperial Northstar Pvt. Ltd.", None, "main",   22),
     ("Imperial Northstar Exim LLP", None,  "main",   23),
     ("Sharmila Harish Rajani",      "SHR", "main",   24),
-    ("Harish Dhirajlal Rajani",     "HDR", "main",   25),
+    # HDR became a system entity (entity table) on 2026-07-13 — his holder row
+    # was renamed to "HDR" and is now mirrored at runtime like DHR/HHR/SDR.
     ("Rajani Foundation Trust",     None,  "main",   26),
     ("Harish & Sharmila Trust",     None,  "main",   27),
     ("DMC",                         None,  "parent", 50),

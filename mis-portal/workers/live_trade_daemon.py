@@ -345,6 +345,7 @@ ACCOUNTS = {
     "zerodha-hhr":    ("zerodha",   "HHR"),
     "zerodha-sdr":    ("zerodha",   "SDR"),
     "zerodha-rajani": ("zerodha",   "Rajani Corp"),
+    "zerodha-hdr":    ("zerodha",   "HDR"),
     "angel-dhr":      ("angel_one", "DHR"),
     "angel-hhr":      ("angel_one", "HHR"),
     "dhan-hhr":       ("dhan",      "HHR"),

@@ -1,7 +1,7 @@
 """
 Zerodha Kite Connect broker wrapper.
 
-Entities : DHR, HHR, SDR, Rajani Corp  (separate Kite Connect app per account, ₹500/month each)
+Entities : DHR, HHR, SDR, Rajani Corp, HDR  (separate Kite Connect app per account, ₹500/month each)
 Auth     : Playwright login (headless) + pyotp TOTP → request_token
            → kite.generate_session() → access_token (expires 6 AM IST daily)
            Refreshed automatically by token_refresh_worker.py at 6:30 AM IST.
@@ -33,7 +33,7 @@ from equity.models import EquityHolding
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_ENTITIES = ["DHR", "HHR", "SDR", "Rajani Corp"]
+SUPPORTED_ENTITIES = ["DHR", "HHR", "SDR", "Rajani Corp", "HDR"]
 
 # Maps entity_name (DB) → env var prefix when they differ
 _ENV_PREFIX = {
