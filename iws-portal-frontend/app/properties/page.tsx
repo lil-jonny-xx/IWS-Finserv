@@ -229,7 +229,7 @@ export default function PropertiesPage() {
           let detail = '';
           try { detail = (await r.json())?.detail || ''; } catch { /* non-JSON body */ }
           throw new Error(detail || (r.status === 413
-            ? 'File too large for the server upload limit (max 25 MB).'
+            ? 'File too large for the server upload limit (max 200 MB).'
             : `Upload failed (HTTP ${r.status})`));
         }
         return r.json();

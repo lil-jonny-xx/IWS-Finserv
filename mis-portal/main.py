@@ -3542,7 +3542,7 @@ def delete_manual_input(
 
 UPLOADS_ROOT          = os.getenv("UPLOADS_DIR", "/var/www/uploads")
 MANUAL_UPLOAD_SUBDIR  = "manual"
-MAX_UPLOAD_BYTES      = 25 * 1024 * 1024   # 25 MB per file
+MAX_UPLOAD_BYTES      = 200 * 1024 * 1024  # 200 MB per file (nginx client_max_body_size must match)
 ATTACHMENT_KINDS      = {"art_image", "deed", "plan", "document"}
 
 
@@ -3606,7 +3606,7 @@ async def upload_manual_attachment(
 
         data = await file.read(MAX_UPLOAD_BYTES + 1)
         if len(data) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="File too large (max 25 MB)")
+            raise HTTPException(status_code=413, detail="File too large (max 200 MB)")
         if not data:
             raise HTTPException(status_code=422, detail="Empty file")
 
@@ -4447,7 +4447,7 @@ async def upload_property_document(
 
         data = await file.read(MAX_UPLOAD_BYTES + 1)
         if len(data) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="File too large (max 25 MB)")
+            raise HTTPException(status_code=413, detail="File too large (max 200 MB)")
         if not data:
             raise HTTPException(status_code=422, detail="Empty file")
 
