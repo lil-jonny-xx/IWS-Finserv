@@ -71,6 +71,34 @@ ALTER TABLE property ADD COLUMN IF NOT EXISTS sold       BOOLEAN NOT NULL DEFAUL
 ALTER TABLE property ADD COLUMN IF NOT EXISTS sale_price NUMERIC(16, 2);
 ALTER TABLE property ADD COLUMN IF NOT EXISTS sale_date  DATE;
 
+-- Purchase cost + hand-entered market value (2026-07-13). Fair value stays
+-- derived (area x RRR x 1.75); market_value, when entered, supersedes it in
+-- the overview. purchase_price gives sold properties a real P&L.
+ALTER TABLE property ADD COLUMN IF NOT EXISTS purchase_price NUMERIC(16, 2);
+ALTER TABLE property ADD COLUMN IF NOT EXISTS market_value   NUMERIC(16, 2);
+
+-- Joint ownership: a property can be held by several entities with a % split.
+-- property.holder_id remains the primary holder (largest share) for ordering.
+CREATE TABLE IF NOT EXISTS property_owner (
+    id          SERIAL PRIMARY KEY,
+    property_id INTEGER NOT NULL REFERENCES property(id) ON DELETE CASCADE,
+    holder_id   INTEGER NOT NULL REFERENCES property_entity(id),
+    pct         NUMERIC(6, 2) NOT NULL DEFAULT 100,
+    UNIQUE (property_id, holder_id)
+);
+
+-- Building floors: label + area per floor; floor plans attach to a floor via
+-- property_document.floor_id (kept when a doc is a floor_plan).
+CREATE TABLE IF NOT EXISTS property_floor (
+    id          SERIAL PRIMARY KEY,
+    property_id INTEGER NOT NULL REFERENCES property(id) ON DELETE CASCADE,
+    floor_label TEXT NOT NULL,
+    area        NUMERIC(14, 2),
+    sort_order  INTEGER NOT NULL DEFAULT 0
+);
+ALTER TABLE property_document
+    ADD COLUMN IF NOT EXISTS floor_id INTEGER REFERENCES property_floor(id) ON DELETE SET NULL;
+
 CREATE TABLE IF NOT EXISTS property_document (
     id            SERIAL PRIMARY KEY,
     property_id   INTEGER NOT NULL REFERENCES property(id) ON DELETE CASCADE,
@@ -126,6 +154,13 @@ def main():
                        VALUES (%s, %s, %s, %s) ON CONFLICT (name) DO NOTHING""",
                     (name, code, grp, order),
                 )
+        with conn.cursor() as cur:
+            # Backfill: every pre-ownership-table property is 100% its holder's.
+            cur.execute("""
+                INSERT INTO property_owner (property_id, holder_id, pct)
+                SELECT p.id, p.holder_id, 100 FROM property p
+                WHERE NOT EXISTS (SELECT 1 FROM property_owner o WHERE o.property_id = p.id)
+            """)
         conn.commit()
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM property_entity")

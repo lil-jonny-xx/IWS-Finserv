@@ -9,15 +9,20 @@ interface User { role: string; full_name: string; entity_id?: number; }
 interface Holder { id: number; name: string; short_code: string | null; grp: 'main' | 'parent'; is_custom: boolean; }
 interface DocType { slug: string; label: string; scope: 'land' | 'building'; optional: boolean; parent: string | null; }
 interface PropDoc {
-  id: number; doc_type: string; original_name: string | null; mime: string | null;
+  id: number; doc_type: string; floor_id: number | null;
+  original_name: string | null; mime: string | null;
   size_bytes: number | null; converted: boolean; has_original: boolean; uploaded_at: string | null;
 }
+interface Owner { holder_id: number; name: string; pct: number; }
+interface Floor { id: number; floor_label: string; area: number | null; }
 interface Property {
   id: number; name: string; property_type: 'land' | 'building';
   holder_id: number; holder_name: string;
+  owners: Owner[]; floors: Floor[];
   location: string | null; taluka: string | null;
   area: number | null; area_unit: string | null; deed_no: string | null;
   acquisition_date: string | null; ownership: string | null;
+  purchase_price: number | null; market_value: number | null;
   rrr: number | null; fair_value: number | null;
   sold: boolean; sale_price: number | null; sale_date: string | null;
   notes: string | null;
@@ -27,15 +32,27 @@ interface PropertiesResponse {
   count: number; total_fair_value: number; total_sold_value: number; properties: Property[];
 }
 
+interface OwnerForm { holder_id: number | ''; pct: string; }
+interface FloorForm { id: number | null; floor_label: string; area: string; }
 interface PropertyForm {
-  id: number | null; name: string; property_type: 'land' | 'building'; holder_id: number | '';
+  id: number | null; name: string; property_type: 'land' | 'building';
+  owners: OwnerForm[]; floors: FloorForm[];
   location: string; taluka: string; area: string; area_unit: string; deed_no: string;
-  acquisition_date: string; ownership: string; rrr: string; notes: string;
+  acquisition_date: string; ownership: string;
+  purchase_price: string; market_value: string; rrr: string; notes: string;
 }
 const EMPTY_FORM: PropertyForm = {
-  id: null, name: '', property_type: 'land', holder_id: '', location: '', taluka: '',
-  area: '', area_unit: 'sq m', deed_no: '', acquisition_date: '', ownership: '', rrr: '', notes: '',
+  id: null, name: '', property_type: 'land',
+  owners: [{ holder_id: '', pct: '100' }], floors: [],
+  location: '', taluka: '', area: '', area_unit: 'sq m', deed_no: '',
+  acquisition_date: '', ownership: '', purchase_price: '', market_value: '', rrr: '', notes: '',
 };
+
+function ownersLabel(p: Property): string {
+  if (!p.owners || p.owners.length === 0) return p.holder_name;
+  if (p.owners.length === 1) return p.owners[0].name;
+  return p.owners.map(o => `${o.name} ${o.pct % 1 === 0 ? o.pct.toFixed(0) : o.pct}%`).join(' · ');
+}
 
 function fmtINR(n: number | null | undefined): string {
   if (n == null) return '—';
@@ -72,7 +89,7 @@ export default function PropertiesPage() {
   const [sellErr, setSellErr]     = useState<string | null>(null);
   const [uploadSel, setUploadSel] = useState<Record<number, string>>({}); // propId -> doc slug
   const fileRef                 = useRef<HTMLInputElement | null>(null);
-  const pendingUpload           = useRef<{ propId: number; slug: string } | null>(null);
+  const pendingUpload           = useRef<{ propId: number; slug: string; floorId?: number } | null>(null);
 
   const isAdmin = user?.role === 'admin';
 
@@ -110,12 +127,16 @@ export default function PropertiesPage() {
 
   const visible = useMemo(() => {
     const all = data?.properties ?? [];
+    // A jointly-owned property shows under every owning entity's tab.
+    const ownedBy = (p: Property, hid: number) =>
+      p.holder_id === hid || (p.owners ?? []).some(o => o.holder_id === hid);
     if (tab === null) return all;
     if (tab === 'parent') {
-      return parentSub === null ? all.filter(p => parentIds.has(p.holder_id))
-                                : all.filter(p => p.holder_id === parentSub);
+      return parentSub === null
+        ? all.filter(p => (p.owners ?? []).some(o => parentIds.has(o.holder_id)) || parentIds.has(p.holder_id))
+        : all.filter(p => ownedBy(p, parentSub));
     }
-    return all.filter(p => p.holder_id === tab);
+    return all.filter(p => ownedBy(p, tab));
   }, [data, tab, parentSub, parentIds]);
 
   const active   = useMemo(() => visible.filter(p => !p.sold), [visible]);
@@ -147,14 +168,28 @@ export default function PropertiesPage() {
 
   const saveProperty = () => {
     if (!form) return;
-    if (!form.name.trim() || form.holder_id === '') { setFormErr('Name and entity are required.'); return; }
+    if (!form.name.trim()) { setFormErr('Name is required.'); return; }
+    const owners = form.owners.filter(o => o.holder_id !== '');
+    if (owners.length === 0) { setFormErr('Pick at least one owning entity.'); return; }
+    const pctSum = owners.reduce((s, o) => s + (Number(o.pct) || 0), 0);
+    if (Math.abs(pctSum - 100) > 0.1) { setFormErr(`Ownership must total 100% (currently ${pctSum}%).`); return; }
+    const floors = form.property_type === 'building'
+      ? form.floors.filter(f => f.floor_label.trim()) : [];
     setFormErr(null); setBusy('save');
+    const primary = [...owners].sort((a, b) => Number(b.pct) - Number(a.pct))[0];
     const body = {
-      name: form.name.trim(), property_type: form.property_type, holder_id: form.holder_id,
+      name: form.name.trim(), property_type: form.property_type,
+      holder_id: primary.holder_id,
+      owners: owners.map(o => ({ holder_id: o.holder_id, pct: Number(o.pct) || 0 })),
+      floors: floors.map(f => ({ id: f.id, floor_label: f.floor_label.trim(),
+                                 area: f.area ? Number(f.area) : null })),
       location: form.location || null, taluka: form.taluka || null,
       area: form.area ? Number(form.area) : null, area_unit: form.area_unit || 'sq m',
       deed_no: form.deed_no || null, acquisition_date: form.acquisition_date || null,
-      ownership: form.ownership || null, rrr: form.rrr ? Number(form.rrr) : null,
+      ownership: form.ownership || null,
+      purchase_price: form.purchase_price ? Number(form.purchase_price) : null,
+      market_value: form.market_value ? Number(form.market_value) : null,
+      rrr: form.rrr ? Number(form.rrr) : null,
       notes: form.notes || null,
     };
     fetch(`${API_URL}/api/v1/properties${form.id != null ? `/${form.id}` : ''}`, {
@@ -204,9 +239,9 @@ export default function PropertiesPage() {
       .catch(e => alert(e.message));
   };
 
-  const startUpload = (propId: number, slug: string) => {
+  const startUpload = (propId: number, slug: string, floorId?: number) => {
     if (!slug) { alert('Choose a document type first.'); return; }
-    pendingUpload.current = { propId, slug };
+    pendingUpload.current = { propId, slug, floorId };
     fileRef.current?.click();
   };
 
@@ -216,6 +251,7 @@ export default function PropertiesPage() {
     if (!files || files.length === 0 || !target) return;
     const fd = new FormData();
     fd.append('doc_type', target.slug);
+    if (target.floorId != null) fd.append('floor_id', String(target.floorId));
     fd.append('file', files[0]);
     setBusy(`upload-${target.propId}`);
     fetch(`${API_URL}/api/v1/properties/${target.propId}/documents`, {
@@ -256,15 +292,25 @@ export default function PropertiesPage() {
       active ? 'bg-prime text-prime-fg' : 'bg-card border border-rule text-dim hover:border-dim hover:text-ink'}`;
 
   const editForm = (p: Property) => setForm({
-    id: p.id, name: p.name, property_type: p.property_type, holder_id: p.holder_id,
+    id: p.id, name: p.name, property_type: p.property_type,
+    owners: (p.owners?.length ? p.owners : [{ holder_id: p.holder_id, name: p.holder_name, pct: 100 }])
+      .map(o => ({ holder_id: o.holder_id, pct: String(o.pct) })),
+    floors: (p.floors ?? []).map(f => ({ id: f.id, floor_label: f.floor_label,
+                                         area: f.area != null ? String(f.area) : '' })),
     location: p.location ?? '', taluka: p.taluka ?? '',
     area: p.area != null ? String(p.area) : '', area_unit: p.area_unit ?? 'sq m',
     deed_no: p.deed_no ?? '', acquisition_date: p.acquisition_date ?? '',
-    ownership: p.ownership ?? '', rrr: p.rrr != null ? String(p.rrr) : '', notes: p.notes ?? '',
+    ownership: p.ownership ?? '',
+    purchase_price: p.purchase_price != null ? String(p.purchase_price) : '',
+    market_value: p.market_value != null ? String(p.market_value) : '',
+    rrr: p.rrr != null ? String(p.rrr) : '', notes: p.notes ?? '',
   });
 
   const formFair = form && form.area && form.rrr
     ? Number(form.area) * Number(form.rrr) * fairMult : null;
+
+  const dataDocs = (pid: number): PropDoc[] =>
+    data?.properties.find(x => x.id === pid)?.documents ?? [];
 
   return (
     <main id="main-content" className="min-h-screen bg-page p-4 sm:p-8">
@@ -356,7 +402,7 @@ export default function PropertiesPage() {
             </div>
 
             <div className="bg-card rounded-lg border border-rule overflow-x-auto">
-              <table className="w-full text-xs min-w-[1100px]">
+              <table className="w-full text-xs min-w-[1300px]">
                 <thead>
                   <tr className="border-b border-rule text-left text-[11px] uppercase tracking-wide text-ghost">
                     <th className="px-3 py-2.5">Name</th>
@@ -367,8 +413,10 @@ export default function PropertiesPage() {
                     <th className="px-3 py-2.5">Deed</th>
                     <th className="px-3 py-2.5">Acquired</th>
                     <th className="px-3 py-2.5">Ownership</th>
+                    <th className="px-3 py-2.5 text-right">Purchase</th>
                     <th className="px-3 py-2.5 text-right">RRR</th>
                     <th className="px-3 py-2.5 text-right">Fair Value</th>
+                    <th className="px-3 py-2.5 text-right">Market Value</th>
                     <th className="px-3 py-2.5">Valuation Report</th>
                     <th className="px-3 py-2.5">Documents</th>
                     {isAdmin && <th className="px-3 py-2.5" />}
@@ -376,7 +424,7 @@ export default function PropertiesPage() {
                 </thead>
                 <tbody>
                   {active.length === 0 && (
-                    <tr><td colSpan={isAdmin ? 13 : 12} className="px-3 py-12 text-center text-ghost">
+                    <tr><td colSpan={isAdmin ? 15 : 14} className="px-3 py-12 text-center text-ghost">
                       No properties recorded{tab !== null ? ' for this entity' : ''} yet.
                     </td></tr>
                   )}
@@ -516,20 +564,38 @@ export default function PropertiesPage() {
                   <option value="building">Building</option>
                 </select>
               </label>
-              <label className="flex flex-col gap-1">
-                <span className="text-ghost">Holding entity *</span>
-                <select value={form.holder_id}
-                        onChange={e => setForm({ ...form, holder_id: e.target.value ? Number(e.target.value) : '' })}
-                        className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink">
-                  <option value="">— select —</option>
-                  <optgroup label="Entities">
-                    {mainHolders.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}
-                  </optgroup>
-                  <optgroup label="Parent Companies">
-                    {parentHolders.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}
-                  </optgroup>
-                </select>
-              </label>
+              <div className="flex flex-col gap-1 sm:col-span-2">
+                <span className="text-ghost">Owning entities * <span className="normal-case">(must total 100%)</span></span>
+                {form.owners.map((o, i) => (
+                  <div key={i} className="flex items-center gap-1.5">
+                    <select value={o.holder_id}
+                            onChange={e => setForm({ ...form, owners: form.owners.map((x, j) =>
+                              j === i ? { ...x, holder_id: e.target.value ? Number(e.target.value) : '' } : x) })}
+                            className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink flex-1">
+                      <option value="">— select entity —</option>
+                      <optgroup label="Entities">
+                        {mainHolders.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}
+                      </optgroup>
+                      <optgroup label="Parent Companies">
+                        {parentHolders.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}
+                      </optgroup>
+                    </select>
+                    <input value={o.pct} type="number" min="0" max="100" step="any" aria-label="Ownership %"
+                           onChange={e => setForm({ ...form, owners: form.owners.map((x, j) =>
+                             j === i ? { ...x, pct: e.target.value } : x) })}
+                           className="bg-page border border-rule rounded px-2 py-1.5 text-ink w-20 text-right" />
+                    <span className="text-ghost">%</span>
+                    {form.owners.length > 1 && (
+                      <button onClick={() => setForm({ ...form, owners: form.owners.filter((_, j) => j !== i) })}
+                              aria-label="Remove owner" className="text-ghost hover:text-red-500">✕</button>
+                    )}
+                  </div>
+                ))}
+                <button onClick={() => setForm({ ...form, owners: [...form.owners, { holder_id: '', pct: '' }] })}
+                        className="self-start text-[11px] border border-wire text-dim px-2 py-0.5 rounded hover:border-dim hover:text-ink transition-colors">
+                  + Add joint owner
+                </button>
+              </div>
               <label className="flex flex-col gap-1">
                 <span className="text-ghost">Location</span>
                 <input value={form.location} onChange={e => setForm({ ...form, location: e.target.value })}
@@ -573,6 +639,12 @@ export default function PropertiesPage() {
                        className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" />
               </label>
               <label className="flex flex-col gap-1">
+                <span className="text-ghost">Purchase price (₹)</span>
+                <input value={form.purchase_price} onChange={e => setForm({ ...form, purchase_price: e.target.value })}
+                       type="number" min="0" step="any"
+                       className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" />
+              </label>
+              <label className="flex flex-col gap-1">
                 <span className="text-ghost">RRR (circle rate, ₹ per {form.area_unit})</span>
                 <input value={form.rrr} onChange={e => setForm({ ...form, rrr: e.target.value })}
                        type="number" min="0" step="any"
@@ -582,6 +654,58 @@ export default function PropertiesPage() {
                 <span className="text-ghost">Fair value ({fairMult}× RRR × area)</span>
                 <span className="px-2.5 py-1.5 text-ink font-semibold tabular-nums">{fmtINR(formFair)}</span>
               </div>
+              <label className="flex flex-col gap-1">
+                <span className="text-ghost">Market value (₹, optional — used over fair value when set)</span>
+                <input value={form.market_value} onChange={e => setForm({ ...form, market_value: e.target.value })}
+                       type="number" min="0" step="any"
+                       className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" />
+              </label>
+              {form.property_type === 'building' && (
+                <div className="flex flex-col gap-1 sm:col-span-2">
+                  <span className="text-ghost">Floors — label, area{form.id != null ? ' & floor plan' : ''}</span>
+                  {form.floors.map((f, i) => {
+                    const plans = form.id != null && f.id != null
+                      ? (dataDocs(form.id).filter(d => d.doc_type === 'floor_plan' && d.floor_id === f.id))
+                      : [];
+                    return (
+                      <div key={i} className="flex flex-wrap items-center gap-1.5">
+                        <input value={f.floor_label} placeholder="e.g. Ground floor"
+                               onChange={e => setForm({ ...form, floors: form.floors.map((x, j) =>
+                                 j === i ? { ...x, floor_label: e.target.value } : x) })}
+                               className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink flex-1 min-w-[10rem]" />
+                        <input value={f.area} type="number" min="0" step="any" placeholder="Area"
+                               aria-label="Floor area"
+                               onChange={e => setForm({ ...form, floors: form.floors.map((x, j) =>
+                                 j === i ? { ...x, area: e.target.value } : x) })}
+                               className="bg-page border border-rule rounded px-2 py-1.5 text-ink w-24 text-right" />
+                        <span className="text-ghost">{form.area_unit}</span>
+                        {form.id != null && f.id != null && (
+                          <button onClick={() => startUpload(form.id!, 'floor_plan', f.id!)}
+                                  disabled={busy === `upload-${form.id}`}
+                                  className="text-[10px] border border-wire text-dim px-1.5 py-0.5 rounded hover:border-dim hover:text-ink transition-colors disabled:opacity-50">
+                            Upload plan
+                          </button>
+                        )}
+                        {plans.map(d => (
+                          <a key={d.id} href={docUrl(d.id)} target="_blank" rel="noopener noreferrer"
+                             className="text-prime hover:underline text-[11px] truncate max-w-[10rem]">
+                            {d.original_name || 'plan'}
+                          </a>
+                        ))}
+                        <button onClick={() => setForm({ ...form, floors: form.floors.filter((_, j) => j !== i) })}
+                                aria-label="Remove floor" className="text-ghost hover:text-red-500">✕</button>
+                      </div>
+                    );
+                  })}
+                  <button onClick={() => setForm({ ...form, floors: [...form.floors, { id: null, floor_label: '', area: '' }] })}
+                          className="self-start text-[11px] border border-wire text-dim px-2 py-0.5 rounded hover:border-dim hover:text-ink transition-colors">
+                    + Add floor
+                  </button>
+                  {form.id == null && form.floors.length > 0 && (
+                    <p className="text-[11px] text-ghost">Floor plans can be uploaded after saving.</p>
+                  )}
+                </div>
+              )}
               <label className="flex flex-col gap-1 sm:col-span-2">
                 <span className="text-ghost">Notes</span>
                 <textarea value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })}
@@ -723,7 +847,7 @@ function PropertyRows({ p, types, isOpen, isAdmin, requiredN, missingN, valRepor
             {p.property_type}
           </span>
         </td>
-        <td className="px-3 py-2.5 text-dim">{p.holder_name}</td>
+        <td className="px-3 py-2.5 text-dim">{ownersLabel(p)}</td>
         <td className="px-3 py-2.5 text-dim">{p.location || '—'}</td>
         <td className="px-3 py-2.5 text-dim">{p.taluka || '—'}</td>
         <td className="px-3 py-2.5 text-right tabular-nums text-dim">
@@ -732,8 +856,10 @@ function PropertyRows({ p, types, isOpen, isAdmin, requiredN, missingN, valRepor
         <td className="px-3 py-2.5 text-dim">{p.deed_no || '—'}</td>
         <td className="px-3 py-2.5 text-dim whitespace-nowrap">{p.acquisition_date || '—'}</td>
         <td className="px-3 py-2.5 text-dim">{p.ownership || '—'}</td>
+        <td className="px-3 py-2.5 text-right tabular-nums text-dim">{fmtINR(p.purchase_price)}</td>
         <td className="px-3 py-2.5 text-right tabular-nums text-dim">{fmtINR(p.rrr)}</td>
-        <td className="px-3 py-2.5 text-right tabular-nums font-semibold text-ink">{fmtINR(p.fair_value)}</td>
+        <td className="px-3 py-2.5 text-right tabular-nums text-dim">{fmtINR(p.fair_value)}</td>
+        <td className="px-3 py-2.5 text-right tabular-nums font-semibold text-ink">{fmtINR(p.market_value)}</td>
         <td className="px-3 py-2.5">
           {valReports.length > 0 ? valReports.map(d => (
             <a key={d.id} href={docUrl(d.id)} target="_blank" rel="noopener noreferrer"
@@ -767,7 +893,7 @@ function PropertyRows({ p, types, isOpen, isAdmin, requiredN, missingN, valRepor
 
       {isOpen && (
         <tr className="border-b border-rule bg-page/40">
-          <td colSpan={isAdmin ? 13 : 12} className="px-4 sm:px-6 py-3">
+          <td colSpan={isAdmin ? 15 : 14} className="px-4 sm:px-6 py-3">
             <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
               <p className="text-[11px] uppercase tracking-wide text-ghost">
                 Document checklist — {p.property_type}
@@ -825,7 +951,7 @@ function SoldRows({ p, types, isOpen, isAdmin, busy, onToggle, onUnsell, onDelet
             sold · {p.property_type}
           </span>
         </td>
-        <td className="px-3 py-2.5 text-dim">{p.holder_name}</td>
+        <td className="px-3 py-2.5 text-dim">{ownersLabel(p)}</td>
         <td className="px-3 py-2.5 text-dim">{p.location || '—'}</td>
         <td className="px-3 py-2.5 text-dim whitespace-nowrap">{p.sale_date || '—'}</td>
         <td className="px-3 py-2.5 text-right tabular-nums font-semibold text-ink">{fmtINR(p.sale_price)}</td>

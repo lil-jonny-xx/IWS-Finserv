@@ -2832,19 +2832,28 @@ def _fetch_property_overview_rows(conn, entity_id: Optional[int] = None):
     entity (same name) its rows carry that entity id so member scoping and the
     per-entity bars line up; other holders (LLPs, trusts, parent companies)
     appear as their own synthetic entities with a negative id — the dashboard
-    only uses entity_id as a list key. No cost basis or ledger exists, so
-    invested is 0 and pnl/ytd/weekly stay 0. Sold properties contribute their
-    sale price instead of a fair value (the asset became realised proceeds).
+    only uses entity_id as a list key. Value per property: sale_price when
+    sold (the asset became realised proceeds), else the hand-entered
+    market_value when present, else area x RRR x 1.75. Joint ownership splits
+    a property's value/cost across its owners by their pct. purchase_price,
+    when recorded, feeds invested + an unrealised pnl.
     """
+    mult = property_docs.FAIR_VALUE_MULTIPLIER
     cur = conn.cursor()
-    cur.execute("""
+    cur.execute(f"""
         SELECT pe.id AS holder_id, pe.name AS holder_name, e.id AS sys_entity_id,
-               SUM(CASE WHEN NOT p.sold THEN p.area * p.rrr END) AS base,
-               SUM(CASE WHEN p.sold THEN p.sale_price END)       AS sold_value
+               SUM(COALESCE(CASE WHEN p.sold THEN p.sale_price
+                                 ELSE COALESCE(p.market_value, p.area * p.rrr * {mult}) END, 0)
+                   * o.pct / 100)                                        AS value,
+               SUM(COALESCE(p.purchase_price, 0) * o.pct / 100)          AS invested,
+               SUM(CASE WHEN p.purchase_price IS NOT NULL THEN
+                        (COALESCE(CASE WHEN p.sold THEN p.sale_price
+                                       ELSE COALESCE(p.market_value, p.area * p.rrr * {mult}) END, 0)
+                         - p.purchase_price) * o.pct / 100 ELSE 0 END)   AS pnl
         FROM property p
-        JOIN property_entity pe ON pe.id = p.holder_id
+        JOIN property_owner o  ON o.property_id = p.id
+        JOIN property_entity pe ON pe.id = o.holder_id
         LEFT JOIN entity e ON e.entity_name = pe.name
-        WHERE (p.area IS NOT NULL AND p.rrr IS NOT NULL) OR p.sold
         GROUP BY pe.id, pe.name, e.id
     """)
     rows = cur.fetchall()
@@ -2855,9 +2864,7 @@ def _fetch_property_overview_rows(conn, entity_id: Optional[int] = None):
         sys_id = r["sys_entity_id"]
         if entity_id is not None and sys_id != entity_id:
             continue   # member scope: only properties held by their own entity
-        fair = float(r["base"]) * property_docs.FAIR_VALUE_MULTIPLIER \
-            if r["base"] is not None else 0.0
-        val = fair + (float(r["sold_value"]) if r["sold_value"] is not None else 0.0)
+        val = float(r["value"]) if r["value"] is not None else 0.0
         if val <= 0:
             continue
         out.append({
@@ -2865,9 +2872,9 @@ def _fetch_property_overview_rows(conn, entity_id: Optional[int] = None):
             "entity_name":        r["holder_name"],
             "asset_class":        "REAL_ESTATE",
             "security_type":      "PROPERTY",
-            "invested":           0.0,
+            "invested":           float(r["invested"] or 0),
             "mkt_value":          val,
-            "pnl_inception":      0.0,
+            "pnl_inception":      float(r["pnl"] or 0),
             "pnl_ytd":            0.0,
             "weekly_change":      0.0,
             "cagr_inception_pct": None,
@@ -4087,7 +4094,7 @@ def create_property_entity(request: Request, body: PropertyEntityRequest,
         release_db_connection(conn)
 
 
-def _property_row(r: dict, docs: list) -> dict:
+def _property_row(r: dict, docs: list, owners: list, floors: list) -> dict:
     area = float(r["area"]) if r["area"] is not None else None
     rrr  = float(r["rrr"]) if r["rrr"] is not None else None
     fair = round(area * rrr * property_docs.FAIR_VALUE_MULTIPLIER, 2) \
@@ -4096,6 +4103,10 @@ def _property_row(r: dict, docs: list) -> dict:
     required = [d["slug"] for d in property_docs.doc_types_for(r["property_type"])
                 if not d["optional"]]
     return {
+        "purchase_price":   float(r["purchase_price"]) if r["purchase_price"] is not None else None,
+        "market_value":     float(r["market_value"]) if r["market_value"] is not None else None,
+        "owners":           owners,
+        "floors":           floors,
         "id":               r["id"],
         "name":             r["name"],
         "property_type":    r["property_type"],
@@ -4137,20 +4148,22 @@ def list_properties(request: Request, holder_id: Optional[int] = None,
             FROM   property p JOIN property_entity e ON e.id = p.holder_id
             {cond} ORDER BY e.sort_order, e.name, p.name""", params)
         props = cur.fetchall()
-        docs_by_pid = {}
+        docs_by_pid, owners_by_pid, floors_by_pid = {}, {}, {}
         if props:
+            pids = [p["id"] for p in props]
             cur.execute(
-                """SELECT id, property_id, doc_type, original_name, mime,
+                """SELECT id, property_id, doc_type, floor_id, original_name, mime,
                           size_bytes, converted, original_path IS NOT NULL AS has_original,
                           uploaded_at
                    FROM property_document WHERE property_id = ANY(%s)
                    ORDER BY uploaded_at""",
-                ([p["id"] for p in props],),
+                (pids,),
             )
             for d in cur.fetchall():
                 docs_by_pid.setdefault(d["property_id"], []).append({
                     "id":            d["id"],
                     "doc_type":      d["doc_type"],
+                    "floor_id":      d["floor_id"],
                     "original_name": d["original_name"],
                     "mime":          d["mime"],
                     "size_bytes":    int(d["size_bytes"]) if d["size_bytes"] is not None else None,
@@ -4158,8 +4171,32 @@ def list_properties(request: Request, holder_id: Optional[int] = None,
                     "has_original":  d["has_original"],
                     "uploaded_at":   d["uploaded_at"].isoformat() if d["uploaded_at"] else None,
                 })
+            cur.execute(
+                """SELECT o.property_id, o.holder_id, o.pct, e.name
+                   FROM property_owner o JOIN property_entity e ON e.id = o.holder_id
+                   WHERE o.property_id = ANY(%s) ORDER BY o.pct DESC, e.name""",
+                (pids,),
+            )
+            for o in cur.fetchall():
+                owners_by_pid.setdefault(o["property_id"], []).append({
+                    "holder_id": o["holder_id"], "name": o["name"], "pct": float(o["pct"]),
+                })
+            cur.execute(
+                """SELECT id, property_id, floor_label, area, sort_order
+                   FROM property_floor WHERE property_id = ANY(%s)
+                   ORDER BY sort_order, id""",
+                (pids,),
+            )
+            for f in cur.fetchall():
+                floors_by_pid.setdefault(f["property_id"], []).append({
+                    "id":          f["id"],
+                    "floor_label": f["floor_label"],
+                    "area":        float(f["area"]) if f["area"] is not None else None,
+                })
         cur.close()
-        rows  = [_property_row(p, docs_by_pid.get(p["id"], [])) for p in props]
+        rows = [_property_row(p, docs_by_pid.get(p["id"], []),
+                              owners_by_pid.get(p["id"], []),
+                              floors_by_pid.get(p["id"], [])) for p in props]
         total = sum(r["fair_value"] for r in rows if r["fair_value"] is not None and not r["sold"])
         sold  = sum(r["sale_price"] for r in rows if r["sold"] and r["sale_price"] is not None)
         return {"count": len(rows), "total_fair_value": round(total, 2),
@@ -4173,6 +4210,17 @@ def list_properties(request: Request, holder_id: Optional[int] = None,
         release_db_connection(conn)
 
 
+class PropertyOwnerIn(BaseModel):
+    holder_id: int
+    pct:       float = 100.0
+
+
+class PropertyFloorIn(BaseModel):
+    id:          Optional[int] = None   # present = update existing floor
+    floor_label: str
+    area:        Optional[float] = None
+
+
 class PropertyRequest(BaseModel):
     name:             str
     property_type:    str
@@ -4184,8 +4232,12 @@ class PropertyRequest(BaseModel):
     deed_no:          Optional[str]   = None
     acquisition_date: Optional[str]   = None   # YYYY-MM-DD
     ownership:        Optional[str]   = None
+    purchase_price:   Optional[float] = None
+    market_value:     Optional[float] = None
     rrr:              Optional[float] = None
     notes:            Optional[str]   = None
+    owners:           Optional[List[PropertyOwnerIn]] = None   # default: holder_id @ 100%
+    floors:           Optional[List[PropertyFloorIn]] = None   # buildings
 
 
 def _validate_property_body(cur, body: PropertyRequest):
@@ -4201,6 +4253,58 @@ def _validate_property_body(cur, body: PropertyRequest):
             datetime.strptime(body.acquisition_date, "%Y-%m-%d")
         except ValueError:
             raise HTTPException(status_code=422, detail="acquisition_date must be YYYY-MM-DD")
+    if body.owners:
+        ids = [o.holder_id for o in body.owners]
+        if len(set(ids)) != len(ids):
+            raise HTTPException(status_code=422, detail="Duplicate owner entity")
+        cur.execute("SELECT COUNT(*) AS n FROM property_entity WHERE id = ANY(%s)", (ids,))
+        if cur.fetchone()["n"] != len(ids):
+            raise HTTPException(status_code=422, detail="Unknown owner entity")
+        if any(o.pct <= 0 for o in body.owners):
+            raise HTTPException(status_code=422, detail="Ownership % must be positive")
+        total = sum(o.pct for o in body.owners)
+        if abs(total - 100.0) > 0.1:
+            raise HTTPException(status_code=422, detail=f"Ownership must total 100% (got {total:g}%)")
+    if body.floors:
+        if any(not f.floor_label.strip() for f in body.floors):
+            raise HTTPException(status_code=422, detail="Every floor needs a label")
+
+
+def _save_property_children(cur, pid: int, body: PropertyRequest):
+    """Replace owners; upsert floors by id (so floor-plan documents keep their
+    floor link across edits) and drop floors omitted from the payload."""
+    owners = body.owners or [PropertyOwnerIn(holder_id=body.holder_id, pct=100.0)]
+    cur.execute("DELETE FROM property_owner WHERE property_id = %s", (pid,))
+    for o in owners:
+        cur.execute(
+            "INSERT INTO property_owner (property_id, holder_id, pct) VALUES (%s,%s,%s)",
+            (pid, o.holder_id, o.pct),
+        )
+
+    floors = body.floors if body.property_type == "building" else []
+    keep = []
+    for i, f in enumerate(floors or []):
+        if f.id is not None:
+            cur.execute(
+                """UPDATE property_floor SET floor_label=%s, area=%s, sort_order=%s
+                   WHERE id=%s AND property_id=%s RETURNING id""",
+                (f.floor_label.strip(), f.area, i, f.id, pid),
+            )
+            row = cur.fetchone()
+            if row:
+                keep.append(row["id"])
+                continue
+        cur.execute(
+            """INSERT INTO property_floor (property_id, floor_label, area, sort_order)
+               VALUES (%s,%s,%s,%s) RETURNING id""",
+            (pid, f.floor_label.strip(), f.area, i),
+        )
+        keep.append(cur.fetchone()["id"])
+    if keep:
+        cur.execute("DELETE FROM property_floor WHERE property_id = %s AND NOT (id = ANY(%s))",
+                    (pid, keep))
+    else:
+        cur.execute("DELETE FROM property_floor WHERE property_id = %s", (pid,))
 
 
 @app.post("/api/v1/properties")
@@ -4218,14 +4322,16 @@ def create_property(request: Request, body: PropertyRequest,
         cur.execute(
             """INSERT INTO property
                    (name, property_type, holder_id, location, taluka, area, area_unit,
-                    deed_no, acquisition_date, ownership, rrr, notes, created_by, updated_by)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                    deed_no, acquisition_date, ownership, purchase_price, market_value,
+                    rrr, notes, created_by, updated_by)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
             (body.name.strip(), body.property_type, body.holder_id, body.location,
              body.taluka, body.area, body.area_unit, body.deed_no,
-             body.acquisition_date or None, body.ownership, body.rrr, body.notes,
-             user_id, user_id),
+             body.acquisition_date or None, body.ownership, body.purchase_price,
+             body.market_value, body.rrr, body.notes, user_id, user_id),
         )
         pid = cur.fetchone()["id"]
+        _save_property_children(cur, pid, body)
         write_audit_log(conn, user_id, "PROPERTY_CREATE", "property", pid, body.name.strip())
         conn.commit()
         cur.close()
@@ -4259,15 +4365,17 @@ def update_property(prop_id: int, request: Request, body: PropertyRequest,
             """UPDATE property SET
                    name=%s, property_type=%s, holder_id=%s, location=%s, taluka=%s,
                    area=%s, area_unit=%s, deed_no=%s, acquisition_date=%s,
-                   ownership=%s, rrr=%s, notes=%s, updated_by=%s, updated_at=NOW()
+                   ownership=%s, purchase_price=%s, market_value=%s, rrr=%s, notes=%s,
+                   updated_by=%s, updated_at=NOW()
                WHERE id=%s RETURNING id""",
             (body.name.strip(), body.property_type, body.holder_id, body.location,
              body.taluka, body.area, body.area_unit, body.deed_no,
-             body.acquisition_date or None, body.ownership, body.rrr, body.notes,
-             user_id, prop_id),
+             body.acquisition_date or None, body.ownership, body.purchase_price,
+             body.market_value, body.rrr, body.notes, user_id, prop_id),
         )
         if not cur.fetchone():
             raise HTTPException(status_code=404, detail="Property not found")
+        _save_property_children(cur, prop_id, body)
         write_audit_log(conn, user_id, "PROPERTY_UPDATE", "property", prop_id, body.name.strip())
         conn.commit()
         cur.close()
@@ -4427,6 +4535,7 @@ async def upload_property_document(
     prop_id: int,
     request: Request,
     doc_type: str = Form(...),
+    floor_id: Optional[int] = Form(None),
     file: UploadFile = File(...),
     authorization: Optional[str] = Header(None),
 ):
@@ -4444,6 +4553,11 @@ async def upload_property_document(
         cur.execute("SELECT id FROM property WHERE id = %s", (prop_id,))
         if not cur.fetchone():
             raise HTTPException(status_code=404, detail="Property not found")
+        if floor_id is not None:
+            cur.execute("SELECT id FROM property_floor WHERE id = %s AND property_id = %s",
+                        (floor_id, prop_id))
+            if not cur.fetchone():
+                raise HTTPException(status_code=422, detail="Unknown floor for this property")
 
         data = await file.read(MAX_UPLOAD_BYTES + 1)
         if len(data) > MAX_UPLOAD_BYTES:
@@ -4478,11 +4592,11 @@ async def upload_property_document(
         user_id = _property_user_id(cur, payload)
         cur.execute(
             """INSERT INTO property_document
-                   (property_id, doc_type, original_name, stored_path, original_path,
+                   (property_id, doc_type, floor_id, original_name, stored_path, original_path,
                     mime, size_bytes, converted, uploaded_by)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                RETURNING id, uploaded_at""",
-            (prop_id, doc_type, file.filename, stored_rel, original_rel,
+            (prop_id, doc_type, floor_id, file.filename, stored_rel, original_rel,
              stored_mime, len(data), converted, user_id),
         )
         row = cur.fetchone()
@@ -5720,14 +5834,14 @@ def get_realised_gains(
                 })
 
         # Sold properties from the register (own holder universe — companies /
-        # trusts). No cost basis exists, so only the sale proceeds are shown
-        # (pnl stays empty). Members see just the holders mapping to their
-        # entity; admins see every holder.
+        # trusts). purchase_price, when recorded, gives a real pnl; without it
+        # only the sale proceeds are shown. Members see just the holders
+        # mapping to their entity; admins see every holder.
         today = date.today()
         fy_start = date(today.year if today.month >= 4 else today.year - 1, 4, 1)
         cur = conn.cursor()
         cur.execute("""
-            SELECT p.name, p.sale_date, p.sale_price,
+            SELECT p.name, p.sale_date, p.sale_price, p.purchase_price,
                    pe.name AS holder_name, e.id AS sys_entity_id
             FROM property p
             JOIN property_entity pe ON pe.id = p.holder_id
@@ -5740,18 +5854,21 @@ def get_realised_gains(
                 continue
             if not since_inception and (r["sale_date"] is None or r["sale_date"] < fy_start):
                 continue
+            sale = float(r["sale_price"]) if r["sale_price"] is not None else None
+            cost = float(r["purchase_price"]) if r["purchase_price"] is not None else None
+            pnl  = (sale - cost) if sale is not None and cost is not None else None
             out.append({
                 "entity":          r["holder_name"],
                 "category":        "Real Estate",
                 "group":           "Real Estate",
                 "security_name":   r["name"],
-                "purchase_amount": None,
+                "purchase_amount": cost,
                 "sale_date":       r["sale_date"].isoformat() if r["sale_date"] else "",
-                "sale_amount":     float(r["sale_price"]) if r["sale_price"] is not None else None,
-                "pnl":             None,
+                "sale_amount":     sale,
+                "pnl":             pnl,
                 "st_pnl":          None,
                 "lt_pnl":          None,
-                "return_pct":      None,
+                "return_pct":      (pnl / cost) if pnl is not None and cost else None,
             })
         cur.close()
         return out
