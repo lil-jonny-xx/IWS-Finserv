@@ -3562,6 +3562,29 @@ def _uploads_abspath(rel: str) -> str:
     return full
 
 
+def _uploads_file_response(rel: str, media: str):
+    """Serve one file from UPLOADS_ROOT after the caller has authorized it.
+
+    With UPLOADS_XACCEL=1 in .env, the app answers with an X-Accel-Redirect
+    header and nginx streams the file itself (sendfile — much faster for big
+    scans, and the Python worker is freed immediately). Requires this nginx
+    block alongside the /api/ location:
+
+        location /_protected_uploads/ { internal; alias /var/www/uploads/; }
+
+    Without the flag, FastAPI streams the file directly (works everywhere).
+    """
+    abs_path = _uploads_abspath(rel)
+    if not os.path.exists(abs_path):
+        raise HTTPException(status_code=404, detail="File missing on disk")
+    headers = {"Cache-Control": "private, max-age=86400"}
+    if os.getenv("UPLOADS_XACCEL") == "1":
+        headers["X-Accel-Redirect"] = "/_protected_uploads/" + rel.replace(os.sep, "/")
+        headers["Content-Type"] = media
+        return Response(status_code=200, headers=headers)
+    return FileResponse(abs_path, media_type=media, headers=headers)
+
+
 def _make_thumbnail(src_abs: str, dst_abs: str) -> bool:
     """Best-effort 480px JPEG thumbnail. Returns False if Pillow is unavailable
     or the source isn't a decodable image (callers then fall back to the original)."""
@@ -3622,7 +3645,8 @@ async def upload_manual_attachment(
                 or "application/octet-stream")
         ext  = os.path.splitext(file.filename or "")[1].lower()[:12]
         uid  = uuid.uuid4().hex
-        rel_dir = os.path.join(MANUAL_UPLOAD_SUBDIR, str(entity_id))
+        # Organized by schema: manual/<entity_id>/<category>/
+        rel_dir = os.path.join(MANUAL_UPLOAD_SUBDIR, str(entity_id), category)
         os.makedirs(os.path.join(UPLOADS_ROOT, rel_dir), exist_ok=True)
         rel_path = os.path.join(rel_dir, uid + ext)
         with open(_uploads_abspath(rel_path), "wb") as fh:
@@ -3758,16 +3782,9 @@ def _serve_attachment(att_id: int, request: Request, authorization, want_thumb: 
 
         use_thumb = want_thumb and bool(r["thumb_path"])
         rel       = r["thumb_path"] if use_thumb else r["stored_path"]
-        abs_path  = _uploads_abspath(rel)
-        if not os.path.exists(abs_path):
-            raise HTTPException(status_code=404, detail="File missing on disk")
         media = "image/jpeg" if use_thumb else (r["mime"] or "application/octet-stream")
         # Inline so images/PDFs render in the browser; private + cacheable.
-        return FileResponse(
-            abs_path,
-            media_type=media,
-            headers={"Cache-Control": "private, max-age=86400"},
-        )
+        return _uploads_file_response(rel, media)
     except HTTPException:
         raise
     except Exception as e:
@@ -3999,7 +4016,7 @@ def save_property_detail(request: Request, body: PropertyDetailRequest,
 # changes or skips the file. All logins may view; only admin writes.
 # ---------------------------------------------------------------------------
 
-PROPERTY_UPLOAD_SUBDIR = "property"
+PROPERTY_UPLOAD_SUBDIR = "properties"   # properties/<property_id>/<doc_type>/
 
 
 def _property_user_id(cur, payload) -> Optional[int]:
@@ -4570,7 +4587,8 @@ async def upload_property_document(
                 or "application/octet-stream")
         ext  = os.path.splitext(file.filename or "")[1].lower()[:12]
         uid  = uuid.uuid4().hex
-        rel_dir = os.path.join(PROPERTY_UPLOAD_SUBDIR, str(prop_id))
+        # Organized by schema: properties/<property_id>/<doc_type>/
+        rel_dir = os.path.join(PROPERTY_UPLOAD_SUBDIR, str(prop_id), doc_type)
         os.makedirs(os.path.join(UPLOADS_ROOT, rel_dir), exist_ok=True)
 
         pdf = property_docs.convert_to_pdf(data, file.filename or "", mime)
@@ -4643,13 +4661,9 @@ def serve_property_document(doc_id: int, request: Request, original: bool = Fals
         if not r:
             raise HTTPException(status_code=404, detail="Document not found")
         rel = r["original_path"] if (original and r["original_path"]) else r["stored_path"]
-        abs_path = _uploads_abspath(rel)
-        if not os.path.exists(abs_path):
-            raise HTTPException(status_code=404, detail="File missing on disk")
         media = (mimetypes.guess_type(rel)[0] or "application/octet-stream") \
             if original else (r["mime"] or "application/octet-stream")
-        return FileResponse(abs_path, media_type=media,
-                            headers={"Cache-Control": "private, max-age=86400"})
+        return _uploads_file_response(rel, media)
     except HTTPException:
         raise
     except Exception as e:
@@ -5319,7 +5333,8 @@ def get_fx_rates(
 # Bank accounts (cash-only; balances fed by uploaded statements or manual entry)
 # ---------------------------------------------------------------------------
 
-BANK_STATEMENT_DIR = "/var/www/mis-portal/bank_statements"
+# Bank statements live under the same canonical uploads root as everything else.
+BANK_STATEMENT_DIR = os.path.join(UPLOADS_ROOT, "bank-statements")
 MAX_STATEMENT_BYTES = 15 * 1024 * 1024   # 15 MB
 
 
