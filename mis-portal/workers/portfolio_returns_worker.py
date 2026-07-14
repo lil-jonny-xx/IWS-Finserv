@@ -2,15 +2,16 @@
 """
 Portfolio-level money-weighted return (XIRR) per entity, from real external cash flows.
 
-Uses external_cashflow (deposits / withdrawals / dividends / interest — see
-import_ledgers.py) as the dated flows and the current brokerage portfolio value
-(equity_holding + foreign_equity_holding + broker_cash) as the final inflow, then
-solves XIRR. This is the true investor return: it reflects when money actually went
-in/out and counts dividends & interest as income — things per-holding price-return
-metrics miss.
+Uses external_cashflow deposits/withdrawals (see import_ledgers.py) as the dated
+flows and the current brokerage portfolio value (equity_holding +
+foreign_equity_holding + broker_cash) as the final inflow, then solves XIRR. This
+is the true investor return: it reflects when money actually crossed the investor
+boundary. Dividend/interest rows are NOT flows — they are credited inside the
+broker account and therefore already live in the terminal value; they are only
+totalled for the income_inr display column.
 
 Sign convention (investor perspective): deposits negative (cash out of pocket),
-withdrawals/dividends/interest positive, current value positive.
+withdrawals positive, current value positive.
 
 USD flows (Vested dividends/interest) are converted at the latest USD→INR rate; this
 is an approximation for historical flows (timing dominates XIRR more than FX drift).
@@ -57,17 +58,6 @@ def ensure_table(cur):
         );
     """)
     cur.execute("ALTER TABLE portfolio_returns ADD COLUMN IF NOT EXISTS coverage VARCHAR(10);")
-
-
-def coverage_flag(cur, entity_id, earliest_flow):
-    """'full' if the ledger's external flows start no later than the entity's oldest
-    holding; else 'partial' — XIRR is unreliable when deposit history is incomplete."""
-    cur.execute("SELECT MIN(first_invested_date) d FROM equity_holding WHERE entity_id=%s AND first_invested_date IS NOT NULL", (entity_id,))
-    r = cur.fetchone()
-    oldest = r["d"] if r else None
-    if oldest is None or earliest_flow is None:
-        return "partial"
-    return "full" if earliest_flow <= oldest else "partial"
 
 
 def usd_inr(cur):
@@ -129,10 +119,18 @@ def main():
             amt = float(r["amount_native"])
             if (r["currency"] or "INR").upper() == "USD":
                 amt *= fx
-            flows.append((r["flow_date"], amt))
-            if r["flow_type"] == "DEPOSIT": dep += amt
-            elif r["flow_type"] == "WITHDRAWAL": wd += amt
-            else: inc += amt
+            if r["flow_type"] == "DEPOSIT":
+                dep += amt; flows.append((r["flow_date"], amt))
+            elif r["flow_type"] == "WITHDRAWAL":
+                wd += amt; flows.append((r["flow_date"], amt))
+            else:
+                # DIVIDEND / INTEREST are credited INSIDE the broker account (these
+                # rows come from broker ledgers), so the money is already part of the
+                # terminal portfolio value (cash balance or reinvested holdings).
+                # Counting them as investor inflows too double-counted the income and
+                # inflated XIRR. Money-weighted return uses only flows that cross the
+                # investor boundary; income is still totalled for display.
+                inc += amt
         cv = current_value(cur, eid, fx)
         flows.append((TODAY, cv))
         rate = xirr(flows)

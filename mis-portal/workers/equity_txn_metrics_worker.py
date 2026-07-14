@@ -20,12 +20,19 @@ Per holding (matched to transactions by entity + broker + ISIN):
 
   cagr_inception_pct   (cmv/cost)^(365/holding_days) - 1, from first_invested_date.
 
-  pnl_ytd              FY-to-date P&L on the position: current_mv - mv_at_FY_start
-                       - net_invested_during_FY  (buys-sells since 1-Apr). Captures
-                       price change on the held position plus proceeds of any in-year
-                       trims. mv_at_FY_start comes from equity_holding_history (which
-                       begins 2026-04-01). Positions opened mid-FY have mv_start = 0.
-  returns_ytd_pct      pnl_ytd / capital_base * 100, base = mv_at_FY_start or in-year cost.
+  pnl_ytd              FY-to-date P&L on the HELD position, per FIFO lot: lots bought
+                       during the FY are measured from their buy price; lots held
+                       before 1-Apr from the FY-start price (nearest snapshot on or
+                       before 1-Apr in equity_holding_history). Realised gains on
+                       in-year trims are NOT included (they live in Realised Gains).
+                       If a pre-FY lot has no FY-start snapshot (entity/broker
+                       onboarded mid-FY), pnl_ytd is left NULL rather than mislabelling
+                       the inception gain as YTD.
+  returns_ytd_pct      pnl_ytd / capital_base * 100, base = sum of lot reference values.
+
+Metric columns this worker owns (xirr/cagr/pnl_ytd/returns_ytd) are written every run
+INCLUDING NULLs, so a holding that stops qualifying (broken txn linkage, suppressed
+annualisation) has its stale value cleared instead of lingering.
 
 Dry-run by default; pass --commit to write. --entity / --broker to scope.
 """
@@ -85,10 +92,15 @@ def ann_guard(value_pct, days):
 
 
 def fy_start_price(cur, entity_id, broker, isin):
-    """(market_value, quantity) at FY start from history; (0,0) if not held then."""
+    """(market_value, quantity) at FY start from history; (0,0) if not held then.
+
+    Nearest snapshot ON OR BEFORE 1-Apr (not exact-date): a single missed snapshot
+    on Apr 1 must not silently zero the anchor. Snapshots began 2026-04-01, so for
+    FY26-27 this is effectively the exact date."""
     cur.execute("""SELECT market_value, quantity FROM equity_holding_history
-                   WHERE entity_id=%s AND broker=%s AND isin=%s AND snapshot_date=%s
-                   ORDER BY market_value DESC LIMIT 1""", (entity_id, broker, isin, FY_START))
+                   WHERE entity_id=%s AND broker=%s AND isin=%s AND snapshot_date<=%s
+                   ORDER BY snapshot_date DESC, market_value DESC LIMIT 1""",
+                (entity_id, broker, isin, FY_START))
     row = cur.fetchone()
     if not row or not row["quantity"]:
         return 0.0, 0.0
@@ -122,7 +134,11 @@ def compute(cur, h):
     cmv = f(h["current_market_value"])
     cur_price = f(h["current_price"])
     qty = f(h["quantity"]) or 0.0
-    out = {"method": "none"}
+    # Owned metric columns default to None and are ALWAYS written (clears stale
+    # values when a holding stops qualifying); first_invested_date is only added
+    # when it improves on the stored value.
+    out = {"method": "none", "xirr_inception_pct": None, "cagr_inception_pct": None,
+           "pnl_ytd": None, "returns_ytd_pct": None}
 
     txns = []
     if isin:
@@ -134,10 +150,14 @@ def compute(cur, h):
         txns = cur.fetchall()
 
     # Does the transaction history reconstruct the current position?
+    # Tolerance: 2% of quantity; the 1-share absolute slack only applies to larger
+    # positions — for a 2-share holding a ±1 mismatch is a 50% error, and lots built
+    # from such history are wrong.
     lots = []
     if txns:
         net_q = sum((f(t["q"]) if t["side"] == "BUY" else -f(t["q"])) for t in txns)
-        if abs(net_q - qty) <= max(1.0, 0.02 * qty):
+        tol = max(1.0, 0.02 * qty) if qty >= 50 else 0.02 * qty + 1e-6
+        if abs(net_q - qty) <= tol:
             lots = fifo_lots(txns)
 
     first_dt = h["first_invested_date"]
@@ -169,7 +189,7 @@ def compute(cur, h):
     # CAGR (point-to-point) — only annualise once held ≥1 year; below that the UI shows
     # the absolute return (returns_inception_pct) instead of a misleading annualised rate.
     if first_dt and cost > 0 and cmv is not None and days and days >= ANNUALISE_MIN_DAYS:
-        cagr = ann_guard(((cmv / cost) ** (365.0 / days) - 1) * 100, days)
+        cagr = ann_guard(((cmv / cost) ** (365.25 / days) - 1) * 100, days)
         if cagr is not None:
             out["cagr_inception_pct"] = cagr
 
@@ -180,12 +200,22 @@ def compute(cur, h):
         if lots:
             pnl = base = 0.0
             for d, q, p in lots:
-                ref = p if d >= FY_START else (p_fy if p_fy else p)
+                if d >= FY_START:
+                    ref = p                            # bought in-year: from buy price
+                elif p_fy:
+                    ref = p_fy                         # held at FY start: from FY-start price
+                else:
+                    # Pre-FY lot with no FY-start snapshot (entity/broker onboarded
+                    # mid-FY). Measuring from the buy price would mislabel the whole
+                    # inception gain as "YTD" — leave pnl_ytd NULL instead.
+                    pnl = base = None
+                    break
                 pnl += q * (cur_price - ref)
                 base += q * ref
-            out["pnl_ytd"] = round(pnl, 2)
-            if base > 0:
-                out["returns_ytd_pct"] = round(pnl / base * 100, 4)
+            if pnl is not None:
+                out["pnl_ytd"] = round(pnl, 2)
+                if base > 0:
+                    out["returns_ytd_pct"] = round(pnl / base * 100, 4)
         elif qty0 and p_fy:                            # no lots: use FY-start price on current qty
             pnl = qty * (cur_price - p_fy)
             out["pnl_ytd"] = round(pnl, 2)
@@ -274,19 +304,26 @@ def main():
                     WHERE {' AND '.join(where)} ORDER BY e.entity_name, broker, symbol""", params)
     rows = cur.fetchall()
 
-    methods = {"real-flow": 0, "2-point": 0, "none": 0}
-    filled = {"xirr_inception_pct": 0, "cagr_inception_pct": 0, "pnl_ytd": 0,
-              "returns_ytd_pct": 0, "first_invested_date": 0}
+    metric_cols = ("xirr_inception_pct", "cagr_inception_pct", "pnl_ytd", "returns_ytd_pct")
+    methods = {"fifo-flow": 0, "2-point": 0, "none": 0}
+    filled = {c: 0 for c in (*metric_cols, "first_invested_date")}
     print(f"{'COMMIT' if args.commit else 'DRY-RUN'} — {len(rows)} holding(s)\n")
     print(f"{'ENT':5}{'BROKER':10}{'SYMBOL':16}{'method':10}{'XIRR%':>9}{'CAGR%':>9}{'YTD P&L':>12}")
     for h in rows:
         u = compute(cur, h)
         methods[u["method"]] = methods.get(u["method"], 0) + 1
-        sets, vals = [], []
-        for col in filled:
-            if col in u and u[col] is not None:
-                sets.append(f"{col}=%s"); vals.append(u[col]); filled[col] += 1
-        if sets and args.commit:
+        # Owned metric columns are written every run INCLUDING NULLs so stale values
+        # clear when a holding stops qualifying; first_invested_date only when improved.
+        sets = [f"{c}=%s" for c in metric_cols]
+        vals = [u[c] for c in metric_cols]
+        for c in metric_cols:
+            if u[c] is not None:
+                filled[c] += 1
+        if u.get("first_invested_date") is not None:
+            sets.append("first_invested_date=%s")
+            vals.append(u["first_invested_date"])
+            filled["first_invested_date"] += 1
+        if args.commit:
             cur.execute(f"UPDATE equity_holding SET {', '.join(sets)}, updated_at=NOW() WHERE id=%s",
                         vals + [h["id"]])
         print(f"{h['entity_name'][:4]:5}{h['broker']:10}{h['symbol'][:15]:16}{u['method']:10}"

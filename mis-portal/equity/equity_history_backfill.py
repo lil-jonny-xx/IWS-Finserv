@@ -149,7 +149,6 @@ def recompute_metrics(conn, entity_id: int, broker_label: str,
         symbol = h["symbol"]
 
         prev_val  = fetch_history_value(conn, entity_id, broker_label, symbol, prev_friday, h["isin"])
-        ytd_val   = fetch_history_value(conn, entity_id, broker_label, symbol, ytd_date, h["isin"])
         first_inv = h["first_invested_date"]
 
         holding = EquityHolding(
@@ -165,8 +164,11 @@ def recompute_metrics(conn, entity_id: int, broker_label: str,
             current_market_value= Decimal(str(h["current_market_value"] or 0)),
         )
 
-        compute_metrics(holding, prev_val, ytd_val, total_value, today, first_inv)
+        compute_metrics(holding, prev_val, total_value, today, first_inv)
 
+        # pnl_ytd / returns_ytd_pct deliberately absent — owned by
+        # equity_txn_metrics_worker (FY anchor, per-lot); overwriting them here
+        # with NULL would wipe its values.
         cur.execute("""
             UPDATE equity_holding SET
                 prev_week_value      = %(prev_week_value)s,
@@ -175,25 +177,21 @@ def recompute_metrics(conn, entity_id: int, broker_label: str,
                 exposure_pct         = %(exposure_pct)s,
                 weekly_change        = %(weekly_change)s,
                 pnl_inception        = %(pnl_inception)s,
-                pnl_ytd              = %(pnl_ytd)s,
                 pnl_weekly_change    = %(pnl_weekly_change)s,
                 returns_inception_pct= %(returns_inception_pct)s,
-                returns_ytd_pct      = %(returns_ytd_pct)s,
                 cagr_inception_pct   = %(cagr_inception_pct)s,
                 updated_at           = NOW()
             WHERE entity_id = %(entity_id)s AND broker = %(broker)s AND symbol = %(symbol)s
         """, {
-            "prev_week_value":       float(holding.prev_week_value) if holding.prev_week_value else None,
-            "market_value_as_on":    float(holding.market_value_as_on) if holding.market_value_as_on else None,
+            "prev_week_value":       float(holding.prev_week_value) if holding.prev_week_value is not None else None,
+            "market_value_as_on":    float(holding.market_value_as_on) if holding.market_value_as_on is not None else None,
             "as_of_date":            holding.as_of_date,
-            "exposure_pct":          float(holding.exposure_pct) if holding.exposure_pct else None,
-            "weekly_change":         float(holding.weekly_change) if holding.weekly_change else None,
-            "pnl_inception":         float(holding.pnl_inception) if holding.pnl_inception else None,
-            "pnl_ytd":               float(holding.pnl_ytd) if holding.pnl_ytd else None,
-            "pnl_weekly_change":     float(holding.pnl_weekly_change) if holding.pnl_weekly_change else None,
-            "returns_inception_pct": float(holding.returns_inception_pct) if holding.returns_inception_pct else None,
-            "returns_ytd_pct":       float(holding.returns_ytd_pct) if holding.returns_ytd_pct else None,
-            "cagr_inception_pct":    float(holding.cagr_inception_pct) if holding.cagr_inception_pct else None,
+            "exposure_pct":          float(holding.exposure_pct) if holding.exposure_pct is not None else None,
+            "weekly_change":         float(holding.weekly_change) if holding.weekly_change is not None else None,
+            "pnl_inception":         float(holding.pnl_inception) if holding.pnl_inception is not None else None,
+            "pnl_weekly_change":     float(holding.pnl_weekly_change) if holding.pnl_weekly_change is not None else None,
+            "returns_inception_pct": float(holding.returns_inception_pct) if holding.returns_inception_pct is not None else None,
+            "cagr_inception_pct":    float(holding.cagr_inception_pct) if holding.cagr_inception_pct is not None else None,
             "entity_id":             entity_id,
             "broker":                broker_label,
             "symbol":                symbol,

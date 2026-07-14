@@ -9,15 +9,25 @@ and writes the full set of metric columns back to holding.
 Metrics computed:
   market_value_as_on      = quantity × last_updated_nav  (= current_value)
   as_of_date              = nav_date of the latest NAV in nav_history
-  prev_week_value         = quantity × closest NAV on or before last Friday
+  prev_week_value         = quantity × closest NAV on or before the last completed
+                            Friday (week-to-date change, same anchor as equity)
   weekly_change           = market_value_as_on - prev_week_value
   exposure_pct            = market_value_as_on / entity_total_mf_value × 100
   pnl_inception           = market_value_as_on - cost_basis
-  pnl_ytd                 = market_value_as_on - (quantity × closest NAV ≤ Apr 1, fiscal year start)
+  pnl_ytd                 = per FIFO unit-lot: units bought during the FY are measured
+                            from their purchase NAV, units held at FY start from the
+                            Apr-1 NAV. (The old whole-position formula credited units
+                            bought mid-year with gains from Apr 1 they never earned.)
+                            Falls back to the whole-position formula only when the
+                            transaction ledger doesn't reconcile.
   pnl_weekly_change       = pnl_inception - (prev_week_value - cost_basis)
   returns_inception_pct   = pnl_inception / cost_basis × 100
-  returns_ytd_pct         = pnl_ytd / (quantity × fy_start_nav) × 100
+  returns_ytd_pct         = pnl_ytd / ytd_capital_base × 100
   cagr_inception_pct      = (market_value_as_on/cost_basis)^(1/years) − 1
+  xirr_inception_pct      = money-weighted from mf_transaction flows (equity.finmath)
+
+CAGR and XIRR are annualised figures: both are suppressed (NULL) until the holding
+is ≥1 year old, via the same ann_guard used by the equity metrics worker.
 
 Schedule: Daily at 10:15 PM IST (16:45 UTC) — runs after amfi_nav_worker
 Cron:     45 16 * * * /var/www/.venv/bin/python /var/www/mis-portal/workers/mf_metrics_worker.py >> /var/log/mis-portal-mf-metrics.log 2>&1
@@ -27,11 +37,16 @@ import sys
 import logging
 import psycopg2
 import psycopg2.extras
+from collections import deque
 from datetime import datetime, date, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
 from dotenv import load_dotenv
 load_dotenv("/var/www/mis-portal/.env", override=True)
+
+sys.path.insert(0, "/var/www/mis-portal")
+from equity.finmath import xirr as solve_xirr            # noqa: E402
+from workers.equity_txn_metrics_worker import ann_guard  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,36 +69,21 @@ TWO  = Decimal("0.01")
 FOUR = Decimal("0.0001")
 
 
-def xirr(cash_flows: list[tuple]) -> float | None:
-    """Newton-Raphson XIRR. cash_flows: [(date, amount)] where purchases negative, receipts positive."""
+def xirr(cash_flows: list[tuple], days_held: int | None = None) -> float | None:
+    """Gated XIRR in percent. cash_flows: [(date, amount)], purchases negative,
+    receipts positive.
+
+    Solving is delegated to equity.finmath.xirr (Newton + residual check +
+    bisection fallback — the old local Newton loop could return a non-converged
+    garbage rate). The result is gated by the shared ann_guard: annualised
+    figures are suppressed until the holding is ≥1 year old and must fall in a
+    plausible band."""
     if len(cash_flows) < 2:
         return None
-    dates   = [cf[0] for cf in cash_flows]
-    amounts = [cf[1] for cf in cash_flows]
-    t0      = min(dates)
-    days    = [(d - t0).days for d in dates]
-
-    def npv(r):
-        return sum(a / (1 + r) ** (d / 365.25) for a, d in zip(amounts, days))
-
-    def dnpv(r):
-        return sum(-a * (d / 365.25) / (1 + r) ** (d / 365.25 + 1) for a, d in zip(amounts, days))
-
-    rate = 0.1
-    for _ in range(200):
-        f  = npv(rate)
-        df = dnpv(rate)
-        if abs(df) < 1e-12:
-            break
-        new_rate = rate - f / df
-        if new_rate <= -1:
-            new_rate = -0.9999
-        if abs(new_rate - rate) < 1e-8:
-            rate = new_rate
-            break
-        rate = new_rate
-
-    return round(rate * 100, 4) if -99 < rate < 100 else None
+    if days_held is None:
+        days_held = (max(d for d, _ in cash_flows) - min(d for d, _ in cash_flows)).days
+    rate = solve_xirr(cash_flows)
+    return ann_guard(rate * 100 if rate is not None else None, days_held)
 
 
 def now_utc():
@@ -162,33 +162,77 @@ def batch_latest_nav_date(conn, security_ids: list[int]) -> dict[int, date]:
 # Load holdings
 # ---------------------------------------------------------------------------
 
-def load_transactions(conn) -> dict:
+def load_transactions(conn) -> tuple[dict, dict]:
     """
     Batch-load all MF transactions.
-    Returns dict keyed by (entity_id, security_id, folio_number) → list of (date, amount).
-    Purchases: negative (money out). Redemptions/payouts: positive (money in).
+    Returns two dicts keyed by (entity_id, security_id, folio_number):
+      flows — [(date, signed cash flow)] for XIRR. Purchases negative (money out),
+              redemptions/payouts positive (money in).
+      lots  — [(date, units, unit_price)] of the CURRENT position via FIFO
+              (redemptions consume the oldest purchases), for lot-based pnl_ytd.
+
+    Sign rules: rows with units use the units' sign (buy = outflow). Zero-unit
+    rows are classified by transaction_type — taxes/charges are investor costs
+    (outflow), dividend/IDCW payouts are receipts (inflow); unknown zero-unit
+    types are excluded from XIRR (logged) rather than guessed. The old rule
+    (`units >= 0` → outflow) silently treated any zero-unit payout as a purchase.
     """
     cur = conn.cursor()
     cur.execute("""
         SELECT entity_id, security_id, folio_number,
-               transaction_date, amount, units
+               transaction_date, transaction_type, amount, units
         FROM   mf_transaction
         WHERE  amount IS NOT NULL
         ORDER  BY entity_id, security_id, folio_number, transaction_date
     """)
     rows = cur.fetchall()
     cur.close()
-    result: dict = {}
+    flows: dict = {}
+    raw:   dict = {}
+    unknown_types: set = set()
     for r in rows:
         key = (r["entity_id"], r["security_id"], r["folio_number"])
-        if key not in result:
-            result[key] = []
         amt   = float(r["amount"])
         units = float(r["units"]) if r["units"] is not None else 0.0
-        # units > 0 → purchase (money leaves investor) → negative cash flow
-        cf = -abs(amt) if units >= 0 else abs(amt)
-        result[key].append((r["transaction_date"], cf))
-    return result
+        ttype = (r["transaction_type"] or "").upper()
+        if abs(units) > 1e-9:
+            cf = -abs(amt) if units > 0 else abs(amt)
+        elif "TAX" in ttype or "CHARGE" in ttype or "FEE" in ttype:
+            cf = -abs(amt)                        # stamp duty / STT / TDS: investor cost
+        elif "DIVIDEND" in ttype or "IDCW" in ttype or "PAYOUT" in ttype or "INTEREST" in ttype:
+            cf = abs(amt)                         # payout received
+        else:
+            cf = None                             # unknown zero-unit row: keep out of XIRR
+            unknown_types.add(ttype)
+        if cf is not None:
+            flows.setdefault(key, []).append((r["transaction_date"], cf))
+        raw.setdefault(key, []).append((r["transaction_date"], units, amt))
+    if unknown_types:
+        logger.warning(f"Zero-unit transaction types excluded from XIRR flows: {sorted(unknown_types)}")
+
+    lots = {key: _fifo_unit_lots(txns) for key, txns in raw.items()}
+    return flows, lots
+
+
+def _fifo_unit_lots(txns: list[tuple]) -> list[tuple]:
+    """FIFO unit lots of the current position: [(buy_date, units, unit_price)].
+    Redemptions consume the oldest purchases; what remains are the held units with
+    their real purchase dates and NAVs (amount/units — CAS redemption amounts are
+    negative, hence abs)."""
+    dq = deque()
+    for d, units, amt in txns:
+        if units > 1e-9:
+            dq.append([d, units, abs(amt) / units])
+        elif units < -1e-9:
+            s = -units
+            while s > 1e-9 and dq:
+                if dq[0][1] <= s + 1e-9:
+                    s -= dq[0][1]
+                    dq.popleft()
+                else:
+                    dq[0][1] -= s
+                    s = 0
+    return [(d, u, p) for d, u, p in dq if u > 1e-9]
 
 
 def load_unit_balances(conn) -> dict:
@@ -268,6 +312,8 @@ def compute(
     today: date,
     cash_flows: list | None = None,
     ledger_ok: bool = True,
+    unit_lots: list | None = None,
+    fy_anchor: date | None = None,
 ) -> dict:
     qty       = Decimal(str(h["quantity"]))
     cost      = Decimal(str(h["cost_basis"])) if h["cost_basis"] else None
@@ -324,24 +370,50 @@ def compute(
         # partial flow series yields nonsense (e.g. a liquid fund showing 49%
         # XIRR). Absolute P&L/return above stays, as it only needs cost + value.
         if ledger_ok:
-            # CAGR inception
+            # CAGR inception — annualised, so only once held ≥1 year (same rule as
+            # equity; the old 0.08-year floor annualised 1-month returns into
+            # wildly misleading figures).
             fid = h.get("first_invested_date")
             if fid:
                 years = (today - fid).days / 365.25
-                if years >= 0.08 and float(cost) > 0:
+                if years >= 1.0 and float(cost) > 0:
                     ratio = float(cur_val / cost)
                     if ratio > 0:
-                        out["cagr_inception_pct"] = round(
-                            (ratio ** (1.0 / years) - 1.0) * 100, 4
+                        out["cagr_inception_pct"] = ann_guard(
+                            (ratio ** (1.0 / years) - 1.0) * 100, (today - fid).days
                         )
 
-            # XIRR inception — uses actual per-transaction cash flows
+            # XIRR inception — actual per-transaction cash flows; gated ≥1 year
+            # inside xirr() via ann_guard.
             if cash_flows:
+                days_held = (today - min(d for d, _ in cash_flows)).days
                 flows = list(cash_flows) + [(today, float(cur_val))]
-                out["xirr_inception_pct"] = xirr(flows)
+                out["xirr_inception_pct"] = xirr(flows, days_held)
 
-    # P&L YTD
-    if fy_start_nav is not None:
+    # P&L YTD — per FIFO unit-lot when the ledger reconciles: units bought during
+    # the FY are measured from their purchase NAV, units held at FY start from the
+    # FY-start NAV. The whole-position formula (current qty × FY-start NAV) credited
+    # mid-year purchases with gains from Apr 1 they never earned.
+    nav_f = float(nav)
+    ytd_done = False
+    if ledger_ok and unit_lots and fy_anchor:
+        pnl = base = 0.0
+        computable = True
+        for d, u, p in unit_lots:
+            if d >= fy_anchor:
+                ref = p
+            elif fy_start_nav is not None:
+                ref = fy_start_nav
+            else:
+                computable = False          # pre-FY units but no FY-start NAV
+                break
+            pnl  += u * (nav_f - ref)
+            base += u * ref
+        if computable and base > 0:
+            out["pnl_ytd"]         = round(pnl, 2)
+            out["returns_ytd_pct"] = round(pnl / base * 100, 4)
+            ytd_done = True
+    if not ytd_done and fy_start_nav is not None:
         ytd_val = (qty * Decimal(str(fy_start_nav))).quantize(TWO)
         if ytd_val > 0:
             pnl_ytd = (cur_val - ytd_val).quantize(TWO)
@@ -418,7 +490,7 @@ def run():
     try:
         conn         = get_db()
         holdings     = load_holdings(conn)
-        all_txn_flows = load_transactions(conn)
+        all_txn_flows, all_unit_lots = load_transactions(conn)
         unit_balances = load_unit_balances(conn)
 
         if not holdings:
@@ -432,15 +504,16 @@ def run():
         # Unique security IDs for batch NAV lookups
         sec_ids = list({h["security_id"] for h in holdings})
 
-        # The most recent NAV is typically from last Friday.
-        # prev_week_value must use the Friday BEFORE that so the change is non-zero.
-        current_friday  = last_completed_friday(today)
-        prev_friday     = current_friday - timedelta(days=7)
+        # NAVs are DAILY (AMFI), so the weekly anchor is the last completed Friday —
+        # week-to-date change, the same anchor the equity side uses. (The old code
+        # assumed weekly NAVs and anchored to the Friday before that, making
+        # "weekly change" span ~10-12 days.)
+        anchor_friday   = last_completed_friday(today)
         ytd_anchor      = fy_start(today)
 
-        logger.info(f"Anchors — current Friday: {current_friday} | prev Friday: {prev_friday} | FY start: {ytd_anchor}")
+        logger.info(f"Anchors — weekly: {anchor_friday} | FY start: {ytd_anchor}")
 
-        prev_week_navs = batch_nav_on_or_before(conn, sec_ids, prev_friday)
+        prev_week_navs = batch_nav_on_or_before(conn, sec_ids, anchor_friday)
         fy_start_navs      = batch_nav_on_or_before(conn, sec_ids, ytd_anchor)
         as_of_dates    = batch_latest_nav_date(conn, sec_ids)
 
@@ -464,6 +537,7 @@ def run():
 
                 txn_key = (h["entity_id"], h["security_id"], h["folio_number"])
                 flows   = all_txn_flows.get(txn_key)
+                lots    = all_unit_lots.get(txn_key)
 
                 ledger_ok = ledger_reconciles(
                     Decimal(str(h["quantity"])), unit_balances.get(txn_key)
@@ -475,7 +549,8 @@ def run():
                         f"— suppressing time-weighted metrics (CAGR/XIRR); P&L kept from cost basis"
                     )
 
-                m = compute(h, e_total, pw_nav, fy_start_nav, aod, today, flows, ledger_ok)
+                m = compute(h, e_total, pw_nav, fy_start_nav, aod, today, flows,
+                            ledger_ok, lots, ytd_anchor)
                 metrics_batch.append(m)
                 processed += 1
             except Exception as e:

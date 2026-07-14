@@ -64,8 +64,14 @@ def snapshot_series(cur, entity_id, broker, isin):
 
 
 def build_flows(series, current_mv, first_invested_date, cost):
-    """Cashflow list [(date, amount)] — outflow negative (buy), inflow positive (sell)."""
-    if not series:
+    """Cashflow list [(date, amount)] — outflow negative (buy), inflow positive (sell).
+
+    Returns None when the series is unusable — including when a quantity jump looks
+    like a corporate action (split/bonus): quantity moves materially but market value
+    doesn't move with the implied cash flow. Treating a 1:1 split as a real buy would
+    inject a huge phantom outflow and produce garbage XIRR, so the holding is skipped
+    entirely (this worker is a best-effort fallback; skipping is safe)."""
+    if not series or current_mv is None:
         return None
     flows = []
     first = series[0]
@@ -79,6 +85,7 @@ def build_flows(series, current_mv, first_invested_date, cost):
         flows.append((first["d"], -float(mv0)))
     # In-period flows from quantity changes.
     prev_q = q0
+    prev_mv = first["mv"]
     for s in series[1:]:
         q = Decimal(str(s["q"]))
         dq = q - prev_q
@@ -87,8 +94,17 @@ def build_flows(series, current_mv, first_invested_date, cost):
             if price is None and s["mv"] is not None and q != 0:
                 price = Decimal(str(s["mv"])) / q
             if price is not None:
+                # Corporate-action guard: a ≥5% quantity move whose implied cash
+                # flow is NOT reflected in the day's market-value change is
+                # split/bonus-shaped — the "trade" moved no money.
+                if (prev_q > 0 and prev_mv is not None and s["mv"] is not None
+                        and float(abs(dq)) / float(prev_q) >= 0.05):
+                    implied = abs(float(dq) * float(price))
+                    if abs(float(s["mv"]) - float(prev_mv)) < 0.5 * implied:
+                        return None
                 flows.append((s["d"], -float(dq) * float(price)))
         prev_q = q
+        prev_mv = s["mv"] if s["mv"] is not None else prev_mv
     # Terminal: liquidate at today's market value.
     flows.append((TODAY, float(current_mv)))
     return flows
@@ -137,9 +153,14 @@ def main():
                   f"gated(≥{ANNUALISE_MIN_DAYS}d)={gated}")
         return
 
-    filled = would_fill = skipped_have = 0
+    filled = would_fill = skipped_have = errored = 0
     for h in rows:
-        raw, gated, days = compute(cur, h)
+        try:
+            raw, gated, days = compute(cur, h)
+        except Exception as e:          # one bad row must not abort the whole run
+            print(f"  ! {h['entity_name']} {h['symbol']} ({h['isin']}): {e}")
+            errored += 1
+            continue
         if h["xirr_inception_pct"] is not None:
             skipped_have += 1            # tradebook XIRR already present — never override
             continue
@@ -153,7 +174,7 @@ def main():
         conn.commit()
     print(f"{'COMMIT' if args.commit else 'DRY-RUN'} — {len(rows)} holding(s): "
           f"tradebook-XIRR already set {skipped_have}, snapshot-XIRR "
-          f"{'filled' if args.commit else 'would fill'} {filled or would_fill}.")
+          f"{'filled' if args.commit else 'would fill'} {filled or would_fill}, errors {errored}.")
     print(f"(snapshots began 2026-04-01; annualised output stays suppressed until a "
           f"position's reconstructable window reaches {ANNUALISE_MIN_DAYS} days.)")
     cur.close(); conn.close()

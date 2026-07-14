@@ -10,7 +10,9 @@ For each entity + broker pair:
 
 Metric sources:
   - prev_week_value   : equity_holding_history for last Friday
-  - pnl_ytd           : equity_holding_history for Jan 1 (or earliest available)
+  - pnl_ytd / returns_ytd_pct: NOT computed here — owned by equity_txn_metrics_worker
+    (Indian-FY anchor, per-lot); the upsert COALESCEs so this worker preserves them
+  - xirr_inception_pct: ledger/adapter value when available, else preserved (COALESCE)
   - first_invested_date: preserved from existing equity_holding row; left NULL on first insert
     (real dates are backfilled from the broker tradebook via zerodha_tradebook_import.py)
   - exposure_pct      : current_market_value / sum(ALL broker holdings for entity) × 100
@@ -94,10 +96,6 @@ def last_friday(today: date) -> date:
     """Return the most recent Friday on or before today."""
     days_since_friday = (today.weekday() - 4) % 7
     return today - timedelta(days=days_since_friday)
-
-
-def jan1(today: date) -> date:
-    return date(today.year, 1, 1)
 
 
 def fetch_history_value(
@@ -300,7 +298,6 @@ def apply_fx(conn, h: EquityHolding, today: date) -> EquityHolding:
 def compute_metrics(
     h: EquityHolding,
     prev_week_value: Optional[Decimal],
-    ytd_value: Optional[Decimal],
     total_portfolio_value: Decimal,
     today: date,
     first_invested_date: Optional[date],
@@ -326,9 +323,11 @@ def compute_metrics(
     # P&L inception
     h.pnl_inception = (h.current_market_value - h.cost).quantize(TWO)
 
-    # P&L YTD — uses Jan 1 snapshot as the cost base for the year
-    if ytd_value is not None and ytd_value > 0:
-        h.pnl_ytd = (h.current_market_value - ytd_value).quantize(TWO)
+    # P&L YTD is NOT computed here. equity_txn_metrics_worker owns pnl_ytd /
+    # returns_ytd_pct (Indian-FY anchor, per-lot). This worker used a Jan-1
+    # calendar anchor with a whole-value method — two writers with two different
+    # definitions on the same columns. The upsert COALESCEs, so leaving these
+    # None preserves the txn worker's values.
 
     # P&L weekly change — change in inception P&L over the week
     if prev_week_value is not None:
@@ -339,12 +338,6 @@ def compute_metrics(
     if h.cost > 0:
         h.returns_inception_pct = (
             h.pnl_inception / h.cost * 100
-        ).quantize(FOUR, ROUND_HALF_UP)
-
-    # Returns YTD %
-    if ytd_value is not None and ytd_value > 0:
-        h.returns_ytd_pct = (
-            h.pnl_ytd / ytd_value * 100
         ).quantize(FOUR, ROUND_HALF_UP)
 
     # CAGR inception — only annualise once held ≥1 year. Below that, annualising a
@@ -438,7 +431,11 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
             returns_ytd_pct       = COALESCE(EXCLUDED.returns_ytd_pct, {tbl}.returns_ytd_pct),
             returns_inception_pct = EXCLUDED.returns_inception_pct,
             cagr_inception_pct    = EXCLUDED.cagr_inception_pct,
-            xirr_inception_pct    = EXCLUDED.xirr_inception_pct,
+            -- COALESCE: this worker has no XIRR of its own for API brokers (only a
+            -- ledger/adapter one when available). A bare EXCLUDED here overwrote the
+            -- txn/snapshot workers' XIRR with NULL on every sync — wiping the column
+            -- for the whole trading day after the 04:30 UTC run.
+            xirr_inception_pct    = COALESCE(EXCLUDED.xirr_inception_pct, {tbl}.xirr_inception_pct),
             first_invested_date   = EXCLUDED.first_invested_date,
             remarks               = EXCLUDED.remarks,
             angel_one_token       = COALESCE(EXCLUDED.angel_one_token, {tbl}.angel_one_token),
@@ -463,17 +460,19 @@ def upsert_equity_holding(cur, h: EquityHolding, first_invested_date: Optional[d
             "cost_native":                 float(h.cost_native)                 if h.cost_native                 is not None else None,
             "current_price_native":        float(h.current_price_native)        if h.current_price_native        is not None else None,
             "current_market_value_native": float(h.current_market_value_native) if h.current_market_value_native is not None else None,
-            "prev_week_value":       float(h.prev_week_value)    if h.prev_week_value    else None,
-            "market_value_as_on":    float(h.market_value_as_on) if h.market_value_as_on else None,
+            # "is not None" everywhere: a legitimate zero (e.g. weekly_change of
+            # exactly 0.00) must store as 0, not NULL — Decimal("0") is falsy.
+            "prev_week_value":       float(h.prev_week_value)    if h.prev_week_value    is not None else None,
+            "market_value_as_on":    float(h.market_value_as_on) if h.market_value_as_on is not None else None,
             "as_of_date":            h.as_of_date,
-            "exposure_pct":          float(h.exposure_pct)          if h.exposure_pct          else None,
-            "weekly_change":         float(h.weekly_change)         if h.weekly_change         else None,
-            "pnl_ytd":               float(h.pnl_ytd)               if h.pnl_ytd               else None,
-            "pnl_inception":         float(h.pnl_inception)         if h.pnl_inception         else None,
-            "pnl_weekly_change":     float(h.pnl_weekly_change)     if h.pnl_weekly_change     else None,
-            "returns_ytd_pct":       float(h.returns_ytd_pct)       if h.returns_ytd_pct       else None,
-            "returns_inception_pct": float(h.returns_inception_pct) if h.returns_inception_pct else None,
-            "cagr_inception_pct":    float(h.cagr_inception_pct)    if h.cagr_inception_pct    else None,
+            "exposure_pct":          float(h.exposure_pct)          if h.exposure_pct          is not None else None,
+            "weekly_change":         float(h.weekly_change)         if h.weekly_change         is not None else None,
+            "pnl_ytd":               float(h.pnl_ytd)               if h.pnl_ytd               is not None else None,
+            "pnl_inception":         float(h.pnl_inception)         if h.pnl_inception         is not None else None,
+            "pnl_weekly_change":     float(h.pnl_weekly_change)     if h.pnl_weekly_change     is not None else None,
+            "returns_ytd_pct":       float(h.returns_ytd_pct)       if h.returns_ytd_pct       is not None else None,
+            "returns_inception_pct": float(h.returns_inception_pct) if h.returns_inception_pct is not None else None,
+            "cagr_inception_pct":    float(h.cagr_inception_pct)    if h.cagr_inception_pct    is not None else None,
             "xirr_inception_pct":    float(h.xirr_inception_pct)    if h.xirr_inception_pct is not None else None,
             "first_invested_date":   first_invested_date,
             "remarks":               h.remarks,
@@ -498,7 +497,7 @@ def snapshot_history(cur, h: EquityHolding, today: date, foreign: bool = False):
             float(h.current_price),
             float(h.current_market_value),
             float(h.cost),
-            float(h.pnl_inception) if h.pnl_inception else None,
+            float(h.pnl_inception) if h.pnl_inception is not None else None,
             h.currency or "INR",
             float(h.fx_rate) if h.fx_rate is not None else 1,
             float(h.current_price_native)        if h.current_price_native        is not None else None,
@@ -821,7 +820,6 @@ def sync_entity_broker(
     total_value = sum(h.current_market_value for h in holdings)
 
     prev_friday = last_friday(today - timedelta(days=1))  # last completed Friday
-    ytd_date    = jan1(today)
 
     # Prime the asset-class override map once (cheap, process-cached) so each
     # upsert can stamp gold/silver/commodity vs equity from the same lookup.
@@ -832,7 +830,6 @@ def sync_entity_broker(
 
     for h in holdings:
         prev_week_val     = fetch_history_value(conn, entity_id, broker_label, h.symbol, prev_friday, h.isin, foreign)
-        ytd_val           = fetch_history_value(conn, entity_id, broker_label, h.symbol, ytd_date, h.isin, foreign)
         # Leave NULL until the real purchase date is known (backfilled from the broker
         # tradebook — see zerodha_tradebook_import.py). Defaulting to today stamped a wrong
         # "Since" date and produced a bogus ~0-year CAGR. Both compute_metrics and the upsert
@@ -845,7 +842,7 @@ def sync_entity_broker(
         first_invest_date = h.first_invested_date or ledger_first_buy or \
             fetch_first_invested_date(conn, entity_id, broker_label, h.symbol, foreign)
 
-        h = compute_metrics(h, prev_week_val, ytd_val, total_value, today, first_invest_date)
+        h = compute_metrics(h, prev_week_val, total_value, today, first_invest_date)
 
         # Recompute XIRR from the ledger each run so it tracks live market value.
         # Adapter-supplied XIRR (if any) wins; otherwise use the ledger result.
