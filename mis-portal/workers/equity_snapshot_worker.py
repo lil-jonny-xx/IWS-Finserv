@@ -160,17 +160,21 @@ def _real_trade_recent(cur, entity_id, security_id, today) -> bool:
 
 
 def _insert_trade(cur, entity_id, security_id, tdate, side, qty, price,
-                  source, source_ref, exchange):
+                  source, source_ref, exchange, broker):
+    # broker is stored so the metrics worker can scope a snapshot-derived trade to
+    # the right broker account (an ISIN held at two brokers by one entity must not
+    # cross-contaminate). Imported/API rows carry the broker as their `source`;
+    # snapshot + manual rows carry the broker column instead.
     amount = float(qty) * float(price)
     cur.execute(
         """
         INSERT INTO stock_transaction
             (entity_id, security_id, transaction_date, transaction_type, quantity, price,
-             amount, amount_inr, currency, exchange, source, source_ref, created_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'INR',%s,%s,%s,NOW())
+             amount, amount_inr, currency, exchange, source, source_ref, broker, created_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'INR',%s,%s,%s,%s,NOW())
         """,
         (entity_id, security_id, tdate, side, float(qty), float(price),
-         amount, amount, exchange, source, source_ref),
+         amount, amount, exchange, source, source_ref, broker),
     )
 
 
@@ -186,7 +190,7 @@ def _has_existing_buys(cur, entity_id, security_id) -> bool:
     return cur.fetchone() is not None
 
 
-def seed_opening_buys(cur, entity_id, holdings, today):
+def seed_opening_buys(cur, entity_id, broker, holdings, today):
     """First-ever snapshot for this account: record each held position as an opening
     BUY at its broker avg cost so Realised Gains has a cost basis for later sells.
     Idempotent per (entity, symbol), and skipped when real buy history already
@@ -209,7 +213,7 @@ def seed_opening_buys(cur, entity_id, holdings, today):
             continue
         tdate  = getattr(h, "first_invested_date", None) or today
         _insert_trade(cur, entity_id, sec_id, tdate, "BUY", qty, avg,
-                      "snapshot_open", source_ref, exch)
+                      "snapshot_open", source_ref, exch, broker)
         seeded += 1
     return seeded
 
@@ -300,7 +304,7 @@ def detect_trades(cur, entity_id, broker, holdings, prev, captured_at, today):
         if _real_trade_recent(cur, entity_id, sec_id, today):
             continue
         _insert_trade(cur, entity_id, sec_id, today, side, qty, price,
-                      "snapshot", source_ref, exch)
+                      "snapshot", source_ref, exch, broker)
         if side == "BUY":
             buys += 1
         else:
@@ -353,7 +357,7 @@ def run():
                 total_snap += len(holdings)
 
                 if not prev:
-                    total_seed += seed_opening_buys(cur, entity_id, holdings, today)
+                    total_seed += seed_opening_buys(cur, entity_id, broker_label, holdings, today)
                 else:
                     b, s = detect_trades(cur, entity_id, broker_label, holdings,
                                          prev, captured_at, today)

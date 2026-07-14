@@ -4,8 +4,19 @@ Equity holding metrics from transaction history.
 
 Fills the equity_holding columns that the broker-API holdings feed leaves empty —
 xirr_inception_pct, cagr_inception_pct, pnl_ytd, returns_ytd_pct — and backfills any
-missing first_invested_date, using the stock_transaction history imported from broker
-tradebooks (see import_tradebooks_multi.py).
+missing first_invested_date, using stock_transaction history.
+
+Trade history is drawn from three tiers per (entity, broker, ISIN), most to least
+authoritative, so a position gets metrics with ZERO manual import:
+  1. imported tradebook (source=broker) + manual register (source='manual')
+  2. auto-captured intraday trades (source='snapshot', equity_snapshot_worker)
+  3. the auto-seeded opening position (source='snapshot_open') — this is the
+     self-building tradebook: a brand-new holding is seeded at its broker avg cost,
+     so it reconstructs and gets full metrics without anyone importing anything.
+Precedence mirrors the DB dedup: when authoritative BUY history exists we drop
+snapshot_open and keep only snapshot rows dated after the last authoritative trade,
+so a dedup gap can't double-count. Reconstructions that lean on snapshot data are
+logged as method 'snap-flow' (vs 'fifo-flow' for pure tradebook history).
 
 Per holding (matched to transactions by entity + broker + ISIN):
 
@@ -140,19 +151,40 @@ def compute(cur, h):
     out = {"method": "none", "xirr_inception_pct": None, "cagr_inception_pct": None,
            "pnl_ytd": None, "returns_ytd_pct": None}
 
-    # Imported tradebook rows for this broker + admin-entered manual rows tagged
-    # with this broker (manual trade register: transfers, demergers, allotments,
-    # trades whose tradebook export isn't uploaded yet).
+    # Three tiers of trade history for this (entity, broker, ISIN), most to least
+    # authoritative:
+    #   authoritative  = imported tradebook (source=broker) + manual register rows
+    #   snapshot       = auto-captured intraday buys/sells (equity_snapshot_worker)
+    #   snapshot_open  = the auto-seeded opening position for a stock that has no
+    #                    tradebook — this is what makes the register self-building:
+    #                    a new holding gets metrics with zero manual import.
+    # Precedence (mirrors the DB dedup so a dedup gap can't double-count): when
+    # authoritative BUY history exists, drop snapshot_open entirely and keep only
+    # snapshot rows dated AFTER the last authoritative trade. Otherwise use the
+    # snapshot tier as-is.
     txns = []
+    used_snapshot = False
     if isin:
         cur.execute("""SELECT st.transaction_date d, st.transaction_type side,
-                              st.quantity q, st.price p
+                              st.quantity q, st.price p, st.source src
                        FROM stock_transaction st JOIN security_master sm ON sm.id=st.security_id
-                       WHERE st.entity_id=%s
-                         AND (st.source=%s OR (st.source='manual' AND st.broker=%s))
-                         AND sm.isin=%s
-                       ORDER BY st.transaction_date, st.id""", (eid, broker, broker, isin))
-        txns = cur.fetchall()
+                       WHERE st.entity_id=%s AND sm.isin=%s
+                         AND ( st.source=%s
+                            OR (st.source='manual' AND st.broker=%s)
+                            OR (st.source IN ('snapshot','snapshot_open') AND st.broker=%s) )
+                       ORDER BY st.transaction_date, st.id""",
+                    (eid, isin, broker, broker, broker))
+        rows = cur.fetchall()
+        auth = [r for r in rows if r["src"] not in ("snapshot", "snapshot_open")]
+        auth_has_buy = any(r["side"] == "BUY" for r in auth)
+        if auth_has_buy:
+            max_auth = max(r["d"] for r in auth)
+            txns = [r for r in rows
+                    if r["src"] not in ("snapshot", "snapshot_open")
+                    or (r["src"] == "snapshot" and r["d"] > max_auth)]
+        else:
+            txns = rows
+        used_snapshot = any(r["src"] in ("snapshot", "snapshot_open") for r in txns)
 
     # Does the transaction history reconstruct the current position?
     # Tolerance: 2% of quantity; the 1-share absolute slack only applies to larger
@@ -179,7 +211,7 @@ def compute(cur, h):
         flows = [(d, -q * p) for d, q, p in lots] + [(TODAY, cmv)]
         rate = xirr(flows)
         if rate is not None:
-            out["method"] = "fifo-flow"
+            out["method"] = "snap-flow" if used_snapshot else "fifo-flow"
     if rate is None and first_dt and cost > 0 and cmv is not None:   # 2-point fallback
         rate = xirr([(first_dt, -cost), (TODAY, cmv)])
         if rate is not None:
