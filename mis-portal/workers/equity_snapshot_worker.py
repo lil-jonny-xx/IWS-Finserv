@@ -313,6 +313,65 @@ def detect_trades(cur, entity_id, broker, holdings, prev, captured_at, today):
     return buys, sells
 
 
+def _broker_has_buy(cur, entity_id, security_id, broker) -> bool:
+    """True if this (entity, security) already has BUY history FOR THIS BROKER —
+    an imported tradebook (source=broker) or a manual/snapshot row tagged to it.
+    Broker-aware (unlike _has_existing_buys) so a stock held at two brokers by one
+    entity can be seeded once per broker."""
+    cur.execute(
+        """SELECT 1 FROM stock_transaction
+           WHERE entity_id=%s AND security_id=%s AND transaction_type='BUY'
+             AND (source=%s OR (source IN ('manual','snapshot','snapshot_open') AND broker=%s))
+           LIMIT 1""",
+        (entity_id, security_id, broker, broker),
+    )
+    return cur.fetchone() is not None
+
+
+def seed_held_without_history(conn, apply: bool) -> int:
+    """Safety net for full automation: seed an opening BUY for any currently-held
+    Indian-equity position that has NO reconstructing history for its broker.
+
+    The live tick only seeds on an account's first-ever snapshot; a position held
+    before that tick (or across a worker outage) can slip through and, being static,
+    is never picked up by the qty-diff either. This backfills those so every holding
+    reconstructs without a manual import. Idempotent (broker-aware BUY guard) and
+    re-runnable. Reads holdings from the equity_holding table (avg_cost/qty already
+    broker-fed), so it does not hit any broker API."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT eh.entity_id, eh.broker, eh.symbol, eh.isin, eh.exchange,
+               eh.quantity, eh.avg_cost, eh.first_invested_date, e.entity_name
+        FROM equity_holding eh JOIN entity e ON e.id=eh.entity_id
+        WHERE eh.broker IN ('zerodha','angel_one','dhan')
+          AND eh.quantity > 0 AND eh.avg_cost > 0
+        ORDER BY e.entity_name, eh.broker, eh.symbol
+    """)
+    rows = cur.fetchall()
+    today = date.today()
+    seeded = 0
+    for r in rows:
+        sec_id = _get_or_create_security(cur, r["isin"] or None, r["symbol"], r["exchange"] or None, False)
+        if _broker_has_buy(cur, r["entity_id"], sec_id, r["broker"]):
+            continue
+        # broker in the ref so a two-broker holding seeds once per broker
+        source_ref = f"snapshot_open:{r['entity_id']}|{r['broker']}|{r['symbol']}"
+        if _synthetic_exists(cur, source_ref):
+            continue
+        tdate = r["first_invested_date"] or today
+        print(f"   seed {r['entity_name']:6} {r['broker']:9} {r['symbol']:14} "
+              f"qty={_d(r['quantity'])} @ {_d(r['avg_cost'])}  ({tdate})")
+        if apply:
+            _insert_trade(cur, r["entity_id"], sec_id, tdate, "BUY",
+                          _d(r["quantity"]), _d(r["avg_cost"]),
+                          "snapshot_open", source_ref, r["exchange"] or None, r["broker"])
+        seeded += 1
+    if apply:
+        conn.commit()
+    cur.close()
+    return seeded
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -379,4 +438,20 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    import argparse
+    ap = argparse.ArgumentParser(description="Equity snapshot worker + seed backfill.")
+    ap.add_argument("--seed-held", action="store_true",
+                    help="backfill opening seeds for held positions lacking history (see seed_held_without_history)")
+    ap.add_argument("--apply", action="store_true", help="with --seed-held: write (default dry-run)")
+    args = ap.parse_args()
+    if args.seed_held:
+        conn = get_conn()
+        try:
+            print(f"{'APPLY' if args.apply else 'DRY-RUN'} — seeding held positions without history:")
+            n = seed_held_without_history(conn, args.apply)
+            print(f"\n{'seeded' if args.apply else 'would seed'} {n} position(s)."
+                  + ("" if args.apply else " Re-run with --apply."))
+        finally:
+            conn.close()
+    else:
+        run()

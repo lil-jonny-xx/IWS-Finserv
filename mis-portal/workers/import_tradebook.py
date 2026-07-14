@@ -80,12 +80,42 @@ def _side(v):
 
 
 def _get_or_create_security(cur, isin, symbol, exchange, dry):
-    """Return security_master id for a stock, creating it if absent (matched by ISIN then symbol)."""
+    """Return security_master id for a stock, ISIN-first.
+
+    When an ISIN is given it is authoritative:
+      1. exact ISIN match wins;
+      2. else a same-symbol row whose ISIN is NULL is ADOPTED (its ISIN backfilled)
+         — that row was a name-only import of this same instrument, now identified;
+      3. else create a NEW row. A same-symbol row with a DIFFERENT non-null ISIN is
+         NOT reused: it is either a stale identifier or a genuinely different company
+         that merely shares a ticker (e.g. Indian 'META', ISIN INExxx, vs US Meta
+         Platforms carried name-only on Vested). Collapsing them cross-contaminates
+         one holding's history with another's — the bug this guards against.
+    When no ISIN is given, fall back to a plain same-symbol match, else create.
+    """
     if isin:
         cur.execute("SELECT id FROM security_master WHERE isin = %s", (isin,))
         row = cur.fetchone()
         if row:
             return row["id"]
+        cur.execute(
+            "SELECT id FROM security_master WHERE security_name = %s AND security_type = 'EQUITY' AND isin IS NULL",
+            (symbol,),
+        )
+        row = cur.fetchone()
+        if row:
+            if not dry:
+                cur.execute("UPDATE security_master SET isin = %s WHERE id = %s", (isin, row["id"]))
+            return row["id"]
+        if dry:
+            return f"<new:{symbol or isin}>"
+        cur.execute("""
+            INSERT INTO security_master (isin, security_name, security_type, asset_class, currency, exchange, created_at)
+            VALUES (%s, %s, 'EQUITY', 'EQUITY', 'INR', %s, NOW())
+            RETURNING id
+        """, (isin, symbol, exchange))
+        return cur.fetchone()["id"]
+
     cur.execute("SELECT id FROM security_master WHERE security_name = %s AND security_type = 'EQUITY'", (symbol,))
     row = cur.fetchone()
     if row:
@@ -96,7 +126,7 @@ def _get_or_create_security(cur, isin, symbol, exchange, dry):
         INSERT INTO security_master (isin, security_name, security_type, asset_class, currency, exchange, created_at)
         VALUES (%s, %s, 'EQUITY', 'EQUITY', 'INR', %s, NOW())
         RETURNING id
-    """, (isin or None, symbol, exchange))
+    """, (None, symbol, exchange))
     return cur.fetchone()["id"]
 
 
