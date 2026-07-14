@@ -7,6 +7,7 @@
 // and blocked by the API (403).
 export const ADMIN_ONLY_HREFS = new Set<string>([
   '/manual-data',
+  '/trades',        // manual trade register — firm-wide data entry, admin only
 ]);
 
 // Filter a nav list down to what the given role may see. Admin sees everything;

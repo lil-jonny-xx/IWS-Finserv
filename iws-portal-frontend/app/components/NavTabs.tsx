@@ -35,6 +35,7 @@ const TABS = [
   { href: '/properties',     label: 'Properties' },
   { href: '/art',            label: 'Art' },
   { href: '/realised-gains', label: 'Realised Gains' },
+  { href: '/trades',         label: 'Trades' },
   { href: '/manual-data',    label: 'Manual Data' },
   { href: '/reports',        label: 'Reports' },
   { href: '/assistant',      label: 'Assistant' },

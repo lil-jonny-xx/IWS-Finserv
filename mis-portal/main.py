@@ -6493,3 +6493,193 @@ def stream_live_trades(request: Request, authorization: Optional[str] = Header(N
             "Connection": "keep-alive",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Manual trade register — "our own tradebook"
+#
+# Admin-entered trades/corporate actions that broker tradebooks and API feeds
+# never carry: demat transfers, demerger/IPO/bonus/rights allotments, off-market
+# deals, and recent trades whose tradebook export hasn't been uploaded yet.
+#
+# Rows land in stock_transaction with source='manual' and the broker column set,
+# so they flow into the SAME pipelines as imported tradebooks:
+#   - equity_txn_metrics_worker merges them with the broker's imported history
+#     (FIFO lots -> XIRR/CAGR/YTD/first_invested_date)
+#   - report_generator's realised-gains FIFO picks them up automatically
+#     (it reads all INR stock_transaction rows)
+#
+# IMPORTANT: do not re-enter trades that a broker tradebook import already
+# covers — the quantity reconstruction check will fail and metrics degrade.
+# ---------------------------------------------------------------------------
+
+MANUAL_TRADE_BUY_KINDS  = {"buy", "transfer_in", "demerger", "ipo", "bonus", "rights"}
+MANUAL_TRADE_SELL_KINDS = {"sell", "transfer_out"}
+MANUAL_TRADE_BROKERS    = {"zerodha", "angel_one", "dhan", "other"}
+
+
+class ManualTradeRequest(BaseModel):
+    entity_id: int
+    broker: str                      # zerodha | angel_one | dhan | other
+    symbol: str = Field(min_length=1, max_length=40)
+    isin: Optional[str] = None       # required only if the symbol can't be resolved
+    kind: str                        # buy|sell|transfer_in|transfer_out|demerger|ipo|bonus|rights
+    trade_date: date
+    quantity: float = Field(gt=0)
+    price: float = Field(ge=0)       # per-share INR; 0 allowed for bonus/demerger allotments
+    notes: Optional[str] = Field(default=None, max_length=500)
+
+
+def _resolve_manual_security(cursor, entity_id: int, symbol: str, isin: Optional[str]):
+    """security_master id for a manual trade. Resolution order: explicit ISIN ->
+    entity's own equity_holding symbol (any broker) -> security_master by name.
+    Creates the security row when an ISIN is given but unknown. Returns
+    (security_id, isin) or raises HTTPException(400) asking for the ISIN."""
+    sym = symbol.strip().upper()
+    if isin:
+        isin = isin.strip().upper()
+        if not re.fullmatch(r"IN[A-Z0-9]{10}", isin):
+            raise HTTPException(status_code=400, detail=f"'{isin}' is not a valid ISIN (INxxxxxxxxxx)")
+        cursor.execute("SELECT id, isin FROM security_master WHERE isin = %s", (isin,))
+        row = cursor.fetchone()
+        if row:
+            return row["id"], row["isin"]
+        cursor.execute(
+            """INSERT INTO security_master (security_name, isin, security_type, currency, exchange)
+               VALUES (%s, %s, 'EQUITY', 'INR', 'NSE') RETURNING id""",
+            (sym, isin),
+        )
+        return cursor.fetchone()["id"], isin
+    # no ISIN given: try the entity's holdings, then security_master by name
+    cursor.execute(
+        """SELECT isin FROM equity_holding
+           WHERE entity_id = %s AND isin IS NOT NULL
+             AND UPPER(REGEXP_REPLACE(symbol, '-(EQ|ST|SM|BE|BZ|GB)$', '')) =
+                 REGEXP_REPLACE(%s, '-(EQ|ST|SM|BE|BZ|GB)$', '')
+           LIMIT 1""",
+        (entity_id, sym),
+    )
+    row = cursor.fetchone()
+    if row:
+        return _resolve_manual_security(cursor, entity_id, sym, row["isin"])
+    cursor.execute(
+        "SELECT id, isin FROM security_master WHERE UPPER(security_name) = %s AND isin IS NOT NULL LIMIT 1",
+        (sym,),
+    )
+    row = cursor.fetchone()
+    if row:
+        return row["id"], row["isin"]
+    raise HTTPException(
+        status_code=400,
+        detail=f"Cannot resolve '{sym}' to an ISIN — not in this entity's holdings. Please supply the ISIN.",
+    )
+
+
+@app.get("/api/v1/manual-trades")
+def list_manual_trades(request: Request, entity_id: Optional[int] = None,
+                       authorization: Optional[str] = Header(None)):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        if _live_role(cursor, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin only")
+        where, params = "st.source = 'manual'", []
+        if entity_id:
+            where += " AND st.entity_id = %s"; params.append(entity_id)
+        cursor.execute(f"""
+            SELECT st.id, st.entity_id, e.entity_name, st.broker,
+                   sm.security_name AS symbol, sm.isin,
+                   st.transaction_date, st.transaction_type, st.quantity, st.price,
+                   st.amount, st.notes, st.created_at
+            FROM stock_transaction st
+            JOIN entity e ON e.id = st.entity_id
+            JOIN security_master sm ON sm.id = st.security_id
+            WHERE {where}
+            ORDER BY st.transaction_date DESC, st.id DESC""", params)
+        return {"trades": [dict(r) for r in cursor.fetchall()]}
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/manual-trades")
+@limiter.limit("30/minute")
+def add_manual_trade(request: Request, body: ManualTradeRequest,
+                     authorization: Optional[str] = Header(None)):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        if _live_role(cursor, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin only")
+
+        kind = body.kind.strip().lower()
+        if kind not in MANUAL_TRADE_BUY_KINDS | MANUAL_TRADE_SELL_KINDS:
+            raise HTTPException(status_code=400, detail=f"Unknown kind '{kind}'")
+        broker = body.broker.strip().lower()
+        if broker not in MANUAL_TRADE_BROKERS:
+            raise HTTPException(status_code=400, detail=f"Unknown broker '{broker}'")
+        if body.trade_date > date.today():
+            raise HTTPException(status_code=400, detail="trade_date is in the future")
+        cursor.execute("SELECT 1 FROM entity WHERE id = %s", (body.entity_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Entity not found")
+
+        sec_id, isin = _resolve_manual_security(cursor, body.entity_id, body.symbol, body.isin)
+        side = "BUY" if kind in MANUAL_TRADE_BUY_KINDS else "SELL"
+        note = f"[{kind}]" + (f" {body.notes.strip()}" if body.notes and body.notes.strip() else "")
+        ref = f"manual:{uuid.uuid4().hex[:16]}"
+        cursor.execute(
+            """INSERT INTO stock_transaction
+                 (entity_id, security_id, transaction_date, transaction_type,
+                  quantity, price, amount, currency, source, source_ref, broker, notes)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,'INR','manual',%s,%s,%s)
+               RETURNING id""",
+            (body.entity_id, sec_id, body.trade_date, side,
+             body.quantity, body.price, round(body.quantity * body.price, 2),
+             ref, broker, note),
+        )
+        new_id = cursor.fetchone()["id"]
+        conn.commit()
+        logger.info(f"Manual trade #{new_id} added by {payload['email']}: "
+                    f"entity={body.entity_id} {broker} {side} {body.quantity} x {body.symbol} ({isin}) [{kind}]")
+        return {"id": new_id, "isin": isin, "side": side,
+                "message": "Trade recorded. Metrics refresh on the next worker run (or within the day via the intraday runs)."}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"add_manual_trade failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record trade")
+    finally:
+        release_db_connection(conn)
+
+
+@app.delete("/api/v1/manual-trades/{trade_id}")
+def delete_manual_trade(trade_id: int, request: Request,
+                        authorization: Optional[str] = Header(None)):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        if _live_role(cursor, payload["email"]) != "admin":
+            raise HTTPException(status_code=403, detail="Admin only")
+        cursor.execute("DELETE FROM stock_transaction WHERE id = %s AND source = 'manual' RETURNING id",
+                       (trade_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Manual trade not found (imported rows cannot be deleted here)")
+        conn.commit()
+        logger.info(f"Manual trade #{trade_id} deleted by {payload['email']}")
+        return {"deleted": trade_id}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        release_db_connection(conn)

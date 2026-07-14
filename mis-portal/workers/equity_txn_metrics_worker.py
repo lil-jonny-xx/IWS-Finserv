@@ -140,13 +140,18 @@ def compute(cur, h):
     out = {"method": "none", "xirr_inception_pct": None, "cagr_inception_pct": None,
            "pnl_ytd": None, "returns_ytd_pct": None}
 
+    # Imported tradebook rows for this broker + admin-entered manual rows tagged
+    # with this broker (manual trade register: transfers, demergers, allotments,
+    # trades whose tradebook export isn't uploaded yet).
     txns = []
     if isin:
         cur.execute("""SELECT st.transaction_date d, st.transaction_type side,
                               st.quantity q, st.price p
                        FROM stock_transaction st JOIN security_master sm ON sm.id=st.security_id
-                       WHERE st.entity_id=%s AND st.source=%s AND sm.isin=%s
-                       ORDER BY st.transaction_date, st.id""", (eid, broker, isin))
+                       WHERE st.entity_id=%s
+                         AND (st.source=%s OR (st.source='manual' AND st.broker=%s))
+                         AND sm.isin=%s
+                       ORDER BY st.transaction_date, st.id""", (eid, broker, broker, isin))
         txns = cur.fetchall()
 
     # Does the transaction history reconstruct the current position?
