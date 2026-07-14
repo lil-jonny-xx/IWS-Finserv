@@ -344,11 +344,30 @@ def entity_id(cur, code):
 
 
 def get_or_create_security(cur, isin, symbol, exchange, currency, commit):
+    """ISIN-first (see import_tradebook._get_or_create_security for the rationale):
+    an exact ISIN match wins; else a same-symbol NULL-isin row is adopted (its ISIN
+    backfilled); else a NEW row is created. A same-symbol row with a DIFFERENT
+    non-null ISIN is never reused — that collapse is what orphaned holdings from
+    their history (stale ISINs, and ticker collisions like Indian META vs US Meta)."""
     if isin:
         cur.execute("SELECT id FROM security_master WHERE isin = %s", (isin,))
         row = cur.fetchone()
         if row:
             return row["id"]
+        cur.execute("SELECT id FROM security_master WHERE security_name = %s AND security_type='EQUITY' AND isin IS NULL", (symbol,))
+        row = cur.fetchone()
+        if row:
+            if commit:
+                cur.execute("UPDATE security_master SET isin = %s WHERE id = %s", (isin, row["id"]))
+            return row["id"]
+        if not commit:
+            return None
+        cur.execute("""
+            INSERT INTO security_master (isin, security_name, security_type, asset_class, currency, exchange, created_at)
+            VALUES (%s,%s,'EQUITY','EQUITY',%s,%s,NOW()) RETURNING id
+        """, (isin, symbol, currency, exchange))
+        return cur.fetchone()["id"]
+
     cur.execute("SELECT id FROM security_master WHERE security_name = %s AND security_type='EQUITY'", (symbol,))
     row = cur.fetchone()
     if row:
@@ -358,7 +377,7 @@ def get_or_create_security(cur, isin, symbol, exchange, currency, commit):
     cur.execute("""
         INSERT INTO security_master (isin, security_name, security_type, asset_class, currency, exchange, created_at)
         VALUES (%s,%s,'EQUITY','EQUITY',%s,%s,NOW()) RETURNING id
-    """, (isin or None, symbol, currency, exchange))
+    """, (None, symbol, currency, exchange))
     return cur.fetchone()["id"]
 
 
