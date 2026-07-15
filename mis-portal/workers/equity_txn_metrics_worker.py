@@ -215,7 +215,7 @@ def compute(cur, h):
                        FROM stock_transaction st JOIN security_master sm ON sm.id=st.security_id
                        WHERE st.entity_id=%s AND sm.isin=%s
                          AND ( st.source=%s
-                            OR (st.source='manual' AND st.broker=%s)
+                            OR (st.source IN ('manual','reconstructed') AND st.broker=%s)
                             OR (st.source IN ('snapshot','snapshot_open') AND st.broker=%s) )
                        ORDER BY st.transaction_date, st.id""",
                     (eid, isin, broker, broker, broker))
@@ -277,13 +277,21 @@ def compute(cur, h):
                     out["first_invested_date"] = earliest
     days = (TODAY - first_dt).days if first_dt else None
 
-    # XIRR — held lots as dated outflows + current value inflow (no intraday churn)
+    # XIRR — held lots as dated outflows + current value inflow (no intraday churn).
+    # Trust the dated lot-flow only when the held-lot cost reconciles with the
+    # authoritative holding cost basis (broker avg cost). FIFO on synthetic or
+    # incomplete history can consume the cheap reconstructed transfer-in lot and
+    # leave expensive later lots whose total cost diverges wildly from what was
+    # actually paid (e.g. DHR HDFCBANK: lot-cost 4.18M vs real basis 2.43M) — that
+    # would make the flow XIRR meaningless, so fall through to the 2-point instead.
     rate = None
     if lots and cmv is not None:
-        flows = [(d, -q * p) for d, q, p in lots] + [(TODAY, cmv)]
-        rate = xirr(flows)
-        if rate is not None:
-            out["method"] = "snap-flow" if used_snapshot else "fifo-flow"
+        lot_cost = sum(q * p for _, q, p in lots)
+        if cost <= 0 or abs(lot_cost - cost) <= 0.10 * cost:
+            flows = [(d, -q * p) for d, q, p in lots] + [(TODAY, cmv)]
+            rate = xirr(flows)
+            if rate is not None:
+                out["method"] = "snap-flow" if used_snapshot else "fifo-flow"
     if rate is None and first_dt and cost > 0 and cmv is not None:   # 2-point fallback
         rate = xirr([(first_dt, -cost), (TODAY, cmv)])
         if rate is not None:
