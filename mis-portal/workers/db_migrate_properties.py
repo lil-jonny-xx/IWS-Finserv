@@ -126,8 +126,9 @@ CREATE INDEX IF NOT EXISTS idx_property_document_pid ON property_document(proper
 # (name, short_code, grp, sort_order) — system entities are appended first at
 # runtime so the register always covers whatever the portal already knows.
 SEED = [
-    ("IWS Finser LLP",              None,  "main",   20),
-    ("IWS Finserv",                 None,  "main",   21),
+    # "IWS Finser LLP" (typo) and "IWS Finserv" were the same holder — merged into
+    # one canonical row on 2026-07-14.
+    ("IWS Finserv LLP",             None,  "main",   20),
     ("Imperial Northstar Pvt. Ltd.", None, "main",   22),
     ("Imperial Northstar Exim LLP", None,  "main",   23),
     ("Sharmila Harish Rajani",      "SHR", "main",   24),
