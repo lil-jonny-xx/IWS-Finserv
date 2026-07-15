@@ -166,7 +166,17 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str,
                     page.wait_for_timeout(random.randint(300, 600))
                     logger.info(f"Period set: {from_date_str} → {to_date_str}")
                 except RuntimeError as e:
-                    logger.warning(f"Could not set Specific Period — using CAMS default period: {e}")
+                    # Do NOT fall through to CAMS's default "Current Financial Year":
+                    # a FY-to-date statement truncates every folio's transaction
+                    # history to ~Apr 1, and since the parser now overwrites
+                    # first_invested_date, that would reset good inception dates to
+                    # the FY start and corrupt CAGR/XIRR. Abort loudly (return False,
+                    # entity skipped) rather than email a truncated CAS.
+                    _save_screenshot(page, f"cams_period_fail_{pan_number[:4]}.png")
+                    raise RuntimeError(
+                        f"Specific Period selection failed for {pan_number[:4]} — "
+                        f"aborting to avoid a truncated Current-FY CAS: {e}"
+                    ) from e
 
                 # --- Email ---
                 _save_screenshot(page, f"cams_prefill_{pan_number[:4]}.png")

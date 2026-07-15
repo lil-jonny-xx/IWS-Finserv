@@ -224,7 +224,7 @@ def ledger_metrics(conn, entity_id: int, broker: str, symbol: str,
     try:
         cur.execute(
             """
-            SELECT trade_date, side, cash_flow_native
+            SELECT trade_date, side, quantity, cash_flow_native
             FROM   equity_trade_ledger
             WHERE  entity_id = %s AND broker = %s AND symbol = %s
             ORDER  BY trade_date
@@ -241,15 +241,36 @@ def ledger_metrics(conn, entity_id: int, broker: str, symbol: str,
     if not rows:
         return None, None
 
-    buys      = [r["trade_date"] for r in rows if r["side"] == "BUY"]
-    first_buy = min(buys) if buys else min(r["trade_date"] for r in rows)
+    # Inception = start of the CURRENT continuous lot, not the global-min buy: a
+    # stock fully sold and re-bought must anchor off the re-entry, else the closed
+    # lot's flows and an over-long holding period corrupt XIRR/CAGR. Walk per-date
+    # net quantity; the current lot begins at the first buy after the last flat point.
+    per_date: dict = {}
+    for r in rows:
+        q = Decimal(str(r["quantity"] or 0))
+        per_date[r["trade_date"]] = per_date.get(r["trade_date"], Decimal("0")) + (
+            q if r["side"] == "BUY" else -q
+        )
+    run = Decimal("0")
+    first_buy = None
+    for d in sorted(per_date):
+        if per_date[d] > 0 and run <= 0:
+            first_buy = d
+        run += per_date[d]
+        if run <= 0:
+            first_buy = None
+    if first_buy is None:                       # never opens from flat (partial history)
+        buys = [r["trade_date"] for r in rows if r["side"] == "BUY"]
+        first_buy = min(buys) if buys else min(r["trade_date"] for r in rows)
 
     xirr_pct = None
     # Like CAGR, XIRR is an annualised ("p.a.") figure — only meaningful once held
     # ≥1 year. Below that the UI shows the absolute return instead, so leave it NULL.
     # (first_buy is still returned; it anchors first_invested_date regardless.)
     if current_mv_native is not None and (today - first_buy).days >= 365:
-        flows = [(r["trade_date"], float(r["cash_flow_native"])) for r in rows]
+        # Clip flows to the current lot so a closed round-trip doesn't pollute XIRR.
+        flows = [(r["trade_date"], float(r["cash_flow_native"]))
+                 for r in rows if r["trade_date"] >= first_buy]
         flows.append((today, float(current_mv_native)))
         rate = finmath.xirr(flows)
         if rate is not None:

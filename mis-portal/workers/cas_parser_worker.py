@@ -72,6 +72,49 @@ def now_utc():
     return datetime.now(timezone.utc)
 
 
+_ZERO_TOL = Decimal("0.001")
+
+
+def current_lot_inception(dated_units: list[tuple]) -> date | None:
+    """First inflow date of the CURRENT continuous holding lot.
+
+    Walks (date, units) rows chronologically tracking the running unit balance.
+    Every time the balance returns to ~0 the position is considered closed, so a
+    later purchase opens a fresh lot. Returns the date the still-open lot began —
+    i.e. the correct inception for a fund that was fully redeemed and re-entered
+    (e.g. HDR's Nippon Dynamic Bond: exited 2013, re-bought 2022 → 2022 is the
+    real inception, not the closed 2013 lot). Metrics annualise from this date, so
+    using the global-min inflow inflated holding periods and corrupted XIRR/CAGR.
+
+    Falls back to the earliest inflow if the ledger never opens a lot from flat
+    (partial/corrupt history where units don't reconcile to zero).
+
+    Units are netted per date before walking so a same-day reversal+purchase (or
+    any intra-day ordering) can't spuriously trip a zero-crossing: a day you end
+    flat is not an inception.
+    """
+    per_date: dict = {}
+    for d, u in dated_units:
+        if d is None:
+            continue
+        per_date[d] = per_date.get(d, Decimal("0")) + (
+            u if isinstance(u, Decimal) else Decimal(str(u))
+        )
+    rows = sorted(per_date.items())
+    running   = Decimal("0")
+    lot_start = None
+    for d, u in rows:
+        if u > 0 and running <= _ZERO_TOL:
+            lot_start = d            # opening a fresh position from flat
+        running += u
+        if running <= _ZERO_TOL:
+            lot_start = None         # fully redeemed — position closed
+    if lot_start is not None:
+        return lot_start
+    inflows = [d for d, u in rows if u > 0]
+    return min(inflows) if inflows else (rows[0][0] if rows else None)
+
+
 def get_db():
     return psycopg2.connect(**DB_CONFIG, cursor_factory=RealDictCursor)
 
@@ -214,7 +257,7 @@ def upsert_holding(cur, entity_id, security_id, folio_number,
             last_updated_nav     = %s,
             source               = 'CAS',
             last_updated         = %s,
-            first_invested_date  = COALESCE(first_invested_date, %s)
+            first_invested_date  = %s
         WHERE entity_id    = %s
         AND   security_id  = %s
         AND   folio_number = %s
@@ -371,19 +414,14 @@ def run(pdf_path: str, password: str, entity_id_override: int | None = None):
                     nav      = scheme.valuation.nav  if scheme.valuation else None
                     avg_cost = (cost / units) if units > 0 else None
 
-                    # First acquisition date = earliest transaction that added units.
-                    # Switch-ins, SIPs, mergers and reinvestments all open a position but
-                    # don't contain "PURCHASE" in their type, so keying on positive units
-                    # catches every inflow while excluding tax (units=0) and
-                    # redemption/switch-out (units<0) rows. Falls back to the earliest dated
-                    # transaction if a folio somehow has no positive-units inflow.
-                    inflows = [
-                        t for t in scheme.transactions
-                        if t.date and t.units and t.units > 0
-                    ]
-                    first_date = (
-                        min(t.date for t in inflows) if inflows
-                        else min((t.date for t in scheme.transactions if t.date), default=None)
+                    # Inception = start of the CURRENT continuous holding lot, not the
+                    # global-earliest inflow. A folio fully redeemed and later re-bought
+                    # (lateral shifts, switches, liquid parking) must reset to the re-entry
+                    # date; keying on the global min pinned it to the closed lot and blew
+                    # up the annualised metrics. current_lot_inception() tracks the running
+                    # balance and returns the first inflow after the last zero-crossing.
+                    first_date = current_lot_inception(
+                        [(t.date, t.units or Decimal("0")) for t in scheme.transactions]
                     )
 
                     upsert_holding(

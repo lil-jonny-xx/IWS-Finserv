@@ -138,6 +138,31 @@ def fifo_lots(txns):
     return [(d, q, p) for d, q, p in lots if q > 1e-9]
 
 
+def had_full_exit(txns) -> bool:
+    """True if the position was fully closed (net qty returned to ~0) at some point
+    and then re-opened. Units are netted per date so same-day trims can't false-trip.
+    Used to decide whether the current-lot inception may move LATER than the stored
+    date: a genuine sell-to-zero-then-rebuy resets inception, but a fresh snapshot_open
+    seed (which just starts recent because that's all the history we have) must not."""
+    per = {}
+    for t in txns:
+        q = f(t["q"]) or 0.0
+        per[t["d"]] = per.get(t["d"], 0.0) + (q if t["side"] == "BUY" else -q)
+    run = 0.0
+    opened = False        # position has been positive at some point
+    closed_once = False   # returned to flat after being open
+    reopened = False      # opened again after a prior close
+    for d in sorted(per):
+        if per[d] > 1e-9 and run <= 1e-9 and closed_once:
+            reopened = True
+        run += per[d]
+        if run > 1e-9:
+            opened = True
+        elif opened:
+            closed_once = True
+    return reopened
+
+
 def compute(cur, h):
     """Return dict of metric updates for one holding row h."""
     eid, broker, isin = h["entity_id"], h["broker"], h["isin"]
@@ -198,9 +223,14 @@ def compute(cur, h):
             lots = fifo_lots(txns)
 
     first_dt = h["first_invested_date"]
-    if lots:                                          # earliest held-lot purchase = true inception
+    if lots:                                          # current held-lot start = true inception
         lot_first = min(d for d, _, _ in lots)
-        if first_dt is None or lot_first < first_dt:
+        # Move earlier freely; move LATER only on a genuine sell-to-zero-then-rebuy
+        # (had_full_exit) so a fresh snapshot_open seed can't reset a real old
+        # inception to a recent date, while an exited-and-re-entered stock resets
+        # off its closed lot instead of anchoring to the original buy.
+        if first_dt is None or lot_first < first_dt or \
+           (lot_first > first_dt and had_full_exit(txns)):
             first_dt = lot_first
             out["first_invested_date"] = lot_first
     days = (TODAY - first_dt).days if first_dt else None

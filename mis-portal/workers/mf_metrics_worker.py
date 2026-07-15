@@ -384,11 +384,16 @@ def compute(
                         )
 
             # XIRR inception — actual per-transaction cash flows; gated ≥1 year
-            # inside xirr() via ann_guard.
+            # inside xirr() via ann_guard. Clip to the current lot (flows on/after
+            # first_invested_date): a folio fully redeemed and re-bought otherwise
+            # dragged in the closed lot's buy/redeem pair and dated XIRR from the
+            # old entry, matching the corrupted first_invested_date it came from.
             if cash_flows:
-                days_held = (today - min(d for d, _ in cash_flows)).days
-                flows = list(cash_flows) + [(today, float(cur_val))]
-                out["xirr_inception_pct"] = xirr(flows, days_held)
+                lot_flows = [(d, c) for d, c in cash_flows if fid is None or d >= fid]
+                if lot_flows:
+                    days_held = (today - min(d for d, _ in lot_flows)).days
+                    flows = list(lot_flows) + [(today, float(cur_val))]
+                    out["xirr_inception_pct"] = xirr(flows, days_held)
 
     # P&L YTD — per FIFO unit-lot when the ledger reconciles: units bought during
     # the FY are measured from their purchase NAV, units held at FY start from the
