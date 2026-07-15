@@ -71,17 +71,28 @@ def _date(v):
 #   currency, exchange, trade_id, skipped_reason(None|str)
 
 def _parse_zerodha_console_xlsx(path):
-    """Zerodha Console 'Query Report' XLSX export (the only format available for
-    closed/converted accounts, e.g. pre-NRI-conversion history): Trade Date /
-    Trading Symbol / Trade Type / Quantity / Price headers, no ISIN column
-    (bridge resolves symbols to ISIN via holdings). The F&O variant adds a
-    Segment column and signed quantities; F&O rows are skipped."""
+    """Zerodha XLSX exports, two related layouts both handled here:
+      1. Console 'Query Report' — Trade Date / Trading Symbol / Trade Type headers,
+         also carries an ISIN column (used for ISIN-first resolution).
+      2. Standard Tradebook XLSX — a preamble then Symbol / ISIN / Trade Date /
+         Trade Type / Quantity / Price / Trade ID (same columns as the CSV export).
+    Both are the only formats for closed/converted accounts (pre-NRI history). The
+    F&O variant adds a Segment column and signed quantities; F&O rows are skipped.
+    Some Zerodha xlsx don't expose cached values in read_only mode, so fall back."""
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     rows = [tuple(r) for r in wb.worksheets[0].iter_rows(values_only=True)]
     wb.close()
+    if not any(any(c is not None for c in r) for r in rows):
+        wb = openpyxl.load_workbook(path, read_only=False, data_only=True)
+        rows = [tuple(r) for r in wb.worksheets[0].iter_rows(values_only=True)]
+        wb.close()
+    # Header row carries Trade Date + Trade Type + a symbol column ("Trading
+    # Symbol" in Query Reports, "Symbol" in Tradebook exports).
     h = _find_header(rows, ["trade date", "trading symbol", "trade type"])
     if h is None:
-        raise ValueError("Zerodha xlsx: could not locate Trade Date/Trading Symbol header")
+        h = _find_header(rows, ["symbol", "trade date", "trade type"])
+    if h is None:
+        raise ValueError("Zerodha xlsx: could not locate Trade Date/Symbol/Trade Type header")
     idx = {str(c).strip(): i for i, c in enumerate(rows[h]) if c is not None}
 
     def g(row, col):
@@ -91,7 +102,7 @@ def _parse_zerodha_console_xlsx(path):
     for row in rows[h + 1:]:
         if row is None or all(c is None for c in row):
             continue
-        symbol = str(g(row, "Trading Symbol") or "").strip()
+        symbol = str(g(row, "Trading Symbol") or g(row, "Symbol") or "").strip()
         if not symbol:
             continue
         seg = str(g(row, "Segment") or "").strip().upper()
@@ -103,7 +114,10 @@ def _parse_zerodha_console_xlsx(path):
         qty = _f(g(row, "Quantity"))
         yield {
             "symbol": symbol,
-            "isin": None,
+            # Console query reports DO carry an ISIN column — use it (ISIN-first
+            # resolution). Closed pre-NRI positions aren't in current holdings, so
+            # the name bridge can't reach them; the ISIN column can.
+            "isin": str(g(row, "ISIN") or "").strip() or None,
             "date": _date(g(row, "Trade Date")),
             "side": side,
             "qty": abs(qty) if qty is not None else None,

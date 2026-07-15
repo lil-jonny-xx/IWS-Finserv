@@ -163,6 +163,26 @@ def had_full_exit(txns) -> bool:
     return reopened
 
 
+def ran_negative(txns) -> bool:
+    """True if the chronological running quantity ever goes negative. That is
+    impossible for a real holding — you cannot sell shares you never bought — so it
+    proves the trade history is missing buys (shares that entered the demat via
+    off-market transfer, which no tradebook records). When true, had_full_exit's
+    sell-to-zero signal is an artifact, not a genuine exit, and must not be trusted
+    to keep the current-lot inception recent. Netted per date so same-day trims
+    can't false-trip."""
+    per = {}
+    for t in txns:
+        q = f(t["q"]) or 0.0
+        per[t["d"]] = per.get(t["d"], 0.0) + (q if t["side"] == "BUY" else -q)
+    run = 0.0
+    for d in sorted(per):
+        run += per[d]
+        if run < -0.5:
+            return True
+    return False
+
+
 def compute(cur, h):
     """Return dict of metric updates for one holding row h."""
     eid, broker, isin = h["entity_id"], h["broker"], h["isin"]
@@ -233,6 +253,28 @@ def compute(cur, h):
            (lot_first > first_dt and had_full_exit(txns)):
             first_dt = lot_first
             out["first_invested_date"] = lot_first
+    elif txns:
+        # Reconstruction failed — the traded net doesn't match the held quantity
+        # because shares moved in/out via off-market transfers, bonuses, or
+        # inter-account moves that no tradebook records (e.g. HHR J&K Bank: 10.8k
+        # traded on Zerodha vs 18.8k held, the rest transferred in). The earliest
+        # recorded buy is still a sound, conservative inception for the
+        # continuously-held shares in either of these sub-cases:
+        #   (a) the position NEVER fully closed (had_full_exit False), or
+        #   (b) the running balance went negative (ran_negative) — proof that buys
+        #       are missing, so had_full_exit's sell-to-zero is an artifact, not a
+        #       real exit (the blue-chip transfer-in case: DHR/HHR HDFCBANK etc.).
+        # Guard with net_q > 0 so a degenerate, mostly-unexplained-sells stream
+        # (e.g. SDR NATIONALUM: net -8.3k) can't anchor off a stray early buy.
+        # Only ever moves the date EARLIER (never resets a real old date to newer).
+        net_q = sum((f(t["q"]) if t["side"] == "BUY" else -f(t["q"])) for t in txns)
+        if net_q > 0 and (not had_full_exit(txns) or ran_negative(txns)):
+            buy_dts = [t["d"] for t in txns if t["side"] == "BUY"]
+            if buy_dts:
+                earliest = min(buy_dts)
+                if first_dt is None or earliest < first_dt:
+                    first_dt = earliest
+                    out["first_invested_date"] = earliest
     days = (TODAY - first_dt).days if first_dt else None
 
     # XIRR — held lots as dated outflows + current value inflow (no intraday churn)
