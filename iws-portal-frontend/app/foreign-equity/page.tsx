@@ -227,7 +227,12 @@ export default function ForeignEquityPage() {
   const router = useRouter();
   const [user, setUser]             = useState<User | null>(null);
   const [entities, setEntities]     = useState<Entity[]>([]);
-  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);   // empty = All; >1 = subset
+  const selKey = selectedIds.join(',');
+  const toggleEntity = useCallback((id: number | null) => {
+    if (id === null) { setSelectedIds([]); return; }
+    setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  }, []);
   const [data, setData]             = useState<ForeignEquityResponse | null>(null);
   const [activity, setActivity]     = useState<ForeignActivityResponse | null>(null);
   const [manual, setManual]         = useState<ManualForeignResponse | null>(null);
@@ -256,7 +261,7 @@ export default function ForeignEquityPage() {
     const controller = new AbortController();
     if (!didInitialLoad.current) setLoading(true);
     setError(null);
-    const qs = selectedId !== null ? `?entity_id=${selectedId}` : '';
+    const qs = selectedIds.length ? '?' + selectedIds.map(id => `entity_id=${id}`).join('&') : '';
     fetch(`${API_URL}/api/v1/foreign-equity/holdings${qs}`, { credentials: 'include', signal: controller.signal })
       .then(r => { if (r.status === 401) { router.push('/'); return null; } if (!r.ok) throw new Error('Failed to load foreign equity holdings.'); return r.json(); })
       .then((d: ForeignEquityResponse | null) => {
@@ -266,33 +271,33 @@ export default function ForeignEquityPage() {
       })
       .catch(err => { if (err.name !== 'AbortError') { setError(err.message); setLoading(false); } });
     return () => controller.abort();
-  }, [router, selectedId, retryCount]);
+  }, [router, selKey, retryCount]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   // Today's detected foreign trades (IBKR Flex fills + Vested snapshot diffs). Silent on failure.
   useEffect(() => {
     const controller = new AbortController();
-    const qs = selectedId !== null ? `?entity_id=${selectedId}` : '';
+    const qs = selectedIds.length ? '?' + selectedIds.map(id => `entity_id=${id}`).join('&') : '';
     fetch(`${API_URL}/api/v1/foreign-equity/activity${qs}`, { credentials: 'include', signal: controller.signal })
       .then(r => (r.ok ? r.json() : null))
       .then((d: ForeignActivityResponse | null) => { if (d) setActivity(d); })
       .catch(() => {});
     return () => controller.abort();
-  }, [selectedId, retryCount]);
+  }, [selKey, retryCount]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   // Manually-entered foreign equity (Manual Data → "Foreign Equity" / overseas_equity).
   // Rolled into the headline totals and listed in its own section. Silent on failure.
   useEffect(() => {
     const controller = new AbortController();
-    const qs = selectedId !== null ? `&entity_id=${selectedId}` : '';
+    const qs = selectedIds.length ? '&' + selectedIds.map(id => `entity_id=${id}`).join('&') : '';
     fetch(`${API_URL}/api/v1/manual-assets?category=overseas_equity${qs}`, { credentials: 'include', signal: controller.signal })
       .then(r => (r.ok ? r.json() : null))
       .then((d: ManualForeignResponse | null) => { if (d) setManual(d); })
       .catch(() => {});
     return () => controller.abort();
-  }, [selectedId, retryCount]);
+  }, [selKey, retryCount]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   const isAdmin       = !!user;  // members have admin-level view access (only Manual Data + user mgmt are admin-only)
-  const showEntityCol = isAdmin && selectedId === null;
+  const showEntityCol = isAdmin && selectedIds.length !== 1;
   const handleRetry   = useCallback(() => setRetryCount(c => c + 1), []);
 
   // Fold manual foreign-equity entries into the headline totals (all INR).
@@ -325,7 +330,7 @@ export default function ForeignEquityPage() {
         </div>
 
         {isAdmin && entities.length > 0 && (
-          <EntitySwitcher section="/foreign-equity" entities={entities} selectedId={selectedId} onSelect={setSelectedId} />
+          <EntitySwitcher section="/foreign-equity" entities={entities} selectedIds={selectedIds} onToggle={toggleEntity} />
         )}
 
         {loading && !data && <Skeleton />}

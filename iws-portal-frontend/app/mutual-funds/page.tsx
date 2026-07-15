@@ -110,7 +110,14 @@ export default function MutualFundsPage() {
   const router = useRouter();
   const [user, setUser]             = useState<User | null>(null);
   const [entities, setEntities]     = useState<Entity[]>([]);
-  const [selectedId, setSelectedId] = useState<number | null>(null);
+  // Multi-entity selection; empty = All. Single-select still server-filters; multi/
+  // empty fetch all entities and MFTable sub-selects client-side.
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const selKey = selectedIds.join(',');
+  const toggleEntity = useCallback((id: number | null) => {
+    if (id === null) { setSelectedIds([]); return; }
+    setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  }, []);
   const [data, setData]             = useState<HoldingsResponse | null>(null);
   const [loading, setLoading]       = useState(true);
   const [error, setError]           = useState<string | null>(null);
@@ -146,44 +153,45 @@ export default function MutualFundsPage() {
     // place without unmounting MFTable, so the user's sort/filters/search are preserved.
     if (!didInitialLoad.current) setLoading(true);
     setError(null);
-    const qs = selectedId !== null ? `?entity_id=${selectedId}` : '';
+    const qs = selectedIds.length ? '?' + selectedIds.map(id => `entity_id=${id}`).join('&') : '';
     fetch(`${API_URL}/api/v1/holdings${qs}`, { credentials: 'include', signal: controller.signal })
       .then(r => { if (r.status === 401) { router.push('/'); return null; } if (!r.ok) throw new Error('Failed to load holdings.'); return r.json(); })
       .then((d: HoldingsResponse | null) => { if (d) setData(d); setLoading(false); didInitialLoad.current = true; })
       .catch(err => { if (err.name !== 'AbortError') { setError(err.message); setLoading(false); } });
     return () => controller.abort();
-  }, [router, selectedId, retryCount]);
+  }, [router, selKey, retryCount]);
 
   useEffect(() => {
     const controller = new AbortController();
     setTxnLoading(true);
     const qs = new URLSearchParams({ limit: String(TXN_PAGE_SIZE), offset: String(txnPage * TXN_PAGE_SIZE) });
-    if (selectedId !== null) qs.set('entity_id', String(selectedId));
+    selectedIds.forEach(id => qs.append('entity_id', String(id)));
     if (txnType) qs.set('txn_type', txnType);
     fetch(`${API_URL}/api/v1/transactions?${qs}`, { credentials: 'include', signal: controller.signal })
       .then(r => r.ok ? r.json() : null)
       .then((d: TxnResponse | null) => { if (d) setTxnData(d); setTxnLoading(false); })
       .catch(err => { if (err.name !== 'AbortError') setTxnLoading(false); });
     return () => controller.abort();
-  }, [selectedId, txnPage, txnType]);
+  }, [selKey, txnPage, txnType]);
 
   useEffect(() => {
     if (viewMode !== 'combined') return;
     const controller = new AbortController();
     setCombinedLoading(true);
-    fetch(`${API_URL}/api/v1/holdings/combined`, { credentials: 'include', signal: controller.signal })
+    const qs = selectedIds.length ? '?' + selectedIds.map(id => `entity_id=${id}`).join('&') : '';
+    fetch(`${API_URL}/api/v1/holdings/combined${qs}`, { credentials: 'include', signal: controller.signal })
       .then(r => { if (!r.ok) throw new Error('Failed to load combined holdings.'); return r.json(); })
       .then((d: CombinedResponse) => { setCombinedData(d); setCombinedLoading(false); })
       .catch(err => { if (err.name !== 'AbortError') setCombinedLoading(false); });
     return () => controller.abort();
-  }, [viewMode]);
+  }, [viewMode, selKey]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   function handleToggleCombined() {
     setViewMode(m => m === 'combined' ? 'normal' : 'combined');
   }
 
   const isAdmin       = !!user;  // members have admin-level view access (only Manual Data + user mgmt are admin-only)
-  const showEntityCol = isAdmin && selectedId === null;
+  const showEntityCol = isAdmin && selectedIds.length !== 1;   // entity col for All or a multi-entity subset
   const handleRetry   = useCallback(() => setRetryCount(c => c + 1), []);
 
   const totals: MFTotals = {
@@ -205,7 +213,7 @@ export default function MutualFundsPage() {
         </div>
 
         {isAdmin && entities.length > 0 && (
-          <EntitySwitcher section="/mutual-funds" entities={entities} selectedId={selectedId} onSelect={setSelectedId} />
+          <EntitySwitcher section="/mutual-funds" entities={entities} selectedIds={selectedIds} onToggle={toggleEntity} />
         )}
 
         {/* Initial-load failure: no data to show, so surface the full error + retry. */}
@@ -248,7 +256,7 @@ export default function MutualFundsPage() {
               onToggleCombined={handleToggleCombined}
               combinedHoldings={combinedData?.holdings}
               combinedTotals={combinedData ? { total_combined: combinedData.total_combined, total_invested: combinedData.total_invested } : undefined}
-              filterResetKey={selectedId}
+              filterResetKey={selKey}
             />
           </div>
         )}

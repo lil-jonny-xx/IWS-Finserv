@@ -223,16 +223,27 @@ function SourceHoldingsTable({ rows }: { rows: PmsHolding[] }) {
   );
 }
 
+// Display overrides for PMS providers: user-facing product name + portfolio
+// manager, keyed on the backend source_label ("Nuvama"/"Zerodha"/"ICICI Pru").
+const PMS_DISPLAY: Record<string, { title: string; manager?: string }> = {
+  Nuvama:  { title: 'Prudent Investment', manager: 'Prashasta Seth' },
+  Zerodha: { title: 'Zerodha',            manager: 'Vijay Thakkar' },
+};
+
 function SourceSection({ s, holdings, showEntity }: {
   s: PmsBySource; holdings: PmsHolding[]; showEntity: boolean;
 }) {
+  const disp = PMS_DISPLAY[s.source_label] ?? { title: s.source_label };
   return (
     <section className="mb-8">
       <div className="flex flex-wrap items-baseline justify-between gap-2 mb-3">
         <div>
           <h2 className="text-lg font-semibold text-ink">
-            {showEntity ? `${s.entity_name} · ` : ''}{s.source_label} PMS
+            {showEntity ? `${s.entity_name} · ` : ''}{disp.title} PMS
           </h2>
+          {disp.manager && (
+            <p className="text-xs text-ghost mt-0.5">Managed by {disp.manager}</p>
+          )}
           <p className="text-xs text-ghost mt-0.5">
             {s.equity_count} holding{s.equity_count === 1 ? '' : 's'}
             {s.as_on_date ? ` · as on ${s.as_on_date}` : ''}
@@ -260,7 +271,12 @@ export default function PmsPage() {
   const router = useRouter();
   const [user, setUser]             = useState<User | null>(null);
   const [entities, setEntities]     = useState<Entity[]>([]);
-  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);   // empty = All; >1 = subset
+  const selKey = selectedIds.join(',');
+  const toggleEntity = useCallback((id: number | null) => {
+    if (id === null) { setSelectedIds([]); return; }
+    setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  }, []);
   const [data, setData]             = useState<PmsResponse | null>(null);
   const [loading, setLoading]       = useState(true);
   const [error, setError]           = useState<string | null>(null);
@@ -286,16 +302,16 @@ export default function PmsPage() {
     const controller = new AbortController();
     setLoading(true);
     setError(null);
-    const qs = selectedId !== null ? `?entity_id=${selectedId}` : '';
+    const qs = selectedIds.length ? '?' + selectedIds.map(id => `entity_id=${id}`).join('&') : '';
     fetch(`${API_URL}/api/v1/pms/holdings${qs}`, { credentials: 'include', signal: controller.signal })
       .then(r => { if (r.status === 401) { router.push('/'); return null; } if (!r.ok) throw new Error('Failed to load PMS holdings.'); return r.json(); })
       .then((d: PmsResponse | null) => { if (d) setData(d); setLoading(false); })
       .catch(err => { if (err.name !== 'AbortError') { setError(err.message); setLoading(false); } });
     return () => controller.abort();
-  }, [router, selectedId, retryCount]);
+  }, [router, selKey, retryCount]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   const isAdmin       = !!user;  // members have admin-level view access (only Manual Data + user mgmt are admin-only)
-  const showEntityCol = isAdmin && selectedId === null;
+  const showEntityCol = isAdmin && selectedIds.length !== 1;
   const handleRetry   = useCallback(() => setRetryCount(c => c + 1), []);
   const t = data?.totals;
 
@@ -314,7 +330,7 @@ export default function PmsPage() {
         </div>
 
         {isAdmin && entities.length > 0 && (
-          <EntitySwitcher section="/pms" entities={entities} selectedId={selectedId} onSelect={setSelectedId} />
+          <EntitySwitcher section="/pms" entities={entities} selectedIds={selectedIds} onToggle={toggleEntity} />
         )}
 
         {loading && !data && (
@@ -372,7 +388,7 @@ export default function PmsPage() {
         )}
 
         <p className="text-center text-xs text-ghost mt-8">
-          IWS Finserv &copy; {new Date().getFullYear()} · PMS data sourced from Nuvama WealthSpectrum, Zerodha and ICICI Prudential
+          IWS Finserv &copy; {new Date().getFullYear()} · PMS data sourced from Prudent Investment (Nuvama WealthSpectrum), Zerodha and ICICI Prudential
         </p>
       </div>
     </main>

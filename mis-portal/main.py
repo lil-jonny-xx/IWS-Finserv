@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Header, Request, Response, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Header, Request, Response, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, EmailStr, Field
@@ -869,12 +869,12 @@ def _compute_realized_gains_cached(conn, entity_id: Optional[int] = None) -> dic
 @app.get("/api/v1/holdings")
 def get_holdings(
     request: Request,
-    entity_id: Optional[int] = None,
+    entity_id: Optional[List[int]] = Query(None),
     authorization: Optional[str] = Header(None),
 ):
     """
     Return MF holdings for the requesting user's entity.
-    Admin users may pass ?entity_id=N to view any entity.
+    Admin users may pass ?entity_id=N (repeatable) to view one entity or a subset.
     """
     conn = None
     try:
@@ -882,121 +882,20 @@ def get_holdings(
 
         conn = get_db_connection()
         cursor = conn.cursor()
-        # Any authenticated user may view every entity (see _resolve_entity):
-        # explicit ?entity_id=N → that entity; no param → all entities.
-        eid = _resolve_entity(cursor, payload, entity_id)
+        # Any authenticated user may view every entity (see _resolve_entities):
+        # ?entity_id=N (repeatable) → that entity or subset; no param → all entities.
+        eids = _resolve_entities(cursor, payload, entity_id)
 
-        # No entity filter → return all holdings across all entities
-        if eid is None:
-            cursor.execute("""
-                SELECT
-                    h.id,
-                    h.entity_id,
-                    h.security_id,
-                    h.folio_number,
-                    h.quantity,
-                    h.cost_basis,
-                    h.avg_cost,
-                    h.invested_amount,
-                    h.first_invested_date,
-                    h.last_updated_nav     AS nav,
-                    h.current_value,
-                    h.last_updated,
-                    h.prev_week_value,
-                    h.market_value_as_on,
-                    h.as_of_date,
-                    h.exposure_pct,
-                    h.weekly_change,
-                    h.pnl_ytd,
-                    h.pnl_inception,
-                    h.pnl_weekly_change,
-                    h.returns_ytd_pct,
-                    h.returns_inception_pct,
-                    h.cagr_inception_pct,
-                    h.xirr_inception_pct,
-                    h.remarks,
-                    sm.isin,
-                    sm.security_name,
-                    sm.security_type,
-                    sm.asset_class,
-                    sm.amfi_code,
-                    e.entity_name,
-                    pg.pan_name AS pan_group_name
-                FROM holding h
-                JOIN security_master sm ON sm.id = h.security_id
-                JOIN entity e ON e.id = h.entity_id
-                JOIN pan_group pg ON pg.id = e.pan_group_id
-                ORDER BY sm.asset_class, sm.security_name, h.folio_number
-            """)
-            rows = cursor.fetchall()
-            cursor.close()
+        where  = ""
+        params: list = []
+        if eids:
+            where = "WHERE h.entity_id = ANY(%s)"
+            params.append(eids)
 
-            realized_gains = _compute_realized_gains_cached(conn)
-
-            holdings = []
-            total_invested = 0.0
-            for r in rows:
-                invested = float(r["invested_amount"]) if r["invested_amount"] else 0.0
-                nav_val  = float(r["nav"]) if r["nav"] else None
-                qty      = float(r["quantity"]) if r["quantity"] else 0.0
-                cur_val  = float(r["current_value"]) if r["current_value"] else (
-                    round(qty * nav_val, 2) if nav_val else None
-                )
-                total_invested += invested
-                rg_key = (r["entity_id"], r["security_id"], r["folio_number"])
-                holdings.append({
-                    "id":                   r["id"],
-                    "isin":                 r["isin"],
-                    "security_name":        r["security_name"],
-                    "security_type":        r["security_type"],
-                    "asset_class":          r["asset_class"],
-                    "amfi_code":            r["amfi_code"],
-                    "folio_number":         r["folio_number"],
-                    "quantity":             qty,
-                    "avg_cost":             float(r["avg_cost"]) if r["avg_cost"] else None,
-                    "cost_basis":           float(r["cost_basis"]) if r["cost_basis"] else None,
-                    "invested_amount":      invested,
-                    "nav":                  nav_val,
-                    "current_value":        cur_val,
-                    "first_invested_date":  str(r["first_invested_date"]) if r["first_invested_date"] else None,
-                    "last_updated":         r["last_updated"].isoformat() if r["last_updated"] else None,
-                    "entity_name":          r["entity_name"],
-                    "pan_group_name":       r["pan_group_name"],
-                    "realized_gain":        realized_gains.get(rg_key, 0.0),
-                    "prev_week_value":      float(r["prev_week_value"])    if r["prev_week_value"]    else None,
-                    "market_value_as_on":   float(r["market_value_as_on"]) if r["market_value_as_on"] else None,
-                    "as_of_date":           str(r["as_of_date"])           if r["as_of_date"]         else None,
-                    "exposure_pct":         float(r["exposure_pct"])       if r["exposure_pct"]       else None,
-                    "weekly_change":        float(r["weekly_change"])      if r["weekly_change"]      else None,
-                    "pnl_ytd":              float(r["pnl_ytd"])            if r["pnl_ytd"]            else None,
-                    "pnl_inception":        float(r["pnl_inception"])      if r["pnl_inception"]      else None,
-                    "pnl_weekly_change":    float(r["pnl_weekly_change"])  if r["pnl_weekly_change"]  else None,
-                    "returns_ytd_pct":      float(r["returns_ytd_pct"])    if r["returns_ytd_pct"]    else None,
-                    "returns_inception_pct":float(r["returns_inception_pct"]) if r["returns_inception_pct"] else None,
-                    "cagr_inception_pct":   float(r["cagr_inception_pct"]) if r["cagr_inception_pct"] else None,
-                    "xirr_inception_pct":   float(r["xirr_inception_pct"]) if r["xirr_inception_pct"] else None,
-                    "remarks":              r["remarks"],
-                })
-
-            return {
-                "entity_id":       0,
-                "entity_name":     "All Entities",
-                "total_holdings":  len(holdings),
-                "total_invested":  round(total_invested, 2),
-                "holdings":        holdings,
-            }
-
-        cursor.execute(
-            "SELECT entity_name FROM entity WHERE id = %s",
-            (eid,)
-        )
-        entity_row = cursor.fetchone()
-        if not entity_row:
-            raise HTTPException(status_code=404, detail="Entity not found")
-
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT
                 h.id,
+                h.entity_id,
                 h.security_id,
                 h.folio_number,
                 h.quantity,
@@ -1025,18 +924,21 @@ def get_holdings(
                 sm.security_type,
                 sm.asset_class,
                 sm.amfi_code,
+                e.entity_name,
                 pg.pan_name AS pan_group_name
             FROM holding h
             JOIN security_master sm ON sm.id = h.security_id
             JOIN entity e ON e.id = h.entity_id
             JOIN pan_group pg ON pg.id = e.pan_group_id
-            WHERE h.entity_id = %s
+            {where}
             ORDER BY sm.asset_class, sm.security_name, h.folio_number
-        """, (eid,))
+        """, params)
         rows = cursor.fetchall()
         cursor.close()
 
-        realized_gains = _compute_realized_gains_cached(conn, entity_id=eid)
+        # Realized gains are keyed by (entity_id, security_id, folio), so the
+        # full-book cache serves every scope — filter happens at lookup.
+        realized_gains = _compute_realized_gains_cached(conn)
 
         holdings = []
         total_invested = 0.0
@@ -1048,7 +950,7 @@ def get_holdings(
                 round(qty * nav_val, 2) if nav_val else None
             )
             total_invested += invested
-            rg_key = (eid, r["security_id"], r["folio_number"])
+            rg_key = (r["entity_id"], r["security_id"], r["folio_number"])
             holdings.append({
                 "id":                   r["id"],
                 "isin":                 r["isin"],
@@ -1065,6 +967,7 @@ def get_holdings(
                 "current_value":        cur_val,
                 "first_invested_date":  str(r["first_invested_date"]) if r["first_invested_date"] else None,
                 "last_updated":         r["last_updated"].isoformat() if r["last_updated"] else None,
+                "entity_name":          r["entity_name"],
                 "pan_group_name":       r["pan_group_name"],
                 "realized_gain":        realized_gains.get(rg_key, 0.0),
                 "prev_week_value":      float(r["prev_week_value"])    if r["prev_week_value"]    else None,
@@ -1082,9 +985,10 @@ def get_holdings(
                 "remarks":              r["remarks"],
             })
 
+        resp_entity_id, entity_name = _entity_label(eids, rows)
         return {
-            "entity_id":       eid,
-            "entity_name":     entity_row["entity_name"],
+            "entity_id":       resp_entity_id,
+            "entity_name":     entity_name,
             "total_holdings":  len(holdings),
             "total_invested":  round(total_invested, 2),
             "holdings":        holdings,
@@ -1102,12 +1006,13 @@ def get_holdings(
 @app.get("/api/v1/holdings/combined")
 def get_combined_holdings(
     request: Request,
+    entity_id: Optional[List[int]] = Query(None),
     authorization: Optional[str] = Header(None),
 ):
     """
-    MF holdings merged by security across all entities.
-    Units summed, cost weighted-averaged, XIRR from pooled transactions.
-    Admin only.
+    MF holdings merged by security across entities. Units summed, cost
+    weighted-averaged, XIRR from pooled transactions. No ?entity_id → pool the
+    whole book; ?entity_id=N (repeatable) → pool only that entity or subset.
     """
     from collections import OrderedDict, defaultdict
     from datetime import date as _date
@@ -1116,8 +1021,11 @@ def get_combined_holdings(
         payload   = _require_auth(request, authorization)
         conn      = get_db_connection()
         cursor    = conn.cursor()
+        eids      = _resolve_entities(cursor, payload, entity_id)
 
-        cursor.execute("""
+        hold_where = "WHERE h.entity_id = ANY(%s)" if eids else ""
+        hold_params: list = [eids] if eids else []
+        cursor.execute(f"""
             SELECT
                 h.id, h.entity_id, h.security_id, h.folio_number,
                 h.quantity, h.avg_cost, h.invested_amount,
@@ -1134,16 +1042,18 @@ def get_combined_holdings(
             FROM holding h
             JOIN security_master sm ON sm.id = h.security_id
             JOIN entity e ON e.id = h.entity_id
+            {hold_where}
             ORDER BY sm.asset_class, sm.security_name, e.entity_name
-        """)
+        """, hold_params)
         rows = cursor.fetchall()
 
-        cursor.execute("""
+        txn_where = "AND entity_id = ANY(%s)" if eids else ""
+        cursor.execute(f"""
             SELECT security_id, transaction_date, amount, units
             FROM mf_transaction
-            WHERE amount IS NOT NULL
+            WHERE amount IS NOT NULL {txn_where}
             ORDER BY security_id, transaction_date
-        """)
+        """, ([eids] if eids else []))
         txn_rows = cursor.fetchall()
         cursor.close()
 
@@ -1318,6 +1228,32 @@ def _resolve_entity(cursor, payload: dict, entity_id_param: Optional[int]) -> Op
     return entity_id_param
 
 
+def _resolve_entities(cursor, payload: dict, entity_ids: Optional[List[int]]) -> Optional[List[int]]:
+    """
+    Multi-entity variant of _resolve_entity. FastAPI parses a repeated
+    ?entity_id=1&entity_id=5 query param into a list; a single ?entity_id=5 into
+    [5]; an absent param into None. Returns a de-duped list, or None for
+    "all entities". Every authenticated user may view any entity (see
+    _resolve_entity), so no per-user gating here.
+    """
+    if not entity_ids:
+        return None
+    return list(dict.fromkeys(entity_ids))
+
+
+def _entity_label(eids: Optional[List[int]], rows, name_key: str = "entity_name") -> tuple:
+    """
+    Derive the (entity_id, entity_name) pair a response advertises for a given
+    entity scope. All entities → (0, "All Entities"); exactly one → that entity's
+    id/name (from the first row when available); a subset → (0, "N entities").
+    """
+    if not eids:
+        return 0, "All Entities"
+    if len(eids) == 1:
+        return eids[0], (rows[0][name_key] if rows else "")
+    return 0, f"{len(eids)} entities"
+
+
 # ---------------------------------------------------------------------------
 # Equity holdings
 # ---------------------------------------------------------------------------
@@ -1425,7 +1361,7 @@ def _equity_totals(rows: list[dict]) -> dict:
 @app.get("/api/v1/equity/holdings")
 def get_equity_holdings(
     request: Request,
-    entity_id: Optional[int] = None,
+    entity_id: Optional[List[int]] = Query(None),
     broker: Optional[str] = None,
     authorization: Optional[str] = Header(None),
 ):
@@ -1440,7 +1376,7 @@ def get_equity_holdings(
 
         conn = get_db_connection()
         cur  = conn.cursor()
-        eid  = _resolve_entity(cur, payload, entity_id)
+        eids = _resolve_entities(cur, payload, entity_id)
 
         # Build WHERE clause
         conditions = []
@@ -1449,9 +1385,9 @@ def get_equity_holdings(
         # (the 2026-06-26 split) — keep the Equity page to actual equity.
         conditions.append(
             "COALESCE(eh.asset_class, 'equity') NOT IN ('gold','silver','commodity')")
-        if eid is not None:
-            conditions.append("eh.entity_id = %s")
-            params.append(eid)
+        if eids:
+            conditions.append("eh.entity_id = ANY(%s)")
+            params.append(eids)
         if broker:
             conditions.append("eh.broker = %s")
             params.append(broker)
@@ -1472,9 +1408,9 @@ def get_equity_holdings(
 
         # Per-broker cash balances for the same scope (entity + optional broker).
         cash_conditions, cash_params = [], []
-        if eid is not None:
-            cash_conditions.append("bc.entity_id = %s")
-            cash_params.append(eid)
+        if eids:
+            cash_conditions.append("bc.entity_id = ANY(%s)")
+            cash_params.append(eids)
         if broker:
             cash_conditions.append("bc.broker = %s")
             cash_params.append(broker)
@@ -1496,11 +1432,11 @@ def get_equity_holdings(
         # derived). Entity-level only: not meaningful per-broker or aggregated across
         # entities, so it's surfaced only when a single entity is in scope.
         pr_row = None
-        if not broker and eid is not None:
+        if not broker and eids and len(eids) == 1:
             cur.execute(
                 """SELECT xirr_pct, income_inr, coverage FROM portfolio_returns
                    WHERE entity_id = %s ORDER BY as_of_date DESC LIMIT 1""",
-                (eid,),
+                (eids[0],),
             )
             pr_row = cur.fetchone()
         cur.close()
@@ -1522,12 +1458,10 @@ def get_equity_holdings(
         )
         totals["portfolio_coverage"] = pr_row["coverage"] if pr_row else None
 
-        entity_name = "All Entities" if eid is None else (
-            rows[0]["entity_name"] if rows else ""
-        )
+        resp_entity_id, entity_name = _entity_label(eids, rows)
 
         return {
-            "entity_id":      eid or 0,
+            "entity_id":      resp_entity_id,
             "entity_name":    entity_name,
             "broker":         broker,
             "total_holdings": len(holdings),
@@ -1560,7 +1494,7 @@ def get_equity_holdings(
 @app.get("/api/v1/equity/activity")
 def get_equity_activity(
     request: Request,
-    entity_id: Optional[int] = None,
+    entity_id: Optional[List[int]] = Query(None),
     day: Optional[str] = None,
     authorization: Optional[str] = Header(None),
 ):
@@ -1578,7 +1512,7 @@ def get_equity_activity(
         payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
-        eid  = _resolve_entity(cur, payload, entity_id)
+        eids = _resolve_entities(cur, payload, entity_id)
 
         try:
             as_of = date.fromisoformat(day) if day else date.today()
@@ -1587,9 +1521,9 @@ def get_equity_activity(
 
         conditions = ["st.source = 'snapshot'", "st.transaction_date = %s"]
         params     = [as_of]
-        if eid is not None:
-            conditions.append("st.entity_id = %s")
-            params.append(eid)
+        if eids:
+            conditions.append("st.entity_id = ANY(%s)")
+            params.append(eids)
         where = " AND ".join(conditions)
 
         # avg_cost comes from the most recent position snapshot for the security
@@ -1651,7 +1585,7 @@ def get_equity_activity(
 
         return {
             "date":               str(as_of),
-            "entity_id":          eid or 0,
+            "entity_id":          (eids[0] if eids and len(eids) == 1 else 0),
             "buy_count":          buy_count,
             "sell_count":         sell_count,
             "realized_pnl_total": round(realized_total, 2),
@@ -1701,7 +1635,7 @@ def _latest_fx_rates(conn) -> dict:
 @app.get("/api/v1/foreign-equity/holdings")
 def get_foreign_equity_holdings(
     request: Request,
-    entity_id: Optional[int] = None,
+    entity_id: Optional[List[int]] = Query(None),
     broker: Optional[str] = None,
     authorization: Optional[str] = Header(None),
 ):
@@ -1717,16 +1651,16 @@ def get_foreign_equity_holdings(
 
         conn = get_db_connection()
         cur  = conn.cursor()
-        eid  = _resolve_entity(cur, payload, entity_id)
+        eids = _resolve_entities(cur, payload, entity_id)
 
         conditions, params = [], []
         # Gold/silver/commodity (e.g. IBKR uranium) moved to the dedicated
         # Gold/Silver page (2026-06-26 split) — exclude from Foreign Equity too.
         conditions.append(
             "COALESCE(eh.asset_class, 'equity') NOT IN ('gold','silver','commodity')")
-        if eid is not None:
-            conditions.append("eh.entity_id = %s")
-            params.append(eid)
+        if eids:
+            conditions.append("eh.entity_id = ANY(%s)")
+            params.append(eids)
         if broker:
             conditions.append("eh.broker = %s")
             params.append(broker)
@@ -1747,9 +1681,9 @@ def get_foreign_equity_holdings(
         # Foreign broker cash for the same scope.
         cash_conditions = ["bc.broker = ANY(%s)"]
         cash_params: list = [list(FOREIGN_BROKERS)]
-        if eid is not None:
-            cash_conditions.append("bc.entity_id = %s")
-            cash_params.append(eid)
+        if eids:
+            cash_conditions.append("bc.entity_id = ANY(%s)")
+            cash_params.append(eids)
         if broker:
             cash_conditions.append("bc.broker = %s")
             cash_params.append(broker)
@@ -1799,12 +1733,10 @@ def get_foreign_equity_holdings(
         as_of_date  = str(max(as_of_dates)) if as_of_dates else None
         last_updated = max(updated_ats).isoformat() if updated_ats else None
 
-        entity_name = "All Entities" if eid is None else (
-            rows[0]["entity_name"] if rows else ""
-        )
+        resp_entity_id, entity_name = _entity_label(eids, rows)
 
         return {
-            "entity_id":      eid or 0,
+            "entity_id":      resp_entity_id,
             "entity_name":    entity_name,
             "broker":         broker,
             "total_holdings": len(holdings),
@@ -1853,7 +1785,7 @@ def get_foreign_equity_holdings(
 @app.get("/api/v1/foreign-equity/activity")
 def get_foreign_equity_activity(
     request: Request,
-    entity_id: Optional[int] = None,
+    entity_id: Optional[List[int]] = Query(None),
     day: Optional[str] = None,
     authorization: Optional[str] = Header(None),
 ):
@@ -1871,7 +1803,7 @@ def get_foreign_equity_activity(
         payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
-        eid  = _resolve_entity(cur, payload, entity_id)
+        eids = _resolve_entities(cur, payload, entity_id)
 
         try:
             as_of = date.fromisoformat(day) if day else date.today()
@@ -1881,9 +1813,9 @@ def get_foreign_equity_activity(
         # snapshot_open rows are opening cost-basis seeds, not trades — never list them.
         conditions = ["etl.trade_date = %s", "etl.source <> 'snapshot_open'"]
         params     = [as_of]
-        if eid is not None:
-            conditions.append("etl.entity_id = %s")
-            params.append(eid)
+        if eids:
+            conditions.append("etl.entity_id = ANY(%s)")
+            params.append(eids)
         where = " AND ".join(conditions)
         cur.execute(
             f"""
@@ -1900,8 +1832,8 @@ def get_foreign_equity_activity(
         rows = cur.fetchall()
 
         # Which entities are in scope for the realised-gains recompute.
-        if eid is not None:
-            entity_ids = [eid]
+        if eids:
+            entity_ids = list(eids)
         else:
             cur.execute("SELECT id FROM entity ORDER BY id")
             entity_ids = [r["id"] for r in cur.fetchall()]
@@ -1953,7 +1885,7 @@ def get_foreign_equity_activity(
 
         return {
             "date":               str(as_of),
-            "entity_id":          eid or 0,
+            "entity_id":          (eids[0] if eids and len(eids) == 1 else 0),
             "buy_count":          buy_count,
             "sell_count":         sell_count,
             "realized_pnl_total": round(realized_total, 2),
@@ -1982,7 +1914,7 @@ FNO_SOURCE_LABEL = {"shareindia": "Share India", "orbis": "Orbis"}
 @app.get("/api/v1/fno/positions")
 def get_fno_positions(
     request: Request,
-    entity_id: Optional[int] = None,
+    entity_id: Optional[List[int]] = Query(None),
     source: Optional[str] = None,
     authorization: Optional[str] = Header(None),
 ):
@@ -1997,12 +1929,12 @@ def get_fno_positions(
 
         conn = get_db_connection()
         cur  = conn.cursor()
-        eid  = _resolve_entity(cur, payload, entity_id)
+        eids = _resolve_entities(cur, payload, entity_id)
 
         conds, params = [], []
-        if eid is not None:
-            conds.append("p.entity_id = %s")
-            params.append(eid)
+        if eids:
+            conds.append("p.entity_id = ANY(%s)")
+            params.append(eids)
         if source:
             conds.append("p.source = %s")
             params.append(source)
@@ -2091,12 +2023,15 @@ def get_fno_positions(
         updated_ats = [r["updated_at"] for r in rows if r["updated_at"]] + \
                       [a["updated_at"] for a in acct_rows if a["updated_at"]]
 
-        entity_name = "All Entities" if eid is None else (
-            rows[0]["entity_name"] if rows else (acct_rows[0]["entity_name"] if acct_rows else "")
-        )
+        if not eids:
+            entity_name = "All Entities"
+        elif len(eids) == 1:
+            entity_name = rows[0]["entity_name"] if rows else (acct_rows[0]["entity_name"] if acct_rows else "")
+        else:
+            entity_name = f"{len(eids)} entities"
 
         return {
-            "entity_id":    eid or 0,
+            "entity_id":    (eids[0] if eids and len(eids) == 1 else 0),
             "entity_name":  entity_name,
             "source":       source,
             "positions":    positions,
@@ -2125,7 +2060,7 @@ def get_fno_positions(
 @app.get("/api/v1/gold-silver/holdings")
 def get_gold_silver_holdings(
     request: Request,
-    entity_id: Optional[int] = None,
+    entity_id: Optional[List[int]] = Query(None),
     authorization: Optional[str] = Header(None),
 ):
     """
@@ -2141,13 +2076,13 @@ def get_gold_silver_holdings(
 
         conn = get_db_connection()
         cur  = conn.cursor()
-        eid  = _resolve_entity(cur, payload, entity_id)
+        eids = _resolve_entities(cur, payload, entity_id)
 
         conds  = ["COALESCE(eh.asset_class, 'equity') IN ('gold','silver','commodity')"]
         params: list = []
-        if eid is not None:
-            conds.append("eh.entity_id = %s")
-            params.append(eid)
+        if eids:
+            conds.append("eh.entity_id = ANY(%s)")
+            params.append(eids)
         where = "WHERE " + " AND ".join(conds)
 
         # Union the domestic + foreign holding tables (identical relevant columns).
@@ -2180,12 +2115,10 @@ def get_gold_silver_holdings(
         def _mv(items):
             return round(sum(float(h["current_market_value"] or 0) for h in items), 2)
 
-        entity_name = "All Entities" if eid is None else (
-            rows[0]["entity_name"] if rows else ""
-        )
+        resp_entity_id, entity_name = _entity_label(eids, rows)
 
         return {
-            "entity_id":         eid or 0,
+            "entity_id":         resp_entity_id,
             "entity_name":       entity_name,
             "total_holdings":    len(holdings),
             "totals":            totals,
@@ -2344,7 +2277,7 @@ def _pms_source_xirr(cur, entity_id: int, source: str, current_value: float) -> 
 @app.get("/api/v1/pms/holdings")
 def get_pms_holdings(
     request: Request,
-    entity_id: Optional[int] = None,
+    entity_id: Optional[List[int]] = Query(None),
     authorization: Optional[str] = Header(None),
 ):
     """
@@ -2359,13 +2292,13 @@ def get_pms_holdings(
 
         conn = get_db_connection()
         cur  = conn.cursor()
-        eid  = _resolve_entity(cur, payload, entity_id)
+        eids = _resolve_entities(cur, payload, entity_id)
 
         conditions = []
         params     = []
-        if eid is not None:
-            conditions.append("p.entity_id = %s")
-            params.append(eid)
+        if eids:
+            conditions.append("p.entity_id = ANY(%s)")
+            params.append(eids)
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
         cur.execute(
@@ -2459,11 +2392,11 @@ def get_pms_holdings(
 
         cur.close()
 
-        entity_name = "All Entities" if eid is None else (rows[0]["entity_name"] if rows else "")
+        resp_entity_id, entity_name = _entity_label(eids, rows)
         as_on = max(as_on_by_key.values()).isoformat() if as_on_by_key else None
 
         return {
-            "entity_id":   eid or 0,
+            "entity_id":   resp_entity_id,
             "entity_name": entity_name,
             "as_on_date":  as_on,
             "totals":      _pms_combine(list(source_aggs.values())),
@@ -3120,125 +3053,78 @@ def get_overview(
 @app.get("/api/v1/transactions")
 def get_transactions(
     request: Request,
-    entity_id: Optional[int] = None,
+    entity_id: Optional[List[int]] = Query(None),
     txn_type: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
     authorization: Optional[str] = Header(None),
 ):
-    """Return MF transactions for the requesting user's entity."""
+    """Return MF transactions for the requesting user's entity or a subset."""
     conn = None
     try:
         payload = _require_auth(request, authorization)
 
         conn = get_db_connection()
         cursor = conn.cursor()
-        # Any authenticated user may view every entity: ?entity_id=N → that entity,
-        # no param → all entities.
-        eid = _resolve_entity(cursor, payload, entity_id)
+        # Any authenticated user may view every entity: ?entity_id=N (repeatable)
+        # → that entity or subset, no param → all entities.
+        eids = _resolve_entities(cursor, payload, entity_id)
 
         limit  = max(1, min(limit, 500))
         offset = max(0, offset)
 
-        type_filter     = txn_type.strip() if txn_type else None
-        type_clause     = "AND t.transaction_type ILIKE %s" if type_filter else ""
-        type_count_clause = "WHERE transaction_type ILIKE %s" if type_filter else ""
+        type_filter = txn_type.strip() if txn_type else None
 
-        if eid is None:
-            # Admin all-entities view
-            params = [type_filter, limit, offset] if type_filter else [limit, offset]
-            cursor.execute(f"""
-                SELECT
-                    t.id, t.transaction_date, t.description, t.transaction_type,
-                    t.amount, t.units, t.nav, t.balance_units, t.folio_number,
-                    sm.security_name, sm.isin, e.entity_name
-                FROM mf_transaction t
-                JOIN security_master sm ON sm.id = t.security_id
-                JOIN entity e ON e.id = t.entity_id
-                WHERE 1=1 {type_clause}
-                ORDER BY t.transaction_date DESC, t.id DESC
-                LIMIT %s OFFSET %s
-            """, params)
-            rows = cursor.fetchall()
-            count_params = [type_filter] if type_filter else []
-            cursor.execute(
-                f"SELECT COUNT(*) AS total FROM mf_transaction {type_count_clause}",
-                count_params
-            )
-            total = cursor.fetchone()["total"]
-            cursor.close()
-            return {
-                "entity_id": 0,
-                "total":     total,
-                "limit":     limit,
-                "offset":    offset,
-                "transactions": [
-                    {
-                        "id":            r["id"],
-                        "date":          str(r["transaction_date"]),
-                        "description":   r["description"],
-                        "type":          r["transaction_type"],
-                        "amount":        float(r["amount"]) if r["amount"] else None,
-                        "units":         float(r["units"])  if r["units"]  else None,
-                        "nav":           float(r["nav"])    if r["nav"]    else None,
-                        "balance_units": float(r["balance_units"]) if r["balance_units"] else None,
-                        "folio_number":  r["folio_number"],
-                        "security_name": r["security_name"],
-                        "isin":          r["isin"],
-                        "entity_name":   r["entity_name"],
-                    }
-                    for r in rows
-                ],
-            }
+        conds  = ["1=1"]
+        params: list = []
+        if eids:
+            conds.append("t.entity_id = ANY(%s)")
+            params.append(eids)
+        if type_filter:
+            conds.append("t.transaction_type ILIKE %s")
+            params.append(type_filter)
+        where = " AND ".join(conds)
 
-        params = [eid, type_filter, limit, offset] if type_filter else [eid, limit, offset]
         cursor.execute(f"""
             SELECT
-                t.id,
-                t.transaction_date,
-                t.description,
-                t.transaction_type,
-                t.amount,
-                t.units,
-                t.nav,
-                t.balance_units,
-                t.folio_number,
-                sm.security_name,
-                sm.isin
+                t.id, t.transaction_date, t.description, t.transaction_type,
+                t.amount, t.units, t.nav, t.balance_units, t.folio_number,
+                sm.security_name, sm.isin, e.entity_name
             FROM mf_transaction t
             JOIN security_master sm ON sm.id = t.security_id
-            WHERE t.entity_id = %s {type_clause}
+            JOIN entity e ON e.id = t.entity_id
+            WHERE {where}
             ORDER BY t.transaction_date DESC, t.id DESC
             LIMIT %s OFFSET %s
-        """, params)
+        """, params + [limit, offset])
         rows = cursor.fetchall()
 
-        count_params = [eid, type_filter] if type_filter else [eid]
         cursor.execute(
-            f"SELECT COUNT(*) AS total FROM mf_transaction t WHERE t.entity_id = %s {type_clause}",
-            count_params
+            f"SELECT COUNT(*) AS total FROM mf_transaction t WHERE {where}",
+            params
         )
         total = cursor.fetchone()["total"]
         cursor.close()
 
         return {
-            "entity_id":  eid,
-            "total":      total,
-            "limit":      limit,
-            "offset":     offset,
+            "entity_id": (eids[0] if eids and len(eids) == 1 else 0),
+            "total":     total,
+            "limit":     limit,
+            "offset":    offset,
             "transactions": [
                 {
-                    "id":               r["id"],
-                    "date":             str(r["transaction_date"]),
-                    "description":      r["description"],
-                    "type":             r["transaction_type"],
-                    "amount":           float(r["amount"]) if r["amount"] else None,
-                    "units":            float(r["units"])  if r["units"]  else None,
-                    "nav":              float(r["nav"])    if r["nav"]    else None,
-                    "balance_units":    float(r["balance_units"]) if r["balance_units"] else None,
-                    "folio_number":     r["folio_number"],
-                    "security_name":    r["security_name"],
-                    "isin":             r["isin"],
+                    "id":            r["id"],
+                    "date":          str(r["transaction_date"]),
+                    "description":   r["description"],
+                    "type":          r["transaction_type"],
+                    "amount":        float(r["amount"]) if r["amount"] else None,
+                    "units":         float(r["units"])  if r["units"]  else None,
+                    "nav":           float(r["nav"])    if r["nav"]    else None,
+                    "balance_units": float(r["balance_units"]) if r["balance_units"] else None,
+                    "folio_number":  r["folio_number"],
+                    "security_name": r["security_name"],
+                    "isin":          r["isin"],
+                    "entity_name":   r["entity_name"],
                 }
                 for r in rows
             ],
@@ -4721,7 +4607,7 @@ def delete_property_document(doc_id: int, request: Request,
 def get_manual_assets(
     request: Request,
     category: str,
-    entity_id: Optional[int] = None,
+    entity_id: Optional[List[int]] = Query(None),
     authorization: Optional[str] = Header(None),
 ):
     """Latest manual_input per (entity, label) for one category, entity-scoped,
@@ -4734,11 +4620,11 @@ def get_manual_assets(
         payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
-        eid  = _resolve_entity(cur, payload, entity_id)
+        eids = _resolve_entities(cur, payload, entity_id)
 
         conds, params = ["m.category = %s"], [category]
-        if eid is not None:
-            conds.append("m.entity_id = %s"); params.append(eid)
+        if eids:
+            conds.append("m.entity_id = ANY(%s)"); params.append(eids)
         where = "WHERE " + " AND ".join(conds)
         cur.execute(
             f"""
@@ -4757,8 +4643,8 @@ def get_manual_assets(
 
         # Attachments for the same scope, grouped by (entity_id, label).
         acond, aparams = ["category = %s"], [category]
-        if eid is not None:
-            acond.append("entity_id = %s"); aparams.append(eid)
+        if eids:
+            acond.append("entity_id = ANY(%s)"); aparams.append(eids)
         cur.execute(
             f"""
             SELECT id, entity_id, category, label, kind, original_name,
@@ -4777,8 +4663,8 @@ def get_manual_assets(
         art_by_key: dict = {}
         if category == "art":
             dcond, dparams = [], []
-            if eid is not None:
-                dcond.append("entity_id = %s"); dparams.append(eid)
+            if eids:
+                dcond.append("entity_id = ANY(%s)"); dparams.append(eids)
             dwhere = ("WHERE " + " AND ".join(dcond)) if dcond else ""
             cur.execute(
                 f"SELECT entity_id, label, painter_name, painter_about FROM art_detail {dwhere}",
@@ -4794,8 +4680,8 @@ def get_manual_assets(
         prop_by_key: dict = {}
         if category == "properties":
             pcond, pparams = [], []
-            if eid is not None:
-                pcond.append("entity_id = %s"); pparams.append(eid)
+            if eids:
+                pcond.append("entity_id = ANY(%s)"); pparams.append(eids)
             pwhere = ("WHERE " + " AND ".join(pcond)) if pcond else ""
             cur.execute(
                 f"""SELECT entity_id, label, location, area_sqft, ready_reckoner_rate
@@ -4819,8 +4705,8 @@ def get_manual_assets(
         rounds_by_key: dict = {}
         if category in UNLISTED_CATEGORIES:
             rcond, rparams = ["category = %s"], [category]
-            if eid is not None:
-                rcond.append("entity_id = %s"); rparams.append(eid)
+            if eids:
+                rcond.append("entity_id = ANY(%s)"); rparams.append(eids)
             rwhere = "WHERE " + " AND ".join(rcond)
             cur.execute(
                 f"""SELECT id, entity_id, label, round_name, round_date, round_valuation,
@@ -4881,7 +4767,7 @@ def get_manual_assets(
         total_value = round(sum(a["current_value"] or 0 for a in out), 2)
         return {
             "category":      category,
-            "entity_id":     eid or 0,
+            "entity_id":     (eids[0] if eids and len(eids) == 1 else 0),
             "total_value":   total_value,
             "count":         len(out),
             "assets":        out,
@@ -5354,21 +5240,21 @@ def _latest_fx_to_inr(cur) -> dict:
 @app.get("/api/v1/bank-accounts")
 def list_bank_accounts(
     request: Request,
-    entity_id: Optional[int] = None,
+    entity_id: Optional[List[int]] = Query(None),
     authorization: Optional[str] = Header(None),
 ):
     """List bank accounts with native balance + INR equivalent.
-    Admin sees all (optionally ?entity_id=N); a member sees only their own entity."""
+    Admin sees all (optionally ?entity_id=N, repeatable); a member sees only their own entity."""
     conn = None
     try:
         payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
-        # Admin + param → that entity; admin no param → all; member → own (param ignored).
-        eid = _resolve_entity(cur, payload, entity_id)
+        # Admin + param → that entity/subset; admin no param → all; member → own (param ignored).
+        eids = _resolve_entities(cur, payload, entity_id)
 
-        where  = "WHERE b.entity_id = %s" if eid is not None else ""
-        params = [eid] if eid is not None else []
+        where  = "WHERE b.entity_id = ANY(%s)" if eids else ""
+        params = [eids] if eids else []
         cur.execute(f"""
             SELECT b.id, b.entity_id, e.entity_name, b.bank_name, b.account_type,
                    b.currency, b.balance, b.balance_as_of, b.notes, b.updated_at,

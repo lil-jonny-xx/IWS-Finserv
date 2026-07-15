@@ -238,7 +238,12 @@ export default function FnoPage() {
   const router = useRouter();
   const [user, setUser]             = useState<User | null>(null);
   const [entities, setEntities]     = useState<Entity[]>([]);
-  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);   // empty = All; >1 = subset
+  const selKey = selectedIds.join(',');
+  const toggleEntity = useCallback((id: number | null) => {
+    if (id === null) { setSelectedIds([]); return; }
+    setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  }, []);
   const [data, setData]             = useState<FnoResponse | null>(null);
   const [loading, setLoading]       = useState(true);
   const [error, setError]           = useState<string | null>(null);
@@ -263,7 +268,7 @@ export default function FnoPage() {
     const controller = new AbortController();
     if (!didInitialLoad.current) setLoading(true);
     setError(null);
-    const qs = selectedId !== null ? `?entity_id=${selectedId}` : '';
+    const qs = selectedIds.length ? '?' + selectedIds.map(id => `entity_id=${id}`).join('&') : '';
     fetch(`${API_URL}/api/v1/fno/positions${qs}`, { credentials: 'include', signal: controller.signal })
       .then(r => { if (r.status === 401) { router.push('/'); return null; } if (!r.ok) throw new Error('Failed to load FnO positions.'); return r.json(); })
       .then((d: FnoResponse | null) => {
@@ -273,10 +278,10 @@ export default function FnoPage() {
       })
       .catch(err => { if (err.name !== 'AbortError') { setError(err.message); setLoading(false); } });
     return () => controller.abort();
-  }, [router, selectedId, retryCount]);
+  }, [router, selKey, retryCount]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   const isAdmin       = !!user;  // members have admin-level view access (only Manual Data + user mgmt are admin-only)
-  const showEntityCol = isAdmin && selectedId === null;
+  const showEntityCol = isAdmin && selectedIds.length !== 1;
   const handleRetry   = useCallback(() => setRetryCount(c => c + 1), []);
 
   return (
@@ -297,7 +302,7 @@ export default function FnoPage() {
         </div>
 
         {isAdmin && entities.length > 0 && (
-          <EntitySwitcher section="/fno" entities={entities} selectedId={selectedId} onSelect={setSelectedId} />
+          <EntitySwitcher section="/fno" entities={entities} selectedIds={selectedIds} onToggle={toggleEntity} />
         )}
 
         {loading && !data && <Skeleton />}

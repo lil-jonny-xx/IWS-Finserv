@@ -80,7 +80,12 @@ export default function ArtPage() {
   const router = useRouter();
   const [user, setUser]             = useState<User | null>(null);
   const [entities, setEntities]     = useState<Entity[]>([]);
-  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);   // empty = All; >1 = subset
+  const selKey = selectedIds.join(',');
+  const toggleEntity = useCallback((id: number | null) => {
+    if (id === null) { setSelectedIds([]); return; }
+    setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  }, []);
   const [data, setData]             = useState<ManualAssetsResponse | null>(null);
   const [loading, setLoading]       = useState(true);
   const [error, setError]           = useState<string | null>(null);
@@ -106,13 +111,13 @@ export default function ArtPage() {
     const controller = new AbortController();
     if (!didInitialLoad.current) setLoading(true);
     setError(null);
-    const qs = selectedId !== null ? `&entity_id=${selectedId}` : '';
+    const qs = selectedIds.length ? '&' + selectedIds.map(id => `entity_id=${id}`).join('&') : '';
     fetch(`${API_URL}/api/v1/manual-assets?category=art${qs}`, { credentials: 'include', signal: controller.signal })
       .then(r => { if (r.status === 401) { router.push('/'); return null; } if (!r.ok) throw new Error('Failed to load art holdings.'); return r.json(); })
       .then((d: ManualAssetsResponse | null) => { if (d) setData(d); setLoading(false); didInitialLoad.current = true; })
       .catch(err => { if (err.name !== 'AbortError') { setError(err.message); setLoading(false); } });
     return () => controller.abort();
-  }, [router, selectedId, retryCount]);
+  }, [router, selKey, retryCount]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   const isAdmin     = !!user;  // members have admin-level view access (only Manual Data + user mgmt are admin-only)
   const handleRetry = useCallback(() => setRetryCount(c => c + 1), []);
@@ -129,7 +134,7 @@ export default function ArtPage() {
         </div>
 
         {isAdmin && entities.length > 0 && (
-          <EntitySwitcher section="/art" entities={entities} selectedId={selectedId} onSelect={setSelectedId} />
+          <EntitySwitcher section="/art" entities={entities} selectedIds={selectedIds} onToggle={toggleEntity} />
         )}
 
         {loading && !data && (

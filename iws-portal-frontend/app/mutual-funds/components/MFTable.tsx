@@ -718,12 +718,11 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
   const [search, setSearch]         = useState('');
   const [filterClass, setFilterClass]   = useState<string | null>(null);
   const [filterType, setFilterType]     = useState<string | null>(null);
-  const [filterEntity, setFilterEntity] = useState<string | null>(null);
   const [expandedRows, setExpandedRows] = useState<Set<number>>(new Set());
 
   // Reset all filters when the entity tab changes so stale filters from one
-  // entity view don't bleed into another (e.g. filterEntity='IWS' hiding all
-  // rows when switching back to the All tab, or to a different entity).
+  // entity view don't bleed into another (e.g. a class filter hiding all rows
+  // when switching back to the All tab, or to a different entity).
   const prevResetKey = useRef(filterResetKey);
   useEffect(() => {
     if (filterResetKey !== prevResetKey.current) {
@@ -731,7 +730,6 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
       setSearch('');
       setFilterClass(null);
       setFilterType(null);
-      setFilterEntity(null);
     }
   }, [filterResetKey]);
 
@@ -760,31 +758,37 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
   // unique filter option values
   const assetClasses  = [...new Set(holdings.map(h => h.asset_class))].sort();
   const secTypes      = [...new Set(holdings.map(h => h.security_type))].sort();
-  const entityNames   = [...new Set(holdings.map(h => h.entity_name).filter(Boolean) as string[])].sort();
-
   // apply all filters
   const filtered = useMemo(() => {
     const q = search.toLowerCase();
     return holdings.filter(h => {
       if (filterClass  && h.asset_class    !== filterClass)  return false;
       if (filterType   && h.security_type  !== filterType)   return false;
-      if (filterEntity && h.entity_name    !== filterEntity) return false;
       if (q && !h.security_name.toLowerCase().includes(q) &&
                !h.folio_number.toLowerCase().includes(q) &&
                !(h.entity_name ?? '').toLowerCase().includes(q)) return false;
       return true;
     });
-  }, [holdings, search, filterClass, filterType, filterEntity]);
+  }, [holdings, search, filterClass, filterType]);
 
+  // Summary totals follow the active client-side filters (class/type/search) so the
+  // top strip agrees with the filtered table + bottom total row. (Entity subset is
+  // scoped server-side, so server totals already reflect it.)
+  const isFiltered = !!(filterClass || filterType || search);
+  const view       = filtered;
   const asOfDate   = holdings.find(h => h.as_of_date)?.as_of_date;
-  const avgCagr    = weightedAvg(holdings, 'cagr_inception_pct');
-  const avgXirr    = weightedAvg(holdings, 'xirr_inception_pct');
-  const hasMath    = holdings.some(h => h.pnl_inception != null);
+  const avgCagr    = weightedAvg(view, 'cagr_inception_pct');
+  const avgXirr    = weightedAvg(view, 'xirr_inception_pct');
+  const hasMath    = view.some(h => h.pnl_inception != null);
 
-  const totalPnlInception  = holdings.reduce((s, h) => s + (h.pnl_inception  ?? 0), 0);
-  const totalPnlYtd        = holdings.reduce((s, h) => s + (h.pnl_ytd        ?? 0), 0);
-  const totalWeeklyChg     = holdings.reduce((s, h) => s + (h.weekly_change  ?? 0), 0);
-  const totalRealized      = holdings.reduce((s, h) => s + (h.realized_gain ?? 0), 0);
+  const totalPnlInception  = view.reduce((s, h) => s + (h.pnl_inception  ?? 0), 0);
+  const totalPnlYtd        = view.reduce((s, h) => s + (h.pnl_ytd        ?? 0), 0);
+  const totalWeeklyChg     = view.reduce((s, h) => s + (h.weekly_change  ?? 0), 0);
+  const totalRealized      = view.reduce((s, h) => s + (h.realized_gain ?? 0), 0);
+  const viewInvested = isFiltered ? view.reduce((s, h) => s + h.invested_amount, 0) : totals.total_invested;
+  const viewMktVal   = isFiltered ? view.reduce((s, h) => s + (h.market_value_as_on ?? h.current_value ?? 0), 0)
+                                  : totals.total_current_value;
+  const viewCount    = isFiltered ? view.length : totals.total_holdings;
 
   const colCount    = 3                          // sr + fund + folio
     + 8                                          // units nav cost since exp% mktval prevwk wklychg
@@ -841,13 +845,13 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
           {totals.total_invested != null && (
             <div>
               <p className="text-xs text-ghost mb-0.5">Total Invested</p>
-              <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(totals.total_invested)}</p>
+              <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(viewInvested)}</p>
             </div>
           )}
           {totals.total_current_value != null && (
             <div>
               <p className="text-xs text-ghost mb-0.5">Market Value</p>
-              <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(totals.total_current_value)}</p>
+              <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(viewMktVal)}</p>
             </div>
           )}
           {hasMath && (
@@ -902,7 +906,7 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
           {totals.total_holdings != null && (
             <div>
               <p className="text-xs text-ghost mb-0.5">Holdings</p>
-              <p className="text-sm font-semibold text-ink tabular-nums">{totals.total_holdings}</p>
+              <p className="text-sm font-semibold text-ink tabular-nums">{viewCount}</p>
             </div>
           )}
         </div>
@@ -950,14 +954,8 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
             selected={filterType}
             onChange={setFilterType}
           />
-          {showEntityCol && viewMode === 'normal' && (
-            <FilterPills
-              label="Entity"
-              options={entityNames}
-              selected={filterEntity}
-              onChange={setFilterEntity}
-            />
-          )}
+          {/* Entity is filtered by the shared EntitySwitcher at the top of the page
+              (redundant per-table entity filter removed). */}
         </div>
       </div>
 

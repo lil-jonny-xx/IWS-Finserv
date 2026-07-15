@@ -1,7 +1,8 @@
 'use client';
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import NavTabs from '@/app/components/NavTabs';
+import EntitySwitcher from '@/app/components/EntitySwitcher';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 const IDLE_TIMEOUT = 30 * 60 * 1000;
@@ -185,9 +186,10 @@ function EntityCard({ entity }: { entity: EntitySummary }) {
         </div>
         <div className="text-right">
           <p className="text-base font-bold text-ink tabular-nums">{fmtINRCompact(entity.total_value)}</p>
-          <p className="text-[11px] mt-0.5" style={{ color: pnlColor }}>
-            {entity.total_pnl >= 0 ? '+' : ''}{fmtINRCompact(entity.total_pnl)} P&L
+          <p className="text-[11px] mt-0.5 tabular-nums" style={{ color: pnlColor }}>
+            {entity.total_pnl >= 0 ? '+' : ''}{fmtINRCompact(entity.total_pnl)}
           </p>
+          <p className="text-[10px] text-ghost mt-0.5">Unrealized profit as of today</p>
         </div>
       </div>
 
@@ -248,7 +250,47 @@ function EntityCard({ entity }: { entity: EntitySummary }) {
 // ── overview section ──────────────────────────────────────────────────────────
 
 function OverviewSection({ data }: { data: OverviewData }) {
-  const { summary, asset_class_breakdown, entities } = data;
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const toggleEntity = useCallback((id: number | null) => {
+    if (id === null) { setSelectedIds([]); return; }
+    setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  }, []);
+
+  const allEntities = data.entities;
+  const entityPills = useMemo(
+    () => allEntities.map(e => ({ id: e.entity_id, name: e.entity_name })),
+    [allEntities],
+  );
+
+  // When a subset is chosen, re-aggregate the top summary, donut and asset-class
+  // breakdown from just those entities. No selection = the server's full-book view
+  // (which also carries a real weighted CAGR we can't recompute per-subset).
+  const selKey = selectedIds.join(',');
+  const { summary, asset_class_breakdown, entities } = useMemo(() => {
+    if (selectedIds.length === 0) return data;
+    const chosen = allEntities.filter(e => selectedIds.includes(e.entity_id));
+    const s = { total_invested: 0, total_value: 0, total_pnl: 0, total_pnl_ytd: 0, total_weekly: 0, weighted_cagr: null as number | null };
+    const byClass = new Map<string, AssetClassItem>();
+    for (const e of chosen) {
+      s.total_invested += e.total_invested;
+      s.total_value    += e.total_value;
+      s.total_pnl      += e.total_pnl;
+      s.total_pnl_ytd  += e.total_pnl_ytd;
+      s.total_weekly   += e.total_weekly;
+      for (const c of e.asset_classes) {
+        const agg = byClass.get(c.asset_class) ?? { asset_class: c.asset_class, invested: 0, value: 0, pnl: 0, pct: 0 };
+        agg.invested += c.invested;
+        agg.value    += c.value;
+        agg.pnl      += c.pnl;
+        byClass.set(c.asset_class, agg);
+      }
+    }
+    const breakdown = Array.from(byClass.values())
+      .map(c => ({ ...c, pct: s.total_value > 0 ? (c.value / s.total_value) * 100 : 0 }))
+      .sort((a, b) => b.value - a.value);
+    return { summary: s, asset_class_breakdown: breakdown, entities: chosen };
+  }, [data, allEntities, selKey]);   // eslint-disable-line react-hooks/exhaustive-deps
+
   const pnlColor   = gainColor(summary.total_pnl);
   const ytdColor   = gainColor(summary.total_pnl_ytd);
   const weekColor  = gainColor(summary.total_weekly);
@@ -263,6 +305,11 @@ function OverviewSection({ data }: { data: OverviewData }) {
 
   return (
     <div className="space-y-6">
+
+      {/* Multi-entity filter — view the whole book or an arbitrary subset */}
+      {entityPills.length > 1 && (
+        <EntitySwitcher entities={entityPills} selectedIds={selectedIds} onToggle={toggleEntity} />
+      )}
 
       {/* Portfolio summary card */}
       <div className="bg-card rounded-lg border border-rule p-5 sm:p-6">

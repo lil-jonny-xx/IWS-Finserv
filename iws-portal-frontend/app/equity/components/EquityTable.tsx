@@ -428,7 +428,8 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
   const [search, setSearch]           = useState('');
   const [filterBroker, setFilterBroker]   = useState<string | null>(null);
   const [filterSector, setFilterSector]   = useState<string | null>(null);
-  const [filterEntity, setFilterEntity]   = useState<string | null>(null);
+  // Entity is filtered by the shared EntitySwitcher at the top of the page, so no
+  // per-table entity filter here (it was redundant).
 
   function handleSort(key: SortKey) {
     if (key === sortKey) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
@@ -439,14 +440,12 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
   const brokerOptions = brokers.length >= 2 ? [...brokers, 'combined'] : brokers;
   const sectors       = [...new Set(holdings.map(h => h.sector ?? 'Equity'))]
     .sort((a, b) => (sectorMeta(a).order - sectorMeta(b).order));
-  const entityNames   = [...new Set(holdings.map(h => h.entity_name).filter(Boolean) as string[])].sort();
 
   const filtered = useMemo(() => {
-    // Step 1: broker/sector/entity filters on raw holdings
+    // Step 1: broker/sector filters (entity subset is scoped server-side).
     let rows = holdings.filter(h => {
       if (filterBroker && filterBroker !== 'combined' && h.broker !== filterBroker) return false;
       if (filterSector && (h.sector ?? 'Equity') !== filterSector) return false;
-      if (filterEntity && h.entity_name          !== filterEntity) return false;
       return true;
     });
 
@@ -465,7 +464,7 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
     }
 
     return rows;
-  }, [holdings, search, filterBroker, filterSector, filterEntity]);
+  }, [holdings, search, filterBroker, filterSector]);
 
   // Empty state — placed AFTER all hooks (useState×6 + useMemo) so the hook
   // call order is identical whether holdings are empty or populated, satisfying
@@ -487,15 +486,28 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
   const bySector: Record<string, EquityHoldingRow[]> = {};
   for (const s of activeSectors) bySector[s] = rows.filter(h => (h.sector ?? 'Equity') === s);
 
+  // Summary totals track the active client-side filters (broker/sector/search) so
+  // the top strip and the bottom Total row always agree. 'combined' is a view, not
+  // a filter, so it doesn't count as filtered (its merged sums equal the API totals).
+  // A multi-entity subset (>1) means the page fetched ALL entities and we're
+  // sub-selecting client-side, so totals must be recomputed. A single entity is
+  // server-scoped (API totals already correct), so it isn't "filtered".
+  const isFiltered  = !!((filterBroker && filterBroker !== 'combined') || filterSector || search);
+  const view        = filtered;
   const asOfDate    = holdings.find(h => h.as_of_date)?.as_of_date;
-  const avgCagrAll  = weightedAvgCagr(holdings);
-  const totalPnlInc = holdings.reduce((s, h) => s + (h.pnl_inception ?? 0), 0);
-  const totalPnlYtd = holdings.reduce((s, h) => s + (h.pnl_ytd ?? 0), 0);
-  const totalWeekly = holdings.reduce((s, h) => s + (h.weekly_change ?? 0), 0);
-  const hasPnl      = holdings.some(h => h.pnl_inception != null);
+  const avgCagrAll  = weightedAvgCagr(view);
+  const totalPnlInc = view.reduce((s, h) => s + (h.pnl_inception ?? 0), 0);
+  const totalPnlYtd = view.reduce((s, h) => s + (h.pnl_ytd ?? 0), 0);
+  const totalWeekly = view.reduce((s, h) => s + (h.weekly_change ?? 0), 0);
+  const hasPnl      = view.some(h => h.pnl_inception != null);
+  const viewCost    = isFiltered ? view.reduce((s, h) => s + h.cost, 0) : totals.total_cost;
+  const viewValue   = isFiltered ? view.reduce((s, h) => s + (h.current_market_value ?? 0), 0)
+                                 : totals.total_current_market_value;
+  const viewCount   = isFiltered ? view.length : holdings.length;
 
   // col count: # + symbol + [entity] + exch + qty + avg_cost + cost + since + mkt_val + prev_wk + wkly_chg + exp% + pnl×3 + ret×3 + remarks
-  const colCount = 2 + (showEntityCol ? 1 : 0) + 14;
+  //          = 2 + [entity] + 16
+  const colCount = 2 + (showEntityCol ? 1 : 0) + 16;
 
   return (
     <div className="bg-card rounded-lg border border-rule overflow-hidden">
@@ -511,13 +523,13 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
         <div className="flex flex-wrap gap-x-8 gap-y-3">
           <div>
             <p className="text-xs text-ghost mb-0.5">Total Cost</p>
-            <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(totals.total_cost)}</p>
+            <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(viewCost)}</p>
           </div>
           <div>
             <p className="text-xs text-ghost mb-0.5">Current Value</p>
-            <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(totals.total_current_market_value)}</p>
+            <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(viewValue)}</p>
           </div>
-          {totals.cash_balance != null && totals.cash_balance > 0 && (
+          {!isFiltered && totals.cash_balance != null && totals.cash_balance > 0 && (
             <>
               <div>
                 <p className="text-xs text-ghost mb-0.5">Cash Balance</p>
@@ -565,7 +577,7 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
               </p>
             </div>
           )}
-          {totals.portfolio_xirr_pct != null && (
+          {!isFiltered && totals.portfolio_xirr_pct != null && (
             <div title="Money-weighted return (XIRR) from actual deposits, withdrawals & dividends in the broker ledger">
               <p className="text-xs text-ghost mb-0.5">Portfolio XIRR</p>
               <p className="text-sm font-semibold tabular-nums"
@@ -574,7 +586,7 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
               </p>
             </div>
           )}
-          {totals.portfolio_income != null && totals.portfolio_income > 0 && (
+          {!isFiltered && totals.portfolio_income != null && totals.portfolio_income > 0 && (
             <div title="Dividends & interest received (from broker ledgers)">
               <p className="text-xs text-ghost mb-0.5">Dividends/Int</p>
               <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(totals.portfolio_income)}</p>
@@ -582,7 +594,7 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
           )}
           <div>
             <p className="text-xs text-ghost mb-0.5">Holdings</p>
-            <p className="text-sm font-semibold text-ink tabular-nums">{holdings.length}</p>
+            <p className="text-sm font-semibold text-ink tabular-nums">{viewCount}</p>
           </div>
         </div>
       </div>
@@ -604,7 +616,6 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
           onChange={setFilterSector}
         />
         <FilterPills label="Broker" options={brokerOptions} labelMap={BROKER_LABELS} selected={filterBroker} onChange={setFilterBroker} />
-        {showEntityCol && <FilterPills label="Entity" options={entityNames} selected={filterEntity} onChange={setFilterEntity} />}
       </div>
 
       {/* Table */}
@@ -685,7 +696,10 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
             {/* Overall totals footer */}
             {rows.length > 0 && (
               <tr className="border-t-2 border-rule bg-page">
-                <td colSpan={6 + (showEntityCol ? 1 : 0)} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim">
+                {/* colSpan covers #, symbol, [entity], exchange, qty, avg_cost so the
+                    next cell lands under the Cost column — was 6 (off by one, shifting
+                    every total one column right). */}
+                <td colSpan={5 + (showEntityCol ? 1 : 0)} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim">
                   Total ({rows.length} holdings)
                 </td>
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">

@@ -177,7 +177,6 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
   const [sortDir, setSortDir]           = useState<SortDir>('desc');
   const [search, setSearch]             = useState('');
   const [filterBroker, setFilterBroker] = useState<string | null>(null);
-  const [filterEntity, setFilterEntity] = useState<string | null>(null);
   const [display, setDisplay]           = useState<Display>('native');
 
   // Currencies offered by the switcher: Native + INR + any with a known FX rate.
@@ -207,12 +206,10 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
   }
 
   const brokers     = [...new Set(holdings.map(h => h.broker))].sort();
-  const entityNames = [...new Set(holdings.map(h => h.entity_name).filter(Boolean) as string[])].sort();
 
   const filtered = useMemo(() => {
     let rows = holdings.filter(h => {
       if (filterBroker && h.broker !== filterBroker) return false;
-      if (filterEntity && h.entity_name !== filterEntity) return false;
       return true;
     });
     if (search) {
@@ -225,7 +222,7 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
       );
     }
     return rows;
-  }, [holdings, search, filterBroker, filterEntity]);
+  }, [holdings, search, filterBroker]);
 
   const hasExtra = !!(extra && extra.count > 0);
   if (holdings.length === 0 && !hasExtra) {
@@ -376,7 +373,6 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
           className="w-full max-w-xs text-xs bg-page border border-wire rounded px-3 py-1.5 text-ink placeholder:text-ghost focus:outline-none focus:border-prime transition-colors"
         />
         <FilterPills label="Broker" options={brokers} labelMap={BROKER_LABELS} selected={filterBroker} onChange={setFilterBroker} />
-        {showEntityCol && <FilterPills label="Entity" options={entityNames} selected={filterEntity} onChange={setFilterEntity} />}
       </div>
 
       {/* Table */}

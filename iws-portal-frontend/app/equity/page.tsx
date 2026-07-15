@@ -163,7 +163,15 @@ export default function EquityPage() {
   const router = useRouter();
   const [user, setUser]                   = useState<User | null>(null);
   const [entities, setEntities]           = useState<Entity[]>([]);
-  const [selectedId, setSelectedId]       = useState<number | null>(null);
+  // Multi-entity selection; empty = All. Single-select still server-filters (one
+  // entity_id, repeatable); empty fetches all. The backend scopes with = ANY(),
+  // so totals already reflect the chosen subset — no client-side entity filter.
+  const [selectedIds, setSelectedIds]     = useState<number[]>([]);
+  const selKey = selectedIds.join(',');
+  const toggleEntity = useCallback((id: number | null) => {
+    if (id === null) { setSelectedIds([]); return; }        // "All" clears
+    setSelectedIds(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  }, []);
   const [data, setData]                   = useState<EquityResponse | null>(null);
   const [activity, setActivity]           = useState<ActivityResponse | null>(null);
   const [loading, setLoading]             = useState(true);
@@ -199,7 +207,7 @@ export default function EquityPage() {
     // sort / filters / search are preserved.
     if (!didInitialLoad.current) setLoading(true);
     setError(null);
-    const qs = selectedId !== null ? `?entity_id=${selectedId}` : '';
+    const qs = selectedIds.length ? '?' + selectedIds.map(id => `entity_id=${id}`).join('&') : '';
     fetch(`${API_URL}/api/v1/equity/holdings${qs}`, { credentials: 'include', signal: controller.signal })
       .then(r => { if (r.status === 401) { router.push('/'); return null; } if (!r.ok) throw new Error('Failed to load equity holdings.'); return r.json(); })
       .then((d: EquityResponse | null) => {
@@ -209,19 +217,19 @@ export default function EquityPage() {
       })
       .catch(err => { if (err.name !== 'AbortError') { setError(err.message); setLoading(false); } });
     return () => controller.abort();
-  }, [router, selectedId, retryCount]);
+  }, [router, selKey, retryCount]);
 
   // Today's detected buys/sells (snapshot worker). Same scope + refresh cadence as
   // holdings; failures are silent so they never disturb the main table.
   useEffect(() => {
     const controller = new AbortController();
-    const qs = selectedId !== null ? `?entity_id=${selectedId}` : '';
+    const qs = selectedIds.length ? '?' + selectedIds.map(id => `entity_id=${id}`).join('&') : '';
     fetch(`${API_URL}/api/v1/equity/activity${qs}`, { credentials: 'include', signal: controller.signal })
       .then(r => (r.ok ? r.json() : null))
       .then((d: ActivityResponse | null) => { if (d) setActivity(d); })
       .catch(() => {});
     return () => controller.abort();
-  }, [selectedId, retryCount]);
+  }, [selKey, retryCount]);
 
   // Auto-refresh every 60 s during market hours (09:15–15:30 IST Mon–Fri)
   useEffect(() => {
@@ -245,7 +253,7 @@ export default function EquityPage() {
     }, 60_000);
 
     return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
-  }, [selectedId]);
+  }, [selKey]);
 
   // Sub-second live fills via SSE (live_trade_daemon → Redis → /api/v1/live/trades).
   // Each fill is shown in "Traded today" instantly (optimistic), then a debounced
@@ -261,7 +269,7 @@ export default function EquityPage() {
       let ev: LiveFill;
       try { ev = JSON.parse(e.data); } catch { return; }
       if (!ev || !ev.symbol) return;
-      if (selectedId !== null && ev.entity_id !== selectedId) return;
+      if (selectedIds.length && !selectedIds.includes(ev.entity_id)) return;
       setActivity(prev => {
         const trade: ActivityTrade = {
           entity_name: ev.entity, security_name: ev.symbol, side: ev.side,
@@ -288,10 +296,10 @@ export default function EquityPage() {
       setSseLive(false);
       if (refetchTimer.current) clearTimeout(refetchTimer.current);
     };
-  }, [user, selectedId]);
+  }, [user, selKey]);
 
   const isAdmin       = !!user;  // members have admin-level view access (only Manual Data + user mgmt are admin-only)
-  const showEntityCol = isAdmin && selectedId === null;
+  const showEntityCol = isAdmin && selectedIds.length !== 1;   // show entity col for All or a multi-entity subset
   const handleRetry   = useCallback(() => setRetryCount(c => c + 1), []);
 
   return (
@@ -326,7 +334,7 @@ export default function EquityPage() {
         </div>
 
         {isAdmin && entities.length > 0 && (
-          <EntitySwitcher section="/equity" entities={entities} selectedId={selectedId} onSelect={setSelectedId} />
+          <EntitySwitcher section="/equity" entities={entities} selectedIds={selectedIds} onToggle={toggleEntity} />
         )}
 
         {loading && !data && <Skeleton />}
