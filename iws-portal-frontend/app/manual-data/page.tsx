@@ -59,7 +59,8 @@ const CATEGORIES: { value: string; label: string; group: string }[] = [
   { value: 'gold_etf',       label: 'Gold / Silver ETF',          group: 'Alternates' },
   { value: 'unlisted',       label: 'Unlisted Equity',            group: 'Alternates' },
   { value: 'startup',        label: 'Startup',                    group: 'Alternates' },
-  { value: 'art',            label: 'Art / Collectibles',         group: 'Alternates' },
+  { value: 'art',            label: 'Art (Paintings)',            group: 'Alternates' },
+  { value: 'collectibles',   label: 'Collectibles',               group: 'Alternates' },
   // Real estate moved to the dedicated property register (/properties page).
   { value: 'funds_transit',  label: 'Funds in Transit',           group: 'Other' },
   { value: 'broker_balance', label: 'Broker Balance',             group: 'Other' },
@@ -111,15 +112,21 @@ interface AttachmentMeta {
   size_bytes: number | null; has_thumb: boolean;
 }
 
+// Art paintings + collectibles share the attachment + detail editor.
+const ART_LIKE = new Set(['art', 'collectibles']);
 const DEFAULT_KINDS = [{ value: 'document', label: 'Document' }];
+const ART_KINDS = [
+  { value: 'art_image',                 label: 'Photo' },
+  { value: 'authentication_certificate', label: 'Authentication certificate' },
+  { value: 'bill',                      label: 'Bill / invoice' },
+  { value: 'document',                  label: 'Other document' },
+];
 const KIND_OPTS: Record<string, { value: string; label: string }[]> = {
-  art: [
-    { value: 'art_image', label: 'Artwork image' },
-    { value: 'document',  label: 'Certificate / document' },
-  ],
+  art:          ART_KINDS,
+  collectibles: ART_KINDS,
 };
 function defaultKind(category: string): string {
-  if (category === 'art') return 'art_image';
+  if (ART_LIKE.has(category)) return 'art_image';
   return 'document';
 }
 
@@ -394,18 +401,26 @@ function AssetExtras({ entityId, category, label, onSaved }: { entityId: number;
   const [msg, setMsg] = useState('');
   const [painterName, setPainterName] = useState('');
   const [painterAbout, setPainterAbout] = useState('');
+  const [location, setLocation] = useState('');
+  const [sellerName, setSellerName] = useState('');
+  const [sellerAddress, setSellerAddress] = useState('');
+  const artLike = ART_LIKE.has(category);
 
   const load = useCallback(async () => {
     if (!label.trim()) { setAtts([]); return; }
     const q = new URLSearchParams({ entity_id: String(entityId), category, label });
     const r = await fetch(`${API_URL}/api/v1/manual-attachments?${q.toString()}`, { credentials: 'include' });
     if (r.ok) setAtts(await r.json());
-    if (category === 'art') {
-      const ar = await fetch(`${API_URL}/api/v1/manual-assets?category=art&entity_id=${entityId}`, { credentials: 'include' });
+    if (ART_LIKE.has(category)) {
+      const ar = await fetch(`${API_URL}/api/v1/manual-assets?category=${category}&entity_id=${entityId}`, { credentials: 'include' });
       if (ar.ok) {
         const d = await ar.json();
         const m = (d.assets || []).find((a: { label: string }) => a.label === label);
-        if (m) { setPainterName(m.painter_name || ''); setPainterAbout(m.painter_about || ''); }
+        if (m) {
+          setPainterName(m.painter_name || ''); setPainterAbout(m.painter_about || '');
+          setLocation(m.location || ''); setSellerName(m.seller_name || '');
+          setSellerAddress(m.seller_address || '');
+        }
       }
     }
   }, [entityId, category, label]);
@@ -432,21 +447,26 @@ function AssetExtras({ entityId, category, label, onSaved }: { entityId: number;
     if (r.ok) load();
   }
 
-  async function savePainter() {
+  async function saveDetail() {
     setBusy(true); setMsg('');
     const r = await fetch(`${API_URL}/api/v1/art-detail`, {
       method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ entity_id: entityId, label, painter_name: painterName, painter_about: painterAbout }),
+      body: JSON.stringify({
+        entity_id: entityId, label,
+        painter_name: painterName, painter_about: painterAbout,
+        location, seller_name: sellerName, seller_address: sellerAddress,
+      }),
     });
     setBusy(false);
-    setMsg(r.ok ? 'Painter details saved' : 'Save failed');
+    setMsg(r.ok ? 'Details saved' : 'Save failed');
   }
 
   if (!label.trim()) {
     return (
       <div className="px-4 py-4 text-[11px]" style={{ color: 'var(--ghost)' }}>
         Enter a name in the “Label / Name” column first — then you can{' '}
-        {category === 'art' ? 'upload artwork photos and add the painter’s details'
+        {category === 'art' ? 'upload photos and add the painter, location & seller details'
+          : category === 'collectibles' ? 'upload photos and add location, seller & valuation details'
           : UNLISTED_CATS.has(category) ? 'add funding rounds, splits/bonuses and supporting documents'
           : 'upload supporting documents and files'} here.
       </div>
@@ -458,33 +478,59 @@ function AssetExtras({ entityId, category, label, onSaved }: { entityId: number;
       {UNLISTED_CATS.has(category) && (
         <RoundsEditor entityId={entityId} category={category} label={label} onSaved={onSaved} />
       )}
-      {category === 'art' && (
-        <div className="flex flex-wrap gap-3 items-start">
-          <div className="flex flex-col gap-1">
-            <label className="text-[11px]" style={{ color: 'var(--dim)' }}>Painter name</label>
-            <input value={painterName} onChange={e => setPainterName(e.target.value)} placeholder="e.g. M.F. Husain"
-                   className="w-56 px-2 py-1 rounded text-xs outline-none"
-                   style={{ background: 'var(--card)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
+      {artLike && (
+        <div className="flex flex-col gap-3">
+          {category === 'art' && (
+            <div className="flex flex-wrap gap-3 items-start">
+              <div className="flex flex-col gap-1">
+                <label className="text-[11px]" style={{ color: 'var(--dim)' }}>Painter name</label>
+                <input value={painterName} onChange={e => setPainterName(e.target.value)} placeholder="e.g. M.F. Husain"
+                       className="w-56 px-2 py-1 rounded text-xs outline-none"
+                       style={{ background: 'var(--card)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
+              </div>
+              <div className="flex flex-col gap-1 flex-1 min-w-[14rem]">
+                <label className="text-[11px]" style={{ color: 'var(--dim)' }}>About the painter / art</label>
+                <textarea value={painterAbout} onChange={e => setPainterAbout(e.target.value)} rows={2}
+                          placeholder="Short note on the artist / provenance"
+                          className="w-full px-2 py-1 rounded text-xs outline-none"
+                          style={{ background: 'var(--card)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
+              </div>
+            </div>
+          )}
+          <div className="flex flex-wrap gap-3 items-start">
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px]" style={{ color: 'var(--dim)' }}>Location (where kept)</label>
+              <input value={location} onChange={e => setLocation(e.target.value)} placeholder="e.g. Goa residence"
+                     className="w-56 px-2 py-1 rounded text-xs outline-none"
+                     style={{ background: 'var(--card)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px]" style={{ color: 'var(--dim)' }}>Seller name</label>
+              <input value={sellerName} onChange={e => setSellerName(e.target.value)}
+                     className="w-56 px-2 py-1 rounded text-xs outline-none"
+                     style={{ background: 'var(--card)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
+            </div>
+            <div className="flex flex-col gap-1 flex-1 min-w-[14rem]">
+              <label className="text-[11px]" style={{ color: 'var(--dim)' }}>Seller address</label>
+              <input value={sellerAddress} onChange={e => setSellerAddress(e.target.value)}
+                     className="w-full px-2 py-1 rounded text-xs outline-none"
+                     style={{ background: 'var(--card)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
+            </div>
+            <button onClick={saveDetail} disabled={busy}
+                    className="mt-5 px-3 py-1 rounded text-xs font-medium"
+                    style={{ background: 'var(--prime)', color: 'var(--prime-fg)', opacity: busy ? 0.6 : 1 }}>
+              Save details
+            </button>
           </div>
-          <div className="flex flex-col gap-1 flex-1 min-w-[14rem]">
-            <label className="text-[11px]" style={{ color: 'var(--dim)' }}>About the painter</label>
-            <textarea value={painterAbout} onChange={e => setPainterAbout(e.target.value)} rows={2}
-                      placeholder="Short note on the artist / provenance"
-                      className="w-full px-2 py-1 rounded text-xs outline-none"
-                      style={{ background: 'var(--card)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
-          </div>
-          <button onClick={savePainter} disabled={busy}
-                  className="mt-5 px-3 py-1 rounded text-xs font-medium"
-                  style={{ background: 'var(--prime)', color: 'var(--prime-fg)', opacity: busy ? 0.6 : 1 }}>
-            Save painter
-          </button>
+          <p className="text-[11px]" style={{ color: 'var(--ghost)' }}>
+            Purchase price uses the Cost column; current valuation uses Current Value.
+          </p>
         </div>
       )}
 
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-[11px] font-medium" style={{ color: 'var(--dim)' }}>
-          {category === 'art' ? 'Artwork image / documents'
-            : 'Documents / files'}:
+          {artLike ? 'Photos / certificates / bills' : 'Documents / files'}:
         </span>
         <select value={kind} onChange={e => setKind(e.target.value)}
                 className="px-2 py-1 rounded text-xs outline-none"
@@ -968,12 +1014,12 @@ export default function ManualDataPage() {
                         <div className="flex items-center gap-1">
                           {showFiles && (
                             <button onClick={() => setOpenExtras(isOpen ? null : idx)}
-                                    title={row.category === 'art' ? 'Artwork photos & painter details'
+                                    title={ART_LIKE.has(row.category) ? 'Photos, details, certificates & bills'
                                       : isUnlisted ? 'Funding rounds, splits/bonuses & documents'
                                       : 'Attach documents / files'}
                                     className="px-2 py-0.5 rounded text-xs whitespace-nowrap"
                                     style={{ color: isOpen ? 'var(--prime-fg)' : 'var(--dim)', background: isOpen ? 'var(--prime)' : 'transparent', border: '1px solid var(--rule)' }}>
-                              {row.category === 'art' ? '🖼 Photos' : isUnlisted ? '📊 Rounds' : '📎 Files'}
+                              {ART_LIKE.has(row.category) ? '🖼 Photos' : isUnlisted ? '📊 Rounds' : '📎 Files'}
                             </button>
                           )}
                           {row._dirty && (

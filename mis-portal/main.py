@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, date
 import os
 import uuid
 import mimetypes
+import urllib.parse
 from dotenv import load_dotenv
 import psycopg2
 import psycopg2.pool  # required: psycopg2.pool is a submodule, not exposed by `import psycopg2` alone
@@ -2576,6 +2577,7 @@ MANUAL_ASSET_CLASS = {
     "unlisted":        "ALTERNATES",
     "startup":         "ALTERNATES",
     "art":             "ART",
+    "collectibles":    "ART",   # same overview bucket as art — only the page split
     "properties":      "REAL_ESTATE",
     "funds_transit":   "CASH",
     "broker_balance":  "CASH",
@@ -2771,22 +2773,34 @@ def _fetch_property_overview_rows(conn, entity_id: Optional[int] = None):
     a property's value/cost across its owners by their pct. purchase_price,
     when recorded, feeds invested + an unrealised pnl.
     """
-    mult = property_docs.FAIR_VALUE_MULTIPLIER
+    mult  = property_docs.FAIR_VALUE_MULTIPLIER
+    share = OLD_LEASE_OWNER_SHARE
+    # Effective value per property: sale_price when sold; else (market OR land
+    # RRR fair value) + summed floor costings, halved for old statutory leases.
+    val_expr = (
+        f"CASE WHEN p.sold THEN p.sale_price ELSE "
+        f"(COALESCE(p.market_value, p.area * p.rrr * {mult}) + COALESCE(fv.bval, 0)) "
+        f"* CASE WHEN p.is_old_lease THEN {share} ELSE 1 END END"
+    )
     cur = conn.cursor()
     cur.execute(f"""
+        WITH fv AS (
+            SELECT property_id,
+                   SUM(COALESCE(built_up_area, area) * rate_per_unit) AS bval
+            FROM property_floor WHERE rate_per_unit IS NOT NULL
+            GROUP BY property_id
+        )
         SELECT pe.id AS holder_id, pe.name AS holder_name, e.id AS sys_entity_id,
-               SUM(COALESCE(CASE WHEN p.sold THEN p.sale_price
-                                 ELSE COALESCE(p.market_value, p.area * p.rrr * {mult}) END, 0)
-                   * o.pct / 100)                                        AS value,
+               SUM(COALESCE({val_expr}, 0) * o.pct / 100)                AS value,
                SUM(COALESCE(p.purchase_price, 0) * o.pct / 100)          AS invested,
                SUM(CASE WHEN p.purchase_price IS NOT NULL THEN
-                        (COALESCE(CASE WHEN p.sold THEN p.sale_price
-                                       ELSE COALESCE(p.market_value, p.area * p.rrr * {mult}) END, 0)
-                         - p.purchase_price) * o.pct / 100 ELSE 0 END)   AS pnl
+                        (COALESCE({val_expr}, 0) - p.purchase_price) * o.pct / 100
+                        ELSE 0 END)                                      AS pnl
         FROM property p
         JOIN property_owner o  ON o.property_id = p.id
         JOIN property_entity pe ON pe.id = o.holder_id
         LEFT JOIN entity e ON e.entity_name = pe.name
+        LEFT JOIN fv ON fv.property_id = p.id
         GROUP BY pe.id, pe.name, e.id
     """)
     rows = cur.fetchall()
@@ -3149,7 +3163,7 @@ VALID_CATEGORIES = {
     "liquid_fund", "debt_fund", "arbitrage_fund", "ppf",
     "pms", "direct_equity", "aif",
     "overseas_fund", "overseas_equity", "forex", "gold_etf",
-    "unlisted", "startup", "art",
+    "unlisted", "startup", "art", "collectibles",
     "funds_transit", "broker_balance", "bank",
 }
 
@@ -3390,7 +3404,7 @@ def delete_manual_input(
             "DELETE FROM manual_attachment WHERE entity_id = %s AND category = %s AND label = %s",
             (entity_id, category, label),
         )
-        if category == "art":
+        if category in ("art", "collectibles"):
             cur.execute("DELETE FROM art_detail WHERE entity_id = %s AND label = %s",
                         (entity_id, label))
         if category == "properties":
@@ -3437,7 +3451,8 @@ def delete_manual_input(
 UPLOADS_ROOT          = os.getenv("UPLOADS_DIR", "/var/www/uploads")
 MANUAL_UPLOAD_SUBDIR  = "manual"
 MAX_UPLOAD_BYTES      = 200 * 1024 * 1024  # 200 MB per file (nginx client_max_body_size must match)
-ATTACHMENT_KINDS      = {"art_image", "deed", "plan", "document"}
+ATTACHMENT_KINDS      = {"art_image", "deed", "plan", "document",
+                         "bill", "authentication_certificate"}
 
 
 def _uploads_abspath(rel: str) -> str:
@@ -3742,17 +3757,21 @@ def delete_manual_attachment(att_id: int, request: Request,
 
 
 class ArtDetailRequest(BaseModel):
-    entity_id:     int
-    label:         str
-    painter_name:  Optional[str] = None
-    painter_about: Optional[str] = None
+    entity_id:      int
+    label:          str
+    painter_name:   Optional[str] = None
+    painter_about:  Optional[str] = None
+    location:       Optional[str] = None   # where the piece is kept
+    seller_name:    Optional[str] = None
+    seller_address: Optional[str] = None
 
 
 @app.post("/api/v1/art-detail")
 @limiter.limit("30/minute")
 def save_art_detail(request: Request, body: ArtDetailRequest,
                     authorization: Optional[str] = Header(None)):
-    """Upsert painter name / about for an Art entry (admin/IWS only)."""
+    """Upsert painter / location / seller details for an Art or Collectibles
+    entry (admin/IWS only). Shared table; collectibles simply leave painter null."""
     conn = None
     try:
         payload = _require_auth(request, authorization)
@@ -3767,15 +3786,20 @@ def save_art_detail(request: Request, body: ArtDetailRequest,
         user_id = urow["id"] if urow else None
         cur.execute(
             """
-            INSERT INTO art_detail (entity_id, label, painter_name, painter_about, updated_by, updated_at)
-            VALUES (%s,%s,%s,%s,%s,NOW())
+            INSERT INTO art_detail (entity_id, label, painter_name, painter_about,
+                                    location, seller_name, seller_address, updated_by, updated_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
             ON CONFLICT (entity_id, label) DO UPDATE SET
-                painter_name  = EXCLUDED.painter_name,
-                painter_about = EXCLUDED.painter_about,
-                updated_by    = EXCLUDED.updated_by,
-                updated_at    = NOW()
+                painter_name   = EXCLUDED.painter_name,
+                painter_about  = EXCLUDED.painter_about,
+                location       = EXCLUDED.location,
+                seller_name    = EXCLUDED.seller_name,
+                seller_address = EXCLUDED.seller_address,
+                updated_by     = EXCLUDED.updated_by,
+                updated_at     = NOW()
             """,
-            (body.entity_id, body.label.strip(), body.painter_name, body.painter_about, user_id),
+            (body.entity_id, body.label.strip(), body.painter_name, body.painter_about,
+             body.location, body.seller_name, body.seller_address, user_id),
         )
         conn.commit()
         cur.close()
@@ -3998,35 +4022,161 @@ def create_property_entity(request: Request, body: PropertyEntityRequest,
         release_db_connection(conn)
 
 
-def _property_row(r: dict, docs: list, owners: list, floors: list) -> dict:
-    area = float(r["area"]) if r["area"] is not None else None
-    rrr  = float(r["rrr"]) if r["rrr"] is not None else None
+@app.get("/api/v1/property-nature-types")
+def list_property_nature_types(request: Request,
+                               authorization: Optional[str] = Header(None)):
+    """Nature options (industrial, orchard… + admin customs) for the property form."""
+    conn = None
+    try:
+        _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        cur.execute("""SELECT id, name, is_custom FROM property_nature_type
+                       ORDER BY sort_order, name""")
+        rows = cur.fetchall()
+        cur.close()
+        return [{"id": r["id"], "name": r["name"], "is_custom": r["is_custom"]} for r in rows]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/property-nature-types: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+class PropertyNatureTypeRequest(BaseModel):
+    name: str
+
+
+@app.post("/api/v1/property-nature-types")
+@limiter.limit("30/minute")
+def create_property_nature_type(request: Request, body: PropertyNatureTypeRequest,
+                                authorization: Optional[str] = Header(None)):
+    """Add a custom nature at runtime (admin only) — same pattern as custom holders."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        _require_admin(cur, payload)
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="name is required")
+        user_id = _property_user_id(cur, payload)
+        cur.execute(
+            """INSERT INTO property_nature_type (name, is_custom, sort_order, created_by)
+               VALUES (%s, TRUE, 900, %s)
+               ON CONFLICT (name) DO NOTHING RETURNING id""",
+            (name, user_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=409, detail="Nature already exists")
+        write_audit_log(conn, user_id, "PROPERTY_NATURE_CREATE", "property_nature_type",
+                        row["id"], name)
+        conn.commit()
+        cur.close()
+        return {"id": row["id"], "name": name}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/property-nature-types: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+# Bhunaksha Goa portal has no documented deep-link to a single survey plot (it is
+# a stateful JS app: State -> District -> Taluka -> Village -> Survey). We expose
+# the portal URL and the row's village/survey so the UI can render a "Bhunaksha"
+# link; the admin makes the final in-portal selection.
+BHUNAKSHA_GOA_URL = "https://bhunaksha.goa.gov.in/bhunaksha/"
+OLD_LEASE_OWNER_SHARE = 0.5   # statutory sitting tenant holds the other half
+
+
+def _maps_link(gps_link, address, location):
+    """Manual GPS override wins; else a keyless Google Maps search link built from
+    the address (falling back to the locality). None when there's nothing to map."""
+    if gps_link:
+        return gps_link
+    q = (address or location or "").strip()
+    if not q:
+        return None
+    return "https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote_plus(q)
+
+
+def _num(v):
+    return float(v) if v is not None else None
+
+
+def _property_row(r: dict, docs: list, owners: list, floors: list,
+                  natures: list, images: list) -> dict:
+    area = _num(r["area"])
+    rrr  = _num(r["rrr"])
+    # Land value from the circle rate (unchanged); building value from floors.
     fair = round(area * rrr * property_docs.FAIR_VALUE_MULTIPLIER, 2) \
         if area is not None and rrr is not None else None
+    building_value = round(sum(f["floor_value"] for f in floors
+                               if f["floor_value"] is not None), 2) if floors else 0.0
+    market = _num(r["market_value"])
+    # Displayed total: hand-entered market value (or land fair value) plus the
+    # summed floor costings for building-like types.
+    base = market if market is not None else (fair or 0.0)
+    total = round((base or 0.0) + (building_value or 0.0), 2)
+    is_old_lease = bool(r["is_old_lease"])
+    # Old statutory lease: the sitting tenant holds ~50%, so only the owner's
+    # half flows into portfolio totals (full value shown alongside).
+    effective = round(total * OLD_LEASE_OWNER_SHARE, 2) if is_old_lease else total
+
     uploaded = {d["doc_type"] for d in docs}
     required = [d["slug"] for d in property_docs.doc_types_for(r["property_type"])
                 if not d["optional"]]
     return {
-        "purchase_price":   float(r["purchase_price"]) if r["purchase_price"] is not None else None,
-        "market_value":     float(r["market_value"]) if r["market_value"] is not None else None,
+        "purchase_price":   _num(r["purchase_price"]),
+        "market_value":     market,
         "owners":           owners,
+        "natures":          natures,
         "floors":           floors,
+        "images":           images,
         "id":               r["id"],
         "name":             r["name"],
         "property_type":    r["property_type"],
         "holder_id":        r["holder_id"],
         "holder_name":      r["holder_name"],
         "location":         r["location"],
+        "address":          r["address"],
         "taluka":           r["taluka"],
+        "village":          r["village"],
+        "survey_no":        r["survey_no"],
+        "gps_link":         r["gps_link"],
+        "maps_link":        _maps_link(r["gps_link"], r["address"], r["location"]),
+        "bhunaksha_url":    BHUNAKSHA_GOA_URL if r["survey_no"] else None,
         "area":             area,
+        "built_up_area":    _num(r["built_up_area"]),
         "area_unit":        r["area_unit"],
         "property_no":      r["property_no"],
         "acquisition_date": r["acquisition_date"].isoformat() if r["acquisition_date"] else None,
         "ownership":        r["ownership"],
+        "tenure":           r["tenure"],
+        "is_old_lease":     is_old_lease,
+        "has_parking":      bool(r["has_parking"]),
+        "parking_count":    r["parking_count"],
+        "seller_name":      r["seller_name"],
+        "seller_address":   r["seller_address"],
+        "stamp_value":      _num(r["stamp_value"]),
+        "lawyer_fees":      _num(r["lawyer_fees"]),
         "rrr":              rrr,
         "fair_value":       fair,
+        "building_value":   building_value or None,
+        "total_value":      total,
+        "value_effective":  effective,   # feeds portfolio totals (halved if old lease)
         "sold":             r["sold"],
-        "sale_price":       float(r["sale_price"]) if r["sale_price"] is not None else None,
+        "sale_price":       _num(r["sale_price"]),
         "sale_date":        r["sale_date"].isoformat() if r["sale_date"] else None,
         "notes":            r["notes"],
         "documents":        docs,
@@ -4053,11 +4203,12 @@ def list_properties(request: Request, holder_id: Optional[int] = None,
             {cond} ORDER BY e.sort_order, e.name, p.name""", params)
         props = cur.fetchall()
         docs_by_pid, owners_by_pid, floors_by_pid = {}, {}, {}
+        natures_by_pid, images_by_pid = {}, {}
         if props:
             pids = [p["id"] for p in props]
             cur.execute(
-                """SELECT id, property_id, doc_type, floor_id, original_name, mime,
-                          size_bytes, converted, original_path IS NOT NULL AS has_original,
+                """SELECT id, property_id, doc_type, floor_id, original_name, custom_label,
+                          mime, size_bytes, converted, original_path IS NOT NULL AS has_original,
                           uploaded_at
                    FROM property_document WHERE property_id = ANY(%s)
                    ORDER BY uploaded_at""",
@@ -4069,6 +4220,7 @@ def list_properties(request: Request, holder_id: Optional[int] = None,
                     "doc_type":      d["doc_type"],
                     "floor_id":      d["floor_id"],
                     "original_name": d["original_name"],
+                    "custom_label":  d["custom_label"],
                     "mime":          d["mime"],
                     "size_bytes":    int(d["size_bytes"]) if d["size_bytes"] is not None else None,
                     "converted":     d["converted"],
@@ -4086,22 +4238,60 @@ def list_properties(request: Request, holder_id: Optional[int] = None,
                     "holder_id": o["holder_id"], "name": o["name"], "pct": float(o["pct"]),
                 })
             cur.execute(
-                """SELECT id, property_id, floor_label, area, sort_order
+                """SELECT id, property_id, floor_label, area, rate_per_unit, built_up_area,
+                          carpet_area, is_rented, rent_amount, tenant, sort_order
                    FROM property_floor WHERE property_id = ANY(%s)
                    ORDER BY sort_order, id""",
                 (pids,),
             )
             for f in cur.fetchall():
+                area  = float(f["area"]) if f["area"] is not None else None
+                bua   = float(f["built_up_area"]) if f["built_up_area"] is not None else None
+                rate  = float(f["rate_per_unit"]) if f["rate_per_unit"] is not None else None
+                basis = bua if bua is not None else area
+                fval  = round(basis * rate, 2) if basis is not None and rate is not None else None
                 floors_by_pid.setdefault(f["property_id"], []).append({
-                    "id":          f["id"],
-                    "floor_label": f["floor_label"],
-                    "area":        float(f["area"]) if f["area"] is not None else None,
+                    "id":            f["id"],
+                    "floor_label":   f["floor_label"],
+                    "area":          area,
+                    "rate_per_unit": rate,
+                    "built_up_area": bua,
+                    "carpet_area":   float(f["carpet_area"]) if f["carpet_area"] is not None else None,
+                    "is_rented":     bool(f["is_rented"]),
+                    "rent_amount":   float(f["rent_amount"]) if f["rent_amount"] is not None else None,
+                    "tenant":        f["tenant"],
+                    "floor_value":   fval,
+                })
+            cur.execute(
+                """SELECT n.property_id, n.nature_id, n.area, t.name
+                   FROM property_nature n JOIN property_nature_type t ON t.id = n.nature_id
+                   WHERE n.property_id = ANY(%s) ORDER BY t.sort_order, t.name""",
+                (pids,),
+            )
+            for n in cur.fetchall():
+                natures_by_pid.setdefault(n["property_id"], []).append({
+                    "nature_id": n["nature_id"], "name": n["name"],
+                    "area": float(n["area"]) if n["area"] is not None else None,
+                })
+            cur.execute(
+                """SELECT id, property_id, caption, is_hero, thumb_path IS NOT NULL AS has_thumb
+                   FROM property_image WHERE property_id = ANY(%s)
+                   ORDER BY is_hero DESC, sort_order, id""",
+                (pids,),
+            )
+            for im in cur.fetchall():
+                images_by_pid.setdefault(im["property_id"], []).append({
+                    "id": im["id"], "caption": im["caption"],
+                    "is_hero": bool(im["is_hero"]), "has_thumb": im["has_thumb"],
                 })
         cur.close()
         rows = [_property_row(p, docs_by_pid.get(p["id"], []),
                               owners_by_pid.get(p["id"], []),
-                              floors_by_pid.get(p["id"], [])) for p in props]
-        total = sum(r["fair_value"] for r in rows if r["fair_value"] is not None and not r["sold"])
+                              floors_by_pid.get(p["id"], []),
+                              natures_by_pid.get(p["id"], []),
+                              images_by_pid.get(p["id"], [])) for p in props]
+        total = sum(r["value_effective"] for r in rows
+                    if r["value_effective"] is not None and not r["sold"])
         sold  = sum(r["sale_price"] for r in rows if r["sold"] and r["sale_price"] is not None)
         return {"count": len(rows), "total_fair_value": round(total, 2),
                 "total_sold_value": round(sold, 2), "properties": rows}
@@ -4119,10 +4309,21 @@ class PropertyOwnerIn(BaseModel):
     pct:       float = 100.0
 
 
+class PropertyNatureIn(BaseModel):
+    nature_id: int
+    area:      Optional[float] = None   # in the property's area_unit
+
+
 class PropertyFloorIn(BaseModel):
-    id:          Optional[int] = None   # present = update existing floor
-    floor_label: str
-    area:        Optional[float] = None
+    id:            Optional[int] = None   # present = update existing floor
+    floor_label:   str
+    area:          Optional[float] = None
+    rate_per_unit: Optional[float] = None
+    built_up_area: Optional[float] = None
+    carpet_area:   Optional[float] = None
+    is_rented:     bool            = False
+    rent_amount:   Optional[float] = None
+    tenant:        Optional[str]   = None
 
 
 class PropertyRequest(BaseModel):
@@ -4130,28 +4331,53 @@ class PropertyRequest(BaseModel):
     property_type:    str
     holder_id:        int
     location:         Optional[str]   = None
+    address:          Optional[str]   = None
     taluka:           Optional[str]   = None
+    village:          Optional[str]   = None
+    survey_no:        Optional[str]   = None
+    gps_link:         Optional[str]   = None   # manual override; blank = derive from address
     area:             Optional[float] = None
+    built_up_area:    Optional[float] = None
     area_unit:        Optional[str]   = "sq m"
     property_no:      Optional[str]   = None   # government-assigned property number
     acquisition_date: Optional[str]   = None   # YYYY-MM-DD
     ownership:        Optional[str]   = None
+    tenure:           Optional[str]   = None   # freehold | leasehold
+    is_old_lease:     bool            = False  # statutory pre-1990 rent-controlled lease
+    has_parking:      bool            = False
+    parking_count:    Optional[int]   = None
+    seller_name:      Optional[str]   = None
+    seller_address:   Optional[str]   = None
+    stamp_value:      Optional[float] = None
+    lawyer_fees:      Optional[float] = None
     purchase_price:   Optional[float] = None
     market_value:     Optional[float] = None
     rrr:              Optional[float] = None
     notes:            Optional[str]   = None
-    owners:           Optional[List[PropertyOwnerIn]] = None   # default: holder_id @ 100%
-    floors:           Optional[List[PropertyFloorIn]] = None   # buildings
+    owners:           Optional[List[PropertyOwnerIn]]  = None   # default: holder_id @ 100%
+    natures:          Optional[List[PropertyNatureIn]] = None   # multi-nature area split
+    floors:           Optional[List[PropertyFloorIn]]  = None   # buildings
 
 
 def _validate_property_body(cur, body: PropertyRequest):
     if not body.name.strip():
         raise HTTPException(status_code=422, detail="name is required")
-    if body.property_type not in ("land", "building"):
-        raise HTTPException(status_code=422, detail="property_type must be land or building")
+    if body.property_type not in property_docs.LAND_TYPES | property_docs.BUILDING_TYPES:
+        raise HTTPException(status_code=422, detail="Unknown property_type")
+    if body.tenure not in (None, "freehold", "leasehold"):
+        raise HTTPException(status_code=422, detail="tenure must be freehold or leasehold")
     cur.execute("SELECT id FROM property_entity WHERE id = %s", (body.holder_id,))
     if not cur.fetchone():
         raise HTTPException(status_code=422, detail="Unknown holder entity")
+    if body.natures:
+        nids = [n.nature_id for n in body.natures]
+        if len(set(nids)) != len(nids):
+            raise HTTPException(status_code=422, detail="Duplicate nature")
+        cur.execute("SELECT COUNT(*) AS n FROM property_nature_type WHERE id = ANY(%s)", (nids,))
+        if cur.fetchone()["n"] != len(nids):
+            raise HTTPException(status_code=422, detail="Unknown nature")
+        if any(n.area is not None and n.area < 0 for n in body.natures):
+            raise HTTPException(status_code=422, detail="Nature area must be non-negative")
     if body.acquisition_date:
         try:
             datetime.strptime(body.acquisition_date, "%Y-%m-%d")
@@ -4175,8 +4401,9 @@ def _validate_property_body(cur, body: PropertyRequest):
 
 
 def _save_property_children(cur, pid: int, body: PropertyRequest):
-    """Replace owners; upsert floors by id (so floor-plan documents keep their
-    floor link across edits) and drop floors omitted from the payload."""
+    """Replace owners + natures; upsert floors by id (so floor-plan / tenancy
+    documents keep their floor link across edits) and drop floors omitted from
+    the payload."""
     owners = body.owners or [PropertyOwnerIn(holder_id=body.holder_id, pct=100.0)]
     cur.execute("DELETE FROM property_owner WHERE property_id = %s", (pid,))
     for o in owners:
@@ -4185,23 +4412,37 @@ def _save_property_children(cur, pid: int, body: PropertyRequest):
             (pid, o.holder_id, o.pct),
         )
 
-    floors = body.floors if body.property_type == "building" else []
+    cur.execute("DELETE FROM property_nature WHERE property_id = %s", (pid,))
+    for n in (body.natures or []):
+        cur.execute(
+            "INSERT INTO property_nature (property_id, nature_id, area) VALUES (%s,%s,%s)",
+            (pid, n.nature_id, n.area),
+        )
+
+    floors = body.floors if property_docs.is_building_like(body.property_type) else []
     keep = []
     for i, f in enumerate(floors or []):
+        cols = (f.floor_label.strip(), f.area, f.rate_per_unit, f.built_up_area,
+                f.carpet_area, f.is_rented, f.rent_amount,
+                (f.tenant or "").strip() or None, i)
         if f.id is not None:
             cur.execute(
-                """UPDATE property_floor SET floor_label=%s, area=%s, sort_order=%s
+                """UPDATE property_floor SET floor_label=%s, area=%s, rate_per_unit=%s,
+                       built_up_area=%s, carpet_area=%s, is_rented=%s, rent_amount=%s,
+                       tenant=%s, sort_order=%s
                    WHERE id=%s AND property_id=%s RETURNING id""",
-                (f.floor_label.strip(), f.area, i, f.id, pid),
+                (*cols, f.id, pid),
             )
             row = cur.fetchone()
             if row:
                 keep.append(row["id"])
                 continue
         cur.execute(
-            """INSERT INTO property_floor (property_id, floor_label, area, sort_order)
-               VALUES (%s,%s,%s,%s) RETURNING id""",
-            (pid, f.floor_label.strip(), f.area, i),
+            """INSERT INTO property_floor
+                   (property_id, floor_label, area, rate_per_unit, built_up_area,
+                    carpet_area, is_rented, rent_amount, tenant, sort_order)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            (pid, *cols),
         )
         keep.append(cur.fetchone()["id"])
     if keep:
@@ -4225,14 +4466,21 @@ def create_property(request: Request, body: PropertyRequest,
         user_id = _property_user_id(cur, payload)
         cur.execute(
             """INSERT INTO property
-                   (name, property_type, holder_id, location, taluka, area, area_unit,
-                    property_no, acquisition_date, ownership, purchase_price, market_value,
-                    rrr, notes, created_by, updated_by)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                   (name, property_type, holder_id, location, address, taluka, village,
+                    survey_no, gps_link, area, built_up_area, area_unit, property_no,
+                    acquisition_date, ownership, tenure, is_old_lease, has_parking,
+                    parking_count, seller_name, seller_address, stamp_value, lawyer_fees,
+                    purchase_price, market_value, rrr, notes, created_by, updated_by)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                       %s,%s,%s,%s,%s,%s,%s) RETURNING id""",
             (body.name.strip(), body.property_type, body.holder_id, body.location,
-             body.taluka, body.area, body.area_unit, body.property_no,
-             body.acquisition_date or None, body.ownership, body.purchase_price,
-             body.market_value, body.rrr, body.notes, user_id, user_id),
+             body.address, body.taluka, body.village, body.survey_no,
+             (body.gps_link or "").strip() or None, body.area, body.built_up_area,
+             body.area_unit, body.property_no, body.acquisition_date or None,
+             body.ownership, body.tenure, body.is_old_lease, body.has_parking,
+             body.parking_count, body.seller_name, body.seller_address, body.stamp_value,
+             body.lawyer_fees, body.purchase_price, body.market_value, body.rrr,
+             body.notes, user_id, user_id),
         )
         pid = cur.fetchone()["id"]
         _save_property_children(cur, pid, body)
@@ -4267,15 +4515,22 @@ def update_property(prop_id: int, request: Request, body: PropertyRequest,
         user_id = _property_user_id(cur, payload)
         cur.execute(
             """UPDATE property SET
-                   name=%s, property_type=%s, holder_id=%s, location=%s, taluka=%s,
-                   area=%s, area_unit=%s, property_no=%s, acquisition_date=%s,
-                   ownership=%s, purchase_price=%s, market_value=%s, rrr=%s, notes=%s,
+                   name=%s, property_type=%s, holder_id=%s, location=%s, address=%s,
+                   taluka=%s, village=%s, survey_no=%s, gps_link=%s, area=%s,
+                   built_up_area=%s, area_unit=%s, property_no=%s, acquisition_date=%s,
+                   ownership=%s, tenure=%s, is_old_lease=%s, has_parking=%s,
+                   parking_count=%s, seller_name=%s, seller_address=%s, stamp_value=%s,
+                   lawyer_fees=%s, purchase_price=%s, market_value=%s, rrr=%s, notes=%s,
                    updated_by=%s, updated_at=NOW()
                WHERE id=%s RETURNING id""",
             (body.name.strip(), body.property_type, body.holder_id, body.location,
-             body.taluka, body.area, body.area_unit, body.property_no,
-             body.acquisition_date or None, body.ownership, body.purchase_price,
-             body.market_value, body.rrr, body.notes, user_id, prop_id),
+             body.address, body.taluka, body.village, body.survey_no,
+             (body.gps_link or "").strip() or None, body.area, body.built_up_area,
+             body.area_unit, body.property_no, body.acquisition_date or None,
+             body.ownership, body.tenure, body.is_old_lease, body.has_parking,
+             body.parking_count, body.seller_name, body.seller_address, body.stamp_value,
+             body.lawyer_fees, body.purchase_price, body.market_value, body.rrr,
+             body.notes, user_id, prop_id),
         )
         if not cur.fetchone():
             raise HTTPException(status_code=404, detail="Property not found")
@@ -4440,6 +4695,7 @@ async def upload_property_document(
     request: Request,
     doc_type: str = Form(...),
     floor_id: Optional[int] = Form(None),
+    custom_label: Optional[str] = Form(None),
     file: UploadFile = File(...),
     authorization: Optional[str] = Header(None),
 ):
@@ -4495,13 +4751,14 @@ async def upload_property_document(
             stored_mime, converted = mime, False
 
         user_id = _property_user_id(cur, payload)
+        clabel = (custom_label or "").strip() or None
         cur.execute(
             """INSERT INTO property_document
-                   (property_id, doc_type, floor_id, original_name, stored_path, original_path,
-                    mime, size_bytes, converted, uploaded_by)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   (property_id, doc_type, floor_id, original_name, custom_label,
+                    stored_path, original_path, mime, size_bytes, converted, uploaded_by)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                RETURNING id, uploaded_at""",
-            (prop_id, doc_type, floor_id, file.filename, stored_rel, original_rel,
+            (prop_id, doc_type, floor_id, file.filename, clabel, stored_rel, original_rel,
              stored_mime, len(data), converted, user_id),
         )
         row = cur.fetchone()
@@ -4512,6 +4769,7 @@ async def upload_property_document(
         return {
             "id":            row["id"],
             "doc_type":      doc_type,
+            "custom_label":  clabel,
             "original_name": file.filename,
             "mime":          stored_mime,
             "converted":     converted,
@@ -4603,6 +4861,214 @@ def delete_property_document(doc_id: int, request: Request,
         release_db_connection(conn)
 
 
+# ---------------------------------------------------------------------------
+# Property images (the Airbnb-style gallery). Separate from the document
+# checklist: photos get thumbnails and one is the hero/cover. Admin writes; all
+# logins may view/serve. Files live under properties/<id>/images/.
+# ---------------------------------------------------------------------------
+PROPERTY_IMAGE_SUBDIR = "images"
+
+
+@app.post("/api/v1/properties/{prop_id}/images")
+@limiter.limit("60/minute")
+async def upload_property_image(
+    prop_id: int,
+    request: Request,
+    caption: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None),
+):
+    """Upload one gallery image (admin only). The first image for a property
+    becomes its hero/cover automatically."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        _require_admin(cur, payload)
+        cur.execute("SELECT id FROM property WHERE id = %s", (prop_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Property not found")
+
+        data = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="File too large (max 200 MB)")
+        if not data:
+            raise HTTPException(status_code=422, detail="Empty file")
+        mime = (file.content_type
+                or mimetypes.guess_type(file.filename or "")[0]
+                or "application/octet-stream")
+        if not mime.startswith("image/"):
+            raise HTTPException(status_code=422, detail="Only image files are allowed")
+
+        ext = os.path.splitext(file.filename or "")[1].lower()[:12] or ".jpg"
+        uid = uuid.uuid4().hex
+        rel_dir = os.path.join(PROPERTY_UPLOAD_SUBDIR, str(prop_id), PROPERTY_IMAGE_SUBDIR)
+        os.makedirs(os.path.join(UPLOADS_ROOT, rel_dir), exist_ok=True)
+        rel_path = os.path.join(rel_dir, uid + ext)
+        with open(_uploads_abspath(rel_path), "wb") as fh:
+            fh.write(data)
+        thumb_rel = None
+        cand = os.path.join(rel_dir, uid + "_thumb.jpg")
+        if _make_thumbnail(_uploads_abspath(rel_path), _uploads_abspath(cand)):
+            thumb_rel = cand
+
+        # First image for the property is the hero; next sort_order after the last.
+        cur.execute(
+            "SELECT COUNT(*) AS n, COALESCE(MAX(sort_order), -1) AS mx "
+            "FROM property_image WHERE property_id = %s", (prop_id,))
+        agg = cur.fetchone()
+        is_hero = agg["n"] == 0
+        user_id = _property_user_id(cur, payload)
+        cur.execute(
+            """INSERT INTO property_image
+                   (property_id, stored_path, thumb_path, caption, sort_order, is_hero,
+                    mime, size_bytes, uploaded_by)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+            (prop_id, rel_path, thumb_rel, (caption or "").strip() or None,
+             agg["mx"] + 1, is_hero, mime, len(data), user_id),
+        )
+        img_id = cur.fetchone()["id"]
+        write_audit_log(conn, user_id, "PROPERTY_IMAGE_UPLOAD", "property_image",
+                        img_id, f"{prop_id} ({file.filename})")
+        conn.commit()
+        cur.close()
+        return {"id": img_id, "is_hero": is_hero, "has_thumb": thumb_rel is not None}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/properties/{prop_id}/images: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+def _serve_property_image(img_id: int, request: Request, authorization, want_thumb: bool):
+    conn = None
+    try:
+        _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        cur.execute("SELECT stored_path, thumb_path, mime FROM property_image WHERE id = %s",
+                    (img_id,))
+        r = cur.fetchone()
+        cur.close()
+        if not r:
+            raise HTTPException(status_code=404, detail="Image not found")
+        use_thumb = want_thumb and bool(r["thumb_path"])
+        rel   = r["thumb_path"] if use_thumb else r["stored_path"]
+        media = "image/jpeg" if use_thumb else (r["mime"] or "application/octet-stream")
+        return _uploads_file_response(rel, media)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error serving property image {img_id}: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.get("/api/v1/property-images/{img_id}/file")
+def serve_property_image_file(img_id: int, request: Request,
+                              authorization: Optional[str] = Header(None)):
+    return _serve_property_image(img_id, request, authorization, want_thumb=False)
+
+
+@app.get("/api/v1/property-images/{img_id}/thumb")
+def serve_property_image_thumb(img_id: int, request: Request,
+                               authorization: Optional[str] = Header(None)):
+    return _serve_property_image(img_id, request, authorization, want_thumb=True)
+
+
+@app.post("/api/v1/property-images/{img_id}/hero")
+@limiter.limit("60/minute")
+def set_property_image_hero(img_id: int, request: Request,
+                            authorization: Optional[str] = Header(None)):
+    """Make this image the property's hero/cover (admin only)."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        _require_admin(cur, payload)
+        cur.execute("SELECT property_id FROM property_image WHERE id = %s", (img_id,))
+        r = cur.fetchone()
+        if not r:
+            raise HTTPException(status_code=404, detail="Image not found")
+        pid = r["property_id"]
+        cur.execute("UPDATE property_image SET is_hero = (id = %s) WHERE property_id = %s",
+                    (img_id, pid))
+        conn.commit()
+        cur.close()
+        return {"hero": img_id}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/property-images/{img_id}/hero: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.delete("/api/v1/property-images/{img_id}")
+def delete_property_image(img_id: int, request: Request,
+                          authorization: Optional[str] = Header(None)):
+    """Delete a gallery image + its files (admin only). If it was the hero, the
+    next remaining image is promoted."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        _require_admin(cur, payload)
+        cur.execute("SELECT property_id, stored_path, thumb_path, is_hero "
+                    "FROM property_image WHERE id = %s", (img_id,))
+        r = cur.fetchone()
+        if not r:
+            raise HTTPException(status_code=404, detail="Image not found")
+        for rel in (r["stored_path"], r["thumb_path"]):
+            if not rel:
+                continue
+            try:
+                p = _uploads_abspath(rel)
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception as e:
+                logger.warning(f"could not remove property image file {rel}: {e}")
+        cur.execute("DELETE FROM property_image WHERE id = %s", (img_id,))
+        if r["is_hero"]:
+            cur.execute(
+                """UPDATE property_image SET is_hero = TRUE
+                   WHERE id = (SELECT id FROM property_image WHERE property_id = %s
+                               ORDER BY sort_order, id LIMIT 1)""",
+                (r["property_id"],))
+        user_id = _property_user_id(cur, payload)
+        write_audit_log(conn, user_id, "PROPERTY_IMAGE_DELETE", "property_image",
+                        img_id, str(r["property_id"]))
+        conn.commit()
+        cur.close()
+        return {"deleted": img_id}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in DELETE /api/v1/property-images/{img_id}: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
 @app.get("/api/v1/manual-assets")
 def get_manual_assets(
     request: Request,
@@ -4659,21 +5125,26 @@ def get_manual_assets(
         for a in cur.fetchall():
             att_by_key.setdefault((a["entity_id"], a["label"]), []).append(_attachment_row(a))
 
-        # Art painter details.
+        # Art / collectibles details (painter for art; location + seller for both).
         art_by_key: dict = {}
-        if category == "art":
+        if category in ("art", "collectibles"):
             dcond, dparams = [], []
             if eids:
                 dcond.append("entity_id = ANY(%s)"); dparams.append(eids)
             dwhere = ("WHERE " + " AND ".join(dcond)) if dcond else ""
             cur.execute(
-                f"SELECT entity_id, label, painter_name, painter_about FROM art_detail {dwhere}",
+                f"""SELECT entity_id, label, painter_name, painter_about,
+                           location, seller_name, seller_address
+                    FROM art_detail {dwhere}""",
                 dparams,
             )
             for d in cur.fetchall():
                 art_by_key[(d["entity_id"], d["label"])] = {
-                    "painter_name":  d["painter_name"],
-                    "painter_about": d["painter_about"],
+                    "painter_name":   d["painter_name"],
+                    "painter_about":  d["painter_about"],
+                    "location":       d["location"],
+                    "seller_name":    d["seller_name"],
+                    "seller_address": d["seller_address"],
                 }
 
         # Property Ready-Reckoner inputs + derived value band, grouped by key.
@@ -4753,8 +5224,11 @@ def get_manual_assets(
                 "updated_at":    m["updated_at"].isoformat() if m["updated_at"] else None,
                 "attachments":   att_by_key.get(key, []),
             }
-            if category == "art":
-                item.update(art_by_key.get(key, {"painter_name": None, "painter_about": None}))
+            if category in ("art", "collectibles"):
+                item.update(art_by_key.get(key, {
+                    "painter_name": None, "painter_about": None,
+                    "location": None, "seller_name": None, "seller_address": None,
+                }))
             if category == "properties":
                 item.update(prop_by_key.get(key, {
                     "location": None, "area_sqft": None, "ready_reckoner_rate": None,
@@ -4831,6 +5305,7 @@ def get_nav_coverage(
                                        WHERE {'TRUE' if is_admin else
                                               'EXISTS (SELECT 1 FROM property)'}"""),
             "/art":            manual(["art"]),
+            "/collectibles":   manual(["collectibles"]),
         }
 
         cur.execute("SELECT category, array_agg(DISTINCT entity_id) AS eids FROM manual_input GROUP BY category")

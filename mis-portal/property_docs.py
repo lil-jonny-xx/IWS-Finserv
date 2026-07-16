@@ -22,6 +22,8 @@ import tempfile
 DOC_TYPES = [
     # ---- land (and therefore every property) -----------------------------
     {"slug": "sale_deed",              "label": "Sale Deed",                             "scope": "land", "optional": False, "parent": None},
+    {"slug": "gift_deed",              "label": "Gift Deed",                             "scope": "land", "optional": True,  "parent": None},
+    {"slug": "seller_agreement",       "label": "Seller Agreement Deed",                 "scope": "land", "optional": True,  "parent": None},
     {"slug": "survey_plan",            "label": "Survey Plan",                           "scope": "land", "optional": False, "parent": None},
     {"slug": "form_1_14",              "label": "Form I & XIV",                          "scope": "land", "optional": False, "parent": None},
     {"slug": "title_report",           "label": "Title Report from Lawyer",              "scope": "land", "optional": False, "parent": None},
@@ -52,6 +54,11 @@ DOC_TYPES = [
     {"slug": "property_card",          "label": "Property Card",                         "scope": "building", "optional": False, "parent": None},
     {"slug": "floor_plan",             "label": "Floor Plans (PDF / AutoCAD)",           "scope": "building", "optional": False, "parent": "approved_plans"},
     {"slug": "elevation",              "label": "Building Elevation",                    "scope": "building", "optional": False, "parent": "approved_plans"},
+    # Per-floor tenancy papers (attached to a floor via property_document.floor_id
+    # when that floor is rented/leased). Optional — buildings with no let floors
+    # never need them.
+    {"slug": "rent_agreement",         "label": "Rent Agreement",                        "scope": "building", "optional": True,  "parent": None},
+    {"slug": "lease_agreement",        "label": "Lease Agreement",                       "scope": "building", "optional": True,  "parent": None},
     {"slug": "house_tax_receipts",     "label": "House Tax Receipts",                    "scope": "building", "optional": True,  "parent": None},
     {"slug": "water_bill",             "label": "Water Bill",                            "scope": "building", "optional": True,  "parent": None},
     {"slug": "electricity_bill",       "label": "Electricity Bill",                      "scope": "building", "optional": True,  "parent": None},
@@ -71,9 +78,20 @@ _IMAGE_MIME_PREFIX = "image/"
 _DOCX_EXTS = {".doc", ".docx", ".odt", ".rtf", ".txt", ".xls", ".xlsx", ".ods"}
 
 
+# Every type except plain land is "building-like": it has floors and the full
+# construction-era document checklist (apartments, godowns, shops are built).
+LAND_TYPES     = {"land"}
+BUILDING_TYPES = {"building", "apartment", "godown", "shop"}
+
+
+def is_building_like(property_type: str) -> bool:
+    return property_type in BUILDING_TYPES
+
+
 def doc_types_for(property_type: str) -> list:
-    """Checklist rows applicable to a 'land' or 'building' property."""
-    if property_type == "building":
+    """Checklist rows applicable to a property. Building-like types (building,
+    apartment, godown, shop) get the full list; plain land gets land-scope rows."""
+    if is_building_like(property_type):
         return DOC_TYPES
     return [d for d in DOC_TYPES if d["scope"] == "land"]
 

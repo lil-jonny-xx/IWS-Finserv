@@ -34,6 +34,7 @@ const TABS = [
   { href: '/unlisted',       label: 'Unlisted' },
   { href: '/properties',     label: 'Properties' },
   { href: '/art',            label: 'Art' },
+  { href: '/collectibles',   label: 'Collectibles' },
   { href: '/realised-gains', label: 'Realised Gains' },
   { href: '/trades',         label: 'Trades' },
   { href: '/manual-data',    label: 'Manual Data' },
@@ -59,7 +60,7 @@ type Tab = { href: string; label: string };
 // Data, Reports, Assistant, Account) are utility pages that always show.
 const DATA_GATED = new Set([
   '/mutual-funds', '/equity', '/foreign-equity', '/fno', '/bank-accounts',
-  '/pms', '/gold-silver', '/unlisted', '/properties', '/art',
+  '/pms', '/gold-silver', '/unlisted', '/properties', '/art', '/collectibles',
 ]);
 
 export default function NavTabs({
