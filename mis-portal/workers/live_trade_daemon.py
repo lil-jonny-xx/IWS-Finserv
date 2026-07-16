@@ -264,6 +264,11 @@ def run_angel(ctx):
     def on_data(wsapp, message, *_):
         # websocket-client calls on_data(ws, msg, opcode, cont) — 4 args; accept the extras.
         try:
+            # Angel's order-update WS sends a b'\x00' ping every ~10s to keep the socket
+            # alive; it's not an order. Skip these (and any empty frame) before logging so
+            # the heartbeat doesn't spam the logfile (~17k lines/day) and bury real fills.
+            if not message or message in (b"\x00", "\x00"):
+                return
             logger.info(f"angel raw order msg {ctx['entity_code']}: {str(message)[:800]}")
             data = json.loads(message) if isinstance(message, str) else message
             payload = data.get("orderData", data) if isinstance(data, dict) else {}
@@ -331,8 +336,32 @@ def run_dhan(ctx):
             logger.error(f"dhan handler error: {e}")
 
     ou.on_update = handler   # sync callback (dhanhq calls it without await)
+
+    # dhanhq's connect_order_update() blocks in its receive loop and exposes no on-open
+    # callback, so a silently connected daemon looked identical to a dead one (only the
+    # one-shot "connecting:" line, then nothing). Run a periodic liveness tick alongside
+    # it: while the WS receive loop is alive the tick keeps firing; when connect returns
+    # (socket closed → Restart=always reconnects) we log that too. 5-min cadence so this
+    # never becomes log spam the way a per-frame heartbeat would.
+    async def _dhan_main():
+        started = datetime.now()
+
+        async def _heartbeat():
+            while True:
+                await asyncio.sleep(300)
+                mins = int((datetime.now() - started).total_seconds() // 60)
+                logger.info(f"dhan/{ctx['entity_code']} listening — alive {mins}m, no fills yet")
+
+        hb = asyncio.ensure_future(_heartbeat())
+        try:
+            await ou.connect_order_update()
+        finally:
+            hb.cancel()
+        logger.warning(f"dhan/{ctx['entity_code']} connect_order_update returned — "
+                       f"socket closed; systemd will reconnect")
+
     logger.info(f"connecting: dhan/{ctx['entity_code']}")
-    asyncio.run(ou.connect_order_update())
+    asyncio.run(_dhan_main())
 
 
 RUNNERS = {"zerodha": run_zerodha, "angel_one": run_angel, "dhan": run_dhan}
