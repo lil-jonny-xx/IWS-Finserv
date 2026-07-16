@@ -453,19 +453,33 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
 
             {rows.length > 0 && (
               <tr className="border-t-2 border-rule bg-page">
+                {/* label spans #, symbol, [entity], exch */}
                 <td colSpan={3 + (showEntityCol ? 1 : 0)} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim">
                   Total ({rows.length} holdings) · {totalsCcy}
                 </td>
-                <td />
-                <td />
+                {/* Qty — share counts sum directly (not currency-scaled) */}
+                <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">
+                  {rows.reduce((s, h) => s + h.quantity, 0).toLocaleString('en-US', { maximumFractionDigits: 2 })}
+                </td>
+                {/* Avg Cost — per-share price, not summable */}
+                <td className="px-3 py-3 text-right tabular-nums text-xs text-ghost whitespace-nowrap">—</td>
+                {/* Cost */}
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">
                   {fmtMoney(convTotal(rows.reduce((s, h) => s + (h.cost ?? 0), 0)), totalsCcy)}
                 </td>
+                {/* Since */}
                 <td />
+                {/* Cur Value */}
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">
                   {fmtMoney(convTotal(rows.reduce((s, h) => s + (h.current_market_value ?? 0), 0)), totalsCcy)}
                 </td>
-                <td />
+                {/* Exp % — sums to ~100% of the shown holdings */}
+                <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-dim whitespace-nowrap">
+                  {rows.some(h => h.exposure_pct != null)
+                    ? rows.reduce((s, h) => s + (h.exposure_pct ?? 0), 0).toFixed(2) + '%'
+                    : '—'}
+                </td>
+                {/* Day P&L */}
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap">
                   {(() => {
                     const v = rows.reduce((s, h) => s + (h.pnl_daily ?? 0), 0);
@@ -473,13 +487,28 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
                     return <span style={{ color: v >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{v >= 0 ? '+' : ''}{fmtMoney(convTotal(v), totalsCcy)}</span>;
                   })()}
                 </td>
+                {/* P&L (Inception) */}
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap">
                   {(() => {
                     const v = rows.reduce((s, h) => s + (h.pnl_inception ?? 0), 0);
                     return <span style={{ color: v >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{v >= 0 ? '+' : ''}{fmtMoney(convTotal(v), totalsCcy)}</span>;
                   })()}
                 </td>
-                <td />
+                {/* XIRR — value-weighted by current market value */}
+                <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap">
+                  {(() => {
+                    let sw = 0, swv = 0;
+                    for (const h of rows) {
+                      if (h.xirr_inception_pct == null) continue;
+                      const w = h.current_market_value ?? 0;
+                      swv += h.xirr_inception_pct * w; sw += w;
+                    }
+                    if (sw <= 0) return <span className="text-ghost">—</span>;
+                    const v = swv / sw;
+                    return <span style={{ color: v >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(v)} p.a.</span>;
+                  })()}
+                </td>
+                {/* Remarks */}
                 <td />
               </tr>
             )}

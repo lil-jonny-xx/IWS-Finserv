@@ -166,6 +166,8 @@ function SourceHoldingsTable({ rows }: { rows: PmsHolding[] }) {
     const pnlSub  = title === 'Equity' && costed.length > 0
       ? costed.reduce((s, h) => s + (h.pnl ?? 0), 0) : null;
     const retSub  = pnlSub != null && costSub != null && costSub > 0 ? (pnlSub / costSub) * 100 : null;
+    const qtySub  = items.some(h => h.quantity != null)   ? items.reduce((s, h) => s + (h.quantity ?? 0), 0)   : null;
+    const wSub    = items.some(h => h.weight_pct != null) ? items.reduce((s, h) => s + (h.weight_pct ?? 0), 0) : null;
     return (
       <>
         <tr className="bg-page">
@@ -188,16 +190,26 @@ function SourceHoldingsTable({ rows }: { rows: PmsHolding[] }) {
           </tr>
         ))}
         <tr className="border-t border-rule bg-card font-medium">
-          <td colSpan={3} className="px-5 py-2.5 text-xs text-dim">{title} total</td>
+          <td colSpan={2} className="px-5 py-2.5 text-xs text-dim">{title} total</td>
+          <td className="px-5 py-2.5 text-sm text-dim text-right tabular-nums">{qty(qtySub)}</td>
           <td className="px-5 py-2.5 text-sm text-dim text-right tabular-nums">{inr(costSub)}</td>
           <td className="px-5 py-2.5 text-sm text-ink text-right tabular-nums">{inr(mvSub)}</td>
           <td className={`px-5 py-2.5 text-sm text-right tabular-nums ${pnlClass(pnlSub)}`}>{signedInr(pnlSub)}</td>
           <td className={`px-5 py-2.5 text-sm text-right tabular-nums ${pnlClass(retSub)}`}>{pct(retSub)}</td>
-          <td />
+          <td className="px-5 py-2.5 text-sm text-dim text-right tabular-nums">{wSub == null ? '—' : `${wSub.toFixed(1)}%`}</td>
         </tr>
       </>
     );
   };
+
+  // Grand total across Equity + Cash — the "total everything down" bottom bar.
+  const gCosted = rows.filter(h => h.cost != null);
+  const gCost   = gCosted.length > 0 ? gCosted.reduce((s, h) => s + (h.cost ?? 0), 0) : null;
+  const gMv     = rows.reduce((s, h) => s + h.market_value, 0);
+  const gQty    = rows.some(h => h.quantity != null)   ? rows.reduce((s, h) => s + (h.quantity ?? 0), 0)   : null;
+  const gPnl    = rows.some(h => h.pnl != null)        ? rows.filter(h => h.pnl != null).reduce((s, h) => s + (h.pnl ?? 0), 0) : null;
+  const gRet    = gPnl != null && gCost != null && gCost > 0 ? (gPnl / gCost) * 100 : null;
+  const gW      = rows.some(h => h.weight_pct != null) ? rows.reduce((s, h) => s + (h.weight_pct ?? 0), 0) : null;
 
   return (
     <div ref={ds.ref} {...ds.bind} className="bg-card rounded-lg border border-rule overflow-x-auto">
@@ -217,6 +229,17 @@ function SourceHoldingsTable({ rows }: { rows: PmsHolding[] }) {
         <tbody>
           {section('Equity', equity)}
           {section('Cash', cash)}
+          {rows.length > 0 && (
+            <tr className="border-t-2 border-rule bg-page font-semibold">
+              <td colSpan={2} className="px-5 py-2.5 text-xs text-dim uppercase tracking-wide">Total ({rows.length} holdings)</td>
+              <td className="px-5 py-2.5 text-sm text-ink text-right tabular-nums">{qty(gQty)}</td>
+              <td className="px-5 py-2.5 text-sm text-ink text-right tabular-nums">{inr(gCost)}</td>
+              <td className="px-5 py-2.5 text-sm text-ink text-right tabular-nums">{inr(gMv)}</td>
+              <td className={`px-5 py-2.5 text-sm text-right tabular-nums ${pnlClass(gPnl)}`}>{signedInr(gPnl)}</td>
+              <td className={`px-5 py-2.5 text-sm text-right tabular-nums ${pnlClass(gRet)}`}>{pct(gRet)}</td>
+              <td className="px-5 py-2.5 text-sm text-dim text-right tabular-nums">{gW == null ? '—' : `${gW.toFixed(1)}%`}</td>
+            </tr>
+          )}
         </tbody>
       </table>
     </div>

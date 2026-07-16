@@ -164,6 +164,24 @@ function weightedAvgCagr(rows: EquityHoldingRow[]): number | null {
   return sumW > 0 ? sumWC / sumW : null;
 }
 
+// Value-weighted average of any percentage column (weighted by current market
+// value) — used for the footer's Returns %/CAGR totals, where a plain sum is
+// meaningless. Rows missing the metric are skipped (they don't dilute the mean).
+function weightedAvgBy(
+  rows: EquityHoldingRow[],
+  key: 'returns_ytd_pct' | 'returns_inception_pct' | 'cagr_inception_pct',
+): number | null {
+  let sumW = 0, sumWV = 0;
+  for (const h of rows) {
+    const v = h[key];
+    if (v == null) continue;
+    const w = h.current_market_value ?? 0;
+    sumWV += v * w;
+    sumW  += w;
+  }
+  return sumW > 0 ? sumWV / sumW : null;
+}
+
 // ── sort ──────────────────────────────────────────────────────────────────────
 
 function sortRows(rows: EquityHoldingRow[], key: SortKey, dir: SortDir): EquityHoldingRow[] {
@@ -500,6 +518,14 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
   const totalPnlYtd = view.reduce((s, h) => s + (h.pnl_ytd ?? 0), 0);
   const totalWeekly = view.reduce((s, h) => s + (h.weekly_change ?? 0), 0);
   const hasPnl      = view.some(h => h.pnl_inception != null);
+  // Footer column totals ("total everything down"): value columns summed,
+  // percentage columns value-weighted, exposure summed (→ ~100% of the view).
+  const totalQty     = view.reduce((s, h) => s + h.quantity, 0);
+  const totalPrevWk  = view.reduce((s, h) => s + (h.prev_week_value ?? 0), 0);
+  const totalExp     = view.reduce((s, h) => s + (h.exposure_pct ?? 0), 0);
+  const hasExp       = view.some(h => h.exposure_pct != null);
+  const avgRetYtd    = weightedAvgBy(view, 'returns_ytd_pct');
+  const avgRetInc    = weightedAvgBy(view, 'returns_inception_pct');
   const viewCost    = isFiltered ? view.reduce((s, h) => s + h.cost, 0) : totals.total_cost;
   const viewValue   = isFiltered ? view.reduce((s, h) => s + (h.current_market_value ?? 0), 0)
                                  : totals.total_current_market_value;
@@ -693,24 +719,44 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
               })
             )}
 
-            {/* Overall totals footer */}
+            {/* Overall totals footer — every column totalled: value columns summed,
+                percentage columns value-weighted, exposure summed. */}
             {rows.length > 0 && (
               <tr className="border-t-2 border-rule bg-page">
-                {/* colSpan covers #, symbol, [entity], exchange, qty, avg_cost so the
-                    next cell lands under the Cost column — was 6 (off by one, shifting
-                    every total one column right). */}
-                <td colSpan={5 + (showEntityCol ? 1 : 0)} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim">
+                {/* label spans #, symbol, [entity], exchange (4 + entity) so Qty gets
+                    its own cell and each total lands under its column. */}
+                <td colSpan={4 + (showEntityCol ? 1 : 0)} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim">
                   Total ({rows.length} holdings)
                 </td>
+                {/* Qty */}
+                <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">
+                  {totalQty.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+                </td>
+                {/* Avg Cost — a per-share price, not summable */}
+                <td className="px-3 py-3 text-right tabular-nums text-xs text-ghost whitespace-nowrap">—</td>
+                {/* Cost */}
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">
                   {fmtINR(rows.reduce((s, h) => s + h.cost, 0))}
                 </td>
+                {/* Since */}
                 <td />
+                {/* Cur Value */}
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">
                   {fmtINR(rows.reduce((s, h) => s + (h.current_market_value ?? 0), 0))}
                 </td>
-                <td /><td />
-                <td className="px-3 py-3 text-right tabular-nums text-xs text-ghost whitespace-nowrap">—</td>
+                {/* Prev Week */}
+                <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-dim whitespace-nowrap">
+                  {totalPrevWk ? fmtINR(totalPrevWk) : '—'}
+                </td>
+                {/* Wkly Chg */}
+                <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap">
+                  <ColorNum n={totalWeekly || null} fmt={fmtINR} />
+                </td>
+                {/* Exp % */}
+                <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-dim whitespace-nowrap">
+                  {hasExp ? totalExp.toFixed(2) + '%' : '—'}
+                </td>
+                {/* P&L YTD / Inception / Wkly */}
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap border-l border-rule">
                   <ColorNum n={rows.reduce((s, h) => s + (h.pnl_ytd ?? 0), 0) || null} fmt={fmtINR} />
                 </td>
@@ -720,13 +766,24 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap">
                   <ColorNum n={rows.reduce((s, h) => s + (h.pnl_weekly_change ?? 0), 0) || null} fmt={fmtINR} />
                 </td>
-                <td className="border-l border-rule" />
-                <td />
+                {/* Returns YTD % / Inc % (value-weighted) */}
+                <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap border-l border-rule">
+                  {avgRetYtd != null
+                    ? <span style={{ color: avgRetYtd >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(avgRetYtd)}</span>
+                    : <span className="text-ghost">—</span>}
+                </td>
+                <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap">
+                  {avgRetInc != null
+                    ? <span style={{ color: avgRetInc >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(avgRetInc)}</span>
+                    : <span className="text-ghost">—</span>}
+                </td>
+                {/* CAGR (value-weighted) */}
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap">
                   {avgCagrAll != null
                     ? <span style={{ color: avgCagrAll >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(avgCagrAll)} p.a.</span>
                     : <span className="text-ghost">—</span>}
                 </td>
+                {/* Remarks */}
                 <td />
               </tr>
             )}

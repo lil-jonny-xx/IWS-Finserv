@@ -110,6 +110,15 @@ function HoldingsSection({
   const groups = groupBySymbol(rows);
   const toggle = (s: string) => setOpen(prev => { const n = new Set(prev); if (n.has(s)) n.delete(s); else n.add(s); return n; });
 
+  // Footer column totals ("total everything down"): value columns summed,
+  // Return derived from total P&L / total cost. Native value spans mixed
+  // currencies so it isn't summed.
+  const tQty  = groups.some(g => g.quantity != null)      ? groups.reduce((s, g) => s + (g.quantity ?? 0), 0)      : null;
+  const tCost = groups.some(g => g.cost != null)          ? groups.reduce((s, g) => s + (g.cost ?? 0), 0)          : null;
+  const tVal  = groups.reduce((s, g) => s + (g.current_market_value ?? 0), 0);
+  const tPnl  = groups.some(g => g.pnl_inception != null) ? groups.reduce((s, g) => s + (g.pnl_inception ?? 0), 0) : null;
+  const tRet  = tPnl != null && tCost != null && tCost !== 0 ? (tPnl / tCost) * 100 : null;
+
   return (
     <section className="bg-card rounded-lg border border-rule overflow-hidden mb-6">
       <div className="px-5 sm:px-6 pt-5 pb-4 border-b border-rule flex flex-wrap items-end justify-between gap-3">
@@ -196,6 +205,17 @@ function HoldingsSection({
                 </Fragment>
               );
             })}
+            <tr className="border-t-2 border-rule bg-page font-semibold">
+              <td colSpan={1 + (showEntityCol ? 1 : 0)} className="px-4 py-3 text-xs text-dim uppercase tracking-wide">
+                Total ({groups.length})
+              </td>
+              <td className="px-4 py-3 text-right tabular-nums text-dim">{fmtNum(tQty)}</td>
+              <td className="px-4 py-3 text-right tabular-nums text-dim">{fmtINR(tCost)}</td>
+              {showNative && <td className="px-4 py-3 text-right tabular-nums text-ghost">—</td>}
+              <td className="px-4 py-3 text-right tabular-nums text-ink">{fmtINR(tVal)}</td>
+              <td className={`px-4 py-3 text-right tabular-nums ${gainClass(tPnl)}`}>{fmtINR(tPnl)}</td>
+              <td className={`px-4 py-3 text-right tabular-nums ${gainClass(tRet)}`}>{fmtPct(tRet)}</td>
+            </tr>
           </tbody>
         </table>
       </DragScroll>

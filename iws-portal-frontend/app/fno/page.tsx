@@ -144,6 +144,11 @@ function PositionsTable({ positions, totals, showEntityCol, lastUpdated }: {
   showEntityCol: boolean;
   lastUpdated: string | null;
 }) {
+  // Footer totals over the shown positions: net qty and P&L sum down; per-contract
+  // prices (Strike/Avg/LTP) are not summable.
+  const totNetQty = positions.reduce((s, p) => s + p.quantity, 0);
+  const totMtm    = positions.some(p => p.mtm_pnl != null)      ? positions.reduce((s, p) => s + (p.mtm_pnl ?? 0), 0)      : null;
+  const totReal   = positions.some(p => p.realized_pnl != null) ? positions.reduce((s, p) => s + (p.realized_pnl ?? 0), 0) : null;
   return (
     <div className="bg-card rounded-lg border border-rule overflow-hidden">
       <div className="px-5 sm:px-6 pt-5 pb-4 border-b border-rule flex flex-wrap items-start justify-between gap-3">
@@ -226,6 +231,16 @@ function PositionsTable({ positions, totals, showEntityCol, lastUpdated }: {
                   </tr>
                 );
               })}
+              <tr className="border-t-2 border-rule bg-page font-semibold">
+                <td colSpan={5 + (showEntityCol ? 1 : 0)} className="px-3 py-2.5 text-xs text-dim uppercase tracking-wide">
+                  Total ({positions.length} position{positions.length === 1 ? '' : 's'})
+                </td>
+                <td className="px-3 py-2.5 text-right tabular-nums text-ink">{num(totNetQty, 0)}</td>
+                <td className="px-3 py-2.5 text-right text-ghost">—</td>
+                <td className="px-3 py-2.5 text-right text-ghost">—</td>
+                <td className="px-3 py-2.5 text-right"><PnlCell value={totMtm} /></td>
+                <td className="px-3 py-2.5 text-right"><PnlCell value={totReal} /></td>
+              </tr>
             </tbody>
           </table>
         </div>

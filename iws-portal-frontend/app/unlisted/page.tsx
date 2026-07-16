@@ -273,10 +273,11 @@ export default function UnlistedPage() {
     setExpanded(prev => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n; });
   }
 
-  const companies  = assets ? groupByLabel(assets) : [];
-  const totalValue = (assets ?? []).reduce((s, a) => s + (a.aggregate?.current_value ?? a.current_value ?? 0), 0);
-  const totalCost  = (assets ?? []).reduce((s, a) => s + (a.aggregate?.cost ?? a.cost ?? 0), 0);
-  const totalPnl   = totalValue - totalCost;
+  const companies   = assets ? groupByLabel(assets) : [];
+  const totalValue  = (assets ?? []).reduce((s, a) => s + (a.aggregate?.current_value ?? a.current_value ?? 0), 0);
+  const totalCost   = (assets ?? []).reduce((s, a) => s + (a.aggregate?.cost ?? a.cost ?? 0), 0);
+  const totalPnl    = totalValue - totalCost;
+  const totalShares = companies.reduce((s, c) => s + c.shares, 0);
 
   return (
     <main id="main-content" className="min-h-screen bg-page p-4 sm:p-8">
@@ -344,6 +345,33 @@ export default function UnlistedPage() {
                     </Fragment>
                   );
                 })}
+
+                {/* Bottom total bar — mirrors the company row columns */}
+                <div className="bg-card rounded-lg border-2 border-rule px-4 sm:px-5 py-3.5 flex flex-wrap items-center gap-x-6 gap-y-2">
+                  <span className="inline-block w-4 shrink-0" />
+                  <div className="flex-1 min-w-[10rem]">
+                    <h3 className="text-sm font-bold text-ink leading-tight">Total</h3>
+                    <p className="text-[11px] text-ghost mt-0.5">{companies.length} compan{companies.length === 1 ? 'y' : 'ies'}</p>
+                  </div>
+                  <div className="text-right w-20">
+                    <p className="text-[10px] uppercase tracking-wide text-ghost">Shares</p>
+                    <p className="text-xs font-semibold text-dim tabular-nums">{fmtNum(totalShares, 0)}</p>
+                  </div>
+                  <div className="text-right w-28">
+                    <p className="text-[10px] uppercase tracking-wide text-ghost">Cost</p>
+                    <p className="text-xs font-semibold text-dim tabular-nums">{fmtINR(totalCost)}</p>
+                  </div>
+                  <div className="text-right w-28">
+                    <p className="text-[10px] uppercase tracking-wide text-ghost">Value</p>
+                    <p className="text-sm font-bold text-ink tabular-nums">{fmtINR(totalValue)}</p>
+                  </div>
+                  <div className="text-right w-28">
+                    <p className="text-[10px] uppercase tracking-wide text-ghost">P&amp;L</p>
+                    <p className="text-xs font-semibold tabular-nums" style={{ color: totalPnl >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
+                      {totalPnl >= 0 ? '+' : ''}{fmtINR(totalPnl)}
+                    </p>
+                  </div>
+                </div>
               </div>
             )}
           </div>

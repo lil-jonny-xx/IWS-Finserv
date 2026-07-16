@@ -184,6 +184,20 @@ function weightedAvg(rows: MFHoldingRow[], key: 'cagr_inception_pct' | 'xirr_inc
   return sumWeight > 0 ? sumWeighted / sumWeight : null;
 }
 
+// Generic value-weighted average for the footer totals row — used for any %
+// column on either the normal (MFHoldingRow) or combined (CombinedHolding) view.
+// Rows missing the metric are skipped so they don't dilute the mean.
+function wavgBy<T>(rows: T[], val: (r: T) => number | null | undefined, wt: (r: T) => number | null | undefined): number | null {
+  let sw = 0, swv = 0;
+  for (const r of rows) {
+    const v = val(r);
+    if (v == null) continue;
+    const w = wt(r) ?? 0;
+    swv += v * w; sw += w;
+  }
+  return sw > 0 ? swv / sw : null;
+}
+
 // ── sort ──────────────────────────────────────────────────────────────────────
 
 function sortRows(rows: MFHoldingRow[], key: SortKey, dir: SortDir): MFHoldingRow[] {
@@ -750,6 +764,19 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
     return localCombined;
   }, [localCombined, combinedHoldings]);
 
+  // Combined view after the active class/type/search filters — shared by the
+  // combined-mode table body and its footer totals row (identical filter logic).
+  const combinedFiltered = useMemo(() => {
+    const q = search.toLowerCase();
+    return effectiveCombined.filter(h => {
+      if (filterClass && h.asset_class !== filterClass) return false;
+      if (filterType  && h.security_type !== filterType)  return false;
+      if (q && !h.security_name.toLowerCase().includes(q) &&
+               !h.entities.join(' ').toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [effectiveCombined, search, filterClass, filterType]);
+
   function handleSort(key: SortKey) {
     if (key === sortKey) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
     else { setSortKey(key); setSortDir('desc'); }
@@ -789,6 +816,19 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
   const viewMktVal   = isFiltered ? view.reduce((s, h) => s + (h.market_value_as_on ?? h.current_value ?? 0), 0)
                                   : totals.total_current_value;
   const viewCount    = isFiltered ? view.length : totals.total_holdings;
+
+  // Footer column totals ("total everything down"): value columns summed,
+  // percentage columns value-weighted by market value, exposure → ~100%.
+  const mfWt            = (h: MFHoldingRow) => h.market_value_as_on ?? h.current_value ?? 0;
+  const totalUnits      = view.reduce((s, h) => s + h.quantity, 0);
+  const totalInvested   = view.reduce((s, h) => s + h.invested_amount, 0);
+  const totalMktVal     = view.reduce((s, h) => s + (h.market_value_as_on ?? h.current_value ?? 0), 0);
+  const totalPrevWk     = view.reduce((s, h) => s + (h.prev_week_value ?? 0), 0);
+  const totalExpPct     = view.reduce((s, h) => s + (h.exposure_pct ?? 0), 0);
+  const hasExp          = view.some(h => h.exposure_pct != null);
+  const totalPnlWeekly  = view.reduce((s, h) => s + (h.pnl_weekly_change ?? 0), 0);
+  const avgRetYtd       = wavgBy(view, h => h.returns_ytd_pct, mfWt);
+  const avgRetInc       = wavgBy(view, h => h.returns_inception_pct, mfWt);
 
   const colCount    = 3                          // sr + fund + folio
     + 8                                          // units nav cost since exp% mktval prevwk wklychg
@@ -1035,6 +1075,56 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
                   );
                 });
               })()}
+              {/* Overall totals footer — every column totalled */}
+              {combinedFiltered.length > 0 && (
+                <tr className="border-t-2 border-rule bg-page">
+                  <td colSpan={4} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim whitespace-nowrap">
+                    Total ({combinedFiltered.length} funds)
+                  </td>
+                  {/* Units */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">{combinedFiltered.reduce((s, h) => s + h.quantity, 0).toFixed(3)}</td>
+                  {/* NAV */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs text-ghost whitespace-nowrap">—</td>
+                  {/* Cost */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">{fmtINR(combinedFiltered.reduce((s, h) => s + h.invested_amount, 0))}</td>
+                  {/* Since */}
+                  <td />
+                  {/* Exp % */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-dim whitespace-nowrap">
+                    {combinedFiltered.some(h => h.exposure_pct != null) ? combinedFiltered.reduce((s, h) => s + (h.exposure_pct ?? 0), 0).toFixed(2) + '%' : '—'}
+                  </td>
+                  {/* Mkt Value */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">{fmtINR(combinedFiltered.reduce((s, h) => s + (h.market_value_as_on ?? h.current_value ?? 0), 0))}</td>
+                  {/* Prev Week */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-dim whitespace-nowrap">
+                    {(() => { const v = combinedFiltered.reduce((s, h) => s + (h.prev_week_value ?? 0), 0); return v ? fmtINR(v) : '—'; })()}
+                  </td>
+                  {/* Wkly Chg */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap"><ColorNum n={combinedFiltered.reduce((s, h) => s + (h.weekly_change ?? 0), 0) || null} fmt={fmtINR} /></td>
+                  {/* P&L YTD / Inception / Wkly */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap border-l border-rule"><ColorNum n={combinedFiltered.reduce((s, h) => s + (h.pnl_ytd ?? 0), 0) || null} fmt={fmtINR} /></td>
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap"><ColorNum n={combinedFiltered.reduce((s, h) => s + (h.pnl_inception ?? 0), 0) || null} fmt={fmtINR} /></td>
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap"><ColorNum n={combinedFiltered.reduce((s, h) => s + (h.pnl_weekly_change ?? 0), 0) || null} fmt={fmtINR} /></td>
+                  {/* Returns Inc % (weighted) */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap border-l border-rule">
+                    {(() => {
+                      const v = wavgBy(combinedFiltered, h => h.returns_inception_pct, h => h.market_value_as_on ?? h.current_value ?? 0);
+                      return v != null ? <span style={{ color: v >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(v)}</span> : <span className="text-ghost">—</span>;
+                    })()}
+                  </td>
+                  {/* XIRR (weighted) */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap">
+                    {(() => {
+                      const v = wavgBy(combinedFiltered, h => h.xirr_inception_pct, h => h.market_value_as_on ?? h.current_value ?? 0);
+                      return v != null ? <span style={{ color: v >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(v)} p.a.</span> : <span className="text-ghost">—</span>;
+                    })()}
+                  </td>
+                  {/* Realized */}
+                  <td className="px-3 pr-5 sm:pr-6 py-3 text-right tabular-nums text-xs font-semibold text-dim whitespace-nowrap">
+                    {(() => { const v = combinedFiltered.reduce((s, h) => s + (h.realized_gain ?? 0), 0); return v > 0 ? fmtINR(v) : '—'; })()}
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         )}
@@ -1093,6 +1183,53 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
                   </Fragment>
                 );
               })}
+              {/* Overall totals footer — every column totalled */}
+              {filtered.length > 0 && (
+                <tr className="border-t-2 border-rule bg-page">
+                  <td colSpan={3} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim whitespace-nowrap">
+                    Total ({view.length} holdings)
+                  </td>
+                  {/* Units */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">{totalUnits.toFixed(3)}</td>
+                  {/* NAV — per-unit price, not summable */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs text-ghost whitespace-nowrap">—</td>
+                  {/* Cost */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">{fmtINR(totalInvested)}</td>
+                  {/* Since */}
+                  <td />
+                  {/* Exp % */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-dim whitespace-nowrap">{hasExp ? totalExpPct.toFixed(2) + '%' : '—'}</td>
+                  {/* Mkt Value */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">{fmtINR(totalMktVal)}</td>
+                  {/* Prev Week */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-dim whitespace-nowrap">{totalPrevWk ? fmtINR(totalPrevWk) : '—'}</td>
+                  {/* Wkly Chg */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap"><ColorNum n={totalWeeklyChg || null} fmt={fmtINR} /></td>
+                  {/* P&L YTD / Inception / Wkly */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap border-l border-rule"><ColorNum n={totalPnlYtd || null} fmt={fmtINR} /></td>
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap"><ColorNum n={totalPnlInception || null} fmt={fmtINR} /></td>
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap"><ColorNum n={totalPnlWeekly || null} fmt={fmtINR} /></td>
+                  {/* Returns YTD % / Inc % (weighted) */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap border-l border-rule">
+                    {avgRetYtd != null ? <span style={{ color: avgRetYtd >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(avgRetYtd)}</span> : <span className="text-ghost">—</span>}
+                  </td>
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap">
+                    {avgRetInc != null ? <span style={{ color: avgRetInc >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(avgRetInc)}</span> : <span className="text-ghost">—</span>}
+                  </td>
+                  {/* CAGR (weighted) */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap">
+                    {avgCagr != null ? <span style={{ color: avgCagr >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(avgCagr)} p.a.</span> : <span className="text-ghost">—</span>}
+                  </td>
+                  {/* XIRR (weighted) */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap">
+                    {avgXirr != null ? <span style={{ color: avgXirr >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(avgXirr)} p.a.</span> : <span className="text-ghost">—</span>}
+                  </td>
+                  {/* Realized */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-dim whitespace-nowrap">{totalRealized > 0 ? fmtINR(totalRealized) : '—'}</td>
+                  {/* Remarks */}
+                  <td />
+                </tr>
+              )}
             </tbody>
           </table>
         )}
