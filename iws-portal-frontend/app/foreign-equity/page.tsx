@@ -3,7 +3,7 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import NavTabs from '@/app/components/NavTabs';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
-import ForeignEquityTable, { type EquityHoldingRow, type EquityTotals, type CashCurrencyRow } from './components/ForeignEquityTable';
+import ForeignEquityTable, { type EquityHoldingRow, type EquityTotals, type CashCurrencyRow, type CashBrokerRow } from './components/ForeignEquityTable';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -20,6 +20,7 @@ interface ForeignEquityResponse {
   as_of_date: string | null;
   last_updated: string | null;
   cash_currency_breakdown?: CashCurrencyRow[];
+  cash_by_broker?: CashBrokerRow[];
 }
 
 interface ForeignActivityTrade {
@@ -223,6 +224,156 @@ function ManualForeignEquity({ assets, showEntityCol }: { assets: ManualForeignA
   );
 }
 
+// DBS Wealth has no API/scrape — the holdings statement is uploaded weekly as a
+// CSV. Parse-then-confirm: /preview shows the extracted rows, /commit snapshot-
+// replaces this entity's DBS holdings. Admin only.
+interface DbsPreviewHolding {
+  name: string; symbol: string; isin: string | null; exchange: string | null;
+  currency: string; quantity: number; avg_cost_native: number | null;
+  price_native: number | null; market_value_native: number | null; resolvable: boolean;
+}
+interface DbsPreviewResponse {
+  entity_id: number; entity_name: string; committed: boolean;
+  account: string | null; as_of: string | null; note: string | null;
+  holdings: DbsPreviewHolding[];
+  cash: { currency: string; market_value_native: number | null }[];
+  replaced?: number; inserted?: number;
+}
+
+function DbsUploadCard({ entities, defaultEntityId, onCommitted }:
+  { entities: Entity[]; defaultEntityId: number | null; onCommitted: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [entityId, setEntityId] = useState<number | ''>(defaultEntityId ?? '');
+  const [file, setFile] = useState<File | null>(null);
+  const [preview, setPreview] = useState<DbsPreviewResponse | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [done, setDone] = useState<string | null>(null);
+
+  useEffect(() => { if (defaultEntityId != null) setEntityId(defaultEntityId); }, [defaultEntityId]);
+
+  const send = async (path: 'preview' | 'commit') => {
+    if (!entityId || !file) { setErr('Pick an entity and a CSV file.'); return; }
+    setBusy(true); setErr(null); setDone(null);
+    try {
+      const fd = new FormData();
+      fd.append('entity_id', String(entityId));
+      fd.append('file', file);
+      const r = await fetch(`${API_URL}/api/v1/foreign-equity/dbs/${path}`,
+        { method: 'POST', credentials: 'include', body: fd });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.detail || `Upload failed (${r.status})`);
+      if (path === 'preview') { setPreview(d); }
+      else {
+        setDone(`Saved — replaced ${d.replaced ?? 0}, wrote ${d.inserted ?? 0} holding(s) as of ${d.as_of}.`);
+        setPreview(null); setFile(null); onCommitted();
+      }
+    } catch (e) { setErr(e instanceof Error ? e.message : 'Upload failed.'); }
+    finally { setBusy(false); }
+  };
+
+  const num = (v: number | null) => v == null ? '—' : v.toLocaleString('en-US', { maximumFractionDigits: 2 });
+
+  return (
+    <div className="bg-card rounded-lg border border-rule overflow-hidden mt-5">
+      <button onClick={() => setOpen(o => !o)} aria-expanded={open}
+        className="w-full flex items-center justify-between px-5 sm:px-6 py-3 text-left hover:bg-page transition-colors">
+        <div className="flex items-center gap-3">
+          <span className="text-sm font-semibold text-ink">Upload DBS statement</span>
+          <span className="text-xs text-ghost">weekly holdings CSV · snapshot-replace</span>
+        </div>
+        <span className="text-xs text-dim">{open ? '▲' : '▼'}</span>
+      </button>
+      {open && (
+        <div className="border-t border-rule p-4 sm:p-5 space-y-4">
+          <div className="flex flex-wrap items-end gap-3">
+            <label className="flex flex-col gap-1">
+              <span className="text-[11px] uppercase tracking-wide text-ghost">Entity</span>
+              <select value={entityId} onChange={e => setEntityId(e.target.value ? Number(e.target.value) : '')}
+                className="bg-page border border-rule rounded px-3 py-1.5 text-sm text-ink">
+                <option value="">Select…</option>
+                {entities.map(en => <option key={en.id} value={en.id}>{en.name}</option>)}
+              </select>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-[11px] uppercase tracking-wide text-ghost">DBS holdings CSV</span>
+              <input type="file" accept=".csv,text/csv"
+                onChange={e => { setFile(e.target.files?.[0] ?? null); setPreview(null); setDone(null); }}
+                className="text-sm text-dim file:mr-3 file:py-1.5 file:px-3 file:rounded file:border file:border-rule file:bg-page file:text-ink file:text-xs" />
+            </label>
+            <button onClick={() => send('preview')} disabled={busy || !file || !entityId}
+              className="text-xs font-medium border border-rule text-dim px-3 py-2 rounded hover:border-dim hover:text-ink transition-colors disabled:opacity-40">
+              {busy ? 'Working…' : 'Preview'}
+            </button>
+          </div>
+
+          {err && <p role="alert" className="text-xs" style={{ color: 'var(--peril)' }}>{err}</p>}
+          {done && <p role="status" className="text-xs" style={{ color: 'var(--gain)' }}>{done}</p>}
+
+          {preview && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs text-ghost">
+                  {preview.entity_name} · account {preview.account ?? '—'} · as of {preview.as_of ?? '—'} · {preview.note}
+                </p>
+                <button onClick={() => send('commit')} disabled={busy}
+                  className="text-xs font-semibold border border-rule px-3 py-1.5 rounded hover:bg-page transition-colors disabled:opacity-40"
+                  style={{ color: 'var(--gain)' }}>
+                  Confirm &amp; replace {preview.holdings.length} holding(s)
+                </button>
+              </div>
+              <div className="overflow-x-auto border border-rule rounded">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="bg-page text-dim">
+                      <th className="px-3 py-2 text-left font-semibold">Symbol</th>
+                      <th className="px-3 py-2 text-left font-semibold">Name</th>
+                      <th className="px-3 py-2 text-left font-semibold">Ccy</th>
+                      <th className="px-3 py-2 text-right font-semibold">Qty</th>
+                      <th className="px-3 py-2 text-right font-semibold">Avg cost</th>
+                      <th className="px-3 py-2 text-right font-semibold">Price</th>
+                      <th className="px-3 py-2 text-right font-semibold">Mkt value</th>
+                      <th className="px-3 py-2 text-left font-semibold">Price feed</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {preview.holdings.map((h, i) => (
+                      <tr key={i} className="border-t border-rule">
+                        <td className="px-3 py-2 text-ink font-medium">{h.symbol}</td>
+                        <td className="px-3 py-2 text-dim">{h.name}</td>
+                        <td className="px-3 py-2 text-ghost">{h.currency}</td>
+                        <td className="px-3 py-2 text-right text-dim">{num(h.quantity)}</td>
+                        <td className="px-3 py-2 text-right text-dim">{num(h.avg_cost_native)}</td>
+                        <td className="px-3 py-2 text-right text-dim">{num(h.price_native)}</td>
+                        <td className="px-3 py-2 text-right text-dim">{num(h.market_value_native)}</td>
+                        <td className="px-3 py-2 text-[11px]" style={{ color: h.resolvable ? 'var(--gain)' : 'var(--ghost)' }}>
+                          {h.resolvable ? 'live' : 'statement value'}
+                        </td>
+                      </tr>
+                    ))}
+                    {preview.cash.map((c, i) => (
+                      <tr key={`c${i}`} className="border-t border-rule bg-page/50">
+                        <td className="px-3 py-2 text-ghost">CASH</td>
+                        <td className="px-3 py-2 text-ghost" colSpan={2}>{c.currency} cash balance</td>
+                        <td className="px-3 py-2 text-right text-ghost" colSpan={4}>{num(c.market_value_native)} {c.currency}</td>
+                        <td className="px-3 py-2 text-[11px] text-ghost">→ broker cash</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="text-[11px] text-ghost">
+                Confirming replaces this entity’s entire DBS holding set — names absent from this file are treated as exited.
+                Cash balances are recorded to broker cash (per-currency), swept currencies dropped.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function ForeignEquityPage() {
   const router = useRouter();
   const [user, setUser]             = useState<User | null>(null);
@@ -371,9 +522,17 @@ export default function ForeignEquityPage() {
               showEntityCol={showEntityCol}
               lastUpdated={data.last_updated}
               cashByCurrency={data.cash_currency_breakdown ?? []}
+              cashByBroker={data.cash_by_broker ?? []}
               extra={manualExtra}
             />
             <ManualForeignEquity assets={manualAssets} showEntityCol={showEntityCol} />
+            {isAdmin && entities.length > 0 && (
+              <DbsUploadCard
+                entities={entities}
+                defaultEntityId={selectedIds.length === 1 ? selectedIds[0] : null}
+                onCommitted={handleRetry}
+              />
+            )}
           </div>
         )}
 

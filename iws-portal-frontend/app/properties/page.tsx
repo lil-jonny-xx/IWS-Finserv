@@ -184,6 +184,12 @@ export default function PropertiesPage() {
 
   const mainHolders   = useMemo(() => holders.filter(h => h.grp === 'main'), [holders]);
   const parentHolders = useMemo(() => holders.filter(h => h.grp === 'parent'), [holders]);
+  // Parent companies collapse into a single tab; clicking it reveals their
+  // individual holder tabs (which still filter as before).
+  const [parentExpanded, setParentExpanded] = useState(false);
+  const parentSelCount = useMemo(
+    () => parentHolders.reduce((n, h) => n + (selHolders.has(h.id) ? 1 : 0), 0),
+    [parentHolders, selHolders]);
 
   const visible = useMemo(() => {
     const all = data?.properties ?? [];
@@ -467,7 +473,16 @@ export default function PropertiesPage() {
           {holderPill(null, 'All')}
           {mainHolders.map(h => holderPill(h.id, holderLabel(h)))}
           {parentHolders.length > 0 && <span className="mx-1 h-4 w-px bg-rule" aria-hidden />}
-          {parentHolders.map(h => holderPill(h.id, holderLabel(h)))}
+          {parentHolders.length > 0 && (
+            <button role="tab" aria-selected={parentSelCount > 0} aria-expanded={parentExpanded}
+              onClick={() => setParentExpanded(v => !v)}
+              className={`px-3 py-1 rounded text-xs font-medium transition-colors inline-flex items-center gap-1 ${
+                parentSelCount > 0 ? 'bg-prime text-prime-fg' : 'bg-card border border-rule text-dim hover:border-dim hover:text-ink'}`}>
+              <span aria-hidden className="text-[9px] leading-none">{parentExpanded ? '▾' : '▸'}</span>
+              Parent Companies{parentSelCount > 0 ? ` (${parentSelCount})` : ''}
+            </button>
+          )}
+          {parentExpanded && parentHolders.map(h => holderPill(h.id, holderLabel(h)))}
           {isAdmin && (
             <span className="flex items-center gap-1.5 ml-2">
               <input value={newEntity} onChange={e => setNewEntity(e.target.value)}

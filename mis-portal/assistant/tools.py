@@ -62,6 +62,23 @@ TOOL_SCHEMAS = [
         "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
+        "name": "get_cash_balances",
+        "description": (
+            "The whole cash book in scope: broker-account free cash (Zerodha/Angel/Dhan "
+            "plus foreign IBKR/Vested/DBS, already in INR) and bank-account balances "
+            "(native currency converted to INR). Use for liquidity / total-cash questions."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "get_pms_holdings",
+        "description": (
+            "PMS / AIF holdings in scope (managed portfolios) with per-line cost and "
+            "current market value. Use for PMS-level questions or full net-worth build-ups."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
         "name": "get_sector_exposure",
         "description": (
             "Combined exposure by sector/asset-class across the whole book in scope: "
@@ -363,8 +380,15 @@ def _equity_holdings(conn, eid: Optional[int]) -> list[dict]:
 
 
 def _manual_positions(conn, eid: Optional[int]) -> list[dict]:
-    """Latest manual position per (entity, category, label) — mirrors get_manual_inputs."""
-    where, params = _entity_clause(eid, "m.entity_id")
+    """Latest manual position per (entity, category, label) — mirrors get_manual_inputs.
+    Collectibles are excluded (owner decision 2026-07-16): tracked separately, kept
+    out of portfolio totals."""
+    conds = ["m.category <> 'collectibles'"]
+    params: list = []
+    if eid is not None:
+        conds.append("m.entity_id = %s")
+        params.append(eid)
+    where = "WHERE " + " AND ".join(conds)
     cur = conn.cursor()
     cur.execute(f"""
         SELECT DISTINCT ON (m.entity_id, m.category, m.label)
@@ -383,10 +407,78 @@ def _manual_positions(conn, eid: Optional[int]) -> list[dict]:
     } for r in rows]
 
 
+def _fx_to_inr(conn) -> dict:
+    """Latest fx_rate per source currency → INR ({'INR': 1.0})."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT DISTINCT ON (from_currency) from_currency, rate
+        FROM fx_rate WHERE to_currency = 'INR'
+        ORDER BY from_currency, rate_date DESC
+    """)
+    m = {r["from_currency"].upper(): float(r["rate"]) for r in cur.fetchall()}
+    cur.close()
+    m["INR"] = 1.0
+    return m
+
+
+def _cash_balances(conn, eid: Optional[int]) -> list[dict]:
+    """The whole cash book in scope: broker-account cash (broker_cash — Zerodha/
+    Angel/Dhan + foreign IBKR/Vested/DBS, already INR) and bank-account cash
+    (bank_account, native → INR)."""
+    where, params = _entity_clause(eid, "bc.entity_id")
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT bc.entity_id, bc.broker, bc.balance, bc.currency, bc.balance_native
+        FROM broker_cash bc {where}
+        ORDER BY bc.balance DESC NULLS LAST
+    """, params)
+    broker_rows = cur.fetchall()
+    bwhere, bparams = _entity_clause(eid, "ba.entity_id")
+    cur.execute(f"""
+        SELECT ba.entity_id, ba.bank_name, ba.currency, ba.balance
+        FROM bank_account ba {bwhere}
+    """, bparams)
+    bank_rows = cur.fetchall()
+    cur.close()
+
+    fx = _fx_to_inr(conn)
+    out = []
+    for r in broker_rows:
+        out.append({"source": "broker", "name": r["broker"],
+                    "currency": r["currency"] or "INR",
+                    "balance_inr": _f(r["balance"]) or 0.0,
+                    "balance_native": _f(r["balance_native"])})
+    for r in bank_rows:
+        native = _f(r["balance"]) or 0.0
+        rate = fx.get((r["currency"] or "INR").upper(), 1.0)
+        out.append({"source": "bank", "name": r["bank_name"],
+                    "currency": r["currency"] or "INR",
+                    "balance_inr": round(native * rate, 2),
+                    "balance_native": native})
+    return out
+
+
+def _pms_holdings(conn, eid: Optional[int]) -> list[dict]:
+    """PMS/AIF holdings (pms_holding) — cost + market value per line."""
+    where, params = _entity_clause(eid, "p.entity_id")
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT p.holding_type, p.security_name, p.cost, p.market_value
+        FROM pms_holding p {where}
+        ORDER BY p.market_value DESC NULLS LAST
+    """, params)
+    rows = cur.fetchall()
+    cur.close()
+    return [{"holding_type": r["holding_type"], "security_name": r["security_name"],
+             "cost": _f(r["cost"]), "current_value": _f(r["market_value"])} for r in rows]
+
+
 def _portfolio_overview(conn, eid: Optional[int]) -> dict:
     mf = _mf_holdings(conn, eid)
     eq = _equity_holdings(conn, eid)
     manual = _manual_positions(conn, eid)
+    cash = _cash_balances(conn, eid)
+    pms = _pms_holdings(conn, eid)
 
     def vsum(rows, key):
         return round(sum((r.get(key) or 0.0) for r in rows), 2)
@@ -394,11 +486,15 @@ def _portfolio_overview(conn, eid: Optional[int]) -> dict:
     mf_value = vsum(mf, "current_value")
     eq_value = vsum(eq, "current_value")
     manual_value = vsum(manual, "current_value")
+    cash_value = vsum(cash, "balance_inr")            # no cost basis → invested = value
+    pms_value = vsum(pms, "current_value")
     mf_invested = vsum(mf, "invested_amount")
     eq_invested = vsum(eq, "cost")
     manual_invested = vsum(manual, "cost")
-    total_value = round(mf_value + eq_value + manual_value, 2)
-    total_invested = round(mf_invested + eq_invested + manual_invested, 2)
+    pms_invested = vsum(pms, "cost")
+    total_value = round(mf_value + eq_value + manual_value + cash_value + pms_value, 2)
+    total_invested = round(mf_invested + eq_invested + manual_invested
+                           + cash_value + pms_invested, 2)
 
     # weighted CAGR over MF + equity positions that carry a cagr figure
     w_sum = w_cagr = 0.0
@@ -421,8 +517,13 @@ def _portfolio_overview(conn, eid: Optional[int]) -> dict:
             [{"group": "DIRECT_EQUITY", "value": eq_value}]
             + [{"group": (r.get("asset_class") or "MF"), "value": (r.get("current_value") or 0.0)} for r in mf]
             + [{"group": (r.get("category") or "MANUAL").upper(), "value": (r.get("current_value") or 0.0)} for r in manual]
+            + [{"group": "CASH", "value": cash_value}]
+            + [{"group": "PMS", "value": pms_value}]
         )["breakdown"],
-        "counts": {"mf": len(mf), "equity": len(eq), "manual": len(manual)},
+        "counts": {"mf": len(mf), "equity": len(eq), "manual": len(manual),
+                   "cash_accounts": len(cash), "pms": len(pms)},
+        "note": "Includes cash (broker+bank) and PMS. Collectibles and real "
+                "estate are deliberately excluded from portfolio totals.",
     }
 
 
@@ -667,6 +768,11 @@ def dispatch(name: str, tool_input: dict, conn, eid: Optional[int]) -> str:
         result = {"holdings": _mf_holdings(conn, eid)}
     elif name == "get_equity_holdings":
         result = {"holdings": _equity_holdings(conn, eid)}
+    elif name == "get_cash_balances":
+        cash = _cash_balances(conn, eid)
+        result = {"cash": cash, "total_inr": round(sum(c["balance_inr"] or 0 for c in cash), 2)}
+    elif name == "get_pms_holdings":
+        result = {"holdings": _pms_holdings(conn, eid)}
     elif name == "get_sector_exposure":
         result = _sector_exposure(conn, eid)
     elif name == "get_performance":

@@ -1408,14 +1408,17 @@ def get_equity_holdings(
         rows = cur.fetchall()
 
         # Per-broker cash balances for the same scope (entity + optional broker).
-        cash_conditions, cash_params = [], []
+        # Indian brokers only — foreign broker cash (IBKR/Vested/DBS) lives on the
+        # Foreign Equity page, so it doesn't double-count here.
+        cash_conditions = ["bc.broker <> ALL(%s)"]
+        cash_params: list = [list(FOREIGN_BROKERS)]
         if eids:
             cash_conditions.append("bc.entity_id = ANY(%s)")
             cash_params.append(eids)
         if broker:
             cash_conditions.append("bc.broker = %s")
             cash_params.append(broker)
-        cash_where = ("WHERE " + " AND ".join(cash_conditions)) if cash_conditions else ""
+        cash_where = "WHERE " + " AND ".join(cash_conditions)
         cur.execute(
             f"""
             SELECT bc.entity_id, e.entity_name, bc.broker, bc.balance,
@@ -1897,6 +1900,155 @@ def get_foreign_equity_activity(
         raise
     except Exception as e:
         logger.error(f"Error in /api/v1/foreign-equity/activity: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+# ---------------------------------------------------------------------------
+# DBS Wealth — no API/scrape; the entity's holdings statement is uploaded as a
+# CSV (weekly). Parse-then-confirm: /preview parses + returns the extracted rows
+# for admin review (no DB write); /commit snapshot-replaces foreign_equity_holding
+# (broker='dbs') for that entity. Live US names then price-refresh via
+# foreign_price_worker; SGX/other unresolvable names keep the statement value.
+# ---------------------------------------------------------------------------
+
+MAX_DBS_BYTES = 5 * 1024 * 1024   # 5 MB — a holdings CSV is a few KB
+
+
+def _dbs_save_and_parse(entity_id: int, file: UploadFile, data: bytes):
+    """Persist the upload under UPLOADS_ROOT and parse it. Returns (stored_path, parsed).
+    UPLOADS_ROOT is defined later in this module, so the dir is resolved lazily here."""
+    from equity import dbs_statement
+    if not dbs_statement.detect(file.filename or "", data[:400].decode("utf-8", "ignore")):
+        raise HTTPException(status_code=422,
+                            detail="Doesn't look like a DBS holdings CSV (no 'Asset Type' header).")
+    folder = os.path.join(UPLOADS_ROOT, "foreign", "dbs", str(entity_id))
+    os.makedirs(folder, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(file.filename or "dbs.csv"))
+    stored = os.path.join(folder, f"{datetime.utcnow():%Y%m%d%H%M%S}_{safe}")
+    with open(stored, "wb") as fh:
+        fh.write(data)
+    os.chmod(stored, 0o600)
+    try:
+        parsed = dbs_statement.parse(stored)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return stored, parsed
+
+
+def _dbs_preview_payload(parsed: dict) -> dict:
+    """Shape a parsed statement for the confirm UI (native figures + resolvable flag)."""
+    def f(v):
+        return float(v) if v is not None else None
+    return {
+        "account": parsed.get("account"),
+        "as_of":   str(parsed["as_of"]) if parsed.get("as_of") else None,
+        "note":    parsed.get("note"),
+        "holdings": [{
+            "name": h["name"], "symbol": h["symbol"], "isin": h.get("isin"),
+            "exchange": h.get("exchange"), "currency": h["currency"],
+            "quantity": f(h["quantity"]), "avg_cost_native": f(h.get("avg_cost_native")),
+            "price_native": f(h.get("price_native")),
+            "market_value_native": f(h.get("market_value_native")),
+            "resolvable": h.get("resolvable", False),
+        } for h in parsed.get("holdings", [])],
+        "cash": [{"currency": c["currency"],
+                  "market_value_native": f(c["market_value_native"])} for c in parsed.get("cash", [])],
+    }
+
+
+@app.post("/api/v1/foreign-equity/dbs/preview")
+@limiter.limit("20/minute")
+async def dbs_preview(
+    request: Request,
+    entity_id: int = Form(...),
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None),
+):
+    """Parse an uploaded DBS holdings CSV and return the extracted rows for review.
+    Does NOT touch foreign_equity_holding — that happens on /commit. Admin only."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        _require_admin(cur, payload)
+        cur.execute("SELECT entity_name FROM entity WHERE id = %s", (entity_id,))
+        ent = cur.fetchone()
+        if not ent:
+            raise HTTPException(status_code=404, detail="Entity not found")
+
+        data = await file.read(MAX_DBS_BYTES + 1)
+        if len(data) == 0:
+            raise HTTPException(status_code=422, detail="Uploaded file is empty.")
+        if len(data) > MAX_DBS_BYTES:
+            raise HTTPException(status_code=413, detail="File too large (max 5 MB).")
+
+        _stored, parsed = _dbs_save_and_parse(entity_id, file, data)
+        cur.close()
+        return {"entity_id": entity_id, "entity_name": ent["entity_name"],
+                "committed": False, **_dbs_preview_payload(parsed)}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/foreign-equity/dbs/preview: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/foreign-equity/dbs/commit")
+@limiter.limit("20/minute")
+async def dbs_commit(
+    request: Request,
+    entity_id: int = Form(...),
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None),
+):
+    """Snapshot-replace the entity's DBS holdings from an uploaded CSV. Anything
+    absent from this file is treated as exited. Admin only."""
+    from equity import dbs_ingest
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        _require_admin(cur, payload)
+        cur.execute("SELECT entity_name FROM entity WHERE id = %s", (entity_id,))
+        ent = cur.fetchone()
+        if not ent:
+            raise HTTPException(status_code=404, detail="Entity not found")
+        cur.execute("SELECT id FROM users WHERE email = %s", (payload["email"],))
+        user_id = cur.fetchone()["id"]
+
+        data = await file.read(MAX_DBS_BYTES + 1)
+        if len(data) == 0:
+            raise HTTPException(status_code=422, detail="Uploaded file is empty.")
+        if len(data) > MAX_DBS_BYTES:
+            raise HTTPException(status_code=413, detail="File too large (max 5 MB).")
+
+        _stored, parsed = _dbs_save_and_parse(entity_id, file, data)
+        summary = dbs_ingest.ingest(conn, entity_id, parsed, commit=True)
+        write_audit_log(conn, user_id, "DBS_HOLDINGS_UPLOAD", "foreign_equity_holding", entity_id,
+                        f"{ent['entity_name']} DBS: replaced {summary['replaced']} → "
+                        f"{summary['inserted']} rows (as of {summary['as_of']}) by {payload['email']}")
+        conn.commit()
+        cur.close()
+        return {"entity_id": entity_id, "entity_name": ent["entity_name"],
+                "committed": True, **summary, **_dbs_preview_payload(parsed)}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/foreign-equity/dbs/commit: {e}")
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
     finally:
         release_db_connection(conn)
@@ -2595,8 +2747,15 @@ def _fetch_manual_overview_rows(conn, entity_id: Optional[int] = None):
     current_value - cost difference.
     """
     cur   = conn.cursor()
-    where = "WHERE m.entity_id = %s" if entity_id else ""
-    params = [entity_id] if entity_id else []
+    # Collectibles are deliberately kept OUT of the portfolio overview (owner
+    # decision 2026-07-16) — tracked on their own page but not folded into
+    # portfolio totals, same treatment as the property register.
+    conds  = ["m.category <> 'collectibles'"]
+    params: list = []
+    if entity_id:
+        conds.append("m.entity_id = %s")
+        params.append(entity_id)
+    where = "WHERE " + " AND ".join(conds)
     cur.execute(f"""
         SELECT DISTINCT ON (m.entity_id, m.category, m.label)
             m.entity_id, e.entity_name, m.category,
@@ -6620,11 +6779,12 @@ def _assistant_user_id(cursor, email: str) -> int:
 
 def _resolve_assistant_scope(cursor, payload: dict, requested_entity_id: Optional[int]) -> Optional[int]:
     """
-    Assistant scope: every authenticated user (admin and member) may scope to a
-    specific entity OR to all entities (None) — matching the uniform data-access
+    Assistant scope: always the whole family. Per-entity scoping was removed
+    (owner decision 2026-07-16) — the assistant now answers over ALL entities'
+    data regardless of any requested entity_id, matching the uniform data-access
     model (the only member restrictions are Manual Data + user management).
     """
-    return requested_entity_id  # None = whole family, N = single entity
+    return None  # always whole-family; requested_entity_id intentionally ignored
 
 
 @app.post("/api/v1/assistant/conversations")

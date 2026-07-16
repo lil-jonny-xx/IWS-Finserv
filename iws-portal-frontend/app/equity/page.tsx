@@ -3,7 +3,7 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import NavTabs from '@/app/components/NavTabs';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
-import EquityTable, { type EquityHoldingRow, type EquityTotals } from './components/EquityTable';
+import EquityTable, { type EquityHoldingRow, type EquityTotals, type CashBrokerRow } from './components/EquityTable';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -16,6 +16,7 @@ interface EquityResponse {
   total_holdings: number;
   holdings: EquityHoldingRow[];
   totals: EquityTotals;
+  cash_by_broker?: CashBrokerRow[];
 }
 
 interface ActivityTrade {
@@ -373,6 +374,7 @@ export default function EquityPage() {
             <EquityTable
               holdings={data.holdings}
               totals={data.totals}
+              cashByBroker={data.cash_by_broker ?? []}
               showEntityCol={showEntityCol}
             />
           </div>

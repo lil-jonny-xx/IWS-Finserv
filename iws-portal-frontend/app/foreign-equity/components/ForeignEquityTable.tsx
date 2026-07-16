@@ -56,6 +56,17 @@ export interface CashCurrencyRow {
   updated_at?: string | null;
 }
 
+export interface CashBrokerRow {
+  entity_id: number;
+  entity_name?: string;
+  broker: string;
+  balance: number;          // INR
+  currency: string;
+  balance_native?: number | null;
+}
+
+const FOREIGN_CASH_BROKER_LABEL: Record<string, string> = { ibkr: 'IBKR', vested: 'Vested', dbs: 'DBS' };
+
 interface Props {
   holdings: EquityHoldingRow[];
   totals: EquityTotals;
@@ -63,6 +74,7 @@ interface Props {
   showEntityCol: boolean;
   lastUpdated?: string | null;
   cashByCurrency?: CashCurrencyRow[];
+  cashByBroker?: CashBrokerRow[];
   // Manually-entered foreign equity (Manual Data → "Foreign Equity"). All INR.
   // Folded into the summary-strip headline so the page total covers both sources.
   extra?: { cost: number; value: number; pnl: number; count: number };
@@ -172,7 +184,7 @@ function BrokerBadge({ broker }: { broker: string }) {
 
 // ── main component ────────────────────────────────────────────────────────────
 
-export default function ForeignEquityTable({ holdings, totals, fxRates, showEntityCol, lastUpdated, cashByCurrency = [], extra }: Props) {
+export default function ForeignEquityTable({ holdings, totals, fxRates, showEntityCol, lastUpdated, cashByCurrency = [], cashByBroker = [], extra }: Props) {
   const [sortKey, setSortKey]           = useState<SortKey>('current_market_value');
   const [sortDir, setSortDir]           = useState<SortDir>('desc');
   const [search, setSearch]             = useState('');
@@ -298,6 +310,30 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
               <p className="text-sm font-semibold text-ink tabular-nums">{fmtMoney(convTotal(totals.cash_balance), totalsCcy)}</p>
             </div>
           )}
+          {cashByBroker.length > 0 && (() => {
+            // Sum INR cash per foreign broker (IBKR / Vested / DBS) across entities in scope.
+            const agg = new Map<string, number>();
+            for (const c of cashByBroker) agg.set(c.broker, (agg.get(c.broker) ?? 0) + (c.balance ?? 0));
+            const items = [...agg.entries()].filter(([, v]) => Math.abs(v) > 0.5)
+              .sort((a, b) => b[1] - a[1]);
+            if (!items.length) return null;
+            return (
+              <div className="basis-full">
+                <p className="text-xs text-ghost mb-1">Cash by broker</p>
+                <div className="flex flex-wrap gap-2">
+                  {items.map(([broker, v]) => (
+                    <span key={broker} className="inline-flex items-baseline gap-1.5 rounded border border-rule bg-page px-2 py-1">
+                      <span className="text-[10px] font-medium text-ghost">{FOREIGN_CASH_BROKER_LABEL[broker] ?? broker}</span>
+                      <span className="text-xs font-semibold tabular-nums text-ink"
+                        style={v < 0 ? { color: 'var(--peril)' } : undefined}>
+                        {fmtMoney(convTotal(v), totalsCcy)}
+                      </span>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            );
+          })()}
           {cashByCurrency.length > 0 && (() => {
             // Sum native balances per currency across the entities in scope. A negative
             // (e.g. a GBP margin loan funding a GBP ETF) shows in the peril colour.

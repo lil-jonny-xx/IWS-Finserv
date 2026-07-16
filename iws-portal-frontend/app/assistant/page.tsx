@@ -15,7 +15,6 @@ import { streamChat } from './lib/stream';
 import ConversationSidebar from './components/ConversationSidebar';
 import ChatThread, { type StreamingState } from './components/ChatThread';
 import Composer from './components/Composer';
-import ScopeSelector from './components/ScopeSelector';
 import ContextCard from './components/ContextCard';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
@@ -42,8 +41,6 @@ export default function AssistantPage() {
   const [messages, setMessages] = useState<Message[]>([]);
 
   const [streaming, setStreaming] = useState<StreamingState>(EMPTY_STREAM);
-  const [newScope, setNewScope] = useState<number | null>(null);
-  const [showScopeModal, setShowScopeModal] = useState(false);
 
   const abortRef = useRef<AbortController | null>(null);
   const isAdmin = !!user;  // members have admin-level view access (only Manual Data + user mgmt are admin-only)
@@ -122,14 +119,11 @@ export default function AssistantPage() {
     }
   }, [router]);
 
+  // Entity scope was removed (2026-07-16): every conversation runs over ALL
+  // entities' data, so a new conversation starts immediately — no scope modal.
   const handleNew = useCallback(() => {
-    if (isAdmin) {
-      setNewScope(null);
-      setShowScopeModal(true);
-    } else {
-      createConversation(null); // member: server pins scope
-    }
-  }, [isAdmin, createConversation]);
+    createConversation(null);
+  }, [createConversation]);
 
   // ── Archive ──────────────────────────────────────
   const handleArchive = useCallback(async (id: number) => {
@@ -262,44 +256,6 @@ export default function AssistantPage() {
           )}
         </section>
       </div>
-
-      {/* Admin: choose scope when starting a conversation */}
-      {showScopeModal && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 p-4"
-          role="dialog"
-          aria-modal="true"
-          aria-label="New conversation scope"
-          onClick={() => setShowScopeModal(false)}
-        >
-          <div
-            className="w-full max-w-md rounded-xl border border-rule bg-card p-5 shadow-xl"
-            onClick={e => e.stopPropagation()}
-          >
-            <h3 className="text-base font-semibold text-ink">New conversation</h3>
-            <p className="mt-1 mb-4 text-xs text-ghost">
-              Choose the portfolio Jarvis should advise on. This is fixed for the conversation.
-            </p>
-            <ScopeSelector entities={entities} value={newScope} onChange={setNewScope} />
-            <div className="mt-6 flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setShowScopeModal(false)}
-                className="rounded-md border border-wire px-3.5 py-2 text-sm text-dim transition-colors hover:border-dim hover:text-ink"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => { setShowScopeModal(false); createConversation(newScope); }}
-                className="rounded-md bg-prime px-4 py-2 text-sm font-medium text-prime-fg transition-colors hover:bg-prime-deep"
-              >
-                Start
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </main>
   );
 }

@@ -52,10 +52,35 @@ export interface EquityTotals {
   portfolio_coverage?: string | null;   // 'full' | 'partial'
 }
 
+export interface CashBrokerRow {
+  entity_id: number;
+  entity_name: string;
+  broker: string;
+  balance: number;
+  currency: string;
+  balance_native?: number | null;
+}
+
 interface Props {
   holdings: EquityHoldingRow[];
   totals: EquityTotals;
+  cashByBroker?: CashBrokerRow[];
   showEntityCol: boolean;
+}
+
+const CASH_BROKER_LABEL: Record<string, string> = {
+  zerodha: 'Zerodha', angel_one: 'Angel One', dhan: 'Dhan',
+  ibkr: 'IBKR', vested: 'Vested', dbs: 'DBS', other: 'Other',
+};
+
+// Sum per-broker cash across the entities in scope → [{broker, total}], largest first.
+function cashByBrokerTotals(rows: CashBrokerRow[]): { broker: string; total: number }[] {
+  const m = new Map<string, number>();
+  for (const r of rows) m.set(r.broker, (m.get(r.broker) ?? 0) + (r.balance || 0));
+  return [...m.entries()]
+    .map(([broker, total]) => ({ broker, total }))
+    .filter(b => Math.abs(b.total) > 0.5)
+    .sort((a, b) => b.total - a.total);
 }
 
 // ── formatters ────────────────────────────────────────────────────────────────
@@ -440,7 +465,8 @@ function BrokerBadge({ broker }: { broker: string }) {
 
 // ── main component ────────────────────────────────────────────────────────────
 
-export default function EquityTable({ holdings, totals, showEntityCol }: Props) {
+export default function EquityTable({ holdings, totals, cashByBroker = [], showEntityCol }: Props) {
+  const cashBrokers = cashByBrokerTotals(cashByBroker);
   const [sortKey, setSortKey]         = useState<SortKey>('current_market_value');
   const [sortDir, setSortDir]         = useState<SortDir>('desc');
   const [search, setSearch]           = useState('');
@@ -623,6 +649,21 @@ export default function EquityTable({ holdings, totals, showEntityCol }: Props) 
             <p className="text-sm font-semibold text-ink tabular-nums">{viewCount}</p>
           </div>
         </div>
+
+        {/* Cash held by each Indian broker, for the entities in scope. */}
+        {!isFiltered && cashBrokers.length > 0 && (
+          <div className="mt-3 pt-3 border-t border-rule">
+            <p className="text-[11px] uppercase tracking-wide text-ghost mb-1.5">Cash by broker</p>
+            <div className="flex flex-wrap gap-x-4 gap-y-1.5">
+              {cashBrokers.map(b => (
+                <span key={b.broker} className="text-xs text-dim">
+                  {CASH_BROKER_LABEL[b.broker] ?? b.broker}
+                  <span className="ml-1.5 font-semibold text-ink tabular-nums">{fmtINR(b.total)}</span>
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Filters */}
