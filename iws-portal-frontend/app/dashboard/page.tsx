@@ -3,9 +3,9 @@ import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import NavTabs from '@/app/components/NavTabs';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
+import MarketRail from '@/app/components/MarketRail';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
-const IDLE_TIMEOUT = 30 * 60 * 1000;
 
 // ── types ──────────────────────────────────────────────────────────────────────
 
@@ -247,9 +247,78 @@ function EntityCard({ entity }: { entity: EntitySummary }) {
   );
 }
 
+// ── include-toggles ───────────────────────────────────────────────────────────
+// Property register and Art/Collectibles sit outside the portfolio totals by
+// default (they're standalone sheets, not the traded book). These let you fold
+// them in for a "everything we own" view without making that the default.
+//
+// Collapsed unless asked for — same ▸/▾ reveal the properties page uses for its
+// Parent Companies group, so this stays out of the way on an ordinary visit.
+
+export interface IncludeOpts { property: boolean; art: boolean; parents: boolean }
+const DEFAULT_INCLUDE: IncludeOpts = { property: false, art: false, parents: false };
+
+function IncludeToggles({ value, onChange, busy }: {
+  value: IncludeOpts; onChange: (v: IncludeOpts) => void; busy: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const activeCount = (value.property ? 1 : 0) + (value.art ? 1 : 0);
+
+  const pill = (on: boolean) =>
+    `shrink-0 px-3 py-1.5 rounded text-xs font-medium transition-colors border ${
+      on ? 'bg-prime text-prime-fg border-prime'
+         : 'bg-card border-rule text-dim hover:border-dim hover:text-ink'}`;
+
+  return (
+    <div className="mb-5">
+      <button
+        onClick={() => setOpen(o => !o)}
+        aria-expanded={open}
+        className="inline-flex items-center gap-1.5 text-xs text-dim hover:text-ink transition-colors"
+      >
+        <span aria-hidden>{open ? '▾' : '▸'}</span>
+        Include more
+        {activeCount > 0 && (
+          <span className="text-[10px] px-1.5 py-px rounded bg-prime/10 text-prime">{activeCount}</span>
+        )}
+        {busy && <span className="text-[10px] text-ghost">updating…</span>}
+      </button>
+
+      {open && (
+        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+          <button className={pill(value.property)}
+                  aria-pressed={value.property}
+                  onClick={() => onChange({ ...value, property: !value.property })}>
+            Properties
+          </button>
+          <button className={pill(value.art)}
+                  aria-pressed={value.art}
+                  onClick={() => onChange({ ...value, art: !value.art })}>
+            Art
+          </button>
+          {/* Only meaningful once Properties is on — the backend ignores it otherwise. */}
+          {value.property && (
+            <>
+              <span className="text-ghost text-xs px-1" aria-hidden>·</span>
+              <button className={pill(value.parents)}
+                      aria-pressed={value.parents}
+                      onClick={() => onChange({ ...value, parents: !value.parents })}>
+                incl. parent companies
+              </button>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── overview section ──────────────────────────────────────────────────────────
 
-function OverviewSection({ data }: { data: OverviewData }) {
+function OverviewSection({ data, include, onInclude, ovBusy }: {
+  data: OverviewData; include: IncludeOpts;
+  onInclude: (v: IncludeOpts) => void; ovBusy: boolean;
+}) {
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const toggleEntity = useCallback((id: number | null) => {
     if (id === null) { setSelectedIds([]); return; }
@@ -310,6 +379,9 @@ function OverviewSection({ data }: { data: OverviewData }) {
       {entityPills.length > 1 && (
         <EntitySwitcher entities={entityPills} selectedIds={selectedIds} onToggle={toggleEntity} />
       )}
+
+      {/* Fold in the standalone sheets (property register / art) — collapsed by default */}
+      <IncludeToggles value={include} onChange={onInclude} busy={ovBusy} />
 
       {/* Portfolio summary card */}
       <div className="bg-card rounded-lg border border-rule p-5 sm:p-6">
@@ -383,51 +455,54 @@ export default function DashboardPage() {
   const [overview, setOverview]   = useState<OverviewData | null>(null);
   const [loading, setLoading]     = useState(true);
   const [error, setError]         = useState<string | null>(null);
-  const [loggingOut, setLoggingOut] = useState(false);
+  const [include, setInclude]     = useState<IncludeOpts>(DEFAULT_INCLUDE);
+  const [ovBusy, setOvBusy]       = useState(false);
   const router = useRouter();
 
-  const handleLogout = useCallback(async () => {
-    setLoggingOut(true);
-    try {
-      await fetch(`${API_URL}/api/v1/auth/logout`, { method: 'POST', credentials: 'include' });
-    } catch { /* ignore */ }
-    router.push('/');
-  }, [router]);
+  // Sign-out and idle-timeout both used to be duplicated here; they now live in
+  // the global TopBar and IdleTimeout components mounted in the root layout.
 
-  // Idle timeout
-  useEffect(() => {
-    let t: NodeJS.Timeout;
-    const reset = () => { clearTimeout(t); t = setTimeout(handleLogout, IDLE_TIMEOUT); };
-    const evts = ['mousedown', 'keypress', 'touchstart'] as const;
-    evts.forEach(e => window.addEventListener(e, reset));
-    window.addEventListener('scroll', reset, { passive: true });
-    reset();
-    return () => { clearTimeout(t); evts.forEach(e => window.removeEventListener(e, reset)); window.removeEventListener('scroll', reset); };
-  }, [handleLogout]);
-
-  // Fetch user + overview in parallel
+  // Session — fetched once. Kept separate from the overview so flipping an
+  // include-toggle doesn't re-check the session on every click.
   useEffect(() => {
     const ctrl = new AbortController();
-    Promise.all([
-      fetch(`${API_URL}/api/v1/me`,       { credentials: 'include', signal: ctrl.signal }),
-      fetch(`${API_URL}/api/v1/overview`, { credentials: 'include', signal: ctrl.signal }),
-    ])
-      .then(async ([meRes, ovRes]) => {
-        if (meRes.status === 401 || ovRes.status === 401) { router.push('/'); return; }
-        if (!meRes.ok) throw new Error('Unable to load session.');
-        const me  = await meRes.json();
-        const ov  = ovRes.ok ? await ovRes.json() : null;
-        setUser(me);
-        setOverview(ov);
+    fetch(`${API_URL}/api/v1/me`, { credentials: 'include', signal: ctrl.signal })
+      .then(async res => {
+        if (res.status === 401) { router.push('/'); return; }
+        if (!res.ok) throw new Error('Unable to load session.');
+        setUser(await res.json());
+      })
+      .catch(err => { if (err.name !== 'AbortError') setError(err.message); });
+    return () => ctrl.abort();
+  }, [router]);
+
+  // Overview — refetched whenever the include-toggles change. Property and Art
+  // totals are computed server-side (the client only re-aggregates entity
+  // subsets), so these have to be a round trip, not a local filter.
+  const incKey = `${include.property}|${include.art}|${include.parents}`;
+  useEffect(() => {
+    const ctrl = new AbortController();
+    setOvBusy(true);
+    const qs = new URLSearchParams();
+    if (include.property) qs.set('include_property', 'true');
+    if (include.art)      qs.set('include_art', 'true');
+    if (include.property && include.parents) qs.set('include_parent_properties', 'true');
+    const suffix = qs.toString() ? `?${qs}` : '';
+    fetch(`${API_URL}/api/v1/overview${suffix}`, { credentials: 'include', signal: ctrl.signal })
+      .then(async res => {
+        if (res.status === 401) { router.push('/'); return; }
+        setOverview(res.ok ? await res.json() : null);
         setLoading(false);
+        setOvBusy(false);
       })
       .catch(err => {
         if (err.name === 'AbortError') return;
         setError(err.message);
         setLoading(false);
+        setOvBusy(false);
       });
     return () => ctrl.abort();
-  }, [router]);
+  }, [router, incKey]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── render ──────────────────────────────────────────────────────────────────
 
@@ -440,20 +515,8 @@ export default function DashboardPage() {
             <span className="text-sm font-semibold text-ink">IWS Finserv</span>
             <NavTabs active="/dashboard" role={user?.role} variant="links" className="hidden sm:flex ml-4" />
           </div>
-          <div className="flex items-center gap-3">
-            {user && (
-              <span className="text-xs text-ghost hidden sm:block">
-                {user.full_name || user.email}
-              </span>
-            )}
-            <button
-              onClick={handleLogout}
-              disabled={loggingOut}
-              className="text-xs text-dim hover:text-ink transition-colors disabled:opacity-50"
-            >
-              {loggingOut ? 'Signing out…' : 'Sign out'}
-            </button>
-          </div>
+          {/* Identity + Sign out live in the global TopBar (root layout) so they
+              are reachable from every page, not just here. */}
         </div>
       </header>
 
@@ -475,7 +538,17 @@ export default function DashboardPage() {
           </div>
         )}
 
-        {!loading && overview && <OverviewSection data={overview} />}
+        {/* Content + market rail. The rail is a right-hand column from `lg` up and
+            drops below the content on anything narrower — it's supporting context,
+            so it should never squeeze the portfolio itself on a small screen. */}
+        {!loading && overview && (
+          <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_320px] lg:gap-6 lg:items-start">
+            <OverviewSection data={overview} include={include} onInclude={setInclude} ovBusy={ovBusy} />
+            <div className="mt-6 lg:mt-0 lg:sticky lg:top-16">
+              <MarketRail />
+            </div>
+          </div>
+        )}
 
         {!loading && !overview && !error && (
           <div className="bg-card rounded-lg border border-rule px-6 py-16 text-center">

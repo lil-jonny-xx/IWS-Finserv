@@ -919,6 +919,7 @@ def get_holdings(
                 h.returns_inception_pct,
                 h.cagr_inception_pct,
                 h.xirr_inception_pct,
+                h.fy_returns,
                 h.remarks,
                 sm.isin,
                 sm.security_name,
@@ -983,6 +984,8 @@ def get_holdings(
                 "returns_inception_pct":float(r["returns_inception_pct"]) if r["returns_inception_pct"] else None,
                 "cagr_inception_pct":   float(r["cagr_inception_pct"]) if r["cagr_inception_pct"] else None,
                 "xirr_inception_pct":   float(r["xirr_inception_pct"]) if r["xirr_inception_pct"] else None,
+                # Completed FYs only; the current FY stays in returns_ytd_pct.
+                "fy_returns":           r["fy_returns"],
                 "remarks":              r["remarks"],
             })
 
@@ -1194,6 +1197,10 @@ def get_combined_holdings(
                 "pnl_inception":        round(s["_pnl_inc"], 2)    if s["_pnl_inc"]    else None,
                 "pnl_weekly_change":    round(s["_pnl_wkly"], 2)   if s["_pnl_wkly"]  else None,
                 "returns_ytd_pct":      None,
+                # Not pooled across folios, same as returns_ytd_pct above: each
+                # folio's FY figure has its own capital base, so they can only be
+                # combined by re-deriving from pooled lots — not by averaging.
+                "fy_returns":           None,
                 "returns_inception_pct": returns_inc,
                 "cagr_inception_pct":   cagr,
                 "xirr_inception_pct":   xirr_val,
@@ -1295,6 +1302,7 @@ _EQUITY_HOLDING_COLS = """
     eh.returns_inception_pct,
     eh.cagr_inception_pct,
     eh.xirr_inception_pct,
+    eh.fy_returns,
     eh.first_invested_date,
     eh.sector,
     eh.asset_class,
@@ -1336,6 +1344,10 @@ def _row_to_holding(r: dict) -> dict:
         "returns_inception_pct": _fmt(r["returns_inception_pct"]),
         "cagr_inception_pct":    _fmt(r["cagr_inception_pct"]),
         "xirr_inception_pct":    _fmt(r.get("xirr_inception_pct")),
+        # {"2025-26": {"pnl": …, "pct": …}} for COMPLETED financial years only;
+        # the current FY stays in returns_ytd_pct. A year absent = not knowable
+        # (see fy_returns_worker), which the UI shows as "—" rather than zero.
+        "fy_returns":            r.get("fy_returns"),
         "first_invested_date":   str(r["first_invested_date"]) if r["first_invested_date"] else None,
         "sector":                r["sector"],
         "asset_class":           r.get("asset_class") or "equity",
@@ -1502,11 +1514,20 @@ def get_equity_activity(
     day: Optional[str] = None,
     authorization: Optional[str] = Header(None),
 ):
-    """Equity trades detected today by the intraday snapshot worker (source='snapshot').
+    """Equity trades recorded today, from every capture path.
 
-    Powers the Equity page's "Traded today" panel. Buys/sells are diffed from hourly
-    position snapshots, so the price is the snapshot LTP at detection, not the exact
-    fill. Realised P&L on a sell is qty × (sale price − latest snapshot avg cost).
+    Powers the Equity page's "Traded today" panel. Rows arrive from three tiers, and
+    all of them belong here: the live order-update daemon (source='{broker}',
+    source_ref '{broker}:live:{order_id}') lands a fill in sub-second; the hourly
+    snapshot differ (source='snapshot') catches whatever the daemon missed, priced at
+    the snapshot LTP rather than the exact fill; the daily reconcile writes the
+    authoritative broker rows and supersedes the other two for dates it covers, so the
+    tiers can't double-count.
+
+    Excludes the synthetic sources: 'snapshot_open' is an opening seed, not a trade,
+    and 'reconstructed' rows are balancing plugs rather than real fills.
+
+    Realised P&L on a sell is qty × (sale price − latest snapshot avg cost).
 
     Admin: optional ?entity_id=N (default all). Member: own entity only.
     ?day=YYYY-MM-DD overrides today (defaults to the current date).
@@ -1523,7 +1544,8 @@ def get_equity_activity(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid day (expected YYYY-MM-DD).")
 
-        conditions = ["st.source = 'snapshot'", "st.transaction_date = %s"]
+        conditions = ["st.source NOT IN ('snapshot_open', 'reconstructed')",
+                      "st.transaction_date = %s"]
         params     = [as_of]
         if eids:
             conditions.append("st.entity_id = ANY(%s)")
@@ -2737,7 +2759,8 @@ MANUAL_ASSET_CLASS = {
 }
 
 
-def _fetch_manual_overview_rows(conn, entity_id: Optional[int] = None):
+def _fetch_manual_overview_rows(conn, entity_id: Optional[int] = None,
+                                include_collectibles: bool = False):
     """
     Latest manual_input per (entity, category, label), shaped to match the
     row dicts the /overview aggregator consumes from holding / equity_holding.
@@ -2745,17 +2768,22 @@ def _fetch_manual_overview_rows(conn, entity_id: Optional[int] = None):
     manual-data form, so no FX conversion is needed here. Manual entries have
     no transaction ledger, so cagr/xirr are left as None and pnl is the simple
     current_value - cost difference.
+
+    `include_collectibles` folds the Art/Collectibles bucket back in — off by
+    default (owner decision 2026-07-16: tracked on their own page, kept out of
+    portfolio totals, same treatment as the property register). The dashboard's
+    "with properties and art" toggle turns it on per-request.
     """
     cur   = conn.cursor()
-    # Collectibles are deliberately kept OUT of the portfolio overview (owner
-    # decision 2026-07-16) — tracked on their own page but not folded into
-    # portfolio totals, same treatment as the property register.
-    conds  = ["m.category <> 'collectibles'"]
+    conds: list = []
     params: list = []
+    if not include_collectibles:
+        conds.append("m.category <> 'collectibles'")
     if entity_id:
         conds.append("m.entity_id = %s")
         params.append(entity_id)
-    where = "WHERE " + " AND ".join(conds)
+    # Both conditions are optional now, so guard against an empty "WHERE".
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
     cur.execute(f"""
         SELECT DISTINCT ON (m.entity_id, m.category, m.label)
             m.entity_id, e.entity_name, m.category,
@@ -2918,10 +2946,19 @@ def _fetch_bank_cash_overview_rows(conn, entity_id: Optional[int] = None):
     return out
 
 
-def _fetch_property_overview_rows(conn, entity_id: Optional[int] = None):
+def _fetch_property_overview_rows(conn, entity_id: Optional[int] = None,
+                                  include_parents: bool = False):
     """
     Property register fair values (area x RRR x 1.75, computed like
-    /api/v1/properties) folded into the REAL_ESTATE bucket. Holders are
+    /api/v1/properties) folded into the REAL_ESTATE bucket.
+
+    `include_parents` controls whether holders tagged grp='parent' (the parent
+    companies — DMC, GIPL, RKDJ Trust, …) contribute. Off by default: those are
+    group holdings rather than the family's own book, and the dashboard exposes
+    them behind the "include parent companies" toggle. grp is a flat flag on
+    property_entity, not an ownership tree.
+
+    Holders are
     property_entity rows, not system entities: where a holder mirrors a system
     entity (same name) its rows carry that entity id so member scoping and the
     per-entity bars line up; other holders (LLPs, trusts, parent companies)
@@ -2942,6 +2979,7 @@ def _fetch_property_overview_rows(conn, entity_id: Optional[int] = None):
         f"* CASE WHEN p.is_old_lease THEN {share} ELSE 1 END END"
     )
     cur = conn.cursor()
+    grp_where = "" if include_parents else "WHERE pe.grp <> 'parent'"
     cur.execute(f"""
         WITH fv AS (
             SELECT property_id,
@@ -2960,6 +2998,7 @@ def _fetch_property_overview_rows(conn, entity_id: Optional[int] = None):
         JOIN property_entity pe ON pe.id = o.holder_id
         LEFT JOIN entity e ON e.entity_name = pe.name
         LEFT JOIN fv ON fv.property_id = p.id
+        {grp_where}
         GROUP BY pe.id, pe.name, e.id
     """)
     rows = cur.fetchall()
@@ -2992,16 +3031,31 @@ def _fetch_property_overview_rows(conn, entity_id: Optional[int] = None):
 @app.get("/api/v1/overview")
 def get_overview(
     request: Request,
+    include_property: bool = False,
+    include_art: bool = False,
+    include_parent_properties: bool = False,
     authorization: Optional[str] = Header(None),
 ):
     """
     Aggregate portfolio overview across all asset classes.
     - Admin  → all entities (per-entity breakdown).
     - Member → scoped to their own entity only (a member never sees other entities).
+
+    Two asset groups sit OUT of the totals by default and are opt-in per request,
+    because they are standalone sheets rather than part of the traded book:
+      include_property           — the property register (REAL_ESTATE bucket)
+      include_art                — Art / Collectibles (ART bucket)
+      include_parent_properties  — only meaningful with include_property: also
+                                   count properties held by parent companies
+                                   (property_entity.grp = 'parent')
+    Defaults keep the historical behaviour, so an un-parameterised call returns
+    exactly what it always did.
+
     Returns:
       - summary: totals across MF + equity
       - asset_class_breakdown: combined allocation
       - entities: per-entity breakdown with MF + equity subtotals
+      - included: which opt-in groups this response actually folded in
     """
     conn = None
     try:
@@ -3083,7 +3137,7 @@ def get_overview(
         # Manual inputs (PPF, PMS/AIF, unlisted equity, startups, overseas,
         # cash balances, …) folded into the same asset-class buckets so the
         # dashboard portfolio matches the generated reports.
-        manual_rows = _fetch_manual_overview_rows(conn, eid)
+        manual_rows = _fetch_manual_overview_rows(conn, eid, include_collectibles=include_art)
 
         # Nuvama PMS holdings (equity → EQUITY bucket, cash → CASH) so the
         # dashboard totals and allocation include the PMS portfolio.
@@ -3095,12 +3149,17 @@ def get_overview(
         # Bank-account cash (HSBC / DBS / FAB / …), native ccy → INR → CASH bucket.
         bank_cash_rows = _fetch_bank_cash_overview_rows(conn, eid)
 
-        # Property register values are deliberately NOT folded in here — the
-        # register is a standalone sheet and its fair values stay off the
-        # overview totals (owner decision 2026-07-13). To re-include, add
-        # _fetch_property_overview_rows(conn, eid) back into all_rows.
+        # Property register values stay OFF the totals unless asked for — the
+        # register is a standalone sheet (owner decision 2026-07-13). The
+        # dashboard's "with properties" toggle opts in per request; parent-company
+        # holdings need the second flag on top.
+        property_rows = (
+            _fetch_property_overview_rows(conn, eid, include_parents=include_parent_properties)
+            if include_property else []
+        )
+
         all_rows = (list(mf_rows) + list(eq_rows) + manual_rows + pms_rows
-                    + broker_cash_rows + bank_cash_rows)
+                    + broker_cash_rows + bank_cash_rows + property_rows)
 
         def row_val(r, key):
             v = r[key]
@@ -3212,6 +3271,13 @@ def get_overview(
             },
             "asset_class_breakdown": asset_class_breakdown,
             "entities": entities_out,
+            # Echo what was folded in, so the UI can label totals that aren't the
+            # default book without having to re-derive it from its own request.
+            "included": {
+                "property":          include_property,
+                "art":               include_art,
+                "parent_properties": include_property and include_parent_properties,
+            },
         }
 
     except HTTPException:
@@ -4258,12 +4324,12 @@ BHUNAKSHA_GOA_URL = "https://bhunaksha.goa.gov.in/bhunaksha/"
 OLD_LEASE_OWNER_SHARE = 0.5   # statutory sitting tenant holds the other half
 
 
-def _maps_link(gps_link, address, location):
+def _maps_link(gps_link, address, village):
     """Manual GPS override wins; else a keyless Google Maps search link built from
-    the address (falling back to the locality). None when there's nothing to map."""
+    the address (falling back to the city/village). None when there's nothing to map."""
     if gps_link:
         return gps_link
-    q = (address or location or "").strip()
+    q = (address or village or "").strip()
     if not q:
         return None
     return "https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote_plus(q)
@@ -4307,13 +4373,12 @@ def _property_row(r: dict, docs: list, owners: list, floors: list,
         "property_type":    r["property_type"],
         "holder_id":        r["holder_id"],
         "holder_name":      r["holder_name"],
-        "location":         r["location"],
+        "village":          r["village"],          # "City/Village" — absorbed the old `location`
         "address":          r["address"],
         "taluka":           r["taluka"],
-        "village":          r["village"],
         "survey_no":        r["survey_no"],
         "gps_link":         r["gps_link"],
-        "maps_link":        _maps_link(r["gps_link"], r["address"], r["location"]),
+        "maps_link":        _maps_link(r["gps_link"], r["address"], r["village"]),
         "bhunaksha_url":    BHUNAKSHA_GOA_URL if r["survey_no"] else None,
         "area":             area,
         "built_up_area":    _num(r["built_up_area"]),
@@ -4489,10 +4554,9 @@ class PropertyRequest(BaseModel):
     name:             str
     property_type:    str
     holder_id:        int
-    location:         Optional[str]   = None
+    village:          Optional[str]   = None   # "City/Village" — absorbed the old `location`
     address:          Optional[str]   = None
     taluka:           Optional[str]   = None
-    village:          Optional[str]   = None
     survey_no:        Optional[str]   = None
     gps_link:         Optional[str]   = None   # manual override; blank = derive from address
     area:             Optional[float] = None
@@ -4625,15 +4689,15 @@ def create_property(request: Request, body: PropertyRequest,
         user_id = _property_user_id(cur, payload)
         cur.execute(
             """INSERT INTO property
-                   (name, property_type, holder_id, location, address, taluka, village,
+                   (name, property_type, holder_id, village, address, taluka,
                     survey_no, gps_link, area, built_up_area, area_unit, property_no,
                     acquisition_date, ownership, tenure, is_old_lease, has_parking,
                     parking_count, seller_name, seller_address, stamp_value, lawyer_fees,
                     purchase_price, market_value, rrr, notes, created_by, updated_by)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                        %s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-            (body.name.strip(), body.property_type, body.holder_id, body.location,
-             body.address, body.taluka, body.village, body.survey_no,
+            (body.name.strip(), body.property_type, body.holder_id, body.village,
+             body.address, body.taluka, body.survey_no,
              (body.gps_link or "").strip() or None, body.area, body.built_up_area,
              body.area_unit, body.property_no, body.acquisition_date or None,
              body.ownership, body.tenure, body.is_old_lease, body.has_parking,
@@ -4674,16 +4738,16 @@ def update_property(prop_id: int, request: Request, body: PropertyRequest,
         user_id = _property_user_id(cur, payload)
         cur.execute(
             """UPDATE property SET
-                   name=%s, property_type=%s, holder_id=%s, location=%s, address=%s,
-                   taluka=%s, village=%s, survey_no=%s, gps_link=%s, area=%s,
+                   name=%s, property_type=%s, holder_id=%s, village=%s, address=%s,
+                   taluka=%s, survey_no=%s, gps_link=%s, area=%s,
                    built_up_area=%s, area_unit=%s, property_no=%s, acquisition_date=%s,
                    ownership=%s, tenure=%s, is_old_lease=%s, has_parking=%s,
                    parking_count=%s, seller_name=%s, seller_address=%s, stamp_value=%s,
                    lawyer_fees=%s, purchase_price=%s, market_value=%s, rrr=%s, notes=%s,
                    updated_by=%s, updated_at=NOW()
                WHERE id=%s RETURNING id""",
-            (body.name.strip(), body.property_type, body.holder_id, body.location,
-             body.address, body.taluka, body.village, body.survey_no,
+            (body.name.strip(), body.property_type, body.holder_id, body.village,
+             body.address, body.taluka, body.survey_no,
              (body.gps_link or "").strip() or None, body.area, body.built_up_area,
              body.area_unit, body.property_no, body.acquisition_date or None,
              body.ownership, body.tenure, body.is_old_lease, body.has_parking,

@@ -31,7 +31,7 @@ interface Property {
   id: number; name: string; property_type: PropertyType;
   holder_id: number; holder_name: string;
   owners: Owner[]; natures: Nature[]; floors: Floor[]; images: PropImage[];
-  location: string | null; address: string | null; taluka: string | null; village: string | null;
+  village: string | null; address: string | null; taluka: string | null;
   survey_no: string | null; gps_link: string | null; maps_link: string | null; bhunaksha_url: string | null;
   area: number | null; built_up_area: number | null; area_unit: string | null; property_no: string | null;
   acquisition_date: string | null; ownership: string | null;
@@ -59,7 +59,7 @@ interface FloorForm {
 interface PropertyForm {
   id: number | null; name: string; property_type: PropertyType;
   owners: OwnerForm[]; natures: NatureForm[]; floors: FloorForm[];
-  location: string; address: string; taluka: string; village: string; survey_no: string; gps_link: string;
+  village: string; address: string; taluka: string; survey_no: string; gps_link: string;
   area: string; built_up_area: string; area_unit: string; property_no: string;
   acquisition_date: string; ownership: string; tenure: string; is_old_lease: boolean;
   has_parking: boolean; parking_count: string;
@@ -69,7 +69,7 @@ interface PropertyForm {
 const EMPTY_FORM: PropertyForm = {
   id: null, name: '', property_type: 'land',
   owners: [{ holder_id: '', pct: '100' }], natures: [], floors: [],
-  location: '', address: '', taluka: '', village: '', survey_no: '', gps_link: '',
+  village: '', address: '', taluka: '', survey_no: '', gps_link: '',
   area: '', built_up_area: '', area_unit: 'sq m', property_no: '',
   acquisition_date: '', ownership: '', tenure: '', is_old_lease: false,
   has_parking: false, parking_count: '',
@@ -269,8 +269,8 @@ export default function PropertiesPage() {
         carpet_area: num(f.carpet_area), is_rented: f.is_rented,
         rent_amount: num(f.rent_amount), tenant: f.tenant.trim() || null,
       })),
-      location: form.location || null, address: form.address || null,
-      taluka: form.taluka || null, village: form.village || null,
+      village: form.village || null, address: form.address || null,
+      taluka: form.taluka || null,
       survey_no: form.survey_no || null, gps_link: form.gps_link || null,
       area: num(form.area), built_up_area: num(form.built_up_area),
       area_unit: form.area_unit || 'sq m', property_no: form.property_no || null,
@@ -431,8 +431,8 @@ export default function PropertiesPage() {
       is_rented: f.is_rented, rent_amount: f.rent_amount != null ? String(f.rent_amount) : '',
       tenant: f.tenant ?? '',
     })),
-    location: p.location ?? '', address: p.address ?? '', taluka: p.taluka ?? '',
-    village: p.village ?? '', survey_no: p.survey_no ?? '', gps_link: p.gps_link ?? '',
+    village: p.village ?? '', address: p.address ?? '', taluka: p.taluka ?? '',
+    survey_no: p.survey_no ?? '', gps_link: p.gps_link ?? '',
     area: p.area != null ? String(p.area) : '', built_up_area: p.built_up_area != null ? String(p.built_up_area) : '',
     area_unit: p.area_unit ?? 'sq m', property_no: p.property_no ?? '',
     acquisition_date: p.acquisition_date ?? '', ownership: p.ownership ?? '',
@@ -541,16 +541,9 @@ export default function PropertiesPage() {
               )}
             </div>
 
-            {/* Active properties as a card grid (Airbnb-style covers) */}
-            {active.length === 0 ? (
-              <div className="bg-card rounded-lg border border-rule px-5 py-16 text-center text-sm text-ghost">
-                No properties recorded{selHolders.size ? ' for this filter' : ''} yet.
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                {active.map(p => <PropertyCoverCard key={p.id} p={p} onOpen={() => setCard(p)} />)}
-              </div>
-            )}
+            {/* Active properties — list view; a row click opens the full detail card. */}
+            <PropertyTable rows={active} onOpen={setCard}
+              emptyText={`No properties recorded${selHolders.size ? ' for this filter' : ''} yet.`} />
 
             {leaseList.length > 0 && (
               <section className="mt-8">
@@ -564,9 +557,7 @@ export default function PropertiesPage() {
                   Pre-1990 rent-controlled leaseholds. The sitting tenant holds ~50% of the value, so only the
                   owner&apos;s half feeds the portfolio total (full value shown alongside).
                 </p>
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                  {leaseList.map(p => <PropertyCoverCard key={p.id} p={p} lease onOpen={() => setCard(p)} />)}
-                </div>
+                <PropertyTable rows={leaseList} onOpen={setCard} lease />
               </section>
             )}
 
@@ -578,9 +569,7 @@ export default function PropertiesPage() {
                     {soldList.length}
                   </span>
                 </h2>
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                  {soldList.map(p => <PropertyCoverCard key={p.id} p={p} sold onOpen={() => setCard(p)} />)}
-                </div>
+                <PropertyTable rows={soldList} onOpen={setCard} sold />
                 <p className="text-[11px] text-ghost mt-2">
                   Sold properties no longer count in the portfolio total — their sale price feeds Realised Gains and the overview.
                 </p>
@@ -657,54 +646,92 @@ export default function PropertiesPage() {
 }
 
 // ---------------------------------------------------------------------------
-// Cover card (grid) — hero image, name, type/nature badges, headline value.
+// List view — one scannable row per property. Every detail (gallery, floors,
+// documents, per-floor economics) lives in PropertyModal, which a row click
+// opens; the row itself carries only what you'd scan a sheet for.
 // ---------------------------------------------------------------------------
-function PropertyCoverCard({ p, onOpen, sold, lease }:
-  { p: Property; onOpen: () => void; sold?: boolean; lease?: boolean }) {
-  const hero = p.images.find(i => i.is_hero) || p.images[0] || null;
-  const headline = sold ? p.sale_price : p.value_effective;
+const COLS = [
+  { key: 'name',     label: 'Name',          align: 'left'  },
+  { key: 'entity',   label: 'Entity',        align: 'left'  },
+  { key: 'village',  label: 'City/Village',  align: 'left'  },
+  { key: 'taluka',   label: 'Taluka',        align: 'left'  },
+  { key: 'area',     label: 'Area',          align: 'right' },
+  { key: 'propno',   label: 'Property No.',  align: 'left'  },
+  { key: 'acquired', label: 'Acquired',      align: 'left'  },
+  { key: 'purchase', label: 'Purchase',      align: 'right' },
+  { key: 'rrr',      label: 'RRR',           align: 'right' },
+  { key: 'value',    label: 'Value',         align: 'right' },
+  { key: 'docs',     label: 'Docs',          align: 'left'  },
+] as const;
+
+function PropertyTable({ rows, onOpen, sold, lease, emptyText }: {
+  rows: Property[]; onOpen: (p: Property) => void;
+  sold?: boolean; lease?: boolean; emptyText?: string;
+}) {
   return (
-    <button onClick={onOpen}
-      className="text-left bg-card rounded-lg border border-rule overflow-hidden flex flex-col hover:border-dim transition-colors">
-      <div className="w-full aspect-[4/3] bg-page overflow-hidden relative">
-        {hero ? (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img src={imgUrl(hero.id, true)} alt={p.name} loading="lazy"
-               className="w-full h-full object-cover" />
-        ) : (
-          <div className="w-full h-full flex items-center justify-center text-ghost text-xs">No image</div>
-        )}
-        {p.images.length > 1 && (
-          <span className="absolute bottom-1.5 right-1.5 text-[10px] bg-ink/60 text-white px-1.5 py-0.5 rounded">
-            {p.images.length} photos
-          </span>
-        )}
-      </div>
-      <div className="p-3.5 flex flex-col gap-1.5 flex-1">
-        <div className="flex items-start justify-between gap-2">
-          <h3 className="text-sm font-semibold text-ink leading-tight">{p.name}</h3>
-          <span className="text-sm font-bold text-ink tabular-nums shrink-0">{fmtINR(headline)}</span>
-        </div>
-        <div className="flex flex-wrap gap-1">
-          <span className={`text-[10px] uppercase tracking-wide px-1.5 py-px rounded border ${
-            p.property_type === 'land' ? 'border-emerald-500/40 text-emerald-500' : 'border-sky-500/40 text-sky-500'}`}>
-            {p.property_type}
-          </span>
-          {sold && <span className="text-[10px] uppercase tracking-wide px-1.5 py-px rounded border border-amber-500/40 text-amber-500">sold</span>}
-          {lease && <span className="text-[10px] uppercase tracking-wide px-1.5 py-px rounded border border-violet-500/40 text-violet-400">old lease</span>}
-          {p.natures.map(n => (
-            <span key={n.nature_id} className="text-[10px] px-1.5 py-px rounded border border-rule text-dim">{n.name}</span>
+    <div className="bg-card rounded-lg border border-rule overflow-x-auto">
+      <table className="w-full text-xs min-w-[1100px]">
+        <thead>
+          <tr className="border-b border-rule text-left text-[11px] uppercase tracking-wide text-ghost">
+            {COLS.map(c => (
+              <th key={c.key} className={`px-3 py-2.5 ${c.align === 'right' ? 'text-right' : ''}`}>
+                {c.key === 'value' && sold ? 'Sale Price' : c.label}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.length === 0 && (
+            <tr><td colSpan={COLS.length} className="px-3 py-12 text-center text-ghost">{emptyText}</td></tr>
+          )}
+          {rows.map(p => (
+            <tr key={p.id}
+                onClick={() => onOpen(p)}
+                tabIndex={0}
+                role="button"
+                onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen(p); } }}
+                className="border-t border-rule cursor-pointer hover:bg-page focus:bg-page focus:outline-none transition-colors">
+              <td className="px-3 py-2.5">
+                <div className="flex items-center gap-2">
+                  <span className="font-medium text-ink">{p.name}</span>
+                  <span className={`text-[10px] uppercase tracking-wide px-1.5 py-px rounded border shrink-0 ${
+                    p.property_type === 'land'
+                      ? 'border-emerald-500/40 text-emerald-500'
+                      : 'border-sky-500/40 text-sky-500'}`}>
+                    {p.property_type}
+                  </span>
+                  {sold  && <span className="text-[10px] uppercase tracking-wide px-1.5 py-px rounded border border-amber-500/40 text-amber-500 shrink-0">sold</span>}
+                  {lease && <span className="text-[10px] uppercase tracking-wide px-1.5 py-px rounded border border-violet-500/40 text-violet-400 shrink-0">old lease</span>}
+                  {p.images.length > 0 && (
+                    <span className="text-[10px] text-ghost shrink-0">{p.images.length}📷</span>
+                  )}
+                </div>
+              </td>
+              <td className="px-3 py-2.5 text-dim">{ownersLabel(p)}</td>
+              <td className="px-3 py-2.5 text-dim">{p.village || '—'}</td>
+              <td className="px-3 py-2.5 text-dim">{p.taluka || '—'}</td>
+              <td className="px-3 py-2.5 text-right text-dim tabular-nums">{fmtArea(p.area, p.area_unit)}</td>
+              <td className="px-3 py-2.5 text-dim">{p.property_no || '—'}</td>
+              <td className="px-3 py-2.5 text-dim">{sold ? (p.sale_date || '—') : (p.acquisition_date || '—')}</td>
+              <td className="px-3 py-2.5 text-right text-dim tabular-nums">{fmtINR(p.purchase_price)}</td>
+              <td className="px-3 py-2.5 text-right text-dim tabular-nums">{p.rrr != null ? fmtINR(p.rrr) : '—'}</td>
+              <td className="px-3 py-2.5 text-right font-semibold text-ink tabular-nums">
+                {fmtINR(sold ? p.sale_price : p.value_effective)}
+                {lease && p.total_value != null && (
+                  <span className="block text-[10px] font-normal text-ghost">of {fmtINR(p.total_value)}</span>
+                )}
+              </td>
+              <td className="px-3 py-2.5 text-dim">
+                {p.documents.length}
+                {p.missing_required.length > 0 && (
+                  <span className="ml-1 text-[10px] text-amber-500">{p.missing_required.length} missing</span>
+                )}
+              </td>
+            </tr>
           ))}
-        </div>
-        <p className="text-[11px] text-ghost">{ownersLabel(p)}</p>
-        {(p.location || p.taluka) && (
-          <p className="text-[11px] text-ghost">{[p.location, p.taluka].filter(Boolean).join(', ')}</p>
-        )}
-        {lease && p.total_value != null && (
-          <p className="text-[11px] text-ghost">Full {fmtINR(p.total_value)} · owner 50% {fmtINR(p.value_effective)}</p>
-        )}
-      </div>
-    </button>
+        </tbody>
+      </table>
+    </div>
   );
 }
 
@@ -714,8 +741,8 @@ function PropertyCoverCard({ p, onOpen, sold, lease }:
 function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div>
-      <p className="text-[10px] uppercase tracking-wide text-ghost">{label}</p>
-      <p className="text-xs text-ink break-words">{children}</p>
+      <p className="text-[11px] uppercase tracking-wide text-ghost">{label}</p>
+      <p className="text-sm text-ink font-medium break-words">{children}</p>
     </div>
   );
 }
@@ -753,10 +780,12 @@ function PropertyModal({ p, isAdmin, busy, docTypesFor, docLabelFor, onClose, on
             <button onClick={onClose} aria-label="Close" className="text-ghost hover:text-ink text-xl leading-none">×</button>
           </div>
 
-          <div className="w-full aspect-[16/9] bg-page rounded-lg overflow-hidden mb-2 flex items-center justify-center">
+          {/* Deliberately a modest fixed height, not a full-width 16:9 hero — the
+              details are what this card is for; the photo is supporting context. */}
+          <div className="w-full h-44 sm:h-52 bg-page rounded-lg overflow-hidden mb-2 flex items-center justify-center">
             {heroImg ? (
               // eslint-disable-next-line @next/next/no-img-element
-              <img src={imgUrl(heroImg.id)} alt={p.name} className="w-full h-full object-contain" />
+              <img src={imgUrl(heroImg.id)} alt={p.name} className="max-w-full max-h-full object-contain" />
             ) : (
               <span className="text-ghost text-xs">No images uploaded</span>
             )}
@@ -765,7 +794,7 @@ function PropertyModal({ p, isAdmin, busy, docTypesFor, docLabelFor, onClose, on
             {p.images.map(im => (
               <div key={im.id} className="relative group">
                 <button onClick={() => setHeroId(im.id)}
-                        className={`w-16 h-16 rounded overflow-hidden border-2 ${im.id === heroId ? 'border-prime' : 'border-transparent'}`}>
+                        className={`w-12 h-12 rounded overflow-hidden border-2 ${im.id === heroId ? 'border-prime' : 'border-transparent'}`}>
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img src={imgUrl(im.id, true)} alt="" className="w-full h-full object-cover" />
                 </button>
@@ -791,15 +820,14 @@ function PropertyModal({ p, isAdmin, busy, docTypesFor, docLabelFor, onClose, on
         </div>
 
         {/* Details */}
-        <div className="px-4 sm:px-6 pb-5 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-x-4 gap-y-3 border-t border-rule pt-4">
+        <div className="px-4 sm:px-6 pb-5 grid grid-cols-2 sm:grid-cols-3 gap-x-5 gap-y-4 border-t border-rule pt-4">
           <Field label="Type">{p.property_type}</Field>
           <Field label="Nature">{p.natures.length ? p.natures.map(n => n.area != null ? `${n.name} (${fmtArea(n.area, p.area_unit)})` : n.name).join(', ') : '—'}</Field>
           <Field label="Tenure">{p.tenure || '—'}{p.is_old_lease ? ' · old lease' : ''}</Field>
           <Field label="Ownership">{p.ownership || '—'}</Field>
+          <Field label="City/Village">{p.village || '—'}</Field>
           <Field label="Address">{p.address || '—'}</Field>
-          <Field label="Location">{p.location || '—'}</Field>
           <Field label="Taluka">{p.taluka || '—'}</Field>
-          <Field label="Village">{p.village || '—'}</Field>
           <Field label="Total area">{fmtArea(p.area, p.area_unit)}</Field>
           <Field label="Built-up area">{fmtArea(p.built_up_area, p.area_unit)}</Field>
           <Field label="Property no.">{p.property_no || '—'}</Field>
@@ -1050,15 +1078,13 @@ function PropertyFormModal({ form, setForm, isAdmin, busy, mainHolders, parentHo
             </div>
           </div>
 
+          <label className="flex flex-col gap-1"><span className="text-ghost">City/Village</span>
+            <input value={form.village} onChange={e => set({ village: e.target.value })} placeholder="also used for the Bhunaksha lookup"
+                   className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" /></label>
           <label className="flex flex-col gap-1"><span className="text-ghost">Address</span>
             <input value={form.address} onChange={e => set({ address: e.target.value })} className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" /></label>
-          <label className="flex flex-col gap-1"><span className="text-ghost">Location (locality)</span>
-            <input value={form.location} onChange={e => set({ location: e.target.value })} className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" /></label>
           <label className="flex flex-col gap-1"><span className="text-ghost">Taluka</span>
             <input value={form.taluka} onChange={e => set({ taluka: e.target.value })} className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" /></label>
-          <label className="flex flex-col gap-1"><span className="text-ghost">Village</span>
-            <input value={form.village} onChange={e => set({ village: e.target.value })} placeholder="for Bhunaksha lookup"
-                   className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" /></label>
 
           <label className="flex flex-col gap-1"><span className="text-ghost">Total area of land</span>
             <div className="flex gap-1.5">
