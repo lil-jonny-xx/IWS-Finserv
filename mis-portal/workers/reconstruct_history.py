@@ -14,8 +14,9 @@ do know: the shares exist (held qty), and their cost is the broker's average cos
 The synthetic row is tagged source='reconstructed' (authoritative tier in the
 metrics worker, fully reversible — delete by that source to undo):
   * gap > 0  (held > recorded)  -> a BUY  for the shortfall (transferred-in / pre-history
-             shares), dated at the EARLIEST real buy for that security (so inception
-             is meaningful), priced at the holding's average cost.
+             shares), dated at the start of the CURRENT lot — the first buy after the
+             position last sat flat (see current_lot_start), NOT the earliest buy ever —
+             priced at the holding's average cost.
   * gap < 0  (held < recorded)  -> a SELL for the excess (shares that left off-market),
              dated at the LAST real trade, priced at average cost (no phantom gain).
 
@@ -60,6 +61,45 @@ def connect():
     )
 
 
+def current_lot_start(rows):
+    """Date of the first BUY after the position last sat flat — else the earliest BUY.
+
+    Dating a gap-filling BUY at the earliest-ever buy silently asserts the shares were
+    held across every exit since. When the traded history demonstrably returns to zero
+    (HHR KICL: bought 300 on 2023-11-20, sold exactly 300 on 2024-01-23), the ledger
+    says everything then owned was sold, so unexplained shares cannot be shown to
+    predate that exit. Anchoring them to the re-entry claims only what the trades
+    support.
+
+    This matters beyond the plug's own date: a plug dated before an exit keeps the
+    running balance off zero, so had_full_exit() never fires, so first_invested_date
+    never resets and the FY worker builds lots for years the position didn't exist.
+    HHR KICL's FY2023-24 was computed entirely on an 11-share plug (base 54,737.97 =
+    11 x 4976.18, the plug's own fabricated price).
+
+    Quantities are netted per date so an intraday round-trip can't read as an exit.
+
+    Returns None when the traded history ends FLAT (or never opens) — the shares are
+    held per the broker but the ledger closed out, so there is no current lot to
+    anchor to and the caller must fall back. HHR AVANTIFEED-EQ is the case: its
+    trades net to exactly 0 while the broker reports 1 share, so the 1-share plug
+    belongs at the last trade, not at the first buy 9 months earlier.
+    """
+    per = {}
+    for r in rows:
+        q = f(r["q"]) or 0.0
+        per[r["d"]] = per.get(r["d"], 0.0) + (q if r["side"] == "BUY" else -q)
+    run = 0.0
+    lot_start = None
+    for d in sorted(per):
+        if per[d] > 1e-9 and run <= 1e-9:
+            lot_start = d
+        run += per[d]
+        if run <= 1e-9:
+            lot_start = None
+    return lot_start
+
+
 def plan_for_holding(cur, h, tol):
     """Return a reconstruction plan dict for one holding, or a skip-reason string."""
     eid, broker, isin = h["entity_id"], h["broker"], h["isin"]
@@ -88,9 +128,12 @@ def plan_for_holding(cur, h, tol):
         return "no-real-buys (leave to snapshot seed)"
 
     max_real = max(r["d"] for r in real)
-    min_buy = min(r["d"] for r in real_buys)
     # snapshot rows that survive supersession (dated after the last real trade)
     kept_snap = [r for r in rows if r["src"] == "snapshot" and r["d"] > max_real]
+    # Anchor the gap-BUY to the CURRENT lot, not the earliest buy ever — see
+    # current_lot_start. Walk the same rows that form base_net below, so the flat
+    # points it finds are the ones the gap is measured against.
+    lot_start = current_lot_start(real + kept_snap)
 
     def net(rs):
         return sum((f(r["q"]) if r["side"] == "BUY" else -f(r["q"])) for r in rs)
@@ -105,7 +148,9 @@ def plan_for_holding(cur, h, tol):
         return "no-cost-basis"
 
     side = "BUY" if gap > 0 else "SELL"
-    date = min_buy if side == "BUY" else max_real
+    # No current lot (ledger ends flat) -> the shares have no trade explaining them at
+    # all, so anchor them to the last known activity rather than the first-ever buy.
+    date = (lot_start or max_real) if side == "BUY" else max_real
     return {
         "entity": h["entity_name"], "symbol": h["symbol"], "isin": isin, "broker": broker,
         "held": qty, "real_net": net(real), "base_net": base_net, "gap": gap,
