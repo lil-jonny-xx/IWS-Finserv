@@ -19,13 +19,10 @@ Series (dataflow / key):
   CPI / {C}.CPI._T.IX.M             headline CPI index, _T = all-items total
                                     (CP01..CP12 are COICOP sub-baskets — not the headline)
   CPI / {C}.CPI._T.YOY_PCH_PA_PT.M  CPI inflation %, year-on-year, computed by the IMF
-  PPI / IND.WPI.IX.M                India's actual WPI. The IMF files it inside the PPI
-                                    dataflow under a WPI indicator — it is not the PPI.
-  PPI / IND.WPI.YOY_PCH_PT.M        WPI inflation %, year-on-year
 
-The two dataflows spell the year-on-year transformation DIFFERENTLY — CPI uses
-YOY_PCH_PA_PT, PPI uses YOY_PCH_PT. Using one code for both silently returns an
-empty series rather than an error, so the codes are per-series here on purpose.
+This worker served India's WPI too (PPI / IND.WPI.*) until that series was found stuck
+at Oct-2025; it now comes from the publisher direct — see workers/wpi_worker.py. CPI is
+current to within ~2 months and stays here.
 
 Monthly data, but polled WEEKLY rather than monthly: the IMF republishes on its own
 schedule and already runs ~2 months behind, so a fixed monthly run that lands just
@@ -70,11 +67,16 @@ UA = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 LAST_N = 120
 
 # code -> (dataflow, sdmx key, label, unit)
+#
+# India's WPI is NOT here, though the IMF files it under PPI/IND.WPI.*: that series
+# stops at Oct-2025 and has for months. It now comes from the Office of the Economic
+# Adviser — the body that actually publishes it, ~6 months ahead of the IMF's copy —
+# via workers/wpi_worker.py. Do not restore IN_WPI/IN_WPI_YOY here: the two sources
+# use different index bases, so both workers writing the code would flip the series
+# between bases every week and fake a ~23% move at each switch.
 SERIES = {
     "IN_CPI":       ("CPI", "IND.CPI._T.IX.M",             "India CPI (index)",   "index"),
     "IN_CPI_YOY":   ("CPI", "IND.CPI._T.YOY_PCH_PA_PT.M", "India CPI inflation", "pct_raw"),
-    "IN_WPI":       ("PPI", "IND.WPI.IX.M",                "India WPI (index)",   "index"),
-    "IN_WPI_YOY":   ("PPI", "IND.WPI.YOY_PCH_PT.M",        "India WPI inflation", "pct_raw"),
     "US_CPI":       ("CPI", "USA.CPI._T.IX.M",             "US CPI (index)",      "index"),
     "US_CPI_YOY":   ("CPI", "USA.CPI._T.YOY_PCH_PA_PT.M", "US CPI inflation",    "pct_raw"),
 }

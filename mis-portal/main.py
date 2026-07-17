@@ -1514,7 +1514,12 @@ def get_equity_activity(
     day: Optional[str] = None,
     authorization: Optional[str] = Header(None),
 ):
-    """Equity trades recorded today, from every capture path.
+    """Equity trades recorded today, from every capture path, grouped per decision.
+
+    One row per entity + security + side: buys of a stock collapse into a single row
+    (total quantity, quantity-weighted rate, `fills` counting what was folded in), and
+    its sells into another. Buys and sells are NOT netted against each other — a stock
+    both bought and sold today stays two rows, so the gross activity is still legible.
 
     Powers the Equity page's "Traded today" panel. Rows arrive from three tiers, and
     all of them belong here: the live order-update daemon (source='{broker}',
@@ -1552,13 +1557,31 @@ def get_equity_activity(
             params.append(eids)
         where = " AND ".join(conditions)
 
+        # One row per entity + security + side: a position worked in ten fills is one
+        # decision, and listing each fill separately buried that. Brokers are folded in
+        # too (the panel never showed a broker column), but ENTITIES are not — they are
+        # separate portfolios, and summing DHR's buy with HHR's would invent a trade
+        # neither made.
+        #
+        # Rate is the quantity-weighted average of the fills, derived from Σ(qty×price)
+        # rather than by averaging the prices, which would misreport a 1-share fill and
+        # a 1000-share fill as equals.
+        #
         # avg_cost comes from the most recent position snapshot for the security
-        # (matched by ISIN when present, else by trading symbol == security_name).
+        # (matched by ISIN when present, else by trading symbol == security_name), so it
+        # is already constant across the group — MIN() just satisfies the aggregate.
         cur.execute(
             f"""
             SELECT st.entity_id, e.entity_name, sm.security_name, sm.isin,
-                   st.transaction_type, st.quantity, st.price, st.amount,
-                   st.exchange, st.created_at, ac.avg_cost
+                   st.transaction_type,
+                   SUM(st.quantity)              AS quantity,
+                   SUM(st.quantity * st.price)   AS notional,
+                   SUM(st.amount)                AS amount,
+                   COUNT(*)                      AS fills,
+                   MAX(st.created_at)            AS created_at,
+                   CASE WHEN COUNT(DISTINCT st.exchange) = 1
+                        THEN MIN(st.exchange) END AS exchange,
+                   MIN(ac.avg_cost)              AS avg_cost
             FROM   stock_transaction st
             JOIN   entity e ON e.id = st.entity_id
             JOIN   security_master sm ON sm.id = st.security_id
@@ -1571,7 +1594,9 @@ def get_equity_activity(
                 LIMIT  1
             ) ac ON TRUE
             WHERE  {where}
-            ORDER  BY st.created_at DESC, e.entity_name, sm.security_name
+            GROUP  BY st.entity_id, e.entity_name, sm.security_name, sm.isin,
+                      st.transaction_type
+            ORDER  BY MAX(st.created_at) DESC, e.entity_name, sm.security_name
             """,
             params,
         )
@@ -1579,12 +1604,17 @@ def get_equity_activity(
         cur.close()
 
         trades = []
+        # Counts are of grouped rows, matching what the panel now lists: ten fills of
+        # one stock read as "1 buy", the decision that was actually taken.
         buy_count = sell_count = 0
         realized_total = 0.0
         for r in rows:
             side  = (r["transaction_type"] or "").upper()
             qty   = float(r["quantity"] or 0)
-            price = float(r["price"] or 0)
+            # Quantity-weighted rate across the grouped fills. A zero-qty group can
+            # only come from bad upstream rows; 0 keeps it renderable instead of
+            # raising ZeroDivisionError on the whole panel.
+            price = (float(r["notional"]) / qty) if qty else 0.0
             avg   = float(r["avg_cost"]) if r["avg_cost"] is not None else None
             pnl   = None
             if side == "SELL" and avg is not None:
@@ -1605,7 +1635,11 @@ def get_equity_activity(
                 "amount":        float(r["amount"] or 0),
                 "avg_cost":      round(avg, 4) if avg is not None else None,
                 "realized_pnl":  pnl,
+                # NULL when the group spans two exchanges — the rate is a blend across
+                # both, so naming one of them would be a lie.
                 "exchange":      r["exchange"],
+                # How many fills collapsed into this row; 1 means nothing was grouped.
+                "fills":         int(r["fills"]),
                 "detected_at":   r["created_at"].isoformat() if r["created_at"] else None,
             })
 

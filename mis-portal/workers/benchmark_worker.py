@@ -13,8 +13,13 @@ FRED and Finnhub sit behind it as fallbacks, but only for the codes they quote o
 verified-identical basis (10 and 2 respectively — see FRED_FALLBACK). Neither has
 free commodities or world indices, so a Yahoo outage still stops those advancing.
 
-Runs every minute during market hours (exits immediately off-hours), updating today's
-row in place so "current" stays live while one row/day feeds prev-week & 31-Mar history.
+Runs every minute, updating the current row in place so "current" stays live while one
+row/day feeds prev-week & 31-Mar history. Indian and US indices are fetched only while
+their own exchange is open; everything that trades round the clock or on some other
+exchange's session (FX, commodities, crypto, world indices) is fetched every
+GLOBAL_REFRESH_MINUTES regardless of the hour. Rows are stamped with the date of
+Yahoo's own print, so polling a shut market refreshes its last close instead of
+fabricating one.
 
   # cron (every minute; the worker self-guards market hours):
   * * * * * /var/www/mis-portal/venv/bin/python -m workers.benchmark_worker >> /var/log/mis-portal-benchmark.log 2>&1
@@ -170,14 +175,37 @@ FRED_URL    = "https://api.stlouisfed.org/fred/series/observations"
 FINNHUB_URL = "https://finnhub.io/api/v1/quote"
 
 
-def fetch_index(symbol: str) -> float:
+def fetch_index(symbol: str) -> tuple[date, float, float | None]:
+    """(date of the print, value, previous close) for one Yahoo symbol.
+
+    The date is Yahoo's own `regularMarketTime`, read in the exchange's timezone —
+    NOT today's date. Same rule the FRED/Finnhub fallbacks already follow, and it
+    is what lets GLOBAL symbols be polled round the clock: on a Saturday, gold's
+    last print is still Friday's, so it upserts Friday's row instead of inventing
+    a Saturday one, while Bitcoin genuinely prints on Saturday and gets its own
+    row. Stamping every fetch as `today` would fabricate weekend closes for every
+    market that was shut.
+
+    previousClose backs the day% the ticker shows; Yahoo quotes it on the same
+    basis as regularMarketPrice, so no cross-source reconciliation is involved.
+    """
     r = requests.get(YF_URL.format(sym=symbol), timeout=10, headers=HEADERS)
     r.raise_for_status()
     meta = r.json()["chart"]["result"][0]["meta"]
     price = meta.get("regularMarketPrice") or meta.get("previousClose")
     if price is None:
         raise ValueError(f"No price in Yahoo response for {symbol}")
-    return float(price)
+
+    ts = meta.get("regularMarketTime")
+    tz = meta.get("exchangeTimezoneName")
+    if ts and tz:
+        as_of = datetime.fromtimestamp(int(ts), zoneinfo.ZoneInfo(tz)).date()
+    else:
+        # No timestamp: fall back to today rather than dropping the reading. Only
+        # reachable for a symbol Yahoo quotes without a market time.
+        as_of = date.today()
+    prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+    return as_of, float(price), (float(prev) if prev is not None else None)
 
 
 def fetch_fred(series_id: str) -> tuple[date, float]:
@@ -242,13 +270,17 @@ def _fallback(code: str):
 def main():
     force = "--force" in sys.argv or os.getenv("BENCHMARK_FORCE") == "1"
     nse_open, us_open = is_nse_open(), is_us_open()
-    if not force and not (nse_open or us_open):
-        logger.info("Both markets closed — skipping benchmark fetch (use --force to override).")
-        return
 
     # GLOBAL = trades outside a single session (FX, commodities, crypto) or on an
     # exchange that's shut while we run (Nikkei, FTSE, …). For a closed exchange the
     # value is simply its last close, which is what a markets strip should show.
+    #
+    # GLOBAL is deliberately NOT gated on the Indian or US session: Bitcoin does not
+    # stop at the NSE bell, and gating it there froze crypto, FX, commodities and
+    # every world index overnight and all weekend — the whole rail went stale off-
+    # hours while claiming to be live. Writes land on the print's OWN date (see
+    # fetch_index), so polling a shut market re-writes its last close rather than
+    # inventing a new one.
     #
     # This worker runs every minute. The IN/US indices are what people actually watch
     # tick, so they refresh every run; the GLOBAL set refreshes on a slower cadence —
@@ -258,9 +290,11 @@ def main():
     market_open = {
         "IN":     nse_open,
         "US":     us_open,
-        "GLOBAL": (nse_open or us_open) and slow_tick,
+        "GLOBAL": slow_tick,
     }
-    today = date.today()
+    if not force and not any(market_open.values()):
+        logger.info("Nothing due this tick (NSE closed, US closed, not a GLOBAL tick).")
+        return
     conn = psycopg2.connect(**DB_CONFIG)
     cur = conn.cursor()
     ok = attempted = fell_back = 0
@@ -269,7 +303,7 @@ def main():
             continue                       # this symbol's market is shut right now
         attempted += 1
         try:
-            value = fetch_index(symbol)
+            as_of, value, prev_close = fetch_index(symbol)
         except Exception as e:
             logger.warning("Yahoo failed for %s (%s): %s", code, symbol, e)
             fb = _fallback(code)
@@ -302,13 +336,15 @@ def main():
         # inserted. A manual override (source='manual', e.g. the GS bonds) is left
         # alone — this worker only ever touches codes it owns.
         cur.execute("""
-            INSERT INTO market_benchmark (code, label, as_of_date, value, unit, source, updated_at)
-            VALUES (%s, %s, %s, %s, %s, 'yahoo', NOW())
+            INSERT INTO market_benchmark (code, label, as_of_date, value, unit, prev_close,
+                                          source, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, 'yahoo', NOW())
             ON CONFLICT (code, as_of_date)
             DO UPDATE SET value = EXCLUDED.value, label = EXCLUDED.label,
-                          unit = EXCLUDED.unit, source = 'yahoo', updated_at = NOW()
-        """, (code, label, today, value, unit))
-        logger.info("%s = %s", code, value)
+                          unit = EXCLUDED.unit, prev_close = EXCLUDED.prev_close,
+                          source = 'yahoo', updated_at = NOW()
+        """, (code, label, as_of, value, unit, prev_close))
+        logger.info("%s = %s (as of %s)", code, value, as_of)
         ok += 1
     conn.commit()
     cur.close()

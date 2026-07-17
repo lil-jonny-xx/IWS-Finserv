@@ -1684,7 +1684,7 @@ def _fetch_benchmarks(conn, as_of: date) -> list[dict]:
     cur = conn.cursor()
     try:
         cur.execute("""
-            SELECT code, label, as_of_date, value, unit
+            SELECT code, label, as_of_date, value, unit, prev_close
             FROM market_benchmark
             WHERE value IS NOT NULL AND as_of_date <= %s
             ORDER BY code, as_of_date
@@ -1696,11 +1696,14 @@ def _fetch_benchmarks(conn, as_of: date) -> list[dict]:
     cur.close()
 
     series: dict = defaultdict(list)
-    label_of, unit_of = {}, {}
+    label_of, unit_of, prev_close_of = {}, {}, {}
     for r in rows:
         series[r["code"]].append((r["as_of_date"], float(r["value"])))
         label_of[r["code"]] = r["label"]
         unit_of[r["code"]] = r["unit"]
+        # Rows are ordered by date, so the last one wins — the prior close belonging
+        # to the most recent reading, which is the one day% is measured against.
+        prev_close_of[r["code"]] = float(r["prev_close"]) if r["prev_close"] is not None else None
 
     prev_cut = as_of.fromordinal(as_of.toordinal() - 7)
     mar31    = _fy_mar31(as_of)
@@ -1722,9 +1725,18 @@ def _fetch_benchmarks(conn, as_of: date) -> list[dict]:
         mar       = _at_or_before(pairs, mar31)
         week_pct  = ((current - prev_week) / prev_week) if (prev_week) else None
         ytd_pct   = ((current - mar) / mar) if (mar) else None
+        # Day move, against the previous session's official close as Yahoo reported
+        # it — not against the previous row, which holds whatever the worker last
+        # wrote that day (an intra-day print, not the close) and would silently
+        # compare across a gap. None where no prior close is stored: the manual GS
+        # bonds and the monthly IMF/FRED series have none, and a monthly reading has
+        # no "day" move to show.
+        prev_close = prev_close_of.get(code)
+        day_pct    = ((current - prev_close) / prev_close) if prev_close else None
         out.append({"code": code, "label": label_of[code], "unit": unit_of[code],
                     "current": current, "prev_week": prev_week, "mar31": mar,
-                    "week_pct": week_pct, "ytd_pct": ytd_pct,
+                    "prev_close": prev_close,
+                    "week_pct": week_pct, "ytd_pct": ytd_pct, "day_pct": day_pct,
                     # Date of the CURRENT reading. Daily series are always ~today, but
                     # monthly ones (IMF inflation) can be a couple of months back, and
                     # the UI has to label them rather than imply they're live.

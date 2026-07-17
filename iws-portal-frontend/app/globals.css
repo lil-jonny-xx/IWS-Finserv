@@ -176,6 +176,40 @@ button:not(:disabled):active {
   40%           { opacity: 1; }
 }
 
+/* ── Markets ticker: one continuous loop ─────────────────────
+   The track holds the index strip TWICE, so translating it by exactly -50% lands
+   the copy precisely where the original started and the loop is seamless. Both
+   halves must therefore stay identical — the duplicate is aria-hidden so screen
+   readers hear the indices once.
+
+   Duration is set per-render from JS (--marquee-duration) off the measured strip
+   width, so the scroll speed stays constant whether 5 indices are live or 19,
+   rather than a fixed duration that crawls when the feed is full. */
+@keyframes marquee {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+.marquee { overflow: hidden; }
+.marquee-track { display: inline-flex; width: max-content; }
+
+/* Applied only when motion is welcome. The blanket reduce rule below would
+   otherwise run this once at 0.01ms and leave the strip parked at -50%, i.e.
+   scrolled off — so the animation is never attached in the first place. */
+@media (prefers-reduced-motion: no-preference) {
+  .marquee-track { animation: marquee var(--marquee-duration, 60s) linear infinite; }
+  /* Pause on hover so a number can actually be read, and while a keyboard user
+     is inside the strip. */
+  .marquee:hover .marquee-track,
+  .marquee:focus-within .marquee-track { animation-play-state: paused; }
+}
+
+/* No motion: drop the duplicate (it is pure animation scaffolding) and hand the
+   strip back to native horizontal scrolling, so every index stays reachable. */
+@media (prefers-reduced-motion: reduce) {
+  .marquee { overflow-x: auto; }
+  .marquee-dup { display: none; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;

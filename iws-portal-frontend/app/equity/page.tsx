@@ -19,7 +19,11 @@ interface EquityResponse {
   cash_by_broker?: CashBrokerRow[];
 }
 
+// One row per entity + security + side — the API folds a day's fills together, so
+// `quantity` is the day's total, `price` the quantity-weighted rate, and `fills` how
+// many individual fills went into it.
 interface ActivityTrade {
+  entity_id?: number;
   entity_name: string;
   security_name: string;
   side: 'BUY' | 'SELL';
@@ -27,6 +31,7 @@ interface ActivityTrade {
   price: number;
   amount: number;
   realized_pnl: number | null;
+  fills?: number;
 }
 interface ActivityResponse {
   date: string;
@@ -50,8 +55,13 @@ interface LiveFill {
   order_id: string;
 }
 
-// Buys/sells detected today by the intraday snapshot worker (source='snapshot').
-// Prices are the snapshot LTP at detection, not the exact fill — see the API docstring.
+// Today's trades, one row per security + side rather than one per fill — a position
+// worked in ten fills is one decision. Qty is the day's total and Rate the
+// quantity-weighted average across the fills, so it need not be a price that ever
+// traded. Buys and sells stay separate rows and are never netted.
+//
+// Rows sourced from the snapshot differ (source='snapshot') are priced at the
+// snapshot LTP at detection rather than the exact fill — see the API docstring.
 function TradedToday({ data, showEntityCol }: { data: ActivityResponse; showEntityCol: boolean }) {
   const [open, setOpen] = useState(true);
   if (!data.trades.length) return null;
@@ -92,7 +102,7 @@ function TradedToday({ data, showEntityCol }: { data: ActivityResponse; showEnti
                 <th className="px-3 py-2 text-left font-semibold">Security</th>
                 <th className="px-3 py-2 text-left font-semibold">Side</th>
                 <th className="px-3 py-2 text-right font-semibold">Qty</th>
-                <th className="px-3 py-2 text-right font-semibold">Rate</th>
+                <th className="px-3 py-2 text-right font-semibold">Avg rate</th>
                 <th className="px-3 py-2 text-right font-semibold">Value</th>
                 <th className="px-3 py-2 text-right font-semibold">Realised P&amp;L</th>
               </tr>
@@ -103,7 +113,14 @@ function TradedToday({ data, showEntityCol }: { data: ActivityResponse; showEnti
                 return (
                   <tr key={i} className="border-t border-rule">
                     {showEntityCol && <td className="px-3 py-2 text-dim">{t.entity_name}</td>}
-                    <td className="px-3 py-2 text-ink">{t.security_name}</td>
+                    <td className="px-3 py-2 text-ink">
+                      {t.security_name}
+                      {/* Only worth saying when fills were actually folded together —
+                          it explains why the rate is not a price that ever traded. */}
+                      {(t.fills ?? 1) > 1 && (
+                        <span className="ml-1.5 text-[10px] text-ghost">{t.fills} fills</span>
+                      )}
+                    </td>
                     <td className="px-3 py-2">
                       <span
                         className="px-1.5 py-0.5 rounded text-[10px] font-semibold"
@@ -273,20 +290,44 @@ export default function EquityPage() {
       if (selectedIds.length && !selectedIds.includes(ev.entity_id)) return;
       setActivity(prev => {
         const trade: ActivityTrade = {
-          entity_name: ev.entity, security_name: ev.symbol, side: ev.side,
-          quantity: ev.qty, price: ev.price, amount: ev.amount, realized_pnl: null,
+          entity_id: ev.entity_id, entity_name: ev.entity, security_name: ev.symbol,
+          side: ev.side, quantity: ev.qty, price: ev.price, amount: ev.amount,
+          realized_pnl: null, fills: 1,
         };
         const isBuy = ev.side === 'BUY';
         if (!prev) return {
           date: ev.date, buy_count: isBuy ? 1 : 0, sell_count: isBuy ? 0 : 1,
           realized_pnl_total: 0, trades: [trade],
         };
-        return {
-          ...prev,
-          buy_count: prev.buy_count + (isBuy ? 1 : 0),
-          sell_count: prev.sell_count + (isBuy ? 0 : 1),
-          trades: [trade, ...prev.trades],
+        // Fold the fill into its existing group, mirroring how the API groups, so the
+        // optimistic row doesn't briefly break the one-row-per-decision rule before
+        // the debounced refetch lands. A new group moves to the top; an existing one
+        // stays put, so a stock being worked doesn't jump around while you read it.
+        const i = prev.trades.findIndex(
+          t => t.security_name === ev.symbol && t.side === ev.side && t.entity_name === ev.entity,
+        );
+        if (i === -1) {
+          return {
+            ...prev,
+            buy_count: prev.buy_count + (isBuy ? 1 : 0),
+            sell_count: prev.sell_count + (isBuy ? 0 : 1),
+            trades: [trade, ...prev.trades],
+          };
+        }
+        const g   = prev.trades[i];
+        const qty = g.quantity + ev.qty;
+        const merged: ActivityTrade = {
+          ...g,
+          quantity: qty,
+          // Re-weight rather than take the latest fill's price.
+          price: qty ? (g.price * g.quantity + ev.price * ev.qty) / qty : g.price,
+          amount: g.amount + ev.amount,
+          fills: (g.fills ?? 1) + 1,
         };
+        const trades = [...prev.trades];
+        trades[i] = merged;
+        // Counts are of groups, so folding into one leaves them unchanged.
+        return { ...prev, trades };
       });
       // Debounced authoritative reconcile (real realised P&L + quantities from the API).
       if (refetchTimer.current) clearTimeout(refetchTimer.current);
