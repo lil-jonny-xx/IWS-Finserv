@@ -33,9 +33,39 @@ export interface EquityHoldingRow {
   returns_ytd_pct?: number;
   returns_inception_pct?: number;
   cagr_inception_pct?: number;
+  fy_returns?: FYReturns | null;
   first_invested_date?: string;
   remarks?: string;
   brokers?: string[];  // set only in Combined view — all brokers holding this symbol
+}
+
+// Growth for COMPLETED financial years, keyed "2025-26". The current FY is not in
+// here — it stays in returns_ytd_pct. A year absent means it isn't knowable (the
+// broker's ledger doesn't reach back, no price anchor, or a corporate action makes
+// the comparison invalid), which renders "—" rather than a zero.
+export type FYReturns = Record<string, { pnl: number; pct: number; base: number }>;
+
+// FY labels present anywhere in the data, newest first. Driven by the rows rather
+// than hardcoded, so the columns roll forward on their own each April.
+function fyLabelsOf(rows: EquityHoldingRow[]): string[] {
+  const s = new Set<string>();
+  for (const h of rows) for (const k of Object.keys(h.fy_returns ?? {})) s.add(k);
+  return [...s].sort().reverse();
+}
+
+// Value-weighted FY % across rows: Σpnl / Σbase, NOT a mean of percentages —
+// each row's return stands on its own capital base, so averaging the percentages
+// would weight a ₹5k holding the same as a ₹5cr one.
+function fyTotal(rows: EquityHoldingRow[], label: string): { pnl: number; pct: number | null } {
+  let pnl = 0, base = 0, seen = false;
+  for (const h of rows) {
+    const v = h.fy_returns?.[label];
+    if (!v) continue;
+    seen = true;
+    pnl  += v.pnl;
+    base += v.base;
+  }
+  return { pnl: seen ? pnl : 0, pct: base > 0 ? (pnl / base) * 100 : null };
 }
 
 export interface EquityTotals {
@@ -289,6 +319,18 @@ function mergeBySymbol(holdings: EquityHoldingRow[]): EquityHoldingRow[] {
       returns_inception_pct: returnsInc,
       returns_ytd_pct: returnsYtd,
       cagr_inception_pct: cagrInc,
+      // Re-derive per FY from the merged rows rather than picking one broker's:
+      // Σpnl / Σbase is the only correct way to combine returns that each stand on
+      // their own capital. A year only survives if some row actually has it.
+      fy_returns: (() => {
+        const out: FYReturns = {};
+        for (const l of fyLabelsOf(rows)) {
+          const t = fyTotal(rows, l);
+          const base = rows.reduce((s, h) => s + (h.fy_returns?.[l]?.base ?? 0), 0);
+          if (base > 0) out[l] = { pnl: t.pnl, pct: t.pct ?? 0, base };
+        }
+        return Object.keys(out).length ? out : null;
+      })(),
       first_invested_date: firstDate,
       exposure_pct: undefined,
     });
@@ -386,12 +428,13 @@ function SectionHeader({ sector, rows, colCount }: { sector: string; rows: Equit
 // ── table headers ─────────────────────────────────────────────────────────────
 
 function TableHead({
-  showEntityCol, sortKey, sortDir, onSort,
+  showEntityCol, sortKey, sortDir, onSort, fyLabels,
 }: {
   showEntityCol: boolean;
   sortKey: SortKey;
   sortDir: SortDir;
   onSort: (k: SortKey) => void;
+  fyLabels: string[];
 }) {
   const base = 'px-3 py-2.5 text-xs font-medium text-ghost bg-card border-b border-rule whitespace-nowrap sticky top-0 z-10';
 
@@ -435,6 +478,7 @@ function TableHead({
         <Th col="exposure_pct"        label="Exp %"                   rowSpan={2} />
         <StaticTh label="P&L" colSpan={3} borderL />
         <StaticTh label="Returns" colSpan={3} borderL />
+        {fyLabels.length > 0 && <StaticTh label="FY Growth" colSpan={fyLabels.length} borderL />}
         <th scope="col" rowSpan={2} className={`${base} text-left pr-5 sm:pr-6`}>Remarks</th>
       </tr>
       <tr>
@@ -444,6 +488,11 @@ function TableHead({
         <Th col="returns_ytd_pct"      label="YTD %"    borderL />
         <Th col="returns_inception_pct" label="Inc %" />
         <Th col="cagr_inception_pct"   label="CAGR" />
+        {/* Not sortable: each FY is its own key inside the JSON, and the sort
+            machinery keys off flat row columns. */}
+        {fyLabels.map((l, i) => (
+          <StaticTh key={l} label={`FY${l}`} borderL={i === 0} />
+        ))}
       </tr>
     </thead>
   );
@@ -557,9 +606,13 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
                                  : totals.total_current_market_value;
   const viewCount   = isFiltered ? view.length : holdings.length;
 
+  // FY columns are driven by the data (see fyLabelsOf) — derived from ALL holdings,
+  // not the filtered view, so the columns don't appear/disappear as you filter.
+  const fyLabels = useMemo(() => fyLabelsOf(holdings), [holdings]);
+
   // col count: # + symbol + [entity] + exch + qty + avg_cost + cost + since + mkt_val + prev_wk + wkly_chg + exp% + pnl×3 + ret×3 + remarks
-  //          = 2 + [entity] + 16
-  const colCount = 2 + (showEntityCol ? 1 : 0) + 16;
+  //          = 2 + [entity] + 16, plus one per completed FY
+  const colCount = 2 + (showEntityCol ? 1 : 0) + 16 + fyLabels.length;
 
   return (
     <div className="bg-card rounded-lg border border-rule overflow-hidden">
@@ -688,7 +741,7 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
       {/* Table */}
       <DragScroll className="overflow-auto max-h-[75vh]" role="region" aria-label="Equity holdings table" tabIndex={0}>
         <table className="w-full text-sm" style={{ minWidth: '1400px' }}>
-          <TableHead showEntityCol={showEntityCol} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
+          <TableHead showEntityCol={showEntityCol} sortKey={sortKey} sortDir={sortDir} onSort={handleSort} fyLabels={fyLabels} />
           <tbody>
             {rows.length === 0 ? (
               <tr>
@@ -752,6 +805,12 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
                               ? <span style={{ color: h.returns_inception_pct >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(h.returns_inception_pct)} <span className="text-ghost">abs</span></span>
                               : <span className="text-ghost">—</span>}
                         </td>
+                        {fyLabels.map((l, i) => (
+                          <td key={l}
+                              className={`px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top ${i === 0 ? 'border-l border-rule' : ''}`}>
+                            <ColorNum n={h.fy_returns?.[l]?.pct ?? null} fmt={fmtPct} />
+                          </td>
+                        ))}
                         <td className="px-3 pr-5 sm:pr-6 py-3 text-xs text-ghost align-top max-w-[160px]">{h.remarks ?? '—'}</td>
                       </tr>
                     ))}
@@ -824,6 +883,19 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
                     ? <span style={{ color: avgCagrAll >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(avgCagrAll)} p.a.</span>
                     : <span className="text-ghost">—</span>}
                 </td>
+                {/* FY Growth — Σpnl / Σbase over the rows that HAVE the year, so a
+                    suppressed row doesn't drag the total toward zero. */}
+                {fyLabels.map((l, i) => {
+                  const t = fyTotal(rows, l);
+                  return (
+                    <td key={l}
+                        className={`px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap ${i === 0 ? 'border-l border-rule' : ''}`}>
+                      {t.pct != null
+                        ? <span style={{ color: t.pct >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(t.pct)}</span>
+                        : <span className="text-ghost">—</span>}
+                    </td>
+                  );
+                })}
                 {/* Remarks */}
                 <td />
               </tr>

@@ -33,7 +33,32 @@ export interface MFHoldingRow {
   returns_inception_pct?: number;
   cagr_inception_pct?: number;
   xirr_inception_pct?: number;
+  fy_returns?: FYReturns | null;
   remarks?: string;
+}
+
+// Growth for COMPLETED financial years, keyed "2025-26"; the current FY stays in
+// returns_ytd_pct. A year absent means it isn't knowable (ledger doesn't reach
+// back, or the folio's units don't reconcile) — rendered "—", never 0.
+export type FYReturns = Record<string, { pnl: number; pct: number; base: number }>;
+
+function fyLabelsOf(rows: MFHoldingRow[]): string[] {
+  const s = new Set<string>();
+  for (const h of rows) for (const k of Object.keys(h.fy_returns ?? {})) s.add(k);
+  return [...s].sort().reverse();
+}
+
+// Σpnl / Σbase — never a mean of percentages; each folio's return stands on its
+// own capital base.
+function fyTotal(rows: MFHoldingRow[], label: string): number | null {
+  let pnl = 0, base = 0;
+  for (const h of rows) {
+    const v = h.fy_returns?.[label];
+    if (!v) continue;
+    pnl  += v.pnl;
+    base += v.base;
+  }
+  return base > 0 ? (pnl / base) * 100 : null;
 }
 
 export interface MFTotals {
@@ -409,11 +434,12 @@ function AssetClassHeader({ cls, rows, colCount }: { cls: string; rows: MFHoldin
 // ── table headers ─────────────────────────────────────────────────────────────
 
 function TableHead({
-  sortKey, sortDir, onSort,
+  sortKey, sortDir, onSort, fyLabels = [],
 }: {
   sortKey: SortKey;
   sortDir: SortDir;
   onSort: (k: SortKey) => void;
+  fyLabels?: string[];
 }) {
   const base = 'px-3 py-2.5 text-xs font-medium text-ghost bg-card border-b border-rule whitespace-nowrap sticky top-0 z-10';
 
@@ -461,6 +487,8 @@ function TableHead({
         <StaticTh label="P&L" colSpan={3} borderL />
         {/* Returns group */}
         <StaticTh label="Returns" colSpan={4} borderL />
+        {/* FY Growth group — completed financial years, data-driven */}
+        {fyLabels.length > 0 && <StaticTh label="FY Growth" colSpan={fyLabels.length} borderL />}
         {/* Realized */}
         <th scope="col" rowSpan={2} className={`${base} text-right border-l border-rule`}>Realized</th>
         <th scope="col" rowSpan={2} className={`${base} text-left pr-5 sm:pr-6`}>Remarks</th>
@@ -475,6 +503,10 @@ function TableHead({
         <Th col="returns_inception_pct" label="Inc %" />
         <Th col="cagr_inception_pct"  label="CAGR" />
         <Th col="xirr_inception_pct"  label="XIRR" />
+        {/* Not sortable: each FY lives inside the JSON, not as a flat row column. */}
+        {fyLabels.map((l, i) => (
+          <StaticTh key={l} label={`FY${l}`} borderL={i === 0} />
+        ))}
       </tr>
     </thead>
   );
@@ -494,9 +526,9 @@ function FundName({ name, type }: { name: string; type: string }) {
 // ── data row ──────────────────────────────────────────────────────────────────
 
 function DataRow({
-  h, srNo,
+  h, srNo, fyLabels = [],
 }: {
-  h: MFHoldingRow; srNo: number;
+  h: MFHoldingRow; srNo: number; fyLabels?: string[];
 }) {
   const mktVal = h.market_value_as_on ?? h.current_value;
   return (
@@ -538,6 +570,13 @@ function DataRow({
           ? <span style={{ color: h.xirr_inception_pct >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(h.xirr_inception_pct)} p.a.</span>
           : <span className="text-ghost">—</span>}
       </td>
+      {/* FY Growth */}
+      {fyLabels.map((l, i) => (
+        <td key={l}
+            className={`px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top ${i === 0 ? 'border-l border-rule' : ''}`}>
+          <ColorNum n={h.fy_returns?.[l]?.pct ?? null} fmt={fmtPct} />
+        </td>
+      ))}
       {/* Realized */}
       <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top border-l border-rule">
         {(h.realized_gain ?? 0) > 0
@@ -830,9 +869,14 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
   const avgRetYtd       = wavgBy(view, h => h.returns_ytd_pct, mfWt);
   const avgRetInc       = wavgBy(view, h => h.returns_inception_pct, mfWt);
 
+  // FY columns are data-driven; derived from ALL holdings so they don't appear and
+  // disappear as the view is filtered.
+  const fyLabels = useMemo(() => fyLabelsOf(holdings), [holdings]);
+
   const colCount    = 3                          // sr + fund + folio
     + 8                                          // units nav cost since exp% mktval prevwk wklychg
     + 7                                          // pnl×3 returns×4
+    + fyLabels.length                            // one per completed FY
     + 2;                                         // realized remarks
 
   // group rows
@@ -1136,6 +1180,7 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
               sortKey={sortKey}
               sortDir={sortDir}
               onSort={handleSort}
+              fyLabels={fyLabels}
             />
             <tbody>
               {filtered.length === 0 ? (
@@ -1176,6 +1221,7 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
                             key={h.id}
                             h={h}
                             srNo={++srCounter}
+                            fyLabels={fyLabels}
                           />
                         ))}
                       </Fragment>
@@ -1224,6 +1270,18 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
                   <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap">
                     {avgXirr != null ? <span style={{ color: avgXirr >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(avgXirr)} p.a.</span> : <span className="text-ghost">—</span>}
                   </td>
+                  {/* FY Growth — Σpnl / Σbase over the folios that HAVE the year */}
+                  {fyLabels.map((l, i) => {
+                    const p = fyTotal(view, l);
+                    return (
+                      <td key={l}
+                          className={`px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap ${i === 0 ? 'border-l border-rule' : ''}`}>
+                        {p != null
+                          ? <span style={{ color: p >= 0 ? 'var(--gain)' : 'var(--peril)' }}>{fmtPct(p)}</span>
+                          : <span className="text-ghost">—</span>}
+                      </td>
+                    );
+                  })}
                   {/* Realized */}
                   <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-dim whitespace-nowrap">{totalRealized > 0 ? fmtINR(totalRealized) : '—'}</td>
                   {/* Remarks */}
