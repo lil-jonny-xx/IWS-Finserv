@@ -1724,7 +1724,11 @@ def _fetch_benchmarks(conn, as_of: date) -> list[dict]:
         ytd_pct   = ((current - mar) / mar) if (mar) else None
         out.append({"code": code, "label": label_of[code], "unit": unit_of[code],
                     "current": current, "prev_week": prev_week, "mar31": mar,
-                    "week_pct": week_pct, "ytd_pct": ytd_pct})
+                    "week_pct": week_pct, "ytd_pct": ytd_pct,
+                    # Date of the CURRENT reading. Daily series are always ~today, but
+                    # monthly ones (IMF inflation) can be a couple of months back, and
+                    # the UI has to label them rather than imply they're live.
+                    "as_of": pairs[-1][0].isoformat()})
     return out
 
 

@@ -11,11 +11,25 @@ interface Benchmark {
   week_pct: number | null;
 }
 
+// The ticker carries INDICES only — the world's markets across the top. Everything
+// else (commodities, rates, FX, crypto) lives in the Overview's Markets rail, where
+// it can be grouped under headings instead of scrolling past as one long line.
+//
+// Grouped by region and rendered in this order, with a separator between groups, so
+// the strip reads as India | US | rest-of-world rather than an undifferentiated run.
+const TICKER_GROUPS: { region: string; codes: string[] }[] = [
+  { region: 'INDIA', codes: ['NIFTY', 'SENSEX', 'NIFTYBANK'] },
+  { region: 'US',    codes: ['DOWJONES', 'NASDAQ', 'SP500', 'RUSSELL2000', 'VIX'] },
+  { region: 'WORLD', codes: ['FTSE100', 'DAX', 'CAC40', 'STOXX50', 'NIKKEI', 'HANGSENG',
+                             'SHANGHAI', 'KOSPI', 'ASX200', 'TSX', 'BOVESPA'] },
+];
+
 const SHORT: Record<string, string> = {
-  NIFTY: 'NIFTY', SENSEX: 'SENSEX',
-  DOWJONES: 'DOW JONES', NASDAQ: 'NASDAQ',
-  GS2032_YTM: 'GS 2032', GS2030_YTM: 'GS 2030',
-  GS2032_PRICE: 'GS 2032 ₹', GS2030_PRICE: 'GS 2030 ₹',
+  NIFTY: 'NIFTY', SENSEX: 'SENSEX', NIFTYBANK: 'BANK NIFTY',
+  DOWJONES: 'DOW', NASDAQ: 'NASDAQ', SP500: 'S&P 500', RUSSELL2000: 'RUSSELL', VIX: 'VIX',
+  FTSE100: 'FTSE', DAX: 'DAX', CAC40: 'CAC', STOXX50: 'STOXX 50', NIKKEI: 'NIKKEI',
+  HANGSENG: 'HANG SENG', SHANGHAI: 'SHANGHAI', KOSPI: 'KOSPI', ASX200: 'ASX',
+  TSX: 'TSX', BOVESPA: 'BOVESPA',
 };
 
 function fmt(v: number | null, unit: string): string {
@@ -42,40 +56,41 @@ export default function BenchmarkTicker() {
     return () => { alive = false; clearInterval(id); };
   }, []);
 
-  // Hide entirely when unauthenticated or no data (e.g. the login screen).
+  // Renders the strip only. The sticky bar, background and the sign-out beside it
+  // live in TopBar, so the sign-out stays put on every page even when the
+  // benchmarks are empty or the feed is down.
   if (!rows || rows.length === 0) return null;
-  const shown = rows.filter(r => r.current != null);
-  if (shown.length === 0) return null;
+  const byCode = new Map(rows.filter(r => r.current != null).map(r => [r.code, r]));
+  const groups = TICKER_GROUPS
+    .map(g => ({ region: g.region, rows: g.codes.map(c => byCode.get(c)).filter((r): r is Benchmark => !!r) }))
+    .filter(g => g.rows.length > 0);
+  if (groups.length === 0) return null;
 
   return (
-    <div
-      style={{
-        position: 'sticky', top: 0, zIndex: 60,
-        background: 'var(--ink)', color: 'var(--card)',
-        borderBottom: '1px solid var(--rule)',
-      }}
-      className="w-full overflow-x-auto"
-      aria-label="Market benchmarks"
-    >
-      <div className="flex items-center gap-6 px-4 py-1.5 text-xs whitespace-nowrap"
-           style={{ fontVariantNumeric: 'tabular-nums' }}>
-        <span className="font-bold tracking-wide" style={{ opacity: 0.6 }}>MARKETS</span>
-        {shown.map(r => {
-          const up = (r.week_pct ?? 0) >= 0;
-          return (
-            <span key={r.code} className="inline-flex items-center gap-1.5">
-              <span style={{ opacity: 0.7 }}>{SHORT[r.code] ?? r.label}</span>
-              <span className="font-semibold">{fmt(r.current, r.unit)}</span>
-              {r.week_pct != null && (
-                <span style={{ color: up ? '#22c55e' : '#ef4444' }}>
-                  {up ? '▲' : '▼'} {Math.abs(r.week_pct * 100).toFixed(2)}%
-                </span>
-              )}
-            </span>
-          );
-        })}
-        <span style={{ opacity: 0.4 }} className="ml-auto pl-4">wk %</span>
-      </div>
+    <div className="flex items-center gap-4 px-4 py-1.5 text-xs whitespace-nowrap overflow-x-auto nav-scroll"
+         style={{ fontVariantNumeric: 'tabular-nums' }}
+         aria-label="Market indices">
+      {groups.map((g, gi) => (
+        <span key={g.region} className="inline-flex items-center gap-4">
+          {gi > 0 && <span aria-hidden style={{ opacity: 0.25 }}>|</span>}
+          <span className="font-bold tracking-wide" style={{ opacity: 0.5 }}>{g.region}</span>
+          {g.rows.map(r => {
+            const up = (r.week_pct ?? 0) >= 0;
+            return (
+              <span key={r.code} className="inline-flex items-center gap-1.5">
+                <span style={{ opacity: 0.7 }}>{SHORT[r.code] ?? r.label}</span>
+                <span className="font-semibold">{fmt(r.current, r.unit)}</span>
+                {r.week_pct != null && (
+                  <span style={{ color: up ? '#22c55e' : '#ef4444' }}>
+                    {up ? '▲' : '▼'} {Math.abs(r.week_pct * 100).toFixed(2)}%
+                  </span>
+                )}
+              </span>
+            );
+          })}
+        </span>
+      ))}
+      <span style={{ opacity: 0.4 }} className="pl-2">wk %</span>
     </div>
   );
 }
