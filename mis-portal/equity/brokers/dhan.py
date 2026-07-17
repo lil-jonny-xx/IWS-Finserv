@@ -207,6 +207,23 @@ def fetch_holdings(entity_code: str) -> list[dict]:
     return holdings
 
 
+def _raise_on_failure(resp: dict, entity_code: str, what: str) -> dict:
+    """Raise if Dhan reported a failure, so a broken call can't masquerade as no data.
+
+    dhanhq returns {'status':'failure', 'remarks': {...}, 'data': ''} for every error —
+    expired token, bad TOTP, HTTP 5xx, timeout. `'' or []` then collapses to an empty
+    list that is indistinguishable from a genuine "nothing happened", so an auth
+    failure would silently log as "fetched 0 trades" and leave a real gap in the
+    ledger. Raising instead lets the caller's error handling and the staleness monitor
+    see it. Callers that have a legitimate empty case (e.g. holdings' DH-1111) handle
+    it before calling this.
+    """
+    if (resp or {}).get("status") == "failure":
+        remarks = resp.get("remarks")
+        raise RuntimeError(f"[{entity_code}] Dhan {what} failed: {remarks}")
+    return resp or {}
+
+
 def fetch_trades(entity_code: str, from_date: str, to_date: str) -> list[dict]:
     """Executed trades over a date range from Dhan trade history (paginated).
     Unlike Zerodha/Angel, Dhan exposes a date-ranged history, so gaps self-heal.
@@ -216,7 +233,7 @@ def fetch_trades(entity_code: str, from_date: str, to_date: str) -> list[dict]:
     out, page = [], 0
     while True:
         resp = dhan.get_trade_history(from_date=from_date, to_date=to_date, page_number=page)
-        data = (resp or {}).get("data") or []
+        data = _raise_on_failure(resp, entity_code, f"trade history {from_date}→{to_date}").get("data") or []
         if not data:
             break
         out.extend(data)
@@ -232,7 +249,7 @@ def fetch_ledger(entity_code: str, from_date: str, to_date: str) -> list[dict]:
     Each item: date, voucherdate, narration/description, debit, credit, runbal."""
     dhan = _dhan_client(entity_code)
     resp = dhan.ledger_report(from_date=from_date, to_date=to_date)
-    data = (resp or {}).get("data") or []
+    data = _raise_on_failure(resp, entity_code, f"ledger {from_date}→{to_date}").get("data") or []
     logger.info(f"[{entity_code}] Dhan: fetched {len(data)} ledger rows {from_date}→{to_date}")
     return data
 

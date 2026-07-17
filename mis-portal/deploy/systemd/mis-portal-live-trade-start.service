@@ -15,4 +15,5 @@ ExecStart=/usr/bin/systemctl start \
     mis-portal-live-trade@angel-dhr.service \
     mis-portal-live-trade@angel-hhr.service \
     mis-portal-live-trade@dhan-hhr.service \
-    mis-portal-live-trade@dhan-rajani.service
+    mis-portal-live-trade@dhan-rajani.service \
+    mis-portal-live-trade@zerodha-hdr.service

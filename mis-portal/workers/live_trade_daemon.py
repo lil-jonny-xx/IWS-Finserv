@@ -80,8 +80,87 @@ def entity_id_for(conn, entity_code: str) -> int:
     return row["id"]
 
 
+def apply_fill_to_holding(cur, entity_id: int, broker: str, fill: dict,
+                          side: str, qty: float, price: float) -> str:
+    """Move `equity_holding` by one live fill, so the portal reflects a trade in
+    sub-second rather than waiting on the 60s light-refresh or the daily reconcile.
+
+    Returns a short outcome string for the log.
+
+    A SELL that takes the position to zero DELETEs the row. That is the only path
+    that removes a fully-exited holding: a broker feed simply stops listing a closed
+    position, and both the light-refresh and the full sync are upsert-only and treat
+    an absent symbol as "no update" (never wipe on a blank/flaky read). Without this
+    the row would keep its last non-zero quantity and be repriced forever — a sold
+    stock still showing market value. Driving it from the fill, not from feed
+    absence, keeps that safety property intact: we only zero when the broker told us
+    it sold.
+
+    Matched on (entity, broker, ISIN) first, then symbol — same key order the
+    light-refresh uses. A BUY with no existing row is left alone: creating one needs
+    sector/asset-class classification, which the light-refresh already does within
+    60s.
+    """
+    isin   = (fill.get("isin") or "").strip() or None
+    symbol = fill.get("symbol")
+
+    row = None
+    if isin:
+        cur.execute("SELECT id, quantity, avg_cost FROM equity_holding "
+                    "WHERE entity_id=%s AND broker=%s AND isin=%s",
+                    (entity_id, broker, isin))
+        row = cur.fetchone()
+    if row is None:
+        cur.execute("SELECT id, quantity, avg_cost FROM equity_holding "
+                    "WHERE entity_id=%s AND broker=%s AND symbol=%s",
+                    (entity_id, broker, symbol))
+        row = cur.fetchone()
+
+    if row is None:
+        return "no holding row (light-refresh will create it)"
+
+    hid      = row["id"] if not isinstance(row, tuple) else row[0]
+    old_qty  = float((row["quantity"] if not isinstance(row, tuple) else row[1]) or 0)
+    old_avg  = float((row["avg_cost"] if not isinstance(row, tuple) else row[2]) or 0)
+
+    if side == "BUY":
+        new_qty  = old_qty + qty
+        new_cost = old_qty * old_avg + qty * price
+        new_avg  = (new_cost / new_qty) if new_qty > 0 else 0.0
+        cur.execute(
+            """UPDATE equity_holding
+                  SET quantity=%s, avg_cost=%s, cost=%s,
+                      current_market_value = CASE WHEN current_price IS NOT NULL
+                                                  THEN %s * current_price
+                                                  ELSE current_market_value END,
+                      updated_at=NOW()
+                WHERE id=%s""",
+            (new_qty, new_avg, new_cost, new_qty, hid),
+        )
+        return f"qty {old_qty:g} -> {new_qty:g}"
+
+    # SELL — avg cost is unchanged by a sale; only quantity and total cost move.
+    new_qty = old_qty - qty
+    if new_qty <= 1e-6:
+        cur.execute("DELETE FROM equity_holding WHERE id=%s", (hid,))
+        return f"qty {old_qty:g} -> 0, position closed (row removed)"
+
+    cur.execute(
+        """UPDATE equity_holding
+              SET quantity=%s, cost=%s,
+                  current_market_value = CASE WHEN current_price IS NOT NULL
+                                              THEN %s * current_price
+                                              ELSE current_market_value END,
+                  updated_at=NOW()
+            WHERE id=%s""",
+        (new_qty, new_qty * old_avg, new_qty, hid),
+    )
+    return f"qty {old_qty:g} -> {new_qty:g}"
+
+
 def record_fill(ctx, fill: dict):
-    """Persist one fill and publish it live. `fill` is the broker-agnostic dict:
+    """Persist one fill, move the holding, and publish it live. `fill` is the
+    broker-agnostic dict:
     {symbol, isin, side, qty, price, order_id, ts (datetime|None), exchange}.
 
     Idempotent on source_ref, so a duplicate order-update event (or a reconnect
@@ -117,7 +196,13 @@ def record_fill(ctx, fill: dict):
                     (ctx["entity_id"], sec_id, tdate, side, qty, price, amount, amount,
                      fill.get("exchange"), ctx["broker"], sref),
                 )
+                # Same transaction as the insert above, so the ledger and the holding
+                # can never disagree, and the source_ref dup-check guards it from
+                # being applied twice on a reconnect replay.
+                holding_outcome = apply_fill_to_holding(
+                    cur, ctx["entity_id"], ctx["broker"], fill, side, qty, price)
                 conn.commit()
+                ctx["_holding_outcome"] = holding_outcome
             return "inserted"
         finally:
             cur.close()
@@ -165,9 +250,11 @@ def record_fill(ctx, fill: dict):
         ctx["redis"].publish(LIVE_CHANNEL, json.dumps(event))
     except Exception as e:
         logger.error(f"redis publish failed for {sref}: {e}")
+    holding_outcome = ctx.pop("_holding_outcome", None)
     logger.info(f"FILL {ctx['entity_code']}/{ctx['broker']} {side} {fill.get('symbol')} "
                 f"{qty} @ {price} (order {order_id})"
-                + ("  [dry-run: not written]" if ctx["dry_run"] else "  [recorded + published]"))
+                + ("  [dry-run: not written]" if ctx["dry_run"]
+                   else f"  [recorded + published; holding: {holding_outcome}]"))
 
 
 # ---------------------------------------------------------------------------
