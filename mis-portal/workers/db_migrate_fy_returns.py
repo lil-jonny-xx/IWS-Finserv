@@ -21,8 +21,9 @@ pnl_ytd / returns_ytd_pct, which stays exactly as it is.
     and a Sovereign Gold Bond, ~2.55% of Indian equity value, which report NULL
     rather than a guess).
 
-  equity_holding.fy_returns   JSONB
-  holding.fy_returns          JSONB
+  equity_holding.fy_returns          JSONB
+  holding.fy_returns                 JSONB
+  foreign_equity_holding.fy_returns  JSONB
     {"2025-26": {"pnl": 12345.67, "pct": 8.9}, "2024-25": {...}}
     JSONB rather than flat columns because the set of years rolls forward every
     April — pnl_fy1/pnl_fy2 would need a migration (and a backfill of meaning)
@@ -77,6 +78,13 @@ CREATE TABLE IF NOT EXISTS security_symbol_map (
 
 ALTER TABLE equity_holding ADD COLUMN IF NOT EXISTS fy_returns JSONB;
 ALTER TABLE holding        ADD COLUMN IF NOT EXISTS fy_returns JSONB;
+-- foreign_equity_holding is NOT fed by fy_returns_worker yet, so this stays NULL and
+-- the FY columns read blank on the Foreign Equity page. The column still has to EXIST:
+-- main._EQUITY_HOLDING_COLS selects eh.fy_returns and is shared by the equity, foreign
+-- equity and gold/silver (UNION of both tables) queries. Without it, the foreign and
+-- gold/silver endpoints raise UndefinedColumn and 500 — which is exactly what they did
+-- between the fy-returns feature landing and 2026-07-17, leaving both tabs blank.
+ALTER TABLE foreign_equity_holding ADD COLUMN IF NOT EXISTS fy_returns JSONB;
 """
 
 
