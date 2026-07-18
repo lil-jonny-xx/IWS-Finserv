@@ -874,6 +874,49 @@ def sync_entity_broker(
         snapshot_history(cur, h, today, foreign)
         count += 1
 
+    # Prune fully-exited positions. The broker holdings feed is the current book, so
+    # any equity_holding row for this (entity, broker) that is NOT in the feed has
+    # been sold to zero — the broker's holdings API stops listing a position once its
+    # quantity hits 0. Without this, such a row lingers forever (its as_of_date frozen
+    # at the last day it was still held), showing on the page as if still owned —
+    # e.g. DHR's angel_one CRIZAC-EQ / NCC-EQ, sold 2026-06-12, still displayed a
+    # month later. Realised gains are unaffected: the sells live in stock_transaction.
+    #
+    # Two guards make this safe against a genuinely-held position that a flaky feed
+    # transiently omits (which the non-empty early-return above does NOT catch — that
+    # only stops a fully-blank read):
+    #   1. Ledger cross-check — only delete when the books also say the position is
+    #      closed (net BUY-SELL qty <= 0 for that security). A holding the ledger
+    #      still shows as owned (e.g. HHR zerodha PGINVIT: bought 25k, sold 10k, net
+    #      15k, but dropped from the zerodha feed since 2026-06-30) is KEPT. If it was
+    #      truly sold, the sell reaches the ledger and it prunes on a later run.
+    #   2. Domestic only — foreign brokers (IBKR Flex etc.) have flaky/paused feeds
+    #      and their trades aren't in stock_transaction, so the ledger guard can't
+    #      vouch for them; leave foreign_equity_holding to its own path.
+    present_isins   = [h.isin for h in holdings if h.isin]
+    present_symbols = [h.symbol for h in holdings if h.symbol]
+    if not foreign and present_symbols:
+        cur.execute(
+            """
+            DELETE FROM equity_holding eh
+             WHERE eh.entity_id = %s AND eh.broker = %s
+               AND (eh.isin IS NULL OR eh.isin <> ALL(%s::text[]))
+               AND eh.symbol <> ALL(%s::text[])
+               AND COALESCE((
+                     SELECT SUM(CASE WHEN st.transaction_type = 'BUY'
+                                     THEN st.quantity ELSE -st.quantity END)
+                       FROM stock_transaction st
+                       JOIN security_master sm ON sm.id = st.security_id
+                      WHERE st.entity_id = eh.entity_id
+                        AND sm.isin IS NOT DISTINCT FROM eh.isin
+                   ), 0) <= 0
+            """,
+            (entity_id, broker_label, present_isins, present_symbols),
+        )
+        pruned = cur.rowcount
+        if pruned:
+            logger.info(f"  [{entity_code}/{broker_label}] Pruned {pruned} exited holding(s)")
+
     conn.commit()
     cur.close()
     logger.info(f"  [{entity_code}/{broker_label}] Upserted {count} holdings")
