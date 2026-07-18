@@ -25,6 +25,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -158,10 +159,65 @@ def apply_fill_to_holding(cur, entity_id: int, broker: str, fill: dict,
     return f"qty {old_qty:g} -> {new_qty:g}"
 
 
+# NSE series suffix that Angel One appends to the equity tradingsymbol ('AWFIS-EQ').
+# ONLY '-EQ' is stripped, and only to LOOK UP an existing security — never to name a new
+# one. Other trailing tokens are not safely strippable: '-SM' rows (ORIANA-SM,
+# ALPEXSOLAR-SM) exist under that exact name with no bare twin, and '-N'/'-AUTO' are part
+# of the real ticker (MCDOWELL-N is United Spirits; BAJAJ-AUTO). Stripping those would
+# manufacture the very duplicate this guards against, in reverse.
+_EQ_SUFFIX = re.compile(r"-EQ$")
+
+
+def resolve_isin(cur, entity_id: int, broker: str, symbol: str) -> str | None:
+    """Best-effort ISIN for a live fill whose stream didn't carry one.
+
+    Angel One's (and Zerodha's) order-update stream gives a tradingsymbol and no ISIN.
+    Identity in security_master is the ISIN, so without it get_or_create_security falls
+    to a name match — and Angel's name ('AWFIS-EQ') does not equal the name the
+    ISIN-bearing row already carries ('AWFIS'). It therefore CREATED a second security
+    for the same instrument, and the same trade got counted twice: once live here, once
+    when broker_txn_sync wrote the authoritative fills under the real security. The
+    reconcile's supersede could not collapse them because it matches on security_id.
+
+    Holdings first: Angel One's holdings feed carries BOTH the '-EQ' symbol and the
+    ISIN, so (entity, broker, symbol) resolves it exactly, with no string surgery.
+    Only if that misses (a first-ever buy, before the 60s light-refresh creates the
+    row) do we fall back to matching an existing security by the de-suffixed name.
+    Returns None when nothing resolves — the caller then behaves as before.
+    """
+    if not symbol:
+        return None
+    cur.execute(
+        "SELECT isin FROM equity_holding "
+        "WHERE entity_id=%s AND broker=%s AND symbol=%s AND isin IS NOT NULL",
+        (entity_id, broker, symbol),
+    )
+    row = cur.fetchone()
+    if row:
+        return row["isin"] if not isinstance(row, tuple) else row[0]
+
+    base = _EQ_SUFFIX.sub("", symbol)
+    if base == symbol:
+        return None
+    # Adopt the ISIN of an existing security under the bare name. Restricted to rows
+    # that HAVE an ISIN: a NULL-isin namesake tells us nothing and matching it would
+    # re-run the collision that put us here.
+    cur.execute(
+        "SELECT isin FROM security_master "
+        "WHERE security_name=%s AND security_type='EQUITY' AND isin IS NOT NULL",
+        (base,),
+    )
+    row = cur.fetchone()
+    return (row["isin"] if not isinstance(row, tuple) else row[0]) if row else None
+
+
 def record_fill(ctx, fill: dict):
     """Persist one fill, move the holding, and publish it live. `fill` is the
     broker-agnostic dict:
     {symbol, isin, side, qty, price, order_id, ts (datetime|None), exchange}.
+
+    `isin` may be None — several brokers' order streams omit it — in which case it is
+    resolved from our own holdings before the security lookup (see resolve_isin).
 
     Idempotent on source_ref, so a duplicate order-update event (or a reconnect
     replay) is a no-op. `ctx` carries conn / redis / broker / entity ids / flags."""
@@ -186,7 +242,13 @@ def record_fill(ctx, fill: dict):
                 return "dup"
             amount = qty * price
             if not ctx["dry_run"]:
-                sec_id = get_or_create_security(cur, fill.get("isin"), fill.get("symbol"),
+                # Resolve the ISIN before the lookup: the stream may omit it, and
+                # without one the security is matched by name, which forks a second
+                # security_master row per instrument and double-counts the trade.
+                isin = (fill.get("isin") or "").strip() or None
+                if not isin:
+                    isin = resolve_isin(cur, ctx["entity_id"], ctx["broker"], fill.get("symbol"))
+                sec_id = get_or_create_security(cur, isin, fill.get("symbol"),
                                                 fill.get("exchange"), "INR", True)
                 cur.execute(
                     """INSERT INTO stock_transaction
