@@ -81,7 +81,7 @@ def resolve_all_missing(conn):
         WHERE isin IS NOT NULL
         AND amfi_code IS NULL
         AND security_type NOT IN (
-            'CASH_FOREX', 'PPF', 'UNLISTED_EQUITY',
+            'EQUITY', 'CASH_FOREX', 'PPF', 'UNLISTED_EQUITY',
             'FOREIGN_EQUITY', 'BROKER_CASH', 'BANK_CASH',
             'TRANSIT', 'PMS'
         )
