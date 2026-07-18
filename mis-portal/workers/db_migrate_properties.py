@@ -123,19 +123,31 @@ CREATE TABLE IF NOT EXISTS property_document (
 CREATE INDEX IF NOT EXISTS idx_property_document_pid ON property_document(property_id);
 """
 
-# (name, short_code, grp, sort_order) — system entities are appended first at
-# runtime so the register always covers whatever the portal already knows.
+# Explicit display order for the main-group holders. Applied to BOTH the mirrored
+# system entities and the SEED rows below, so the register lists people/IWS entities
+# in this exact sequence — HDR, SHR, DHR, … — regardless of entity-table id order or
+# which source a holder came from. Anything not named here falls after (see main()).
+MAIN_ORDER = {
+    "HDR": 1, "SHR": 2, "DHR": 3, "SDR": 4, "ADR": 5,
+    "IWS": 6, "HHR": 7, "IWS Fincorp": 8,
+    # then the companies / trusts
+    "Rajani Corp": 9,
+    "Imperial Northstar Pvt. Ltd.": 10, "Imperial Northstar Exim LLP": 11,
+    "Rajani Foundation Trust": 12, "Harish & Sharmila Trust": 13,
+}
+
+# (name, short_code, grp, sort_order) — system entities are mirrored at runtime so the
+# register always covers whatever the portal already knows. Main-group order comes from
+# MAIN_ORDER above; the sort_order here is only a fallback for parent-group rows.
 SEED = [
-    # "IWS Finser LLP" (typo) and "IWS Finserv" were the same holder — merged into
-    # one canonical row on 2026-07-14.
-    ("IWS Finserv LLP",             None,  "main",   20),
-    ("Imperial Northstar Pvt. Ltd.", None, "main",   22),
-    ("Imperial Northstar Exim LLP", None,  "main",   23),
-    ("Sharmila Harish Rajani",      "SHR", "main",   24),
+    ("Imperial Northstar Pvt. Ltd.", None, "main",   0),
+    ("Imperial Northstar Exim LLP", None,  "main",   0),
+    # SHR is not a system entity (not in the entity table); seeded here. Shown as "SHR".
+    ("SHR",                          "SHR", "main",   0),
     # HDR became a system entity (entity table) on 2026-07-13 — his holder row
-    # was renamed to "HDR" and is now mirrored at runtime like DHR/HHR/SDR.
-    ("Rajani Foundation Trust",     None,  "main",   26),
-    ("Harish & Sharmila Trust",     None,  "main",   27),
+    # is now mirrored at runtime like DHR/HHR/SDR.
+    ("Rajani Foundation Trust",     None,  "main",   0),
+    ("Harish & Sharmila Trust",     None,  "main",   0),
     ("DMC",                         None,  "parent", 50),
     ("DMMC",                        None,  "parent", 51),
     ("Rajani Trading",              None,  "parent", 52),
@@ -156,9 +168,12 @@ def main():
         with conn.cursor() as cur:
             cur.execute(DDL)
             # Mirror the system entities (DHR, ADR, IWS…) into the holder list.
+            # Fallback order 100+i keeps any un-mapped system entity after the named
+            # ones while preserving its entity-table order; MAIN_ORDER overrides it.
             cur.execute("SELECT entity_name FROM entity ORDER BY id")
-            system = [(r[0], None, "main", i) for i, r in enumerate(cur.fetchall())]
+            system = [(r[0], None, "main", 100 + i) for i, r in enumerate(cur.fetchall())]
             for name, code, grp, order in system + SEED:
+                order = MAIN_ORDER.get(name, order)
                 cur.execute(
                     """INSERT INTO property_entity (name, short_code, grp, sort_order)
                        VALUES (%s, %s, %s, %s) ON CONFLICT (name) DO NOTHING""",
