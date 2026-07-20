@@ -1,7 +1,6 @@
 'use client';
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import NavTabs from '@/app/components/NavTabs';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
 import MFTable, { type MFHoldingRow, type MFTotals, type CombinedHolding } from './components/MFTable';
 import DragScroll from '@/app/components/DragScroll';
@@ -209,7 +208,6 @@ export default function MutualFundsPage() {
             <h1 className="text-2xl sm:text-3xl font-bold text-ink">Mutual Fund Holdings</h1>
             <p className="text-sm text-ghost mt-0.5">All MF folios with weekly metrics</p>
           </div>
-          <NavTabs active="/mutual-funds" role={user?.role} />
         </div>
 
         {isAdmin && entities.length > 0 && (

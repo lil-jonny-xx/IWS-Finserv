@@ -1,7 +1,6 @@
 'use client';
 import { useEffect, useState, useCallback, useRef, Fragment } from 'react';
 import { useRouter } from 'next/navigation';
-import NavTabs from '@/app/components/NavTabs';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
 import DragScroll from '@/app/components/DragScroll';
 
@@ -286,7 +285,6 @@ export default function GoldSilverPage() {
             <h1 className="text-2xl sm:text-3xl font-bold text-ink">Commodities</h1>
             <span className="text-sm text-ghost">Precious metals (gold &amp; silver ETFs, sovereign gold bonds) and commodities</span>
           </div>
-          <NavTabs active="/gold-silver" role={user?.role} />
         </div>
 
         {isAdmin && entities.length > 0 && (

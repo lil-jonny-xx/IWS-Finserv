@@ -1,5 +1,4 @@
 'use client';
-import NavTabs from '@/app/components/NavTabs';
 import { useEffect, useState, useCallback, Fragment } from 'react';
 import { useRouter } from 'next/navigation';
 import DragScroll from '@/app/components/DragScroll';
@@ -804,14 +803,7 @@ export default function ManualDataPage() {
 
   return (
     <div className="min-h-screen" style={{ background: 'var(--page)' }}>
-      {/* Nav bar */}
-      <header style={{ background: 'var(--card)', borderBottom: '1px solid var(--rule)' }}
-              className="px-6 py-3 flex items-center justify-between">
-        <div className="flex items-center gap-6 min-w-0 flex-1">
-          <span className="font-bold text-sm" style={{ color: 'var(--ink)' }}>Rajani MIS</span>
-          <NavTabs active="/manual-data" role={'admin'} variant="links" />
-        </div>
-      </header>
+      {/* Section tabs are global — see components/GlobalNav in the root layout. */}
 
       <main id="main-content" className="max-w-7xl mx-auto px-4 py-6">
         <div className="flex items-center justify-between mb-5">

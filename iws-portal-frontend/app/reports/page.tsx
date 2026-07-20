@@ -1,7 +1,6 @@
 'use client';
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import NavTabs from '@/app/components/NavTabs';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -34,7 +33,6 @@ export default function ReportsPage() {
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
-  const [isAdmin, setIsAdmin] = useState(false);
 
   const fetchReports = useCallback(async () => {
     const res = await fetch(`${API_URL}/api/v1/reports`, { credentials: 'include' });
@@ -50,7 +48,7 @@ export default function ReportsPage() {
     const c = new AbortController();
     fetch(`${API_URL}/api/v1/me`, { credentials: 'include', signal: c.signal })
       .then(r => r.ok ? r.json() : null)
-      .then((u: { role?: string } | null) => { if (!u) { router.replace('/'); return; } setIsAdmin(u.role === 'admin'); })
+      .then((u: { role?: string } | null) => { if (!u) router.replace('/'); })
       .catch(err => { if (err.name !== 'AbortError') router.replace('/'); });
     return () => c.abort();
   }, [router]);
@@ -96,14 +94,7 @@ export default function ReportsPage() {
 
   return (
     <div className="min-h-screen" style={{ background: 'var(--page)' }}>
-      {/* Nav bar */}
-      <header style={{ background: 'var(--card)', borderBottom: '1px solid var(--rule)' }}
-              className="px-6 py-3 flex items-center justify-between">
-        <div className="flex items-center gap-6 min-w-0 flex-1">
-          <span className="font-bold text-sm" style={{ color: 'var(--ink)' }}>Rajani MIS</span>
-          <NavTabs active="/reports" role={isAdmin ? 'admin' : 'member'} variant="links" />
-        </div>
-      </header>
+      {/* Section tabs are global — see components/GlobalNav in the root layout. */}
 
       <main id="main-content" className="max-w-5xl mx-auto px-4 py-6">
         <div className="flex items-center justify-between mb-6">

@@ -1,7 +1,6 @@
 'use client';
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import NavTabs from '@/app/components/NavTabs';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
 import { useDragScroll } from '@/app/components/DragScroll';
 
@@ -349,7 +348,6 @@ export default function PmsPage() {
               PMS holdings by provider{data?.as_on_date ? ` · as on ${data.as_on_date}` : ''}
             </p>
           </div>
-          <NavTabs active="/pms" role={user?.role} />
         </div>
 
         {isAdmin && entities.length > 0 && (

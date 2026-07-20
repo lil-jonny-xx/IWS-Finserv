@@ -27,6 +27,12 @@
   --notice-ink:        oklch(30%  0.090 230);   /* 7.9:1 on notice bg */
   --notice-dim:        oklch(44%  0.080 230);   /* 5.6:1 on notice bg */
 
+  /* Height of the sticky chrome (ticker bar + section nav). Measured and
+     republished at runtime by components/StickyChrome; this default covers the
+     server render and first paint. Content that sticks below the chrome should
+     offset by it rather than hardcoding a number. */
+  --chrome-h:          88px;
+
   /* Structure */
   --wire:              oklch(84%  0.010 75);    /* input borders */
   --rule:              oklch(88%  0.008 75);    /* dividers */

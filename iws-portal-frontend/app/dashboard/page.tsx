@@ -1,16 +1,12 @@
 'use client';
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
-import Image from 'next/image';
-import NavTabs from '@/app/components/NavTabs';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
 import MarketRail from '@/app/components/MarketRail';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
 // ── types ──────────────────────────────────────────────────────────────────────
-
-interface User { full_name: string; email: string; role: string; }
 
 interface AssetClassItem {
   asset_class: string;
@@ -452,7 +448,6 @@ function OverviewSection({ data, include, onInclude, ovBusy }: {
 // ── dashboard page ────────────────────────────────────────────────────────────
 
 export default function DashboardPage() {
-  const [user, setUser]           = useState<User | null>(null);
   const [overview, setOverview]   = useState<OverviewData | null>(null);
   const [loading, setLoading]     = useState(true);
   const [error, setError]         = useState<string | null>(null);
@@ -463,15 +458,16 @@ export default function DashboardPage() {
   // Sign-out and idle-timeout both used to be duplicated here; they now live in
   // the global TopBar and IdleTimeout components mounted in the root layout.
 
-  // Session — fetched once. Kept separate from the overview so flipping an
-  // include-toggle doesn't re-check the session on every click.
+  // Session — fetched once, purely to bounce an expired session to login. The
+  // name and role are read by the global chrome (TopBar / GlobalNav), so this
+  // page no longer keeps the user in state. Kept separate from the overview so
+  // flipping an include-toggle doesn't re-check the session on every click.
   useEffect(() => {
     const ctrl = new AbortController();
     fetch(`${API_URL}/api/v1/me`, { credentials: 'include', signal: ctrl.signal })
-      .then(async res => {
+      .then(res => {
         if (res.status === 401) { router.push('/'); return; }
         if (!res.ok) throw new Error('Unable to load session.');
-        setUser(await res.json());
       })
       .catch(err => { if (err.name !== 'AbortError') setError(err.message); });
     return () => ctrl.abort();
@@ -509,25 +505,9 @@ export default function DashboardPage() {
 
   return (
     <div className="min-h-screen bg-page">
-      {/* Header */}
-      <header className="sticky top-0 z-30 bg-card border-b border-rule">
-        <div className="max-w-screen-xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3 min-w-0 flex-1">
-            <Image
-              src="/logo.png"
-              alt=""
-              width={342}
-              height={346}
-              priority
-              className="h-8 w-auto shrink-0"
-            />
-            <span className="text-sm font-semibold text-ink">Rajani MIS</span>
-            <NavTabs active="/dashboard" role={user?.role} variant="links" className="hidden sm:flex ml-4" />
-          </div>
-          {/* Identity + Sign out live in the global TopBar (root layout) so they
-              are reachable from every page, not just here. */}
-        </div>
-      </header>
+      {/* Logo, wordmark and section tabs live in the global GlobalNav (root
+          layout), as do identity and Sign out (TopBar) — this page no longer
+          carries its own header. */}
 
       <main className="max-w-screen-xl mx-auto px-4 sm:px-6 py-6">
         {error && (
@@ -553,7 +533,9 @@ export default function DashboardPage() {
         {!loading && overview && (
           <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_320px] lg:gap-6 lg:items-start">
             <OverviewSection data={overview} include={include} onInclude={setInclude} ovBusy={ovBusy} />
-            <div className="mt-6 lg:mt-0 lg:sticky lg:top-16">
+            {/* Offset by the sticky chrome rather than a fixed 4rem, which was
+                tuned to this page's old header and now sits under the nav. */}
+            <div className="mt-6 lg:mt-0 lg:sticky" style={{ top: 'calc(var(--chrome-h) + 1.5rem)' }}>
               <MarketRail />
             </div>
           </div>

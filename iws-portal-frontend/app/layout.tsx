@@ -3,7 +3,7 @@ import { Geist, Geist_Mono } from "next/font/google";
 
 export const dynamic = 'force-dynamic';
 import "./globals.css";
-import TopBar from "./TopBar";
+import StickyChrome from "./components/StickyChrome";
 import IdleTimeout from "./IdleTimeout";
 
 const geistSans = Geist({
@@ -38,7 +38,7 @@ export default function RootLayout({
         >
           Skip to main content
         </a>
-        <TopBar />
+        <StickyChrome />
         <IdleTimeout />
         {children}
       </body>

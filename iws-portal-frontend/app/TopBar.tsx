@@ -10,9 +10,10 @@
 // Auth state is inferred from the route, the same way IdleTimeout does it — the
 // login page is the only unauthenticated route, and every other route already
 // bounces to '/' on a 401.
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import BenchmarkTicker from './BenchmarkTicker';
+import { useMe } from '@/app/lib/useMe';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -21,20 +22,11 @@ const HIDDEN_ROUTES = new Set(['/', '/forgot-password']);
 export default function TopBar() {
   const pathname = usePathname();
   const router = useRouter();
-  const [user, setUser] = useState<{ full_name?: string; email?: string } | null>(null);
   const [loggingOut, setLoggingOut] = useState(false);
 
   const hidden = HIDDEN_ROUTES.has(pathname);
-
-  useEffect(() => {
-    if (hidden) { setUser(null); return; }
-    const ctrl = new AbortController();
-    fetch(`${API_URL}/api/v1/me`, { credentials: 'include', signal: ctrl.signal })
-      .then(r => (r.ok ? r.json() : null))
-      .then(d => setUser(d))
-      .catch(() => { /* offline / aborted — the bar still shows Sign out */ });
-    return () => ctrl.abort();
-  }, [hidden, pathname]);
+  // Shared with GlobalNav so the two bars don't both fetch the session.
+  const user = useMe(!hidden);
 
   const handleLogout = useCallback(async () => {
     setLoggingOut(true);
@@ -51,7 +43,8 @@ export default function TopBar() {
   return (
     <div
       style={{
-        position: 'sticky', top: 0, zIndex: 60,
+        // Stickiness is owned by StickyChrome, which sticks this bar and the nav
+        // together — see the note there on why they can't stick independently.
         background: 'var(--ink)', color: 'var(--card)',
         borderBottom: '1px solid var(--rule)',
       }}

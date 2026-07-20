@@ -1,7 +1,6 @@
 'use client';
 import { useEffect, useState, useCallback, useRef, type ReactNode } from 'react';
 import { useRouter } from 'next/navigation';
-import NavTabs from '@/app/components/NavTabs';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
@@ -231,7 +230,6 @@ export default function GalleryAssetGrid({ category, title, subtitle, showPainte
             <h1 className="text-2xl sm:text-3xl font-bold text-ink">{title}</h1>
             <span className="text-sm text-ghost">{subtitle}</span>
           </div>
-          <NavTabs active={`/${category === 'art' ? 'art' : 'collectibles'}`} role={user?.role} />
         </div>
 
         {isViewer && entities.length > 0 && (

@@ -1,7 +1,6 @@
 'use client';
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import NavTabs from '@/app/components/NavTabs';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
 import ForeignEquityTable, { type EquityHoldingRow, type EquityTotals, type CashCurrencyRow, type CashBrokerRow } from './components/ForeignEquityTable';
 import { asOf, asOfDate } from '@/app/lib/asOf';
@@ -516,7 +515,6 @@ export default function ForeignEquityPage() {
               )}
             </div>
           </div>
-          <NavTabs active="/foreign-equity" role={user?.role} />
         </div>
 
         {isAdmin && entities.length > 0 && (

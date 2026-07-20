@@ -1,7 +1,6 @@
 'use client';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import NavTabs from '@/app/components/NavTabs';
 import type {
   Citation,
   ChartSpec,
@@ -212,7 +211,6 @@ export default function AssistantPage() {
             <h1 className="text-xl font-bold text-ink">Assistant</h1>
             <span className="text-xs text-ghost">Read-only portfolio advisor</span>
           </div>
-          <NavTabs active="/assistant" role={user?.role} />
         </div>
       </header>
 

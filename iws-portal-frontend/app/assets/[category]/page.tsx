@@ -1,7 +1,6 @@
 'use client';
 import { use, useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import NavTabs from '@/app/components/NavTabs';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
 import { DYNAMIC_CATEGORY_LABELS } from '@/app/lib/manualCategories';
 
@@ -174,7 +173,6 @@ export default function ManualAssetPage({ params }: { params: Promise<{ category
             <h1 className="text-2xl sm:text-3xl font-bold text-ink">{title}</h1>
             <span className="text-sm text-ghost">Entered in Manual Data, with attached documents</span>
           </div>
-          <NavTabs active={`/assets/${category}`} role={user?.role} />
         </div>
 
         {entities.length > 0 && (

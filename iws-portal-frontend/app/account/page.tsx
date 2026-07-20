@@ -1,7 +1,6 @@
 'use client';
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import NavTabs from '@/app/components/NavTabs';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -101,7 +100,6 @@ export default function AccountPage() {
             <h1 className="text-2xl sm:text-3xl font-bold text-ink">Account</h1>
             <p className="text-sm text-ghost mt-0.5">Signed in as {me?.email} · {me?.role}</p>
           </div>
-          <NavTabs active="/account" role={me?.role} />
         </div>
 
         <div className="grid gap-6 md:grid-cols-2 max-w-4xl">

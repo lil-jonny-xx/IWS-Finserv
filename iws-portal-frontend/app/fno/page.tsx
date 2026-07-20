@@ -1,7 +1,6 @@
 'use client';
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import NavTabs from '@/app/components/NavTabs';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
@@ -313,7 +312,6 @@ export default function FnoPage() {
               )}
             </div>
           </div>
-          <NavTabs active="/fno" role={user?.role} />
         </div>
 
         {isAdmin && entities.length > 0 && (

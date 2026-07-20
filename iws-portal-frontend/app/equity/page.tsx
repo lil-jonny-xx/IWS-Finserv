@@ -1,7 +1,6 @@
 'use client';
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import NavTabs from '@/app/components/NavTabs';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
 import EquityTable, { type EquityHoldingRow, type EquityTotals, type CashBrokerRow } from './components/EquityTable';
 
@@ -372,7 +371,6 @@ export default function EquityPage() {
               )}
             </div>
           </div>
-          <NavTabs active="/equity" role={user?.role} />
         </div>
 
         {isAdmin && entities.length > 0 && (

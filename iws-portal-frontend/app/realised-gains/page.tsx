@@ -1,7 +1,6 @@
 'use client';
 import { useEffect, useState, useMemo, Fragment } from 'react';
 import { useRouter } from 'next/navigation';
-import NavTabs from '@/app/components/NavTabs';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -69,7 +68,6 @@ export default function RealisedGainsPage() {
   const [loading, setLoading] = useState(true);
   const [period, setPeriod] = useState<Period>('fy');
   const [switches, setSwitches] = useState<Switches>('include');
-  const [role, setRole] = useState<string | undefined>(undefined);
 
   // Role only decides which nav tabs show (Manual Data is admin-only); the report
   // data itself is available to every authenticated user.
@@ -77,7 +75,7 @@ export default function RealisedGainsPage() {
     const c = new AbortController();
     fetch(`${API_URL}/api/v1/me`, { credentials: 'include', signal: c.signal })
       .then(r => r.ok ? r.json() : null)
-      .then((u: { role?: string } | null) => { if (!u) { router.replace('/'); return; } setRole(u.role); })
+      .then((u: { role?: string } | null) => { if (!u) router.replace('/'); })
       .catch(err => { if (err.name !== 'AbortError') router.replace('/'); });
     return () => c.abort();
   }, [router]);
@@ -133,13 +131,7 @@ export default function RealisedGainsPage() {
 
   return (
     <div className="min-h-screen" style={{ background: 'var(--page)' }}>
-      <header style={{ background: 'var(--card)', borderBottom: '1px solid var(--rule)' }}
-              className="px-6 py-3 flex items-center justify-between">
-        <div className="flex items-center gap-6 min-w-0 flex-1">
-          <span className="font-bold text-sm" style={{ color: 'var(--ink)' }}>Rajani MIS</span>
-          <NavTabs active="/realised-gains" role={role} variant="links" />
-        </div>
-      </header>
+      {/* Section tabs are global — see components/GlobalNav in the root layout. */}
 
       <main className="max-w-6xl mx-auto px-4 py-6">
         <div className="mb-4 flex items-end justify-between">

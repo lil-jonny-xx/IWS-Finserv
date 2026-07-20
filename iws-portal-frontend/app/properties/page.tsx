@@ -1,7 +1,6 @@
 'use client';
 import { useEffect, useMemo, useRef, useState, useCallback, type ReactNode } from 'react';
 import { useRouter } from 'next/navigation';
-import NavTabs from '@/app/components/NavTabs';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -465,7 +464,6 @@ export default function PropertiesPage() {
             <h1 className="text-2xl sm:text-3xl font-bold text-ink">Properties</h1>
             <span className="text-sm text-ghost">Land &amp; building register — documents, circle rates and fair values</span>
           </div>
-          <NavTabs active="/properties" role={user?.role} />
         </div>
 
         {/* Multi-select holder filter (empty = All) */}

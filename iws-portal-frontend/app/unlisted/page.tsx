@@ -1,7 +1,6 @@
 'use client';
 import { useEffect, useState, useCallback, useRef, Fragment } from 'react';
 import { useRouter } from 'next/navigation';
-import NavTabs from '@/app/components/NavTabs';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
@@ -287,7 +286,6 @@ export default function UnlistedPage() {
             <h1 className="text-2xl sm:text-3xl font-bold text-ink">Unlisted &amp; Startups</h1>
             <span className="text-sm text-ghost">Private holdings valued from funding rounds, splits &amp; bonuses</span>
           </div>
-          <NavTabs active="/unlisted" role={user?.role} />
         </div>
 
         {isAdmin && entities.length > 0 && (

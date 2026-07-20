@@ -1,7 +1,6 @@
 'use client';
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
-import NavTabs from '@/app/components/NavTabs';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
 import { asOf, asOfDate } from '@/app/lib/asOf';
 
@@ -212,7 +211,6 @@ export default function BanksPage() {
             <h1 className="text-2xl sm:text-3xl font-bold text-ink">Bank Accounts</h1>
             <span className="text-sm text-ghost">Bank &amp; forex balances — entered in Manual Data, with uploaded statements</span>
           </div>
-          <NavTabs active="/bank-accounts" role={user?.role} />
         </div>
 
         {isAdmin && entities.length > 0 && (

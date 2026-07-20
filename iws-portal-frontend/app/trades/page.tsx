@@ -1,7 +1,6 @@
 'use client';
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import NavTabs from '@/app/components/NavTabs';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -152,7 +151,6 @@ export default function TradesPage() {
               Our own tradebook — transfers, demergers, IPO/bonus allotments and trades not yet covered by a broker import
             </span>
           </div>
-          <NavTabs active="/trades" role={user?.role} />
         </div>
 
         {user && user.role !== 'admin' && (
