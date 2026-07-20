@@ -242,7 +242,7 @@ export default function ManualAssetPage({ params }: { params: Promise<{ category
           </div>
         )}
 
-        <p className="text-center text-xs text-ghost mt-8">IWS Finserv &copy; {new Date().getFullYear()}</p>
+        <p className="text-center text-xs text-ghost mt-8">Rajani MIS &copy; {new Date().getFullYear()}</p>
       </div>
 
       {lightbox != null && (

@@ -17,7 +17,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "IWS MIS Portal",
+  title: "Rajani MIS Portal",
   description: "Internal MIS Dashboard",
 };
 

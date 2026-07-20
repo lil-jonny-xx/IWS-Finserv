@@ -136,7 +136,7 @@ export default function RealisedGainsPage() {
       <header style={{ background: 'var(--card)', borderBottom: '1px solid var(--rule)' }}
               className="px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-6 min-w-0 flex-1">
-          <span className="font-bold text-sm" style={{ color: 'var(--ink)' }}>IWS MIS</span>
+          <span className="font-bold text-sm" style={{ color: 'var(--ink)' }}>Rajani MIS</span>
           <NavTabs active="/realised-gains" role={role} variant="links" />
         </div>
       </header>

@@ -351,7 +351,7 @@ export default function GoldSilverPage() {
         )}
 
         <p className="text-center text-xs text-ghost mt-8">
-          IWS Finserv &copy; {new Date().getFullYear()} · Updates on each broker sync
+          Rajani MIS &copy; {new Date().getFullYear()} · Updates on each broker sync
         </p>
       </div>
     </main>

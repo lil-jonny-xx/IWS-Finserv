@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
+import Image from 'next/image';
 import NavTabs from '@/app/components/NavTabs';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
 import MarketRail from '@/app/components/MarketRail';
@@ -512,7 +513,15 @@ export default function DashboardPage() {
       <header className="sticky top-0 z-30 bg-card border-b border-rule">
         <div className="max-w-screen-xl mx-auto px-4 sm:px-6 h-14 flex items-center justify-between gap-4">
           <div className="flex items-center gap-3 min-w-0 flex-1">
-            <span className="text-sm font-semibold text-ink">IWS Finserv</span>
+            <Image
+              src="/logo.png"
+              alt=""
+              width={342}
+              height={346}
+              priority
+              className="h-8 w-auto shrink-0"
+            />
+            <span className="text-sm font-semibold text-ink">Rajani MIS</span>
             <NavTabs active="/dashboard" role={user?.role} variant="links" className="hidden sm:flex ml-4" />
           </div>
           {/* Identity + Sign out live in the global TopBar (root layout) so they

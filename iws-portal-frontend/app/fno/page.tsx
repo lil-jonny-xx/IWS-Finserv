@@ -361,7 +361,7 @@ export default function FnoPage() {
         )}
 
         <p className="text-center text-xs text-ghost mt-8">
-          IWS Finserv &copy; {new Date().getFullYear()} · FnO positions update on each portal sync
+          Rajani MIS &copy; {new Date().getFullYear()} · FnO positions update on each portal sync
         </p>
       </div>
     </main>

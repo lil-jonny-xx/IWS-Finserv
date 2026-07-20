@@ -349,7 +349,7 @@ export default function MutualFundsPage() {
         )}
 
         <p className="text-center text-xs text-ghost mt-8">
-          IWS Finserv &copy; {new Date().getFullYear()} · NAV updated daily at 10:00 PM IST · Metrics at 10:15 PM IST
+          Rajani MIS &copy; {new Date().getFullYear()} · NAV updated daily at 10:00 PM IST · Metrics at 10:15 PM IST
         </p>
       </div>
     </main>

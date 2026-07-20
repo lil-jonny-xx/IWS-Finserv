@@ -280,7 +280,7 @@ export default function GalleryAssetGrid({ category, title, subtitle, showPainte
           </div>
         )}
 
-        <p className="text-center text-xs text-ghost mt-8">IWS Finserv &copy; {new Date().getFullYear()}</p>
+        <p className="text-center text-xs text-ghost mt-8">Rajani MIS &copy; {new Date().getFullYear()}</p>
       </div>
 
       {open && <AssetModal a={open} showPainter={showPainter} onClose={() => setOpen(null)} />}

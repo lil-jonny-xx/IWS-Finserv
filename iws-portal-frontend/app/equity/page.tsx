@@ -422,7 +422,7 @@ export default function EquityPage() {
         )}
 
         <p className="text-center text-xs text-ghost mt-8">
-          IWS Finserv &copy; {new Date().getFullYear()} · Live prices during market hours (09:15–15:30 IST)
+          Rajani MIS &copy; {new Date().getFullYear()} · Live prices during market hours (09:15–15:30 IST)
         </p>
       </div>
     </main>

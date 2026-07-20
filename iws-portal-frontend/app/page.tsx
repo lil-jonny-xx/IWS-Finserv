@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import Image from 'next/image';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -62,8 +63,16 @@ export default function LoginPage() {
   return (
     <main id="main-content" className="min-h-screen flex flex-col items-center justify-center bg-page px-4 py-10">
       <div className="bg-card p-6 sm:p-8 rounded-lg shadow-sm border border-rule w-full max-w-sm">
+        <Image
+          src="/logo.png"
+          alt=""
+          width={342}
+          height={346}
+          priority
+          className="h-16 w-auto mx-auto mb-3"
+        />
         <p className="text-center text-xs font-semibold text-ghost tracking-widest uppercase mb-2">
-          IWS Finserv
+          Rajani MIS
         </p>
         <h1 className="text-2xl font-bold text-ink mb-6 text-center">Sign in</h1>
         <form
@@ -123,7 +132,7 @@ export default function LoginPage() {
           </a>
         </p>
         <p className="text-center text-xs text-ghost mt-6">
-          IWS Finserv &copy; {new Date().getFullYear()}
+          Rajani MIS &copy; {new Date().getFullYear()}
         </p>
       </div>
     </main>

@@ -578,7 +578,7 @@ export default function PropertiesPage() {
           </div>
         )}
 
-        <p className="text-center text-xs text-ghost mt-8">IWS Finserv &copy; {new Date().getFullYear()}</p>
+        <p className="text-center text-xs text-ghost mt-8">Rajani MIS &copy; {new Date().getFullYear()}</p>
       </div>
 
       {/* Detail card modal (Airbnb-style) */}

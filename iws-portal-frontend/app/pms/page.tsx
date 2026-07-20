@@ -411,7 +411,7 @@ export default function PmsPage() {
         )}
 
         <p className="text-center text-xs text-ghost mt-8">
-          IWS Finserv &copy; {new Date().getFullYear()} · PMS data sourced from Prudent Investment (Nuvama WealthSpectrum), Zerodha and ICICI Prudential
+          Rajani MIS &copy; {new Date().getFullYear()} · PMS data sourced from Prudent Investment (Nuvama WealthSpectrum), Zerodha and ICICI Prudential
         </p>
       </div>
     </main>

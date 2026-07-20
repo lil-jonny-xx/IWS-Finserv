@@ -35,7 +35,7 @@ export default function ForgotPasswordPage() {
     <main id="main-content" className="min-h-screen flex flex-col items-center justify-center bg-page px-4 py-10">
       <div className="bg-card p-6 sm:p-8 rounded-lg shadow-sm border border-rule w-full max-w-sm">
         <p className="text-center text-xs font-semibold text-ghost tracking-widest uppercase mb-2">
-          IWS Finserv
+          Rajani MIS
         </p>
         <h1 className="text-2xl font-bold text-ink mb-2 text-center">Reset password</h1>
 
