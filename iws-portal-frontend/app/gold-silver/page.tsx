@@ -1,8 +1,8 @@
 'use client';
-import { useEffect, useState, useCallback, useRef, Fragment } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
-import DragScroll from '@/app/components/DragScroll';
+import EquityTable, { type EquityHoldingRow, type EquityTotals } from '@/app/equity/components/EquityTable';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -34,192 +34,14 @@ interface GoldSilverResponse {
   commodities: HoldingRow[];
   metals_total: number;
   commodities_total: number;
+  metals_totals: EquityTotals;
+  commodities_totals: EquityTotals;
   fx_rates: Record<string, number>;
 }
-
-const CCY_SYMBOL: Record<string, string> = { INR: '₹', USD: '$', GBP: '£', EUR: '€', SGD: 'S$', AED: 'AED ', HKD: 'HK$', CHF: 'CHF ' };
 
 function fmtINR(n: number | null | undefined): string {
   if (n == null) return '—';
   return '₹' + Math.round(n).toLocaleString('en-IN');
-}
-function fmtNative(n: number | null | undefined, ccy: string): string {
-  if (n == null) return '—';
-  const sym = CCY_SYMBOL[ccy] || `${ccy} `;
-  return sym + n.toLocaleString('en-IN', { maximumFractionDigits: 2 });
-}
-function fmtNum(n: number | null | undefined): string {
-  if (n == null) return '—';
-  return n.toLocaleString('en-IN', { maximumFractionDigits: 4 });
-}
-function fmtPct(n: number | null | undefined): string {
-  if (n == null) return '—';
-  return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
-}
-function gainClass(n: number | null | undefined): string {
-  if (n == null || n === 0) return 'text-dim';
-  return n > 0 ? 'text-gain' : 'text-loss';
-}
-
-
-interface GroupedHolding {
-  symbol: string; sector: string | null; currency: string;
-  quantity: number | null; cost: number | null;
-  current_market_value: number | null; current_market_value_native: number | null;
-  pnl_inception: number | null; returns_inception_pct: number | null;
-  entities: string[]; rows: HoldingRow[];
-}
-
-function sumKey(rows: HoldingRow[], key: keyof HoldingRow): number | null {
-  let any = false, t = 0;
-  for (const r of rows) { const v = r[key] as number | null; if (v != null) { any = true; t += v; } }
-  return any ? t : null;
-}
-
-// Collapse the same instrument held across multiple brokers (and entities) into
-// one row; the per-broker lines are revealed on expand.
-function groupBySymbol(rows: HoldingRow[]): GroupedHolding[] {
-  const map = new Map<string, HoldingRow[]>();
-  for (const r of rows) { if (!map.has(r.symbol)) map.set(r.symbol, []); map.get(r.symbol)!.push(r); }
-  return [...map.values()].map(group => {
-    const cost = sumKey(group, 'cost');
-    const pnl  = sumKey(group, 'pnl_inception');
-    const sameCcy = group.every(g => g.currency === group[0].currency);
-    return {
-      symbol: group[0].symbol, sector: group[0].sector, currency: group[0].currency,
-      quantity: sumKey(group, 'quantity'), cost,
-      current_market_value: sumKey(group, 'current_market_value'),
-      current_market_value_native: sameCcy ? sumKey(group, 'current_market_value_native') : null,
-      pnl_inception: pnl,
-      returns_inception_pct: cost && cost !== 0 && pnl != null ? (pnl / cost) * 100 : null,
-      entities: [...new Set(group.map(g => g.entity_name).filter(Boolean) as string[])],
-      rows: group,
-    };
-  }).sort((a, b) => (b.current_market_value ?? 0) - (a.current_market_value ?? 0));
-}
-
-function HoldingsSection({
-  title, subtitle, rows, total, showEntityCol, showNative,
-}: {
-  title: string; subtitle: string; rows: HoldingRow[]; total: number;
-  showEntityCol: boolean; showNative: boolean;
-}) {
-  const [open, setOpen] = useState<Set<string>>(new Set());
-  if (rows.length === 0) return null;
-  const groups = groupBySymbol(rows);
-  const toggle = (s: string) => setOpen(prev => { const n = new Set(prev); if (n.has(s)) n.delete(s); else n.add(s); return n; });
-
-  // Footer column totals ("total everything down"): value columns summed,
-  // Return derived from total P&L / total cost. Native value spans mixed
-  // currencies so it isn't summed.
-  const tQty  = groups.some(g => g.quantity != null)      ? groups.reduce((s, g) => s + (g.quantity ?? 0), 0)      : null;
-  const tCost = groups.some(g => g.cost != null)          ? groups.reduce((s, g) => s + (g.cost ?? 0), 0)          : null;
-  const tVal  = groups.reduce((s, g) => s + (g.current_market_value ?? 0), 0);
-  const tPnl  = groups.some(g => g.pnl_inception != null) ? groups.reduce((s, g) => s + (g.pnl_inception ?? 0), 0) : null;
-  const tRet  = tPnl != null && tCost != null && tCost !== 0 ? (tPnl / tCost) * 100 : null;
-
-  return (
-    <section className="bg-card rounded-lg border border-rule overflow-hidden mb-6">
-      <div className="px-5 sm:px-6 pt-5 pb-4 border-b border-rule flex flex-wrap items-end justify-between gap-3">
-        <div>
-          <h2 className="text-sm font-semibold text-ink">{title}</h2>
-          <p className="text-xs text-ghost mt-0.5">{subtitle}</p>
-        </div>
-        <div className="text-right">
-          <p className="text-[11px] uppercase tracking-wide text-ghost">Current Value</p>
-          <p className="text-lg font-bold text-ink tabular-nums">{fmtINR(total)}</p>
-        </div>
-      </div>
-      <DragScroll className="overflow-x-auto">
-        <table className="w-full text-xs">
-          <thead>
-            <tr className="text-left text-ghost border-b border-rule">
-              <th className="px-4 py-2.5 font-medium">Instrument</th>
-              {showEntityCol && <th className="px-4 py-2.5 font-medium">Entity</th>}
-              <th className="px-4 py-2.5 font-medium text-right">Qty</th>
-              <th className="px-4 py-2.5 font-medium text-right">Invested (₹)</th>
-              {showNative && <th className="px-4 py-2.5 font-medium text-right">Native Value</th>}
-              <th className="px-4 py-2.5 font-medium text-right">Current Value (₹)</th>
-              <th className="px-4 py-2.5 font-medium text-right">P&amp;L (₹)</th>
-              <th className="px-4 py-2.5 font-medium text-right">Return</th>
-            </tr>
-          </thead>
-          <tbody>
-            {groups.map(g => {
-              const multi = g.rows.length > 1;
-              const isOpen = open.has(g.symbol);
-              return (
-                <Fragment key={g.symbol}>
-                  <tr
-                    className={`border-b border-rule last:border-0 transition-colors ${multi ? 'cursor-pointer hover:bg-page/60' : 'hover:bg-page/60'} ${isOpen ? 'bg-page/40' : ''}`}
-                    onClick={multi ? () => toggle(g.symbol) : undefined}
-                  >
-                    <td className="px-4 py-3">
-                      <div className="font-medium text-ink flex items-center gap-1.5">
-                        {multi && (
-                          <span className="inline-block text-[9px] text-ghost transition-transform" style={{ transform: isOpen ? 'rotate(90deg)' : 'none' }}>▶</span>
-                        )}
-                        {g.symbol}
-                      </div>
-                      <div className="text-[11px] text-ghost">
-                        {g.sector || '—'}{g.currency !== 'INR' ? ` · ${g.currency}` : ''}
-                        {multi && ` · ${g.rows.length} brokers`}
-                      </div>
-                    </td>
-                    {showEntityCol && (
-                      <td className="px-4 py-3 text-dim">
-                        {g.entities.length <= 1 ? (g.entities[0] ?? '—') : `${g.entities.length} entities`}
-                      </td>
-                    )}
-                    <td className="px-4 py-3 text-right tabular-nums text-dim">{fmtNum(g.quantity)}</td>
-                    <td className="px-4 py-3 text-right tabular-nums text-dim">{fmtINR(g.cost)}</td>
-                    {showNative && (
-                      <td className="px-4 py-3 text-right tabular-nums text-dim">
-                        {g.currency !== 'INR' ? fmtNative(g.current_market_value_native, g.currency) : '—'}
-                      </td>
-                    )}
-                    <td className="px-4 py-3 text-right tabular-nums font-medium text-ink">{fmtINR(g.current_market_value)}</td>
-                    <td className={`px-4 py-3 text-right tabular-nums ${gainClass(g.pnl_inception)}`}>{fmtINR(g.pnl_inception)}</td>
-                    <td className={`px-4 py-3 text-right tabular-nums ${gainClass(g.returns_inception_pct)}`}>{fmtPct(g.returns_inception_pct)}</td>
-                  </tr>
-                  {multi && isOpen && g.rows.map(h => (
-                    <tr key={`${h.broker}-${h.entity_id}`} className="border-b border-rule last:border-0 bg-page/20 text-[11px]">
-                      <td className="px-4 py-2 pl-9">
-                        <span className="text-dim capitalize">{h.broker}</span>
-                        {showEntityCol && <span className="text-ghost"> · {h.entity_name}</span>}
-                      </td>
-                      {showEntityCol && <td className="px-4 py-2 text-ghost">{h.entity_name}</td>}
-                      <td className="px-4 py-2 text-right tabular-nums text-ghost">{fmtNum(h.quantity)}</td>
-                      <td className="px-4 py-2 text-right tabular-nums text-ghost">{fmtINR(h.cost)}</td>
-                      {showNative && (
-                        <td className="px-4 py-2 text-right tabular-nums text-ghost">
-                          {h.currency !== 'INR' ? fmtNative(h.current_market_value_native, h.currency) : '—'}
-                        </td>
-                      )}
-                      <td className="px-4 py-2 text-right tabular-nums text-dim">{fmtINR(h.current_market_value)}</td>
-                      <td className={`px-4 py-2 text-right tabular-nums ${gainClass(h.pnl_inception)}`}>{fmtINR(h.pnl_inception)}</td>
-                      <td className={`px-4 py-2 text-right tabular-nums ${gainClass(h.returns_inception_pct)}`}>{fmtPct(h.returns_inception_pct)}</td>
-                    </tr>
-                  ))}
-                </Fragment>
-              );
-            })}
-            <tr className="border-t-2 border-rule bg-page font-semibold">
-              <td colSpan={1 + (showEntityCol ? 1 : 0)} className="px-4 py-3 text-xs text-dim uppercase tracking-wide">
-                Total ({groups.length})
-              </td>
-              <td className="px-4 py-3 text-right tabular-nums text-dim">{fmtNum(tQty)}</td>
-              <td className="px-4 py-3 text-right tabular-nums text-dim">{fmtINR(tCost)}</td>
-              {showNative && <td className="px-4 py-3 text-right tabular-nums text-ghost">—</td>}
-              <td className="px-4 py-3 text-right tabular-nums text-ink">{fmtINR(tVal)}</td>
-              <td className={`px-4 py-3 text-right tabular-nums ${gainClass(tPnl)}`}>{fmtINR(tPnl)}</td>
-              <td className={`px-4 py-3 text-right tabular-nums ${gainClass(tRet)}`}>{fmtPct(tRet)}</td>
-            </tr>
-          </tbody>
-        </table>
-      </DragScroll>
-    </section>
-  );
 }
 
 export default function GoldSilverPage() {
@@ -329,22 +151,31 @@ export default function GoldSilverPage() {
               </div>
             )}
 
-            <HoldingsSection
-              title="Precious Metals"
-              subtitle="Gold &amp; silver ETFs and sovereign gold bonds"
-              rows={data.metals}
-              total={data.metals_total}
-              showEntityCol={showEntityCol}
-              showNative={data.metals.some(h => h.currency !== 'INR')}
-            />
-            <HoldingsSection
-              title="Commodities"
-              subtitle="Uranium and other commodity instruments (incl. international)"
-              rows={data.commodities}
-              total={data.commodities_total}
-              showEntityCol={showEntityCol}
-              showNative={data.commodities.some(h => h.currency !== 'INR')}
-            />
+            {/* Same table component the Equity tab uses, so every metric computed
+                for equity (YTD, CAGR, XIRR, FY growth, weekly change, exposure)
+                appears here too, with its sorting, filtering and totals footer. */}
+            {data.metals.length > 0 && (
+              <section className="mb-6">
+                <h2 className="text-base font-semibold text-ink mb-1">Precious Metals</h2>
+                <p className="text-xs text-ghost mb-2">Gold &amp; silver ETFs and sovereign gold bonds</p>
+                <EquityTable
+                  holdings={data.metals as unknown as EquityHoldingRow[]}
+                  totals={data.metals_totals}
+                  showEntityCol={showEntityCol}
+                />
+              </section>
+            )}
+            {data.commodities.length > 0 && (
+              <section>
+                <h2 className="text-base font-semibold text-ink mb-1">Commodities</h2>
+                <p className="text-xs text-ghost mb-2">Uranium and other commodity instruments (incl. international)</p>
+                <EquityTable
+                  holdings={data.commodities as unknown as EquityHoldingRow[]}
+                  totals={data.commodities_totals}
+                  showEntityCol={showEntityCol}
+                />
+              </section>
+            )}
           </div>
         )}
 

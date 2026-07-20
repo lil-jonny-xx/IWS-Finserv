@@ -89,7 +89,10 @@ function TotalCard({ label, value, sub, subClass }: {
 function EntityMetricsTable({ rows }: { rows: PmsByEntity[] }) {
   const ds = useDragScroll();
   const sum = (f: (r: PmsByEntity) => number) => rows.reduce((s, r) => s + f(r), 0);
-  const totalInvested = sum(r => r.invested_cost);
+  // Invested = equity cost only. Cash parked in a PMS account is principal
+  // that was never put to work, so including it understates the return it is
+  // shown beside. It keeps its own column.
+  const totalInvested = sum(r => r.equity_cost);
   const totalValue    = sum(r => r.total);
   const totalPnl      = rows.some(r => r.equity_pnl != null)
     ? sum(r => r.equity_pnl ?? 0) : null;
@@ -102,7 +105,7 @@ function EntityMetricsTable({ rows }: { rows: PmsByEntity[] }) {
           <tr className="text-left text-xs text-ghost">
             <th className="px-5 py-3 font-medium">Entity</th>
             <th className="px-5 py-3 font-medium text-right">PMS Accounts</th>
-            <th className="px-5 py-3 font-medium text-right">Invested (Cost + Cash)</th>
+            <th className="px-5 py-3 font-medium text-right">Invested</th>
             <th className="px-5 py-3 font-medium text-right">Cash</th>
             <th className="px-5 py-3 font-medium text-right">Current Value</th>
             <th className="px-5 py-3 font-medium text-right">P&L</th>
@@ -117,7 +120,7 @@ function EntityMetricsTable({ rows }: { rows: PmsByEntity[] }) {
                 {!r.cost_complete && <span className="text-xs text-ghost" title="One or more PMS providers don't report cost — P&L covers costed holdings only."> *</span>}
               </td>
               <td className="px-5 py-2.5 text-sm text-dim text-right tabular-nums">{r.pms_count}</td>
-              <td className="px-5 py-2.5 text-sm text-dim text-right tabular-nums">₹{inr(r.invested_cost)}</td>
+              <td className="px-5 py-2.5 text-sm text-dim text-right tabular-nums">₹{inr(r.equity_cost)}</td>
               <td className="px-5 py-2.5 text-sm text-dim text-right tabular-nums">₹{inr(r.cash_total)}</td>
               <td className="px-5 py-2.5 text-sm text-ink font-medium text-right tabular-nums">₹{inr(r.total)}</td>
               <td className={`px-5 py-2.5 text-sm text-right tabular-nums ${pnlClass(r.equity_pnl)}`}>{signedInr(r.equity_pnl)}</td>
@@ -275,7 +278,7 @@ function SourceSection({ s, holdings, showEntity }: {
         </div>
       </div>
       <div className="bg-card rounded-lg border border-rule px-5 py-3.5 mb-3 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-x-6 gap-y-3">
-        <SourceStat label="Invested (Cost + Cash)" value={`₹${inr(s.cost_complete ? s.invested_cost : null)}`} />
+        <SourceStat label="Invested" value={`₹${inr(s.cost_complete ? s.equity_cost : null)}`} />
         <SourceStat label="Current Value" value={`₹${inr(s.total)}`} />
         <SourceStat label="Cash" value={`₹${inr(s.cash_total)}`} />
         <SourceStat label="P&L" value={signedInr(s.equity_pnl)} valueClass={pnlClass(s.equity_pnl)} />
@@ -375,8 +378,8 @@ export default function PmsPage() {
         {data && t && (
           <>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-5">
-              <TotalCard label="Total Invested (Cost + Cash)" value={`₹${inr(t.invested_cost)}`}
-                sub={`Cost ₹${inr(t.equity_cost)} + Cash ₹${inr(t.cash_total)}`} />
+              <TotalCard label="Total Invested" value={`₹${inr(t.equity_cost)}`}
+                sub={`Excludes ₹${inr(t.cash_total)} uninvested cash`} />
               <TotalCard label="Equity" value={`₹${inr(t.equity_total)}`}
                 sub={`${t.equity_count} holding${t.equity_count === 1 ? '' : 's'} · P&L ${signedInr(t.equity_pnl)}`}
                 subClass={pnlClass(t.equity_pnl)} />

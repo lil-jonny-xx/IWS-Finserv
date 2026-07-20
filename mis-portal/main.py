@@ -2320,6 +2320,10 @@ def get_gold_silver_holdings(
         metals      = [h for h in holdings if h["asset_class"] in ("gold", "silver")]
         commodities = [h for h in holdings if h["asset_class"] == "commodity"]
         totals      = _equity_totals(rows)
+        # Per-section totals so each table can carry the same footer the Equity
+        # tab does, computed over its own rows rather than the page-wide set.
+        metal_rows  = [r for r in rows if (r.get("asset_class") or "") in ("gold", "silver")]
+        comm_rows   = [r for r in rows if (r.get("asset_class") or "") == "commodity"]
 
         def _mv(items):
             return round(sum(float(h["current_market_value"] or 0) for h in items), 2)
@@ -2336,6 +2340,8 @@ def get_gold_silver_holdings(
             "commodities":       commodities,
             "metals_total":      _mv(metals),
             "commodities_total": _mv(commodities),
+            "metals_totals":      _equity_totals(metal_rows),
+            "commodities_totals": _equity_totals(comm_rows),
             "fx_rates":          fx_rates,
         }
 
@@ -2887,8 +2893,17 @@ def _fetch_pms_overview_rows(conn, entity_id: Optional[int] = None):
     for r in rows:
         cost     = float(r["cost"])         if r["cost"]         is not None else None
         mkt      = float(r["market_value"]) if r["market_value"] is not None else 0.0
-        invested = cost if cost is not None else 0.0
-        pnl      = (mkt - cost) if cost is not None else 0.0
+        is_cash  = r["holding_type"] == "cash"
+        if is_cash:
+            # Uninvested cash sitting in a PMS account is principal, not a
+            # position: it earns no return and must not dilute or contribute to
+            # P&L. Same convention as broker cash (invested == value, pnl 0).
+            # Nuvama reports a cost on its cash rows, which otherwise booked a
+            # spurious few rupees of "profit" on money that was never invested.
+            invested, pnl = mkt, 0.0
+        else:
+            invested = cost if cost is not None else 0.0
+            pnl      = (mkt - cost) if cost is not None else 0.0
         out.append({
             "entity_id":          r["entity_id"],
             "entity_name":        r["entity_name"],
