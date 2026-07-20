@@ -9,6 +9,7 @@ import jwt
 import bcrypt
 from datetime import datetime, timedelta, date
 import os
+import tempfile
 import uuid
 import mimetypes
 import urllib.parse
@@ -231,6 +232,7 @@ def ping():
     return {"status": "ok"}
 
 @app.get("/api/v1/health")
+@limiter.limit("240/minute")
 def health_check(request: Request, authorization: Optional[str] = Header(None)):
     """Detailed health check - requires authentication."""
     try:
@@ -412,6 +414,7 @@ _GENERIC_FORGOT_MSG = ("If an account exists for that email, your administrator 
 
 
 @app.post("/api/v1/auth/change-password")
+@limiter.limit("5/minute")
 def change_password(request: Request, body: ChangePasswordRequest, response: Response,
                     authorization: Optional[str] = Header(None)):
     """Authenticated self-service password change: verify the current password, set a new one."""
@@ -488,6 +491,7 @@ def forgot_password(request: Request, body: ForgotPasswordRequest):
 
 
 @app.get("/api/v1/auth/users")
+@limiter.limit("30/minute")
 def list_users(request: Request, authorization: Optional[str] = Header(None)):
     """Admin: active login accounts (for the reset dropdown). No password data."""
     payload = _require_auth(request, authorization)
@@ -509,6 +513,7 @@ def list_users(request: Request, authorization: Optional[str] = Header(None)):
 
 
 @app.get("/api/v1/auth/reset-requests")
+@limiter.limit("30/minute")
 def list_reset_requests(request: Request, authorization: Optional[str] = Header(None)):
     """Admin: pending 'forgot password' requests."""
     payload = _require_auth(request, authorization)
@@ -533,6 +538,7 @@ def list_reset_requests(request: Request, authorization: Optional[str] = Header(
 
 
 @app.post("/api/v1/auth/admin-reset-password")
+@limiter.limit("5/minute")
 def admin_reset_password(request: Request, body: AdminResetPasswordRequest,
                          authorization: Optional[str] = Header(None)):
     """Admin: set a new password for any active user and resolve their pending requests."""
@@ -570,6 +576,7 @@ def admin_reset_password(request: Request, body: AdminResetPasswordRequest,
 
 
 @app.post("/api/v1/auth/logout")
+@limiter.limit("30/minute")
 def logout(request: Request, response: Response, authorization: Optional[str] = Header(None)):
     """Logout - revokes JWT token and clears cookie."""
     conn = None
@@ -602,6 +609,7 @@ def logout(request: Request, response: Response, authorization: Optional[str] = 
         release_db_connection(conn)
 
 @app.get("/api/v1/me")
+@limiter.limit("240/minute")
 def get_current_user(request: Request, authorization: Optional[str] = Header(None)):
     """Get current user from JWT cookie or header."""
     conn = None
@@ -647,6 +655,7 @@ def get_current_user(request: Request, authorization: Optional[str] = Header(Non
         release_db_connection(conn)
 
 @app.get("/api/v1/entities")
+@limiter.limit("240/minute")
 def get_entities(request: Request, authorization: Optional[str] = Header(None)):
     """Get all entities — available to any authenticated user (drives the entity switcher)."""
     conn = None
@@ -868,6 +877,7 @@ def _compute_realized_gains_cached(conn, entity_id: Optional[int] = None) -> dic
 
 
 @app.get("/api/v1/holdings")
+@limiter.limit("120/minute")
 def get_holdings(
     request: Request,
     entity_id: Optional[List[int]] = Query(None),
@@ -1008,6 +1018,7 @@ def get_holdings(
 
 
 @app.get("/api/v1/holdings/combined")
+@limiter.limit("120/minute")
 def get_combined_holdings(
     request: Request,
     entity_id: Optional[List[int]] = Query(None),
@@ -1372,6 +1383,7 @@ def _equity_totals(rows: list[dict]) -> dict:
 
 
 @app.get("/api/v1/equity/holdings")
+@limiter.limit("120/minute")
 def get_equity_holdings(
     request: Request,
     entity_id: Optional[List[int]] = Query(None),
@@ -1380,8 +1392,9 @@ def get_equity_holdings(
 ):
     """
     Equity holdings with all portfolio metrics.
-    Admin: optional ?entity_id=N to filter by entity, ?broker=zerodha|angel_one|dhan
-    Member: always returns their own entity only.
+    Optional ?entity_id=N to filter by entity, ?broker=zerodha|angel_one|dhan
+    Entity scoping is uniform: every authenticated login (member AND admin) may
+    view any entity — see _resolve_entities.
     """
     conn = None
     try:
@@ -1508,6 +1521,7 @@ def get_equity_holdings(
 
 
 @app.get("/api/v1/equity/activity")
+@limiter.limit("120/minute")
 def get_equity_activity(
     request: Request,
     entity_id: Optional[List[int]] = Query(None),
@@ -1534,7 +1548,7 @@ def get_equity_activity(
 
     Realised P&L on a sell is qty × (sale price − latest snapshot avg cost).
 
-    Admin: optional ?entity_id=N (default all). Member: own entity only.
+    Optional ?entity_id=N (default all); any login may request any entity.
     ?day=YYYY-MM-DD overrides today (defaults to the current date).
     """
     conn = None
@@ -1693,6 +1707,7 @@ def _latest_fx_rates(conn) -> dict:
 
 
 @app.get("/api/v1/foreign-equity/holdings")
+@limiter.limit("120/minute")
 def get_foreign_equity_holdings(
     request: Request,
     entity_id: Optional[List[int]] = Query(None),
@@ -1843,6 +1858,7 @@ def get_foreign_equity_holdings(
 
 
 @app.get("/api/v1/foreign-equity/activity")
+@limiter.limit("120/minute")
 def get_foreign_equity_activity(
     request: Request,
     entity_id: Optional[List[int]] = Query(None),
@@ -1856,7 +1872,7 @@ def get_foreign_equity_activity(
     amounts are converted to INR at the trade-date FX; realised P&L on sells reuses
     the Foreign-Equity realised-gains engine (avg cost on native flows).
 
-    Admin: optional ?entity_id=N (default all). Member: own entity only.
+    Optional ?entity_id=N (default all); any login may request any entity.
     """
     conn = None
     try:
@@ -2121,6 +2137,7 @@ FNO_SOURCE_LABEL = {"shareindia": "Share India", "orbis": "Orbis"}
 
 
 @app.get("/api/v1/fno/positions")
+@limiter.limit("120/minute")
 def get_fno_positions(
     request: Request,
     entity_id: Optional[List[int]] = Query(None),
@@ -2130,7 +2147,7 @@ def get_fno_positions(
     """
     Open FnO positions (net quantity; negative = short) plus per-account
     margin / MTM summaries. All figures are INR. Admin sees all entities
-    (or ?entity_id=N); a member sees only their entity.
+    (or ?entity_id=N); any login may request any entity.
     """
     conn = None
     try:
@@ -2267,6 +2284,7 @@ def get_fno_positions(
 # ---------------------------------------------------------------------------
 
 @app.get("/api/v1/gold-silver/holdings")
+@limiter.limit("120/minute")
 def get_gold_silver_holdings(
     request: Request,
     entity_id: Optional[List[int]] = Query(None),
@@ -2277,7 +2295,7 @@ def get_gold_silver_holdings(
     (e.g. IBKR uranium), grouped into precious metals vs commodities. Rows carry
     both native (USD/SGD/…) and INR figures plus the latest fx_rates map so the
     frontend can show native values where they exist (URNU in USD, SGBs in INR).
-    Admin sees all entities (or ?entity_id=N); a member sees only their entity.
+    All entities by default (or ?entity_id=N); any login may request any entity.
     """
     conn = None
     try:
@@ -2484,6 +2502,7 @@ def _pms_source_xirr(cur, entity_id: int, source: str, current_value: float) -> 
 
 
 @app.get("/api/v1/pms/holdings")
+@limiter.limit("120/minute")
 def get_pms_holdings(
     request: Request,
     entity_id: Optional[List[int]] = Query(None),
@@ -2493,7 +2512,7 @@ def get_pms_holdings(
     All PMS holdings segmented by source (Nuvama WealthSpectrum, Zerodha PMS,
     ICICI Prudential PMS), with totals + P&L metrics overall, per entity, and
     per (entity, source) — plus XIRR where the source's ledger flows exist.
-    Admin: optional ?entity_id=N to filter. Member: own entity only.
+    Optional ?entity_id=N to filter; any login may request any entity.
     """
     conn = None
     try:
@@ -2628,6 +2647,7 @@ def get_pms_holdings(
 # ---------------------------------------------------------------------------
 
 @app.get("/api/v1/equity/summary")
+@limiter.limit("120/minute")
 def get_equity_summary(
     request: Request,
     entity_id: Optional[int] = None,
@@ -2636,8 +2656,7 @@ def get_equity_summary(
     """
     Aggregated equity portfolio totals.
     Returns one row per (entity, broker) with summed cost, value, P&L, returns.
-    Admin: all entities unless ?entity_id=N is passed.
-    Member: their entity only.
+    All entities unless ?entity_id=N is passed; any login may request any entity.
     """
     conn = None
     try:
@@ -3010,8 +3029,8 @@ def _fetch_property_overview_rows(conn, entity_id: Optional[int] = None,
 
     Holders are
     property_entity rows, not system entities: where a holder mirrors a system
-    entity (same name) its rows carry that entity id so member scoping and the
-    per-entity bars line up; other holders (LLPs, trusts, parent companies)
+    entity (same name) its rows carry that entity id so the entity filter and
+    the per-entity bars line up; other holders (LLPs, trusts, parent companies)
     appear as their own synthetic entities with a negative id — the dashboard
     only uses entity_id as a list key. Value per property: sale_price when
     sold (the asset became realised proceeds), else the hand-entered
@@ -3058,7 +3077,7 @@ def _fetch_property_overview_rows(conn, entity_id: Optional[int] = None,
     for r in rows:
         sys_id = r["sys_entity_id"]
         if entity_id is not None and sys_id != entity_id:
-            continue   # member scope: only properties held by their own entity
+            continue   # caller-requested entity filter (not a per-user restriction)
         val = float(r["value"]) if r["value"] is not None else 0.0
         if val <= 0:
             continue
@@ -3079,6 +3098,7 @@ def _fetch_property_overview_rows(conn, entity_id: Optional[int] = None,
 
 
 @app.get("/api/v1/overview")
+@limiter.limit("120/minute")
 def get_overview(
     request: Request,
     include_property: bool = False,
@@ -3087,9 +3107,10 @@ def get_overview(
     authorization: Optional[str] = Header(None),
 ):
     """
-    Aggregate portfolio overview across all asset classes.
-    - Admin  → all entities (per-entity breakdown).
-    - Member → scoped to their own entity only (a member never sees other entities).
+    Aggregate portfolio overview across all asset classes, for every entity
+    (per-entity breakdown). Entity visibility is deliberately uniform: every
+    authenticated login sees all entities. The only member restrictions are the
+    Manual Data page and user management, gated separately by role.
 
     Two asset groups sit OUT of the totals by default and are opt-in per request,
     because they are standalone sheets rather than part of the traded book:
@@ -3112,7 +3133,7 @@ def get_overview(
         payload   = _require_auth(request, authorization)
         conn      = get_db_connection()
         cursor    = conn.cursor()
-        # Admin → None (all entities); member → their own entity_id. This makes the
+        # Always None (all entities) — entity visibility is uniform. This makes the
         # Overview available to individual-entity logins, scoped to just themselves.
         eid = _resolve_entity(cursor, payload, None)
 
@@ -3340,6 +3361,7 @@ def get_overview(
 
 
 @app.get("/api/v1/transactions")
+@limiter.limit("120/minute")
 def get_transactions(
     request: Request,
     entity_id: Optional[List[int]] = Query(None),
@@ -3499,6 +3521,7 @@ class BankBalanceUpdate(BaseModel):
 
 
 @app.get("/api/v1/manual-inputs")
+@limiter.limit("120/minute")
 def get_manual_inputs(
     request: Request,
     entity_id: Optional[int] = None,
@@ -3642,6 +3665,7 @@ def save_manual_inputs(
 
 
 @app.delete("/api/v1/manual-inputs")
+@limiter.limit("30/minute")
 def delete_manual_input(
     request: Request,
     entity_id: int,
@@ -3730,6 +3754,160 @@ MAX_UPLOAD_BYTES      = 200 * 1024 * 1024  # 200 MB per file (nginx client_max_b
 ATTACHMENT_KINDS      = {"art_image", "deed", "plan", "document",
                          "bill", "authentication_certificate"}
 
+# Upload content policy.
+#
+# The stored mime used to be whatever the client's Content-Type header claimed,
+# and it was echoed straight back as the response Content-Type with no
+# disposition. That let an uploader store text/html (or image/svg+xml, which
+# browsers execute as a document) and get it rendered as script on this origin.
+# Now: the declared type must appear here AND the filename's extension must be
+# one this type is allowed to carry, else the upload is refused.
+#
+# Deliberately absent: image/svg+xml, text/html, application/xhtml+xml — all
+# script-bearing document types with no use in this portal.
+ALLOWED_UPLOAD_MIME = {
+    "image/jpeg": {".jpg", ".jpeg"},
+    "image/png":  {".png"},
+    "image/webp": {".webp"},
+    "image/gif":  {".gif"},
+    "image/heic": {".heic"},
+    "image/heif": {".heif"},
+    "image/tiff": {".tif", ".tiff"},
+    "application/pdf": {".pdf"},
+    # statement/report formats reaching the bank-statement and DBS upload paths
+    "text/csv":    {".csv", ".txt"},
+    "text/plain":  {".csv", ".txt"},
+    "application/vnd.ms-excel": {".xls", ".csv"},
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {".xlsx"},
+    "application/msword": {".doc"},
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": {".docx"},
+}
+
+# Types a browser may render in place. Everything else is served as a download,
+# so an unexpected format can never execute in this origin's context. Images and
+# PDFs must stay inline — the property photo viewer, the manual-data thumbnails
+# and the document previews are plain <img>/<embed> tags pointing at these routes.
+INLINE_SAFE_MIME = {m for m in ALLOWED_UPLOAD_MIME if m.startswith("image/")} | {"application/pdf"}
+
+# Leading magic bytes per family, checked against the declared type so a rename
+# alone can't smuggle a payload past the extension gate.
+_MAGIC = [
+    (b"\xff\xd8\xff",       "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n",  "image/png"),
+    (b"GIF87a",             "image/gif"),
+    (b"GIF89a",             "image/gif"),
+    (b"%PDF-",              "application/pdf"),
+]
+
+
+UPLOAD_CHUNK_BYTES = 1024 * 1024      # 1 MB — peak RAM per in-flight upload
+
+
+async def _spool_upload(file: UploadFile) -> tuple:
+    """Stream an upload to a temp file, enforcing MAX_UPLOAD_BYTES as it goes.
+
+    Returns (tmp_abs_path, size, head_bytes). The caller owns the temp file and
+    must os.replace() it into place or unlink it — _discard_spool() handles the
+    error path.
+
+    Uploads used to be materialised with a single 200 MB read, so a handful of
+    concurrent uploads could exhaust the process against a 10-connection pool.
+    Peak memory is now one chunk regardless of file size, which matters because
+    real uploads here do reach ~90 MB (scanned approved-plan PDFs).
+
+    The temp file is created inside UPLOADS_ROOT so the final os.replace() is a
+    same-filesystem atomic rename rather than a copy.
+    """
+    tmp_dir = os.path.join(UPLOADS_ROOT, ".incoming")
+    os.makedirs(tmp_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=tmp_dir, suffix=".part")
+    size, head = 0, b""
+    try:
+        with os.fdopen(fd, "wb") as out:
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                if not head:
+                    head = chunk[:16]
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413,
+                                        detail="File too large (max 200 MB)")
+                out.write(chunk)
+    except BaseException:
+        _discard_spool(tmp)
+        raise
+    if size == 0:
+        _discard_spool(tmp)
+        raise HTTPException(status_code=422, detail="Empty file")
+    return tmp, size, head
+
+
+def _discard_spool(tmp: Optional[str]) -> None:
+    """Remove a spooled temp file, ignoring an already-gone path."""
+    if not tmp:
+        return
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"could not remove spooled upload {tmp}: {e}")
+
+
+def _commit_spool(tmp: str, rel_path: str) -> None:
+    """Move a spooled upload to its final relative path inside UPLOADS_ROOT."""
+    dest = _uploads_abspath(rel_path)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    os.replace(tmp, dest)
+    os.chmod(dest, 0o640)
+
+
+def _validated_upload_mime(filename: str, declared: Optional[str], data: bytes) -> tuple:
+    """Return (mime, ext) for a permitted upload, or raise 415.
+
+    Trusts the extension over the client's Content-Type header (the header is
+    attacker-chosen; the extension at least has to survive the whitelist), then
+    sanity-checks the leading bytes for the formats with stable magic numbers.
+    """
+    ext = os.path.splitext(filename or "")[1].lower()[:12]
+    declared = (declared or "").split(";")[0].strip().lower()
+
+    # Prefer a whitelisted declared type that matches the extension; otherwise
+    # fall back to whichever whitelisted type owns this extension.
+    mime = None
+    if declared in ALLOWED_UPLOAD_MIME and ext in ALLOWED_UPLOAD_MIME[declared]:
+        mime = declared
+    else:
+        for m, exts in ALLOWED_UPLOAD_MIME.items():
+            if ext in exts:
+                mime = m
+                break
+
+    if mime is None:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type ({ext or 'no extension'}). Allowed: "
+                   "images, PDF, CSV/TXT, Excel and Word documents.",
+        )
+
+    head = data[:16]
+    for sig, sig_mime in _MAGIC:
+        if head.startswith(sig) and sig_mime != mime:
+            raise HTTPException(
+                status_code=415,
+                detail=f"File content is {sig_mime}, which does not match its "
+                       f"{ext} extension.",
+            )
+    # A declared image whose bytes match no image signature is rejected outright:
+    # images are the one family we can always identify, so a miss means a rename.
+    if mime.startswith("image/") and mime in {"image/jpeg", "image/png", "image/gif"}:
+        if not any(head.startswith(sig) for sig, sm in _MAGIC if sm == mime):
+            raise HTTPException(status_code=415,
+                                detail=f"File does not appear to be a valid {mime}.")
+    return mime, ext
+
 
 def _uploads_abspath(rel: str) -> str:
     """Resolve a stored-relative path to an absolute one, refusing traversal."""
@@ -3755,7 +3933,23 @@ def _uploads_file_response(rel: str, media: str):
     abs_path = _uploads_abspath(rel)
     if not os.path.exists(abs_path):
         raise HTTPException(status_code=404, detail="File missing on disk")
-    headers = {"Cache-Control": "private, max-age=86400"}
+
+    # Never echo a stored Content-Type we don't recognise: an old row predating
+    # the upload whitelist could still carry text/html. Unknown types degrade to
+    # octet-stream + attachment, so the browser downloads rather than renders.
+    media = (media or "").split(";")[0].strip().lower()
+    if media not in ALLOWED_UPLOAD_MIME:
+        media = "application/octet-stream"
+
+    headers = {
+        "Cache-Control": "private, max-age=86400",
+        # Belt-and-braces alongside nginx's global nosniff: without it a browser
+        # could sniff an octet-stream body back into an executable type.
+        "X-Content-Type-Options": "nosniff",
+    }
+    if media not in INLINE_SAFE_MIME:
+        headers["Content-Disposition"] = "attachment"
+
     if os.getenv("UPLOADS_XACCEL") == "1":
         headers["X-Accel-Redirect"] = "/_protected_uploads/" + rel.replace(os.sep, "/")
         headers["Content-Type"] = media
@@ -3780,7 +3974,13 @@ def _make_thumbnail(src_abs: str, dst_abs: str) -> bool:
 
 
 def _member_entity(cur, payload) -> "Optional[int]":
-    """Entity id a member is scoped to (None for admin)."""
+    """Entity id a member is scoped to.
+
+    Under uniform entity visibility (see _resolve_entity) this returns None for
+    every caller, admin or member — nobody is entity-restricted on read. Kept as
+    the single seam to reintroduce per-member scoping: make this return the
+    user's own entity_id and the callers below start filtering again.
+    """
     if _live_role(cur, payload["email"]) == "admin":
         return None
     return _resolve_entity(cur, payload, None)
@@ -3812,23 +4012,19 @@ async def upload_manual_attachment(
         if kind not in ATTACHMENT_KINDS:
             kind = "document"
 
-        data = await file.read(MAX_UPLOAD_BYTES + 1)
-        if len(data) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="File too large (max 200 MB)")
-        if not data:
-            raise HTTPException(status_code=422, detail="Empty file")
+        tmp, size, head = await _spool_upload(file)
+        try:
+            mime, ext = _validated_upload_mime(file.filename or "", file.content_type, head)
+        except BaseException:
+            _discard_spool(tmp)
+            raise
 
-        mime = (file.content_type
-                or mimetypes.guess_type(file.filename or "")[0]
-                or "application/octet-stream")
-        ext  = os.path.splitext(file.filename or "")[1].lower()[:12]
         uid  = uuid.uuid4().hex
         # Organized by schema: manual/<entity_id>/<category>/
         rel_dir = os.path.join(MANUAL_UPLOAD_SUBDIR, str(entity_id), category)
         os.makedirs(os.path.join(UPLOADS_ROOT, rel_dir), exist_ok=True)
         rel_path = os.path.join(rel_dir, uid + ext)
-        with open(_uploads_abspath(rel_path), "wb") as fh:
-            fh.write(data)
+        _commit_spool(tmp, rel_path)
 
         thumb_rel = None
         if mime.startswith("image/"):
@@ -3849,7 +4045,7 @@ async def upload_manual_attachment(
             RETURNING id, uploaded_at
             """,
             (entity_id, category, label.strip(), kind, file.filename, rel_path,
-             thumb_rel, mime, len(data), user_id),
+             thumb_rel, mime, size, user_id),
         )
         row = cur.fetchone()
         write_audit_log(conn, user_id, "MANUAL_ATTACHMENT_UPLOAD", "manual_attachment",
@@ -3861,7 +4057,7 @@ async def upload_manual_attachment(
             "kind":          kind,
             "original_name": file.filename,
             "mime":          mime,
-            "size_bytes":    len(data),
+            "size_bytes":    size,
             "has_thumb":     thumb_rel is not None,
             "uploaded_at":   row["uploaded_at"].isoformat(),
         }
@@ -3894,6 +4090,7 @@ def _attachment_row(r: dict) -> dict:
 
 
 @app.get("/api/v1/manual-attachments")
+@limiter.limit("120/minute")
 def list_manual_attachments(
     request: Request,
     entity_id: Optional[int] = None,
@@ -3901,7 +4098,7 @@ def list_manual_attachments(
     label: Optional[str] = None,
     authorization: Optional[str] = Header(None),
 ):
-    """List attachments, entity-scoped (a member sees only their entity's)."""
+    """List attachments for the requested entity (visible to any login)."""
     conn = None
     try:
         payload = _require_auth(request, authorization)
@@ -3973,18 +4170,21 @@ def _serve_attachment(att_id: int, request: Request, authorization, want_thumb: 
 
 
 @app.get("/api/v1/manual-attachments/{att_id}/file")
+@limiter.limit("300/minute")
 def serve_manual_attachment_file(att_id: int, request: Request,
                                  authorization: Optional[str] = Header(None)):
     return _serve_attachment(att_id, request, authorization, want_thumb=False)
 
 
 @app.get("/api/v1/manual-attachments/{att_id}/thumb")
+@limiter.limit("300/minute")
 def serve_manual_attachment_thumb(att_id: int, request: Request,
                                   authorization: Optional[str] = Header(None)):
     return _serve_attachment(att_id, request, authorization, want_thumb=True)
 
 
 @app.delete("/api/v1/manual-attachments/{att_id}")
+@limiter.limit("30/minute")
 def delete_manual_attachment(att_id: int, request: Request,
                              authorization: Optional[str] = Header(None)):
     """Delete an attachment + its files (admin/IWS only)."""
@@ -4218,6 +4418,7 @@ def _require_admin(cur, payload):
 
 
 @app.get("/api/v1/property-doc-types")
+@limiter.limit("120/minute")
 def get_property_doc_types(request: Request,
                            authorization: Optional[str] = Header(None)):
     """The land/building document checklist that drives the upload dropdown."""
@@ -4227,6 +4428,7 @@ def get_property_doc_types(request: Request,
 
 
 @app.get("/api/v1/property-entities")
+@limiter.limit("120/minute")
 def list_property_entities(request: Request,
                            authorization: Optional[str] = Header(None)):
     conn = None
@@ -4299,6 +4501,7 @@ def create_property_entity(request: Request, body: PropertyEntityRequest,
 
 
 @app.get("/api/v1/property-nature-types")
+@limiter.limit("120/minute")
 def list_property_nature_types(request: Request,
                                authorization: Optional[str] = Header(None)):
     """Nature options (industrial, orchard… + admin customs) for the property form."""
@@ -4460,6 +4663,7 @@ def _property_row(r: dict, docs: list, owners: list, floors: list,
 
 
 @app.get("/api/v1/properties")
+@limiter.limit("120/minute")
 def list_properties(request: Request, holder_id: Optional[int] = None,
                     authorization: Optional[str] = Header(None)):
     """The property sheet. Every authenticated login may view (holders are
@@ -4827,6 +5031,7 @@ def update_property(prop_id: int, request: Request, body: PropertyRequest,
 
 
 @app.delete("/api/v1/properties/{prop_id}")
+@limiter.limit("30/minute")
 def delete_property(prop_id: int, request: Request,
                     authorization: Optional[str] = Header(None)):
     """Delete a property + its document files (admin only)."""
@@ -4993,35 +5198,45 @@ async def upload_property_document(
             if not cur.fetchone():
                 raise HTTPException(status_code=422, detail="Unknown floor for this property")
 
-        data = await file.read(MAX_UPLOAD_BYTES + 1)
-        if len(data) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="File too large (max 200 MB)")
-        if not data:
-            raise HTTPException(status_code=422, detail="Empty file")
+        tmp, size, head = await _spool_upload(file)
+        try:
+            mime, ext = _validated_upload_mime(file.filename or "", file.content_type, head)
+        except BaseException:
+            _discard_spool(tmp)
+            raise
 
-        mime = (file.content_type
-                or mimetypes.guess_type(file.filename or "")[0]
-                or "application/octet-stream")
-        ext  = os.path.splitext(file.filename or "")[1].lower()[:12]
         uid  = uuid.uuid4().hex
         # Organized by schema: properties/<property_id>/<doc_type>/
         rel_dir = os.path.join(PROPERTY_UPLOAD_SUBDIR, str(prop_id), doc_type)
         os.makedirs(os.path.join(UPLOADS_ROOT, rel_dir), exist_ok=True)
 
-        pdf = property_docs.convert_to_pdf(data, file.filename or "", mime)
+        # Only read the upload back into memory when a conversion is actually on
+        # the cards. Scanned PDFs — the large files here — are declined by
+        # convert_to_pdf outright, so they go disk-to-disk and never hit the heap.
+        pdf = None
+        try:
+            if property_docs.will_convert(file.filename or "", mime):
+                with open(tmp, "rb") as fh:
+                    pdf = property_docs.convert_to_pdf(fh.read(), file.filename or "", mime)
+        except HTTPException:
+            _discard_spool(tmp)
+            raise
+        except Exception as e:
+            logger.warning(f"PDF conversion failed for {file.filename!r}: {e}")
+            pdf = None
+
         original_rel = None
         if pdf is not None:
             stored_rel = os.path.join(rel_dir, uid + ".pdf")
             with open(_uploads_abspath(stored_rel), "wb") as fh:
                 fh.write(pdf)
+            # Keep the original alongside the converted PDF.
             original_rel = os.path.join(rel_dir, uid + "_orig" + ext)
-            with open(_uploads_abspath(original_rel), "wb") as fh:
-                fh.write(data)
+            _commit_spool(tmp, original_rel)
             stored_mime, converted = "application/pdf", True
         else:
             stored_rel = os.path.join(rel_dir, uid + ext)
-            with open(_uploads_abspath(stored_rel), "wb") as fh:
-                fh.write(data)
+            _commit_spool(tmp, stored_rel)
             stored_mime, converted = mime, False
 
         user_id = _property_user_id(cur, payload)
@@ -5033,7 +5248,7 @@ async def upload_property_document(
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                RETURNING id, uploaded_at""",
             (prop_id, doc_type, floor_id, file.filename, clabel, stored_rel, original_rel,
-             stored_mime, len(data), converted, user_id),
+             stored_mime, size, converted, user_id),
         )
         row = cur.fetchone()
         write_audit_log(conn, user_id, "PROPERTY_DOC_UPLOAD", "property_document",
@@ -5064,6 +5279,7 @@ async def upload_property_document(
 
 
 @app.get("/api/v1/property-documents/{doc_id}/file")
+@limiter.limit("300/minute")
 def serve_property_document(doc_id: int, request: Request, original: bool = False,
                             authorization: Optional[str] = Header(None)):
     """Serve a document inline (PDF/image renders in the browser). Pass
@@ -5093,6 +5309,7 @@ def serve_property_document(doc_id: int, request: Request, original: bool = Fals
 
 
 @app.delete("/api/v1/property-documents/{doc_id}")
+@limiter.limit("30/minute")
 def delete_property_document(doc_id: int, request: Request,
                              authorization: Optional[str] = Header(None)):
     conn = None
@@ -5164,24 +5381,21 @@ async def upload_property_image(
         if not cur.fetchone():
             raise HTTPException(status_code=404, detail="Property not found")
 
-        data = await file.read(MAX_UPLOAD_BYTES + 1)
-        if len(data) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="File too large (max 200 MB)")
-        if not data:
-            raise HTTPException(status_code=422, detail="Empty file")
-        mime = (file.content_type
-                or mimetypes.guess_type(file.filename or "")[0]
-                or "application/octet-stream")
-        if not mime.startswith("image/"):
-            raise HTTPException(status_code=422, detail="Only image files are allowed")
+        tmp, size, head = await _spool_upload(file)
+        try:
+            mime, ext = _validated_upload_mime(file.filename or "", file.content_type, head)
+            if not mime.startswith("image/"):
+                raise HTTPException(status_code=422, detail="Only image files are allowed")
+        except BaseException:
+            _discard_spool(tmp)
+            raise
 
-        ext = os.path.splitext(file.filename or "")[1].lower()[:12] or ".jpg"
+        ext = ext or ".jpg"
         uid = uuid.uuid4().hex
         rel_dir = os.path.join(PROPERTY_UPLOAD_SUBDIR, str(prop_id), PROPERTY_IMAGE_SUBDIR)
         os.makedirs(os.path.join(UPLOADS_ROOT, rel_dir), exist_ok=True)
         rel_path = os.path.join(rel_dir, uid + ext)
-        with open(_uploads_abspath(rel_path), "wb") as fh:
-            fh.write(data)
+        _commit_spool(tmp, rel_path)
         thumb_rel = None
         cand = os.path.join(rel_dir, uid + "_thumb.jpg")
         if _make_thumbnail(_uploads_abspath(rel_path), _uploads_abspath(cand)):
@@ -5200,7 +5414,7 @@ async def upload_property_image(
                     mime, size_bytes, uploaded_by)
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
             (prop_id, rel_path, thumb_rel, (caption or "").strip() or None,
-             agg["mx"] + 1, is_hero, mime, len(data), user_id),
+             agg["mx"] + 1, is_hero, mime, size, user_id),
         )
         img_id = cur.fetchone()["id"]
         write_audit_log(conn, user_id, "PROPERTY_IMAGE_UPLOAD", "property_image",
@@ -5247,12 +5461,14 @@ def _serve_property_image(img_id: int, request: Request, authorization, want_thu
 
 
 @app.get("/api/v1/property-images/{img_id}/file")
+@limiter.limit("300/minute")
 def serve_property_image_file(img_id: int, request: Request,
                               authorization: Optional[str] = Header(None)):
     return _serve_property_image(img_id, request, authorization, want_thumb=False)
 
 
 @app.get("/api/v1/property-images/{img_id}/thumb")
+@limiter.limit("300/minute")
 def serve_property_image_thumb(img_id: int, request: Request,
                                authorization: Optional[str] = Header(None)):
     return _serve_property_image(img_id, request, authorization, want_thumb=True)
@@ -5293,6 +5509,7 @@ def set_property_image_hero(img_id: int, request: Request,
 
 
 @app.delete("/api/v1/property-images/{img_id}")
+@limiter.limit("30/minute")
 def delete_property_image(img_id: int, request: Request,
                           authorization: Optional[str] = Header(None)):
     """Delete a gallery image + its files (admin only). If it was the hero, the
@@ -5344,6 +5561,7 @@ def delete_property_image(img_id: int, request: Request,
 
 
 @app.get("/api/v1/manual-assets")
+@limiter.limit("120/minute")
 def get_manual_assets(
     request: Request,
     category: str,
@@ -5531,6 +5749,7 @@ def get_manual_assets(
 
 
 @app.get("/api/v1/nav-coverage")
+@limiter.limit("240/minute")
 def get_nav_coverage(
     request: Request,
     authorization: Optional[str] = Header(None),
@@ -5885,6 +6104,7 @@ def save_unlisted_rounds(request: Request, body: UnlistedRoundsRequest,
 
 
 @app.get("/api/v1/unlisted-rounds")
+@limiter.limit("120/minute")
 def get_unlisted_rounds(
     request: Request,
     category: str,
@@ -5941,6 +6161,7 @@ def get_unlisted_rounds(
 # ---------------------------------------------------------------------------
 
 @app.get("/api/v1/fx-rates")
+@limiter.limit("120/minute")
 def get_fx_rates(
     request: Request,
     authorization: Optional[str] = Header(None),
@@ -5991,19 +6212,20 @@ def _latest_fx_to_inr(cur) -> dict:
 
 
 @app.get("/api/v1/bank-accounts")
+@limiter.limit("120/minute")
 def list_bank_accounts(
     request: Request,
     entity_id: Optional[List[int]] = Query(None),
     authorization: Optional[str] = Header(None),
 ):
     """List bank accounts with native balance + INR equivalent.
-    Admin sees all (optionally ?entity_id=N, repeatable); a member sees only their own entity."""
+    Optional ?entity_id=N (repeatable); any login may request any entity."""
     conn = None
     try:
         payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
-        # Admin + param → that entity/subset; admin no param → all; member → own (param ignored).
+        # Param → that entity/subset; no param → all entities. No per-user gating.
         eids = _resolve_entities(cur, payload, entity_id)
 
         where  = "WHERE b.entity_id = ANY(%s)" if eids else ""
@@ -6113,6 +6335,7 @@ def create_bank_account(
 
 
 @app.get("/api/v1/bank-accounts/{account_id}/statements")
+@limiter.limit("120/minute")
 def list_bank_statements(
     account_id: int,
     request: Request,
@@ -6189,7 +6412,7 @@ async def upload_bank_statement(
             raise HTTPException(status_code=422,
                                 detail="Unsupported file type — upload a PDF, CSV, or Excel statement.")
 
-        data = await file.read()
+        data = await file.read(MAX_STATEMENT_BYTES + 1)
         if len(data) == 0:
             raise HTTPException(status_code=422, detail="Uploaded file is empty.")
         if len(data) > MAX_STATEMENT_BYTES:
@@ -6358,6 +6581,7 @@ class BenchmarkUpsertRequest(BaseModel):
 
 
 @app.get("/api/v1/benchmarks")
+@limiter.limit("120/minute")
 def get_benchmarks(
     request: Request,
     authorization: Optional[str] = Header(None),
@@ -6438,13 +6662,14 @@ def save_benchmarks(
 # ---------------------------------------------------------------------------
 
 @app.get("/api/v1/realised-gains")
+@limiter.limit("120/minute")
 def get_realised_gains(
     request: Request,
     period: str = "fy",
     switches: str = "include",
     authorization: Optional[str] = Header(None),
 ):
-    """Realised gains — admin sees all entities; a member sees only their own.
+    """Realised gains across all entities (uniform visibility).
 
     period   — "fy" (default, FY-to-date) or "inception" (whole history).
     switches — "include" (default) or "exclude" (drop SWITCH_IN/SWITCH_OUT).
@@ -6454,7 +6679,7 @@ def get_realised_gains(
         payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
-        # Admin → None (all entities); member → their own entity_id only.
+        # Always None (all entities) — entity visibility is uniform.
         eid = _resolve_entity(cur, payload, None)
 
         from workers.report_generator import _fetch_realised_gains
@@ -6541,6 +6766,7 @@ def get_realised_gains(
 # ---------------------------------------------------------------------------
 
 @app.get("/api/v1/reports")
+@limiter.limit("120/minute")
 def list_reports(
     request: Request,
     authorization: Optional[str] = Header(None),
@@ -6550,9 +6776,9 @@ def list_reports(
         payload = _require_auth(request, authorization)
         conn = get_db_connection()
         cur  = conn.cursor()
-        # Admin → all reports; member → only their own entity's reports. Combined /
-        # master workbooks span every entity and have entity_id NULL, so filtering
-        # by entity_id also keeps those firm-wide files out of a member's list.
+        # Always None → every report, for every login (uniform entity visibility).
+        # Retained as a seam: were this to resolve to a single entity, combined /
+        # master workbooks (entity_id NULL) would drop out of the list too.
         eid = _resolve_entity(cur, payload, None)
         where  = "WHERE r.entity_id = %s" if eid is not None else ""
         params = [eid] if eid is not None else []
@@ -6626,6 +6852,7 @@ def generate_reports_endpoint(
 
 
 @app.get("/api/v1/reports/{report_id}/download")
+@limiter.limit("30/minute")
 def download_report(
     report_id: int,
     request: Request,
@@ -6933,6 +7160,7 @@ def assistant_create_conversation(
 
 
 @app.get("/api/v1/assistant/conversations")
+@limiter.limit("120/minute")
 def assistant_list_conversations(
     request: Request,
     authorization: Optional[str] = Header(None),
@@ -6954,6 +7182,7 @@ def assistant_list_conversations(
 
 
 @app.get("/api/v1/assistant/conversations/{conversation_id}")
+@limiter.limit("120/minute")
 def assistant_get_conversation(
     request: Request,
     conversation_id: int,
@@ -7216,6 +7445,7 @@ def _resolve_manual_security(cursor, entity_id: int, symbol: str, isin: Optional
 
 
 @app.get("/api/v1/manual-trades")
+@limiter.limit("120/minute")
 def list_manual_trades(request: Request, entity_id: Optional[int] = None,
                        authorization: Optional[str] = Header(None)):
     conn = None
@@ -7301,6 +7531,7 @@ def add_manual_trade(request: Request, body: ManualTradeRequest,
 
 
 @app.delete("/api/v1/manual-trades/{trade_id}")
+@limiter.limit("30/minute")
 def delete_manual_trade(trade_id: int, request: Request,
                         authorization: Optional[str] = Header(None)):
     conn = None
