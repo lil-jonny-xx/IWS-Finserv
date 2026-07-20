@@ -100,6 +100,19 @@ def _soffice_bin():
     return shutil.which("soffice") or shutil.which("libreoffice")
 
 
+def will_convert(filename: str, mime: str) -> bool:
+    """Whether convert_to_pdf() would attempt a conversion for this upload.
+
+    Lets a caller streaming an upload to disk decide whether it needs the bytes
+    in memory at all. The big uploads here are scanned PDFs, which convert_to_pdf
+    declines immediately — so checking first keeps a 90 MB plan off the heap.
+    """
+    ext = os.path.splitext(filename or "")[1].lower()
+    if mime == "application/pdf" or ext == ".pdf" or ext in _NEVER_CONVERT_EXT:
+        return False
+    return (mime or "").startswith(_IMAGE_MIME_PREFIX) or ext in _DOCX_EXTS
+
+
 def convert_to_pdf(data: bytes, filename: str, mime: str):
     """Return PDF bytes for the upload, or None when no conversion applies
     (already a PDF, a CAD file, or an office doc with LibreOffice absent —
