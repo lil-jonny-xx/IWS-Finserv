@@ -26,12 +26,17 @@ export interface Benchmark {
 // skipped, so a feed that isn't live yet simply doesn't render a row (rather than
 // showing a blank one).
 const SECTIONS: { title: string; codes: string[]; note?: string }[] = [
-  // Precious metals are the ₹ spot rows (GOLD_INR/…), not the COMEX futures the
-  // worker also tracks: a front-month contract in $/troy-oz is not the price of
-  // the metal, and not a unit anyone here transacts in. The rest stay in their
-  // own global convention — copper $/lb, crude $/bbl, gas $/MMBtu — because
-  // that is how they are quoted and nobody buys them in rupees.
-  { title: 'Commodities', codes: ['GOLD_INR', 'SILVER_INR', 'PLATINUM_INR', 'COPPER', 'CRUDE_WTI', 'CRUDE_BRENT', 'NATGAS'] },
+  // Metals read in dollars, but per the unit an Indian desk actually deals in —
+  // gold and platinum per 10 g, silver per kg — rather than the $/troy-oz the
+  // COMEX series is quoted in (see UNIT_SCALE).
+  //
+  // These are the COMEX codes, not the ₹ spot ones the worker also records. The
+  // ₹ series began on 2026-07-20 with a single reading, so it has no ~7-day-back
+  // value and no 31-Mar base: Wk and YTD both rendered blank. COMEX carries 254
+  // readings back to 2025-07-17, so both columns populate. The rest of the
+  // section keeps its own global convention — copper $/lb, crude $/bbl,
+  // gas $/MMBtu — because that is how they are quoted.
+  { title: 'Commodities', codes: ['GOLD', 'SILVER', 'PLATINUM', 'COPPER', 'CRUDE_WTI', 'CRUDE_BRENT', 'NATGAS'] },
   { title: 'Rates & Yields', codes: ['US13W', 'US5Y', 'US10Y', 'US30Y', 'GS2030_YTM', 'GS2032_YTM'] },
   { title: 'Currencies', codes: ['USDINR', 'EURINR', 'GBPINR', 'JPYINR', 'AEDINR', 'SGDINR', 'CHFINR', 'EURUSD', 'DXY'] },
   { title: 'Crypto', codes: ['BTCINR', 'BTCUSD', 'ETHINR', 'ETHUSD'] },
@@ -66,9 +71,8 @@ const PERIODIC = new Set([...MONTHLY, 'US_MORTGAGE30']);
 // for a 320px rail.
 const SHORT: Record<string, string> = {
   // The metals carry their unit in the label — it's the only place in a 320px
-  // rail with room for it, and ₹1,24,354 means nothing without the "/10g".
-  GOLD_INR: 'Gold ₹/10g', SILVER_INR: 'Silver ₹/kg', PLATINUM_INR: 'Platinum ₹/10g',
-  GOLD: 'Gold (COMEX $)', SILVER: 'Silver (COMEX $)', PLATINUM: 'Platinum ($)',
+  // rail with room for it, and $1,289 means nothing without the "/10g".
+  GOLD: 'Gold $/10g', SILVER: 'Silver $/kg', PLATINUM: 'Platinum $/10g',
   COPPER: 'Copper',
   CRUDE_WTI: 'Crude (WTI)', CRUDE_BRENT: 'Crude (Brent)', NATGAS: 'Natural Gas',
   US13W: 'US 13-Week', US5Y: 'US 5-Year', US10Y: 'US 10-Year', US30Y: 'US 30-Year',
@@ -82,6 +86,24 @@ const SHORT: Record<string, string> = {
   US_MORTGAGE30: 'US home loan 30y', US_FD_12M: 'US FD 12-mo (CD)',
 };
 
+// Metals arrive quoted in $/troy-oz (the COMEX convention) but are read here per
+// the unit an Indian desk transacts in: gold and platinum per 10 g, silver per kg.
+//
+// This is a display-side rescale, not a different series, and that matters — the
+// factor is constant, and Wk/YTD are ratios, so dividing both ends by the same
+// number leaves them exactly as the API computed them. The stored $/troy-oz
+// history keeps driving both columns unchanged; only the headline value moves.
+const TROY_OZ_GRAMS = 31.1034768;
+const UNIT_SCALE: Record<string, number> = {
+  GOLD:     10 / TROY_OZ_GRAMS,     // $/troy-oz -> $/10g
+  PLATINUM: 10 / TROY_OZ_GRAMS,     // $/troy-oz -> $/10g
+  SILVER: 1000 / TROY_OZ_GRAMS,     // $/troy-oz -> $/kg
+};
+
+function scaled(v: number | null, code: string): number | null {
+  return v == null ? null : v * (UNIT_SCALE[code] ?? 1);
+}
+
 function asOfLabel(iso: string | null, monthly: boolean): string {
   if (!iso) return '—';
   const d = new Date(iso + 'T00:00:00');
@@ -94,12 +116,6 @@ function fmtValue(v: number | null, unit: string): string {
   if (v == null) return '—';
   if (unit === 'pct_raw' || unit === 'pct') return `${v.toFixed(2)}%`;
   if (unit === 'fx') return v.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
-  // Rupee-denominated metals. Never compacted, even though gold and silver clear
-  // ₹1L per unit: "₹1.24L /10g" is a bullion rate read to the rupee, and rounding
-  // it to two significant figures throws away the part that moves day to day.
-  if (unit === 'inr') {
-    return `₹${v.toLocaleString('en-IN', { maximumFractionDigits: v < 1000 ? 2 : 0 })}`;
-  }
   // Crypto in INR runs to millions — compact it so the column doesn't blow out.
   if (Math.abs(v) >= 100_000) {
     return v.toLocaleString('en-IN', { notation: 'compact', maximumFractionDigits: 2 });
@@ -197,7 +213,7 @@ export default function MarketRail() {
                 <tr key={r.code} className="border-b border-rule/50 last:border-0">
                   <td className="px-4 py-2 text-dim whitespace-nowrap">{SHORT[r.code] ?? r.label}</td>
                   <td className="px-2 py-2 text-right font-medium text-ink whitespace-nowrap">
-                    {fmtValue(r.current, r.unit)}
+                    {fmtValue(scaled(r.current, r.code), r.unit)}
                   </td>
                   {PERIODIC.has(r.code) ? (
                     // A monthly/weekly reading has no meaningful week/YTD move — showing
