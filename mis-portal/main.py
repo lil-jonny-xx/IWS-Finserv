@@ -2320,10 +2320,6 @@ def get_gold_silver_holdings(
         metals      = [h for h in holdings if h["asset_class"] in ("gold", "silver")]
         commodities = [h for h in holdings if h["asset_class"] == "commodity"]
         totals      = _equity_totals(rows)
-        # Per-section totals so each table can carry the same footer the Equity
-        # tab does, computed over its own rows rather than the page-wide set.
-        metal_rows  = [r for r in rows if (r.get("asset_class") or "") in ("gold", "silver")]
-        comm_rows   = [r for r in rows if (r.get("asset_class") or "") == "commodity"]
 
         def _mv(items):
             return round(sum(float(h["current_market_value"] or 0) for h in items), 2)
@@ -2340,8 +2336,6 @@ def get_gold_silver_holdings(
             "commodities":       commodities,
             "metals_total":      _mv(metals),
             "commodities_total": _mv(commodities),
-            "metals_totals":      _equity_totals(metal_rows),
-            "commodities_totals": _equity_totals(comm_rows),
             "fx_rates":          fx_rates,
         }
 

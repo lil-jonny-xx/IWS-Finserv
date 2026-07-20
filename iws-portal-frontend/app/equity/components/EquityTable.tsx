@@ -823,9 +823,11 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
                 percentage columns value-weighted, exposure summed. */}
             {rows.length > 0 && (
               <tr className="border-t-2 border-rule bg-page">
-                {/* label spans #, symbol, [entity], exchange (4 + entity) so Qty gets
-                    its own cell and each total lands under its column. */}
-                <td colSpan={4 + (showEntityCol ? 1 : 0)} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim">
+                {/* Label spans exactly the non-numeric lead-in: #, Stock, Exch —
+                    three columns, plus Entity when shown. It previously claimed
+                    4 + entity, one too many, which pushed every total one column
+                    right of its heading. */}
+                <td colSpan={3 + (showEntityCol ? 1 : 0)} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim">
                   Total ({rows.length} holdings)
                 </td>
                 {/* Qty */}
