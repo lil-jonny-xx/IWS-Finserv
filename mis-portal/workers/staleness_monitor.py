@@ -22,10 +22,13 @@ modes slip past it, each of which has bitten us:
      freshness check per source (check_pms_stale).
 
   4. STALE HAND-ENTERED FIGURES — no worker owns manual_input, so a bank/forex/manual
-     foreign-equity balance simply sits at whatever was last typed. A 2026-07-20 audit
-     found 10 of 31 cash accounts (₹2.84 Cr) still on 03-Jul figures: they were skipped
-     in the 18-Jul pass and nothing surfaced it. Caught by check_manual_stale (absolute
-     age + "left behind while its peers were refreshed").
+     foreign-equity balance simply sits at whatever was last typed, and a stopped
+     update routine looks identical to a quiet month. Caught by check_manual_stale,
+     which watches whether a CATEGORY has gone untouched. It does not flag individual
+     accounts: the owner updates what moved and leaves the rest, so an account older
+     than its neighbours is normally just one whose balance did not change (confirmed
+     2026-07-20 — an earlier per-account version flagged 10 accounts that held the
+     most accurate figures available).
 
 All findings are emailed via alert.send_alert; the exit code stays 0 whenever the
 checks themselves ran, so running under cron_wrapper does not double-alert. It exits
@@ -94,28 +97,32 @@ PMS_EXPECTED = {
 }
 
 # ---------------------------------------------------------------------------
-# 4. Stale hand-entered figures — DB freshness per manual_input account
+# 4. Stale hand-entered figures — DB freshness per manual_input CATEGORY
 # ---------------------------------------------------------------------------
 # Manual cash and manually-tracked foreign equity are only as current as the last
-# time somebody typed them in, and no worker can refresh them. On 2026-07-20 an
-# audit found 10 of 31 cash accounts (₹2.84 Cr) still carrying 03-Jul figures —
-# they had simply been skipped in the 18-Jul pass, and nothing surfaced that.
+# time somebody typed them in, and no worker can refresh them.
 #
-# category -> max age (days) before an account is considered overdue. These are
-# entered by hand roughly fortnightly, so the absolute threshold allows one
-# missed cycle of grace before it complains.
+# This deliberately measures the CATEGORY, not the account. The owner's workflow
+# is to update the accounts that moved and leave the rest alone, so an account
+# that was not re-saved in the last pass is normally just an account whose balance
+# did not change — confirmed 2026-07-20, when 10 accounts flagged by an earlier
+# per-account version turned out to hold the most accurate figures available.
+# Alerting per account therefore means alerting on correct data, which is the
+# fastest way to teach everyone to ignore this mail.
+#
+# What IS worth knowing is that a whole category has gone untouched: nobody has
+# entered any bank balance at all in three weeks means the update itself stopped
+# happening, which no other check would surface.
+#
+# category -> days without ANY entry in that category before it is called stale.
+# Entered roughly fortnightly, so this allows one missed cycle of grace.
 MANUAL_EXPECTED = {
     "bank":            21,
     "forex":           21,
     "overseas_equity": 21,
 }
-# The absolute threshold above is slow: a skipped account stays quiet until the
-# whole cycle is overdue. This catches it the same day — when most accounts in an
-# entity+category were refreshed together and a few were left behind, the ones
-# left behind are almost always an oversight rather than a deliberate choice.
-LAGGARD_GAP_DAYS = 10
-# Cap on how many accounts to name per category, so one neglected entity cannot
-# produce a hundred-line email that trains everyone to ignore it.
+# Named in the mail so the reply-to-action is obvious, capped so one neglected
+# category cannot produce a wall of text.
 MANUAL_MAX_NAMED = 6
 
 
@@ -261,19 +268,17 @@ def check_pms_stale():
 
 
 def check_manual_stale():
-    """(category, detail) for hand-entered accounts that look overdue for a refresh.
+    """(category, detail) for hand-entered categories nobody has touched lately.
 
-    Two signals, because they catch different mistakes:
-      • OVERDUE  — the account's own figure is older than its category threshold,
-        i.e. the whole update cycle was missed.
-      • LEFT BEHIND — most accounts in the same entity+category were re-entered
-        recently and this one was not. Fires the same day as the partial update,
-        long before the absolute threshold would.
+    Fires only when NO account in a category has been entered inside its window —
+    i.e. the update itself stopped happening. It deliberately says nothing about
+    an individual account being older than its neighbours: the owner updates what
+    moved and leaves the rest, so a stale-looking account is normally just one
+    whose balance did not change, and alerting on it means alerting on correct
+    data.
 
-    Reports the *value* sitting behind stale figures, since that is what decides
-    whether it matters. Says nothing about accounts re-entered with an unchanged
-    balance: a dormant account genuinely does not move, and flagging those would
-    be noise.
+    Reports the value sitting behind the category and names its oldest accounts,
+    so the mail says what to go and do.
     """
     try:
         import psycopg2
@@ -300,10 +305,11 @@ def check_manual_stale():
             SELECT l.entity_id, e.entity_name, l.category, l.label,
                    l.updated_at, l.current_value,
                    EXTRACT(EPOCH FROM (NOW() - l.updated_at)) / 86400.0 AS age_days,
+                   -- Freshest entry anywhere in this category: the category is
+                   -- only stale when even this one is past the threshold.
                    EXTRACT(EPOCH FROM (
-                       MAX(l.updated_at) OVER (PARTITION BY l.entity_id, l.category)
-                       - l.updated_at
-                   )) / 86400.0 AS behind_peers_days
+                       NOW() - MAX(l.updated_at) OVER (PARTITION BY l.category)
+                   )) / 86400.0 AS category_age_days
             FROM   latest l
             JOIN   entity e ON e.id = l.entity_id
         """, (list(MANUAL_EXPECTED),))
@@ -313,32 +319,30 @@ def check_manual_stale():
     finally:
         conn.close()
 
-    # Bucket by category, keeping the worst offenders first.
+    # Group by category, keeping only categories where even the freshest entry is
+    # past the window. One account lagging its neighbours is not a finding.
     by_cat = {}
     for r in rows:
-        age    = float(r["age_days"] or 0)
-        behind = float(r["behind_peers_days"] or 0)
-        overdue = age > MANUAL_EXPECTED.get(r["category"], 21)
-        laggard = behind > LAGGARD_GAP_DAYS
-        if not (overdue or laggard):
+        cat = r["category"]
+        if float(r["category_age_days"] or 0) <= MANUAL_EXPECTED.get(cat, 21):
             continue
-        by_cat.setdefault(r["category"], []).append({
+        by_cat.setdefault(cat, []).append({
             "who":   f"{r['entity_name']} · {r['label']}",
-            "age":   age,
+            "age":   float(r["age_days"] or 0),
             "value": float(r["current_value"] or 0),
-            "why":   "overdue" if overdue else "left behind",
         })
 
     out = []
     for cat, items in sorted(by_cat.items()):
         items.sort(key=lambda x: x["age"], reverse=True)
-        total = sum(i["value"] for i in items)
-        named = items[:MANUAL_MAX_NAMED]
-        detail = (f"{len(items)} account(s) holding ₹{total:,.0f} not re-entered recently "
-                  f"(threshold {MANUAL_EXPECTED[cat]}d):")
+        total   = sum(i["value"] for i in items)
+        freshest = min(i["age"] for i in items)
+        named   = items[:MANUAL_MAX_NAMED]
+        detail = (f"nothing entered in {freshest:.0f} days (threshold "
+                  f"{MANUAL_EXPECTED[cat]}d) — {len(items)} account(s) "
+                  f"holding ₹{total:,.0f}. Oldest:")
         for i in named:
-            detail += (f"\n      – {i['who']}: {i['age']:.0f}d old, "
-                       f"₹{i['value']:,.0f} [{i['why']}]")
+            detail += f"\n      – {i['who']}: {i['age']:.0f}d old, ₹{i['value']:,.0f}"
         if len(items) > len(named):
             detail += f"\n      – …and {len(items) - len(named)} more"
         out.append((cat, detail))
