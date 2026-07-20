@@ -2,7 +2,7 @@
 """
 Staleness monitor — email when portal data goes stale in a way cron_wrapper can't see.
 
-cron_wrapper alerts only on a worker that RAN and exited non-zero. Three failure
+cron_wrapper alerts only on a worker that RAN and exited non-zero. Four failure
 modes slip past it, each of which has bitten us:
 
   1. SILENT NON-EXECUTION — a cron line that never fires (broker_txn_sync sat dead
@@ -20,6 +20,12 @@ modes slip past it, each of which has bitten us:
 
   3. STALE PMS FEED — pms_holding rows stop advancing (Nuvama again). Caught by a DB
      freshness check per source (check_pms_stale).
+
+  4. STALE HAND-ENTERED FIGURES — no worker owns manual_input, so a bank/forex/manual
+     foreign-equity balance simply sits at whatever was last typed. A 2026-07-20 audit
+     found 10 of 31 cash accounts (₹2.84 Cr) still on 03-Jul figures: they were skipped
+     in the 18-Jul pass and nothing surfaced it. Caught by check_manual_stale (absolute
+     age + "left behind while its peers were refreshed").
 
 All findings are emailed via alert.send_alert; the exit code stays 0 whenever the
 checks themselves ran, so running under cron_wrapper does not double-alert. It exits
@@ -86,6 +92,31 @@ PMS_EXPECTED = {
     "icici_pms":  48,
     "zerodha_pms": 24,
 }
+
+# ---------------------------------------------------------------------------
+# 4. Stale hand-entered figures — DB freshness per manual_input account
+# ---------------------------------------------------------------------------
+# Manual cash and manually-tracked foreign equity are only as current as the last
+# time somebody typed them in, and no worker can refresh them. On 2026-07-20 an
+# audit found 10 of 31 cash accounts (₹2.84 Cr) still carrying 03-Jul figures —
+# they had simply been skipped in the 18-Jul pass, and nothing surfaced that.
+#
+# category -> max age (days) before an account is considered overdue. These are
+# entered by hand roughly fortnightly, so the absolute threshold allows one
+# missed cycle of grace before it complains.
+MANUAL_EXPECTED = {
+    "bank":            21,
+    "forex":           21,
+    "overseas_equity": 21,
+}
+# The absolute threshold above is slow: a skipped account stays quiet until the
+# whole cycle is overdue. This catches it the same day — when most accounts in an
+# entity+category were refreshed together and a few were left behind, the ones
+# left behind are almost always an oversight rather than a deliberate choice.
+LAGGARD_GAP_DAYS = 10
+# Cap on how many accounts to name per category, so one neglected entity cannot
+# produce a hundred-line email that trains everyone to ignore it.
+MANUAL_MAX_NAMED = 6
 
 
 def check_stale():
@@ -229,11 +260,97 @@ def check_pms_stale():
     return out
 
 
+def check_manual_stale():
+    """(category, detail) for hand-entered accounts that look overdue for a refresh.
+
+    Two signals, because they catch different mistakes:
+      • OVERDUE  — the account's own figure is older than its category threshold,
+        i.e. the whole update cycle was missed.
+      • LEFT BEHIND — most accounts in the same entity+category were re-entered
+        recently and this one was not. Fires the same day as the partial update,
+        long before the absolute threshold would.
+
+    Reports the *value* sitting behind stale figures, since that is what decides
+    whether it matters. Says nothing about accounts re-entered with an unchanged
+    balance: a dormant account genuinely does not move, and flagging those would
+    be noise.
+    """
+    try:
+        import psycopg2
+        import psycopg2.extras
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            dbname=os.getenv("DB_NAME", "mis_portal"),
+            user=os.getenv("DB_USER", "postgres"),
+            password=os.getenv("DB_PASSWORD", ""),
+        )
+    except Exception as e:
+        return [("manual_input", f"could not connect to DB to check manual freshness: {e}")]
+
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            WITH latest AS (
+                SELECT DISTINCT ON (entity_id, category, label)
+                       entity_id, category, label, updated_at, current_value
+                FROM   manual_input
+                WHERE  category = ANY(%s)
+                ORDER  BY entity_id, category, label, updated_at DESC
+            )
+            SELECT l.entity_id, e.entity_name, l.category, l.label,
+                   l.updated_at, l.current_value,
+                   EXTRACT(EPOCH FROM (NOW() - l.updated_at)) / 86400.0 AS age_days,
+                   EXTRACT(EPOCH FROM (
+                       MAX(l.updated_at) OVER (PARTITION BY l.entity_id, l.category)
+                       - l.updated_at
+                   )) / 86400.0 AS behind_peers_days
+            FROM   latest l
+            JOIN   entity e ON e.id = l.entity_id
+        """, (list(MANUAL_EXPECTED),))
+        rows = cur.fetchall()
+    except Exception as e:
+        return [("manual_input", f"could not query manual_input: {e}")]
+    finally:
+        conn.close()
+
+    # Bucket by category, keeping the worst offenders first.
+    by_cat = {}
+    for r in rows:
+        age    = float(r["age_days"] or 0)
+        behind = float(r["behind_peers_days"] or 0)
+        overdue = age > MANUAL_EXPECTED.get(r["category"], 21)
+        laggard = behind > LAGGARD_GAP_DAYS
+        if not (overdue or laggard):
+            continue
+        by_cat.setdefault(r["category"], []).append({
+            "who":   f"{r['entity_name']} · {r['label']}",
+            "age":   age,
+            "value": float(r["current_value"] or 0),
+            "why":   "overdue" if overdue else "left behind",
+        })
+
+    out = []
+    for cat, items in sorted(by_cat.items()):
+        items.sort(key=lambda x: x["age"], reverse=True)
+        total = sum(i["value"] for i in items)
+        named = items[:MANUAL_MAX_NAMED]
+        detail = (f"{len(items)} account(s) holding ₹{total:,.0f} not re-entered recently "
+                  f"(threshold {MANUAL_EXPECTED[cat]}d):")
+        for i in named:
+            detail += (f"\n      – {i['who']}: {i['age']:.0f}d old, "
+                       f"₹{i['value']:,.0f} [{i['why']}]")
+        if len(items) > len(named):
+            detail += f"\n      – …and {len(items) - len(named)} more"
+        out.append((cat, detail))
+    return out
+
+
 def main():
     sections = [
         ("Scheduled workers that appear NOT to have run", check_stale()),
         ("Broker tokens failing authentication right now", check_token_health()),
         ("PMS feeds that have gone stale", check_pms_stale()),
+        ("Hand-entered figures overdue for a refresh", check_manual_stale()),
     ]
     findings = [(title, items) for title, items in sections if items]
 
@@ -251,8 +368,10 @@ def main():
         lines.append("")
     lines += [
         "cron_wrapper alerts only on a worker that ran and errored; this monitor",
-        "catches jobs that never fired, broker tokens that died mid-day, and PMS",
-        "feeds that stopped advancing. Check the item above and its worker/log.",
+        "catches jobs that never fired, broker tokens that died mid-day, PMS feeds",
+        "that stopped advancing, and hand-entered figures nobody has refreshed.",
+        "Check the item above and its worker/log — or, for manual entries, re-enter",
+        "the balance from the statement in Manual Data.",
     ]
     body = "\n".join(lines)
     print(body)
