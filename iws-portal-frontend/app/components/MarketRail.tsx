@@ -124,19 +124,26 @@ export default function MarketRail() {
   const byCode = new Map(rows.map(r => [r.code, r]));
 
   const sections = SECTIONS
-    .map(s => ({
-      title: s.title,
-      note: s.note,
-      rows: s.codes.map(c => byCode.get(c)).filter((r): r is Benchmark => !!r && r.current != null),
-    }))
+    .map(s => {
+      const rows = s.codes.map(c => byCode.get(c)).filter((r): r is Benchmark => !!r && r.current != null);
+      return {
+        title: s.title,
+        note: s.note,
+        rows,
+        // Inflation and Loans & Deposits are wholly periodic, so their last two
+        // columns carry the period the reading is from rather than a week/YTD
+        // move. Derived from the rows actually present, not hardcoded: a section
+        // that gains a daily series picks up the Wk/YTD headers on its own.
+        allPeriodic: rows.length > 0 && rows.every(r => PERIODIC.has(r.code)),
+      };
+    })
     .filter(s => s.rows.length > 0);
   if (sections.length === 0) return null;
 
   return (
     <aside className="bg-card rounded-lg border border-rule overflow-hidden" aria-label="Market data">
-      <div className="px-4 py-3 border-b border-rule flex items-baseline justify-between">
+      <div className="px-4 py-3 border-b border-rule">
         <h2 className="text-sm font-semibold text-ink">Markets</h2>
-        <span className="text-[10px] uppercase tracking-wide text-ghost">wk · ytd</span>
       </div>
 
       {sections.map(sec => (
@@ -146,6 +153,30 @@ export default function MarketRail() {
             {sec.note && <span className="font-normal normal-case tracking-normal">{sec.note}</span>}
           </h3>
           <table className="w-full text-xs" style={{ fontVariantNumeric: 'tabular-nums' }}>
+            {/* Column headers per segment rather than once for the whole rail —
+                the last two columns mean different things in different sections. */}
+            <thead>
+              <tr className="text-[9px] uppercase tracking-wide text-ghost">
+                <th scope="col" className="px-4 pt-2 pb-1 text-left font-normal">
+                  <span className="sr-only">Series</span>
+                </th>
+                <th scope="col" className="px-2 pt-2 pb-1 text-right font-normal">
+                  <span className="sr-only">Latest</span>
+                </th>
+                {sec.allPeriodic ? (
+                  // These columns carry the period the reading is from, not a move.
+                  // Caveat: Loans & Deposits mixes cadence — US_FD_12M is monthly but
+                  // US_MORTGAGE30 is a weekly print — so "Monthly" is loose there. The
+                  // row's own stamp is a day rather than a month, which shows which.
+                  <th scope="col" colSpan={2} className="px-4 pt-2 pb-1 text-right font-normal">Monthly</th>
+                ) : (
+                  <>
+                    <th scope="col" className="px-2 pt-2 pb-1 text-right font-normal">Wk</th>
+                    <th scope="col" className="px-4 pt-2 pb-1 text-right font-normal">YTD</th>
+                  </>
+                )}
+              </tr>
+            </thead>
             <tbody>
               {sec.rows.map(r => (
                 <tr key={r.code} className="border-b border-rule/50 last:border-0">
