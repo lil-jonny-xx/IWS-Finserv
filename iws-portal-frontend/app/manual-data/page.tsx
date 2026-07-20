@@ -731,6 +731,22 @@ export default function ManualDataPage() {
         setError(`"${r.label}" has no value entered — add a cost or current value before saving.`);
         return;
       }
+      // Cost / current value / prev week are stored in INR, always. A foreign
+      // row with no raw amount means the native figure was typed straight into
+      // those INR columns, which nothing downstream can detect — the portfolio
+      // totals just silently under-count it by the exchange rate. Block it here.
+      if (r.currency !== 'INR' && !r.raw_amount.trim()) {
+        setError(
+          `"${r.label}" is a ${r.currency} entry but has no foreign amount. ` +
+          `Cost and current value must be in INR — put the ${r.currency} figure in the ` +
+          `"Foreign amt" column and the INR value is worked out for you.`
+        );
+        return;
+      }
+      if (r.currency !== 'INR' && !r.fx_rate.trim()) {
+        setError(`"${r.label}" has a ${r.currency} amount but no FX rate — enter the rate used to convert it to INR.`);
+        return;
+      }
     }
     setPassword('');
     setAuthError('');
@@ -792,7 +808,7 @@ export default function ManualDataPage() {
       <header style={{ background: 'var(--card)', borderBottom: '1px solid var(--rule)' }}
               className="px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-6 min-w-0 flex-1">
-          <span className="font-bold text-sm" style={{ color: 'var(--ink)' }}>IWS MIS</span>
+          <span className="font-bold text-sm" style={{ color: 'var(--ink)' }}>Rajani MIS</span>
           <NavTabs active="/manual-data" role={'admin'} variant="links" />
         </div>
       </header>
@@ -891,6 +907,10 @@ export default function ManualDataPage() {
                   const computedINR = row.raw_amount && row.fx_rate
                     ? (parseFloat(row.raw_amount) * parseFloat(row.fx_rate)).toFixed(0)
                     : null;
+                  // Foreign row whose native figure was never captured — the INR
+                  // columns are probably holding a foreign amount. Flagged inline
+                  // so it is caught while typing, not at the save click.
+                  const missingRaw = row.currency !== 'INR' && !row.raw_amount.trim();
 
                   const showFiles = true;   // attachments available for every manual entry
                   const isUnlisted = UNLISTED_CATS.has(row.category);
@@ -941,9 +961,13 @@ export default function ManualDataPage() {
                                  style={{ background: 'var(--page)', border: '1px solid var(--wire)', color: 'var(--ink)' }} />
                           {isUnlisted ? (
                             <div className="text-right mt-0.5" style={{ color: 'var(--ghost)', fontSize: 9 }}>or use 📊 Rounds</div>
-                          ) : computedINR && (
+                          ) : computedINR ? (
                             <div className="text-right mt-0.5" style={{ color: 'var(--ghost)', fontSize: 10 }}>
                               ≈ ₹{parseInt(computedINR).toLocaleString('en-IN')}
+                            </div>
+                          ) : missingRaw && (
+                            <div className="text-right mt-0.5" style={{ color: 'var(--peril)', fontSize: 10 }}>
+                              must be INR
                             </div>
                           )}
                         </div>
@@ -969,13 +993,16 @@ export default function ManualDataPage() {
 
                       {/* Raw amount (foreign) */}
                       <td className="px-2 py-1.5">
-                        <input type="number" value={row.raw_amount} placeholder={isForeign ? 'foreign amt' : '—'}
+                        <input type="number" value={row.raw_amount}
+                               placeholder={isForeign ? `${row.currency} amt` : '—'}
                                disabled={!isForeign}
+                               title={missingRaw ? `Enter the ${row.currency} figure here — cost and current value are stored in INR.` : undefined}
                                onChange={e => autoFillFx(idx, row.currency, e.target.value)}
                                className="w-24 px-2 py-1 rounded text-xs outline-none text-right"
                                style={{
                                  background: isForeign ? 'var(--page)' : 'var(--rule)',
-                                 border: '1px solid var(--wire)', color: 'var(--ink)',
+                                 border: `1px solid ${missingRaw ? 'var(--peril)' : 'var(--wire)'}`,
+                                 color: 'var(--ink)',
                                  opacity: isForeign ? 1 : 0.4,
                                }} />
                       </td>

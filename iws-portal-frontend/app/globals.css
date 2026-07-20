@@ -35,6 +35,10 @@
   /* Gain / loss */
   --gain:              oklch(42%  0.140 145);
 
+  /* Caution: stale/aging data. Amber — weaker than peril, which is reserved for
+     destructive actions and losses. */
+  --caution:           oklch(52%  0.130  70);
+
   /* Motion — global ease-out-quint for every Tailwind transition-* utility that
      doesn't set its own ease-* class. Replaces the default symmetrical ease so UI
      state changes arrive fast and settle gently. */
@@ -75,6 +79,7 @@
     --muted:             oklch(35%  0.006 258);
 
     --gain:              oklch(68%  0.140 145);
+    --caution:           oklch(75%  0.130  70);
     --chart-equity:      oklch(72%  0.160  40);
     --chart-fixed:       oklch(68%  0.120 258);
     --chart-alt:         oklch(65%  0.130 155);
@@ -112,6 +117,7 @@
   --color-muted:         var(--muted);
 
   --color-gain:          var(--gain);
+  --color-caution:       var(--caution);
   --color-chart-equity:  var(--chart-equity);
   --color-chart-fixed:   var(--chart-fixed);
   --color-chart-alt:     var(--chart-alt);

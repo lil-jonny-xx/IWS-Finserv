@@ -4,6 +4,7 @@ import { useRouter } from 'next/navigation';
 import NavTabs from '@/app/components/NavTabs';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
 import ForeignEquityTable, { type EquityHoldingRow, type EquityTotals, type CashCurrencyRow, type CashBrokerRow } from './components/ForeignEquityTable';
+import { asOf, asOfDate } from '@/app/lib/asOf';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -43,11 +44,14 @@ interface ForeignActivityResponse {
 }
 
 // Manually-entered foreign equity — Manual Data category "overseas_equity"
-// (labelled "Foreign Equity" in the form). Values are already in INR.
+// (labelled "Foreign Equity" in the form). cost/current_value are always INR;
+// raw_amount is the figure as entered in the asset's own currency.
 interface ManualForeignAsset {
   entity_id: number; entity_name: string; label: string;
   cost: number | null; current_value: number | null; currency: string;
+  raw_amount: number | null; fx_rate: number | null;
   inception_date: string | null; notes: string | null;
+  updated_at?: string | null;   // last time this figure was entered — see lib/asOf
 }
 interface ManualForeignResponse {
   category: string; entity_id: number; total_value: number; count: number; assets: ManualForeignAsset[];
@@ -178,8 +182,22 @@ function fmtINR(n: number | null | undefined): string {
   return (n < 0 ? '−₹' : '₹') + Math.round(Math.abs(n)).toLocaleString('en-IN');
 }
 
+// Same symbol table the Bank Accounts and holdings tables use.
+const MANUAL_CCY_SYMBOL: Record<string, string> = {
+  INR: '₹', USD: '$', EUR: '€', GBP: '£', CHF: 'CHF ', SGD: 'S$', AED: 'AED ', HKD: 'HK$',
+};
+function fmtNative(n: number | null | undefined, ccy: string): string {
+  if (n == null) return '—';
+  if (!ccy || ccy === 'INR') return fmtINR(n);
+  const sym = MANUAL_CCY_SYMBOL[ccy] ?? ccy + ' ';
+  return (n < 0 ? '−' : '') + sym +
+    Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
 // Manually-tracked foreign equity, entered in Manual Data. Broker-synced holdings
-// live in the table above; these are hand-entered positions (INR figures).
+// live in the table above; these are hand-entered positions. A foreign-currency
+// entry leads with the amount in its own currency (raw_amount, exactly as typed)
+// and shows the INR conversion underneath — the headline totals stay INR.
 function ManualForeignEquity({ assets, showEntityCol }: { assets: ManualForeignAsset[]; showEntityCol: boolean }) {
   if (!assets.length) return null;
   return (
@@ -193,6 +211,13 @@ function ManualForeignEquity({ assets, showEntityCol }: { assets: ManualForeignA
       <div className="p-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         {assets.map(a => {
           const pnl = a.cost != null && a.current_value != null ? a.current_value - a.cost : null;
+          const ccy = a.currency || 'INR';
+          const foreign = ccy !== 'INR';
+          // Native cost has no stored counterpart — derive it from the same rate
+          // that produced raw_amount, so cost and value are quoted on one basis.
+          const costNative = foreign && a.fx_rate ? (a.cost != null ? a.cost / a.fx_rate : null) : a.cost;
+          const showNative = foreign && a.raw_amount != null;
+          const entered = asOf(a.updated_at);
           return (
             <div key={`${a.entity_id}-${a.label}`} className="bg-page rounded-lg border border-rule p-4 flex flex-col gap-2">
               <div className="flex items-start justify-between gap-3">
@@ -200,18 +225,32 @@ function ManualForeignEquity({ assets, showEntityCol }: { assets: ManualForeignA
                   <h3 className="text-sm font-semibold text-ink leading-tight">{a.label}</h3>
                   {showEntityCol && <p className="text-[11px] text-ghost mt-0.5">{a.entity_name}</p>}
                   {a.inception_date && <p className="text-[11px] text-ghost">Since {a.inception_date}</p>}
+                  {entered && (
+                    <p className="text-[11px] mt-0.5"
+                       style={{ color: entered.stale ? 'var(--caution)' : 'var(--ghost)' }}
+                       title={`Figure last entered on ${asOfDate(a.updated_at)}`}>
+                      {entered.stale && '⚠ '}Entered {entered.label}
+                    </p>
+                  )}
                 </div>
                 <div className="text-right shrink-0">
                   <p className="text-[11px] uppercase tracking-wide text-ghost">Value</p>
-                  <p className="text-base font-bold text-ink tabular-nums">{fmtINR(a.current_value)}</p>
-                  {a.currency && a.currency !== 'INR' && <p className="text-[11px] text-ghost">{a.currency}</p>}
+                  <p className="text-base font-bold text-ink tabular-nums">
+                    {showNative ? fmtNative(a.raw_amount, ccy) : fmtINR(a.current_value)}
+                  </p>
+                  {showNative
+                    ? <p className="text-[11px] text-ghost tabular-nums">{fmtINR(a.current_value)}</p>
+                    : foreign && <p className="text-[11px] text-ghost">{ccy}</p>}
                 </div>
               </div>
               <div className="flex items-center justify-between text-[11px] text-ghost">
-                <span>Cost {fmtINR(a.cost)}</span>
+                <span>Cost {showNative ? fmtNative(costNative, ccy) : fmtINR(a.cost)}</span>
                 {pnl != null && (
                   <span style={{ color: pnl >= 0 ? 'var(--gain)' : 'var(--peril)' }} className="font-medium tabular-nums">
-                    {pnl >= 0 ? '+' : ''}{fmtINR(pnl)}
+                    {pnl >= 0 ? '+' : ''}
+                    {showNative && costNative != null && a.raw_amount != null
+                      ? fmtNative(a.raw_amount - costNative, ccy)
+                      : fmtINR(pnl)}
                   </span>
                 )}
               </div>
@@ -537,7 +576,7 @@ export default function ForeignEquityPage() {
         )}
 
         <p className="text-center text-xs text-ghost mt-8">
-          IWS Finserv &copy; {new Date().getFullYear()} · Foreign holdings update on each broker sync
+          Rajani MIS &copy; {new Date().getFullYear()} · Foreign holdings update on each broker sync
         </p>
       </div>
     </main>

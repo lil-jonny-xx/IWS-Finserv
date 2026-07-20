@@ -3,6 +3,7 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import NavTabs from '@/app/components/NavTabs';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
+import { asOf, asOfDate } from '@/app/lib/asOf';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -19,6 +20,7 @@ interface BankAsset {
   raw_amount?: number | null;   // balance as entered, in the account's own currency
   fx_rate?: number | null;      // INR-per-unit rate used at entry time
   inception_date: string | null; notes: string | null;
+  updated_at?: string | null;   // last time this balance was entered — see lib/asOf
   attachments: Attachment[];
   source?: 'bank' | 'forex';   // which Manual Data category this row came from
 }
@@ -68,6 +70,7 @@ function BankCard({ a, showEntity, onOpen, fxRates }: {
   const [ccy, setCcy] = useState(native);
   const ccyOptions = [native, ...Object.keys(fxRates).filter(c => c !== native).sort()];
   const { val, ccy: shownCcy, approx } = convert(a, ccy, fxRates);
+  const entered = asOf(a.updated_at);
   return (
     <div className="bg-card rounded-lg border border-rule overflow-hidden flex flex-col">
       <div className="px-5 pt-4 pb-3 border-b border-rule flex items-start justify-between gap-3">
@@ -75,6 +78,13 @@ function BankCard({ a, showEntity, onOpen, fxRates }: {
           <h3 className="text-sm font-semibold text-ink leading-tight">{a.label}</h3>
           {showEntity && <p className="text-[11px] text-ghost mt-0.5">{a.entity_name}</p>}
           {a.inception_date && <p className="text-[11px] text-ghost">As of {a.inception_date}</p>}
+          {entered && (
+            <p className="text-[11px] mt-0.5"
+               style={{ color: entered.stale ? 'var(--caution)' : 'var(--ghost)' }}
+               title={`Balance last entered on ${asOfDate(a.updated_at)}`}>
+              {entered.stale && '⚠ '}Entered {entered.label}
+            </p>
+          )}
         </div>
         <div className="text-right shrink-0">
           <p className="text-[11px] uppercase tracking-wide text-ghost">Balance</p>
@@ -285,7 +295,7 @@ export default function BanksPage() {
           </div>
         )}
 
-        <p className="text-center text-xs text-ghost mt-8">IWS Finserv &copy; {new Date().getFullYear()}</p>
+        <p className="text-center text-xs text-ghost mt-8">Rajani MIS &copy; {new Date().getFullYear()}</p>
       </div>
 
       {lightbox != null && (
