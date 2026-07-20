@@ -133,6 +133,48 @@ INDEX_SYMBOLS = {
 YF_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
+# ── Precious metals, in rupees per Indian trade unit ─────────────────────────
+#
+# The COMEX rows above (GOLD/SILVER/PLATINUM) are FUTURES quoted in $/troy-oz —
+# a front-month contract, not the metal, and in a currency and unit nobody here
+# transacts in. These codes carry what an Indian holder actually buys and sells:
+# spot bullion in rupees, gold and platinum per 10 grams, silver per kilogram.
+# The rail shows these; the COMEX rows stay for anyone who wants the contract.
+#
+# Yahoo publishes no spot metal symbol at all — XAUUSD=X, XAU=X, XAUINR=X and
+# friends every one 404 — so spot comes from gold-api.com: free, keyless, and
+# quoting the metal itself rather than a contract or an ETF proxy (see the
+# FRED/Finnhub note below for why an ETF proxy is not an option).
+#
+# Caveat worth knowing before comparing these to a jeweller's board: this is the
+# INTERNATIONAL spot price expressed in rupees, not the Indian domestic bullion
+# rate. Domestic adds import duty and GST and lands roughly 8-10% higher, so a
+# gap against an IBJA/MCX quote is the duty, not a bug. International spot is the
+# right basis for a portfolio holding — it's what the metal is worth — but if the
+# domestic rate is ever wanted it needs IBJA as a source, not a markup applied here.
+#
+# code -> (gold-api symbol, grams per quoted unit, label)
+SPOT_METALS = {
+    "GOLD_INR":     ("XAU",   10.0, "Gold (spot, ₹/10g)"),
+    "SILVER_INR":   ("XAG", 1000.0, "Silver (spot, ₹/kg)"),
+    "PLATINUM_INR": ("XPT",   10.0, "Platinum (spot, ₹/10g)"),
+}
+GOLD_API_URL  = "https://api.gold-api.com/price/{sym}"
+TROY_OZ_GRAMS = 31.1034768
+
+# Metals refresh every run, not on the 15-minute GLOBAL cadence below.
+#
+# That cadence exists to spare an unofficial Yahoo endpoint ~2,600 calls/hour
+# (see GLOBAL_REFRESH_MINUTES) — but the metals are not Yahoo's: three of the
+# four calls here go to gold-api, which restamps every ~30s, so a 15-minute gate
+# was throwing away 29 of every 30 upstream prints on the rail's headline rows.
+# The fourth is the USD/INR leg, adding 60 Yahoo calls/hour against the ~620 the
+# worker already makes — a ~10% increase, not a step change.
+#
+# Kept as its own constant so tightening or loosening the metals never silently
+# moves the 35 GLOBAL symbols with them.
+METALS_REFRESH_MINUTES = 1
+
 # Minutes between refreshes of the GLOBAL set (commodities / FX / crypto / world
 # indices). The India + US indices still refresh every run.
 GLOBAL_REFRESH_MINUTES = 15
@@ -206,6 +248,27 @@ def fetch_index(symbol: str) -> tuple[date, float, float | None]:
         as_of = date.today()
     prev = meta.get("chartPreviousClose") or meta.get("previousClose")
     return as_of, float(price), (float(prev) if prev is not None else None)
+
+
+def fetch_spot_metal(symbol: str) -> tuple[date, float]:
+    """(date of the print, USD per troy ounce) for one spot metal.
+
+    Dated by the feed's own `updatedAt` read in IST, on the same rule fetch_index
+    follows: a Saturday poll re-writes Friday's row rather than inventing a
+    weekend print for a metal that never traded.
+    """
+    r = requests.get(GOLD_API_URL.format(sym=symbol), timeout=10, headers=HEADERS)
+    r.raise_for_status()
+    d = r.json()
+    price = d.get("price")
+    if not price:
+        raise ValueError(f"No price in gold-api response for {symbol}")
+    ts = d.get("updatedAt")
+    if ts:
+        as_of = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(IST).date()
+    else:
+        as_of = date.today()
+    return as_of, float(price)
 
 
 def fetch_fred(series_id: str) -> tuple[date, float]:
@@ -286,13 +349,17 @@ def main():
     # tick, so they refresh every run; the GLOBAL set refreshes on a slower cadence —
     # otherwise 43 symbols x 60 runs/hour is ~2,600 calls/hour at an unofficial
     # endpoint with no documented limit, to move a gold price by a few paise.
-    slow_tick = datetime.now(IST).minute % GLOBAL_REFRESH_MINUTES == 0
+    slow_tick   = datetime.now(IST).minute % GLOBAL_REFRESH_MINUTES == 0
+    metals_tick = datetime.now(IST).minute % METALS_REFRESH_MINUTES == 0
     market_open = {
         "IN":     nse_open,
         "US":     us_open,
         "GLOBAL": slow_tick,
     }
-    if not force and not any(market_open.values()):
+    # metals_tick counts here too: with the metals on their own cadence, an
+    # otherwise-quiet tick (NSE shut, US shut, no GLOBAL refresh due) still has
+    # work to do, and returning early would strand them on the 15-minute gate.
+    if not force and not any(market_open.values()) and not metals_tick:
         logger.info("Nothing due this tick (NSE closed, US closed, not a GLOBAL tick).")
         return
     conn = psycopg2.connect(**DB_CONFIG)
@@ -346,6 +413,49 @@ def main():
         """, (code, label, as_of, value, unit, prev_close))
         logger.info("%s = %s (as of %s)", code, value, as_of)
         ok += 1
+
+    # Spot metals in rupees, on their own every-run cadence (METALS_REFRESH_MINUTES)
+    # rather than the 15-minute GLOBAL one the COMEX rows use.
+    #
+    # The USD/INR leg is fetched here rather than read back from the table so the
+    # metal price and the rate it is converted at belong to the same instant — a
+    # fresh $/oz divided by yesterday's stored rate would be a third basis again.
+    # If that fetch fails the whole block is skipped: a metal price with no rate
+    # to convert it isn't a row worth writing.
+    if force or metals_tick:
+        try:
+            _, usdinr, _ = fetch_index(INDEX_SYMBOLS["USDINR"][0])
+        except Exception as e:
+            logger.error("USD/INR fetch failed (%s) — skipping the spot-metal rows", e)
+            usdinr = None
+        for code, (sym, grams, label) in (SPOT_METALS.items() if usdinr else ()):
+            attempted += 1
+            try:
+                as_of, usd_per_oz = fetch_spot_metal(sym)
+            except Exception as e:
+                # No fallback by design. Nothing else free quotes spot metal on
+                # this basis, and the FRED/Finnhub note above applies in full:
+                # a stalled series costs far less than one with a foreign basis
+                # spliced into it.
+                logger.error("gold-api failed for %s (%s): %s — leaving the series alone",
+                             code, sym, e)
+                continue
+            value = round(usd_per_oz * usdinr / TROY_OZ_GRAMS * grams, 2)
+            # prev_close is deliberately not written: gold-api quotes no prior
+            # close, and the column must hold the previous SESSION's close (see
+            # _fetch_benchmarks) — not whatever this worker last wrote today.
+            # Left NULL, day% reads as absent; the rail shows week/YTD anyway.
+            cur.execute("""
+                INSERT INTO market_benchmark (code, label, as_of_date, value, unit,
+                                              source, updated_at)
+                VALUES (%s, %s, %s, %s, 'inr', 'gold-api', NOW())
+                ON CONFLICT (code, as_of_date)
+                DO UPDATE SET value = EXCLUDED.value, label = EXCLUDED.label,
+                              unit = EXCLUDED.unit, source = 'gold-api',
+                              updated_at = NOW()
+            """, (code, label, as_of, value))
+            logger.info("%s = %s (as of %s)", code, value, as_of)
+            ok += 1
     conn.commit()
     cur.close()
     conn.close()

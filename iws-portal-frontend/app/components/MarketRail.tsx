@@ -26,7 +26,12 @@ export interface Benchmark {
 // skipped, so a feed that isn't live yet simply doesn't render a row (rather than
 // showing a blank one).
 const SECTIONS: { title: string; codes: string[]; note?: string }[] = [
-  { title: 'Commodities', codes: ['GOLD', 'SILVER', 'PLATINUM', 'COPPER', 'CRUDE_WTI', 'CRUDE_BRENT', 'NATGAS'] },
+  // Precious metals are the ₹ spot rows (GOLD_INR/…), not the COMEX futures the
+  // worker also tracks: a front-month contract in $/troy-oz is not the price of
+  // the metal, and not a unit anyone here transacts in. The rest stay in their
+  // own global convention — copper $/lb, crude $/bbl, gas $/MMBtu — because
+  // that is how they are quoted and nobody buys them in rupees.
+  { title: 'Commodities', codes: ['GOLD_INR', 'SILVER_INR', 'PLATINUM_INR', 'COPPER', 'CRUDE_WTI', 'CRUDE_BRENT', 'NATGAS'] },
   { title: 'Rates & Yields', codes: ['US13W', 'US5Y', 'US10Y', 'US30Y', 'GS2030_YTM', 'GS2032_YTM'] },
   { title: 'Currencies', codes: ['USDINR', 'EURINR', 'GBPINR', 'JPYINR', 'AEDINR', 'SGDINR', 'CHFINR', 'EURUSD', 'DXY'] },
   { title: 'Crypto', codes: ['BTCINR', 'BTCUSD', 'ETHINR', 'ETHUSD'] },
@@ -60,7 +65,11 @@ const PERIODIC = new Set([...MONTHLY, 'US_MORTGAGE30']);
 // Shorter than the API's label, which is verbose enough for a report but too long
 // for a 320px rail.
 const SHORT: Record<string, string> = {
-  GOLD: 'Gold', SILVER: 'Silver', PLATINUM: 'Platinum', COPPER: 'Copper',
+  // The metals carry their unit in the label — it's the only place in a 320px
+  // rail with room for it, and ₹1,24,354 means nothing without the "/10g".
+  GOLD_INR: 'Gold ₹/10g', SILVER_INR: 'Silver ₹/kg', PLATINUM_INR: 'Platinum ₹/10g',
+  GOLD: 'Gold (COMEX $)', SILVER: 'Silver (COMEX $)', PLATINUM: 'Platinum ($)',
+  COPPER: 'Copper',
   CRUDE_WTI: 'Crude (WTI)', CRUDE_BRENT: 'Crude (Brent)', NATGAS: 'Natural Gas',
   US13W: 'US 13-Week', US5Y: 'US 5-Year', US10Y: 'US 10-Year', US30Y: 'US 30-Year',
   GS2030_YTM: 'India GS 2030', GS2032_YTM: 'India GS 2032',
@@ -85,6 +94,12 @@ function fmtValue(v: number | null, unit: string): string {
   if (v == null) return '—';
   if (unit === 'pct_raw' || unit === 'pct') return `${v.toFixed(2)}%`;
   if (unit === 'fx') return v.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+  // Rupee-denominated metals. Never compacted, even though gold and silver clear
+  // ₹1L per unit: "₹1.24L /10g" is a bullion rate read to the rupee, and rounding
+  // it to two significant figures throws away the part that moves day to day.
+  if (unit === 'inr') {
+    return `₹${v.toLocaleString('en-IN', { maximumFractionDigits: v < 1000 ? 2 : 0 })}`;
+  }
   // Crypto in INR runs to millions — compact it so the column doesn't blow out.
   if (Math.abs(v) >= 100_000) {
     return v.toLocaleString('en-IN', { notation: 'compact', maximumFractionDigits: 2 });
