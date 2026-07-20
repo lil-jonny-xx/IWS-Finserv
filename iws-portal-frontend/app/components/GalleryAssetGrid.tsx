@@ -2,6 +2,7 @@
 import { useEffect, useState, useCallback, useRef, type ReactNode } from 'react';
 import { useRouter } from 'next/navigation';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
+import PhotoLightbox from '@/app/components/PhotoLightbox';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -95,6 +96,7 @@ function AssetModal({ a, showPainter, onClose }: { a: GalleryAsset; showPainter:
   const images = a.attachments.filter(isImage);
   const docs = a.attachments.filter(x => !isImage(x));
   const [heroId, setHeroId] = useState<number | null>(images[0]?.id ?? null);
+  const [zoom, setZoom] = useState<number | null>(null);
   useEffect(() => { setHeroId(images[0]?.id ?? null); }, [a.label]); // eslint-disable-line react-hooks/exhaustive-deps
   const hero = images.find(i => i.id === heroId) || images[0] || null;
 
@@ -113,8 +115,14 @@ function AssetModal({ a, showPainter, onClose }: { a: GalleryAsset; showPainter:
 
           <div className="w-full aspect-[16/9] bg-page rounded-lg overflow-hidden mb-2 flex items-center justify-center">
             {hero ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={fileUrl(hero.id)} alt={a.label} className="w-full h-full object-contain" />
+              <button
+                onClick={() => setZoom(hero.id)}
+                className="w-full h-full flex items-center justify-center cursor-zoom-in"
+                aria-label={`Zoom into photo of ${a.label}`}
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={fileUrl(hero.id)} alt={a.label} className="w-full h-full object-contain" />
+              </button>
             ) : (
               <span className="text-ghost text-xs">No images uploaded</span>
             )}
@@ -172,6 +180,11 @@ function AssetModal({ a, showPainter, onClose }: { a: GalleryAsset; showPainter:
           </div>
         )}
       </div>
+
+      {/* Above this modal (z-70 vs z-50) so the artwork is unobstructed. */}
+      {zoom != null && (
+        <PhotoLightbox src={fileUrl(zoom)} alt={a.label} onClose={() => setZoom(null)} />
+      )}
     </div>
   );
 }

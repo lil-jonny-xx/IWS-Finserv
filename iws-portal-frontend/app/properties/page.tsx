@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useMemo, useRef, useState, useCallback, type ReactNode } from 'react';
 import { useRouter } from 'next/navigation';
+import PhotoLightbox from '@/app/components/PhotoLightbox';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -760,6 +761,7 @@ function PropertyModal({ p, isAdmin, busy, docTypesFor, docLabelFor, onClose, on
     setHeroId(h ? h.id : null);
   }, [p.id]); // eslint-disable-line react-hooks/exhaustive-deps
   const heroImg = p.images.find(i => i.id === heroId) || hero0;
+  const [zoom, setZoom] = useState<number | null>(null);
 
   const types = docTypesFor(p.property_type);
   const byType: Record<string, PropDoc[]> = {};
@@ -782,8 +784,14 @@ function PropertyModal({ p, isAdmin, busy, docTypesFor, docLabelFor, onClose, on
               details are what this card is for; the photo is supporting context. */}
           <div className="w-full h-44 sm:h-52 bg-page rounded-lg overflow-hidden mb-2 flex items-center justify-center">
             {heroImg ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={imgUrl(heroImg.id)} alt={p.name} className="max-w-full max-h-full object-contain" />
+              <button
+                onClick={() => setZoom(heroImg.id)}
+                className="w-full h-full flex items-center justify-center cursor-zoom-in"
+                aria-label={`Zoom into photo of ${p.name}`}
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={imgUrl(heroImg.id)} alt={p.name} className="max-w-full max-h-full object-contain" />
+              </button>
             ) : (
               <span className="text-ghost text-xs">No images uploaded</span>
             )}
@@ -964,6 +972,11 @@ function PropertyModal({ p, isAdmin, busy, docTypesFor, docLabelFor, onClose, on
           </div>
         )}
       </div>
+
+      {/* Sits above this modal (z-70 vs z-50) so the photo is unobstructed. */}
+      {zoom != null && (
+        <PhotoLightbox src={imgUrl(zoom)} alt={p.name} onClose={() => setZoom(null)} />
+      )}
     </div>
   );
 }
