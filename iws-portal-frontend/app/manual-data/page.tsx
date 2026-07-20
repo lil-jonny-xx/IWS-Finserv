@@ -52,6 +52,7 @@ const CATEGORIES: { value: string; label: string; group: string }[] = [
   { value: 'pms',            label: 'PMS',                        group: 'Equity' },
   { value: 'direct_equity',  label: 'Direct Equity (Aggregated)', group: 'Equity' },
   { value: 'aif',            label: 'AIF',                        group: 'Equity' },
+  { value: 'fno',            label: 'Futures & Options',          group: 'Equity' },
   { value: 'overseas_fund',  label: 'Overseas Fund',              group: 'Alternates' },
   { value: 'overseas_equity',label: 'Foreign Equity',             group: 'Alternates' },
   { value: 'forex',          label: 'Forex / Foreign Cash',       group: 'Alternates' },

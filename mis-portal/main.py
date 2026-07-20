@@ -2778,6 +2778,10 @@ MANUAL_ASSET_CLASS = {
     "pms":            "PMS",
     "aif":            "EQUITY",
     "direct_equity":  "DIRECT_EQUITY",
+    # Own bucket rather than folded into EQUITY: derivative exposure has a very
+    # different risk profile, and until the Symphony XTS feed lands this figure is
+    # hand-entered — worth being able to see it apart from the cash equity book.
+    "fno":            "FNO",
     "overseas_fund":   "ALTERNATES",
     "overseas_equity": "ALTERNATES",
     "forex":           "ALTERNATES",
@@ -2812,7 +2816,10 @@ def _fetch_manual_overview_rows(conn, entity_id: Optional[int] = None,
     conds: list = []
     params: list = []
     if not include_collectibles:
-        conds.append("m.category <> 'collectibles'")
+        # Both categories, not just collectibles: the Art page reads 'art' too, so
+        # gating only 'collectibles' let an art entry into portfolio totals with the
+        # toggle off (invisible today only because 'art' happens to have no rows).
+        conds.append("m.category NOT IN ('art', 'collectibles')")
     if entity_id:
         conds.append("m.entity_id = %s")
         params.append(entity_id)
@@ -3424,6 +3431,7 @@ VALID_CATEGORIES = {
     "overseas_fund", "overseas_equity", "forex", "gold_etf",
     "unlisted", "startup", "art", "collectibles",
     "funds_transit", "broker_balance", "bank",
+    "fno",
 }
 
 VALID_CURRENCIES = {"INR", "USD", "GBP", "EUR", "AED", "SGD", "HKD"}
@@ -5549,7 +5557,11 @@ def get_nav_coverage(
             "/equity":         ids(f"SELECT DISTINCT entity_id FROM equity_holding WHERE {non_commodity}"),
             "/foreign-equity": sorted(set(ids(f"SELECT DISTINCT entity_id FROM foreign_equity_holding WHERE {non_commodity}"))
                                       | set(manual(["overseas_equity"]))),
-            "/fno":            ids("SELECT DISTINCT entity_id FROM fno_position"),
+            # Broker-synced positions OR hand-entered values — the Symphony XTS
+            # feed isn't live yet, so manual entries are currently the only way
+            # this tab has anything to show.
+            "/fno":            sorted(set(ids("SELECT DISTINCT entity_id FROM fno_position"))
+                                      | set(manual(["fno"]))),
             "/bank-accounts":  manual(["bank", "forex"]),
             "/pms":            ids("SELECT DISTINCT entity_id FROM pms_holding"),
             "/gold-silver":    ids(f"""SELECT entity_id FROM equity_holding WHERE {commodity}

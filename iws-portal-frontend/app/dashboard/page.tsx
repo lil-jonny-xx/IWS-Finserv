@@ -74,6 +74,7 @@ function gainColor(n: number): string {
 const CLASS_COLORS: Record<string, string> = {
   EQUITY:        'var(--chart-equity)',
   DIRECT_EQUITY: '#6366f1',   // indigo for direct stocks
+  FNO:           '#7c3aed',   // violet for derivative exposure
   PMS:           '#f59e0b',   // amber for PMS portfolios
   FIXED_INCOME:  'var(--chart-fixed)',
   ALTERNATES:    'var(--chart-alt)',
@@ -91,6 +92,7 @@ const CLASS_COLORS: Record<string, string> = {
 const CLASS_LABELS: Record<string, string> = {
   EQUITY:        'Equity MF',
   DIRECT_EQUITY: 'Direct Equity',
+  FNO:           'Futures & Options',
   PMS:           'PMS',
   FIXED_INCOME:  'Fixed Income',
   ALTERNATES:    'Alternates',

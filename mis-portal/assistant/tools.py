@@ -381,9 +381,11 @@ def _equity_holdings(conn, eid: Optional[int]) -> list[dict]:
 
 def _manual_positions(conn, eid: Optional[int]) -> list[dict]:
     """Latest manual position per (entity, category, label) — mirrors get_manual_inputs.
-    Collectibles are excluded (owner decision 2026-07-16): tracked separately, kept
-    out of portfolio totals."""
-    conds = ["m.category <> 'collectibles'"]
+    Art and collectibles are excluded (owner decision 2026-07-16, art added 2026-07-20):
+    tracked on their own page and in the register report, kept out of portfolio totals.
+    Both categories are named — filtering only 'collectibles' let anything saved as
+    'art' reach the assistant's totals."""
+    conds = ["m.category NOT IN ('art', 'collectibles')"]
     params: list = []
     if eid is not None:
         conds.append("m.entity_id = %s")

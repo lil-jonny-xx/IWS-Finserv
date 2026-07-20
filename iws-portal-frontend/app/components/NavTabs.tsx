@@ -27,7 +27,7 @@ const TABS = [
   { href: '/mutual-funds',   label: 'Mutual Funds' },
   { href: '/equity',         label: 'Equity' },
   { href: '/foreign-equity', label: 'Foreign Equity' },
-  { href: '/fno',            label: 'FnO' },
+  { href: '/fno',            label: 'Futures & Options' },
   { href: '/bank-accounts',  label: 'Banks' },
   { href: '/pms',            label: 'PMS' },
   { href: '/gold-silver',    label: 'Commodities' },
