@@ -6,7 +6,7 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
 interface Report {
   id: number;
-  type: 'individual' | 'combined' | 'master';
+  type: 'individual' | 'combined' | 'master' | 'registers';
   entity_name: string;
   filename: string;
   as_of_date: string;
@@ -161,6 +161,9 @@ export default function ReportsPage() {
               // 'master' = the single consolidated workbook; show it like the combined download.
               const combined   = reps.filter(r => r.type === 'combined' || r.type === 'master');
               const individual = reps.filter(r => r.type === 'individual');
+              // Properties + Art/Collectibles registers — a standalone workbook, so
+              // it needs its own button or it would generate and never be listed.
+              const registers  = reps.filter(r => r.type === 'registers');
 
               return (
                 <div key={d} style={{ background: 'var(--card)', border: '1px solid var(--rule)', borderRadius: 10, overflow: 'hidden' }}>
@@ -183,6 +186,14 @@ export default function ReportsPage() {
                         className="px-3 py-1 rounded text-xs font-medium transition-colors"
                         style={{ background: 'var(--prime)', color: 'var(--prime-fg)' }}>
                         {combined[0].type === 'master' ? '⬇ MIS Report' : '⬇ Combined Report'}
+                      </button>
+                    )}
+                    {registers.length > 0 && (
+                      <button
+                        onClick={() => downloadReport(registers[0].id, registers[0].filename)}
+                        className="ml-2 px-3 py-1 rounded text-xs font-medium transition-colors"
+                        style={{ background: 'var(--page)', border: '1px solid var(--rule)', color: 'var(--dim)' }}>
+                        ⬇ Registers
                       </button>
                     )}
                   </div>

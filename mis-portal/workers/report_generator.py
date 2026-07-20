@@ -890,15 +890,10 @@ def build_individual_report(conn, entity_id: int, entity_name: str, as_of: date)
 
     _write_total_row(ws, row, "B. TOTAL EQUITY", None); row += 2
 
-    # ── Real Estate ─────────────────────────────────────────────────────────────
-    props = man_by_cat.get("properties", [])
-    if props:
-        row = _write_section(ws, row, "REAL ESTATE")
-        data_start = row
-        for i, m in enumerate(props):
-            _write_data_row(ws, row, m, i % 2 == 1); row += 1
-        _write_total_row(ws, row, "Total Real Estate", (data_start, row - 1)); row += 1
-        _write_total_row(ws, row, "C. TOTAL REAL ESTATE", None); row += 2
+    # Real estate and art/collectibles are standalone registers, not part of the
+    # tradeable book — they live in the Registers workbook (build_register_workbook).
+    # The section that used to sit here read manual_input category "properties",
+    # which has been empty since the register moved to the `property` table.
 
     # ── Alternates ────────────────────────────────────────────────────────────
     row = _write_section(ws, row, "ALTERNATES")
@@ -920,13 +915,13 @@ def build_individual_report(conn, entity_id: int, entity_name: str, as_of: date)
             _write_data_row(ws, row, m, i % 2 == 1); row += 1
         _write_total_row(ws, row, f"Total {label}", (data_start, row - 1)); row += 1
 
-    _write_total_row(ws, row, "D. TOTAL ALTERNATES", None); row += 2
+    _write_total_row(ws, row, "C. TOTAL ALTERNATES", None); row += 2
 
     # ── Below-the-line ────────────────────────────────────────────────────────
     for cat, label in [
-        ("funds_transit",  "E. Funds in Transit"),
-        ("broker_balance", "F. Broker Balance"),
-        ("bank",           "G. Funds in Bank"),
+        ("funds_transit",  "D. Funds in Transit"),
+        ("broker_balance", "E. Broker Balance"),
+        ("bank",           "F. Funds in Bank"),
     ]:
         items = man_by_cat.get(cat, [])
         # Fold automated broker cash (broker_cash) into the Broker Balance line.
@@ -1244,15 +1239,7 @@ def build_combined_report(conn, as_of: date, ws=None):
                 _comb_total(ws, row, f"Total {label}", sub_start, row - 1); row += 1
             _comb_total(ws, row, "Total Alternates"); row += 1
 
-        # ── Real Estate ────────────────────────────────────────────────────────
-        props = man_by_cat.get("properties", [])
-        if props:
-            row = _comb_section(ws, row, "REAL ESTATE")
-            data_start = row
-            alt = False
-            for m in props:
-                _comb_data_row(ws, row, m, "Manual", alt); row += 1; alt = not alt
-            _comb_total(ws, row, "Total Real Estate", data_start, row - 1); row += 1
+        # Real estate lives in the Registers workbook — see build_register_workbook.
 
         # ── Below-the-line ────────────────────────────────────────────────────
         btl = []
@@ -2258,6 +2245,7 @@ def build_weekly_sheet(wb, sheet_title: str, label: str, bundle: dict, as_of: da
             ("PMS (Managed)",          pms_managed),
             ("PMS (Manual)",           man.get("pms", [])),
             ("AIF",                    man.get("aif", [])),
+            ("Futures & Options",      man.get("fno", [])),
             ("Foreign Funds (Manual)", man.get("overseas_fund", []) + man.get("overseas_equity", [])),
         ]),
         ("C. COMMODITIES & PRECIOUS METALS", [
@@ -2267,13 +2255,9 @@ def build_weekly_sheet(wb, sheet_title: str, label: str, bundle: dict, as_of: da
         ("D. ALTERNATES", [
             ("Unlisted Equity",        man.get("unlisted", [])),
             ("Startups",               man.get("startup", [])),
-            ("Art / Collectibles",     man.get("art", [])),
             ("Forex / Foreign Cash",   man.get("forex", [])),
         ]),
-        ("E. REAL ESTATE", [
-            ("Properties",             man.get("properties", [])),
-        ]),
-        ("F. LIQUIDITY", [
+        ("E. LIQUIDITY", [
             ("Broker Cash",            cash),
             ("Bank Accounts",          bank),
             ("Funds in Transit",       man.get("funds_transit", [])),
@@ -2481,6 +2465,192 @@ def _render_realised_block(ws, start_row: int, label: str, rows: list, as_of: da
     return note_r + 1
 
 
+# ── register workbook (properties + art / collectibles) ──────────────────────
+#
+# These two registers are deliberately kept OUT of the portfolio reports and out
+# of the dashboard totals (owner decision: they are standalone asset registers,
+# not part of the tradeable book). They used to have sections in the entity and
+# master workbooks that silently rendered empty — properties moved to their own
+# `property` table in the 2026-07-13 rebuild and the report kept reading the old
+# manual_input category, while the Art line read `art` after everything had been
+# recategorised to `collectibles`. Both now live here, read from the right source,
+# and the dead sections are gone from the portfolio reports.
+#
+# Every sheet gets an Excel AutoFilter on its header row, so each column can be
+# filtered/sorted from its own dropdown.
+
+# Valuation must match what the Properties page shows, or the register is worse
+# than useless. Both constants are imported from the modules that own them rather
+# than re-declared here — a second copy of 1.75 is exactly how the two drift apart.
+try:                                          # worker runs with mis-portal/ on the path
+    from property_docs import FAIR_VALUE_MULTIPLIER
+except ImportError:                           # pragma: no cover — layout fallback
+    from mis_portal.property_docs import FAIR_VALUE_MULTIPLIER  # type: ignore
+
+OLD_LEASE_OWNER_SHARE = 0.5   # statutory sitting tenant holds the other half
+
+
+def _fetch_property_register(conn):
+    """Every property with its holder, valuation inputs and effective fair value.
+
+    The value expression mirrors _fetch_property_overview_rows in main.py exactly:
+    sale_price once sold; else hand-entered market_value, else area x RRR x the
+    fair-value multiplier; plus summed floor costings; halved for an old statutory
+    lease. Getting any of those wrong would put a number in the register that the
+    Properties page contradicts.
+    """
+    val_expr = (
+        f"CASE WHEN p.sold THEN p.sale_price ELSE "
+        f"(COALESCE(p.market_value, p.area * p.rrr * {FAIR_VALUE_MULTIPLIER}) "
+        f" + COALESCE(fv.bval, 0)) "
+        f"* CASE WHEN p.is_old_lease THEN {OLD_LEASE_OWNER_SHARE} ELSE 1 END END"
+    )
+    cur = conn.cursor()
+    cur.execute(f"""
+        WITH fv AS (
+            SELECT property_id,
+                   SUM(COALESCE(built_up_area, area) * rate_per_unit) AS bval
+            FROM property_floor WHERE rate_per_unit IS NOT NULL
+            GROUP BY property_id
+        )
+        SELECT p.name, p.property_type, e.name AS holder_name, p.ownership,
+               p.village, p.taluka, p.address, p.survey_no, p.property_no,
+               p.area, p.area_unit, p.built_up_area, p.tenure, p.is_old_lease,
+               p.acquisition_date, p.purchase_price, p.rrr, p.market_value,
+               p.sold, p.sale_date, p.sale_price, p.notes,
+               {val_expr} AS fair_value
+        FROM   property p
+        JOIN   property_entity e ON e.id = p.holder_id
+        LEFT   JOIN fv ON fv.property_id = p.id
+        ORDER  BY e.sort_order, e.name, p.sold, p.name
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    return rows
+
+
+def _fetch_art_register(conn):
+    """Latest art + collectibles entry per (entity, label), with painter/location
+    detail. Both categories together: the split is a page-level distinction, and
+    for a register you want the one list."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT DISTINCT ON (m.entity_id, m.category, m.label)
+               m.category, m.label, e.entity_name, m.cost, m.current_value,
+               m.currency, m.inception_date, m.notes, m.updated_at,
+               d.painter_name, d.location, d.seller_name, d.seller_address
+        FROM   manual_input m
+        JOIN   entity e ON e.id = m.entity_id
+        LEFT   JOIN art_detail d
+               ON d.entity_id = m.entity_id AND d.label = m.label
+        WHERE  m.category IN ('art', 'collectibles')
+        ORDER  BY m.entity_id, m.category, m.label, m.updated_at DESC
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    return rows
+
+
+def _register_sheet(ws, title: str, headers: list, rows: list, widths: list):
+    """Title row, filterable header row, then the data. Shared by both registers
+    so they read as one document."""
+    ncols = len(headers)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols)
+    c = ws.cell(row=1, column=1, value=title)
+    c.font, c.fill = HDR_FONT, HDR_FILL
+    c.alignment = Alignment(horizontal="center", vertical="center")
+
+    for i, h in enumerate(headers, start=1):
+        c = ws.cell(row=2, column=i, value=h)
+        c.font, c.fill = SUB_FONT, SUB_FILL
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.column_dimensions[get_column_letter(i)].width = widths[i - 1]
+
+    for r, values in enumerate(rows, start=3):
+        for i, v in enumerate(values, start=1):
+            c = ws.cell(row=r, column=i, value=v)
+            c.font = BODY_FONT
+            if r % 2 == 1:
+                c.fill = ALT_FILL
+            if isinstance(v, (int, float)):
+                c.number_format = '#,##0'
+                c.alignment = Alignment(horizontal="right")
+
+    # The filter dropdowns the registers are meant to be worked through.
+    last = f"{get_column_letter(ncols)}{max(2, len(rows) + 2)}"
+    ws.auto_filter.ref = f"A2:{last}"
+    ws.freeze_panes = "A3"
+    return ws
+
+
+def build_register_workbook(conn, as_of: date):
+    """Standalone register workbook: Properties + Art & Collectibles, all entities.
+    Returns None when both registers are empty, so no pointless file is written."""
+    props = _fetch_property_register(conn)
+    art   = _fetch_art_register(conn)
+    if not props and not art:
+        return None
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    if props:
+        headers = ["Property", "Type", "Holder", "Ownership", "Village", "Taluka",
+                   "Address", "Survey No", "Property No", "Area", "Unit",
+                   "Built-up Area", "Tenure", "Old Lease", "Acquired",
+                   "Purchase Price (₹)", "RRR (₹)", "Fair Value (₹)", "Status",
+                   "Sale Date", "Sale Price (₹)", "Notes"]
+        widths  = [28, 12, 20, 14, 14, 14, 30, 14, 14, 10, 8, 12, 12, 10, 12,
+                   16, 14, 16, 10, 12, 16, 30]
+        rows = []
+        for p in props:
+            rows.append([
+                p["name"], p["property_type"], p["holder_name"], p["ownership"],
+                p["village"], p["taluka"], p["address"], p["survey_no"],
+                p["property_no"],
+                float(p["area"]) if p["area"] is not None else None,
+                p["area_unit"],
+                float(p["built_up_area"]) if p["built_up_area"] is not None else None,
+                p["tenure"],
+                "Yes" if p["is_old_lease"] else "",
+                p["acquisition_date"].isoformat() if p["acquisition_date"] else None,
+                float(p["purchase_price"]) if p["purchase_price"] is not None else None,
+                float(p["rrr"]) if p["rrr"] is not None else None,
+                float(p["fair_value"]) if p["fair_value"] is not None else None,
+                "Sold" if p["sold"] else "Held",
+                p["sale_date"].isoformat() if p["sale_date"] else None,
+                float(p["sale_price"]) if p["sale_price"] is not None else None,
+                p["notes"],
+            ])
+        _register_sheet(wb.create_sheet("Properties"),
+                        f"PROPERTY REGISTER — as of {as_of:%d %b %Y}",
+                        headers, rows, widths)
+
+    if art:
+        headers = ["Item", "Class", "Entity", "Painter", "Kept At", "Acquired",
+                   "Purchase Price", "Current Valuation", "Currency",
+                   "Seller", "Seller Address", "Last Updated", "Notes"]
+        widths  = [30, 14, 20, 22, 20, 12, 16, 18, 10, 22, 30, 14, 30]
+        rows = []
+        for a in art:
+            rows.append([
+                a["label"],
+                "Collectible" if a["category"] == "collectibles" else "Art",
+                a["entity_name"], a["painter_name"], a["location"],
+                a["inception_date"].isoformat() if a["inception_date"] else None,
+                float(a["cost"]) if a["cost"] is not None else None,
+                float(a["current_value"]) if a["current_value"] is not None else None,
+                a["currency"], a["seller_name"], a["seller_address"],
+                a["updated_at"].strftime("%Y-%m-%d") if a["updated_at"] else None,
+                a["notes"],
+            ])
+        _register_sheet(wb.create_sheet("Art & Collectibles"),
+                        f"ART & COLLECTIBLES REGISTER — as of {as_of:%d %b %Y}",
+                        headers, rows, widths)
+
+    return wb
+
+
 def build_master_workbook(conn, as_of: date):
     """
     Consolidated MIS workbook, fully data-driven:
@@ -2584,6 +2754,16 @@ def generate_reports(conn, generated_by_user_id: Optional[int] = None) -> list[d
         fpath = os.path.join(folder, fname)
         build_entity_workbook(conn, e, as_of, benchmarks).save(fpath)
         _register("individual", e["id"], ename, fname, fpath)
+
+    # 3) Register workbook — properties + art/collectibles, all entities. These are
+    # standalone registers kept out of the portfolio reports and totals, so they get
+    # their own file rather than an empty section in everyone else's.
+    reg_wb = build_register_workbook(conn, as_of)
+    if reg_wb is not None:
+        r_name = f"Registers_{as_of.strftime('%Y%m%d')}.xlsx"
+        r_path = os.path.join(folder, r_name)
+        reg_wb.save(r_path)
+        _register("registers", None, "Registers — Properties & Art", r_name, r_path)
 
     conn.commit()
     cur.close()
