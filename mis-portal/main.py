@@ -3034,17 +3034,20 @@ def _fetch_property_overview_rows(conn, entity_id: Optional[int] = None,
     appear as their own synthetic entities with a negative id — the dashboard
     only uses entity_id as a list key. Value per property: sale_price when
     sold (the asset became realised proceeds), else the hand-entered
-    market_value when present, else area x RRR x 1.75. Joint ownership splits
+    market_land_value when present, else area x RRR x 1.75, plus the summed
+    floor costings in either case. Joint ownership splits
     a property's value/cost across its owners by their pct. purchase_price,
     when recorded, feeds invested + an unrealised pnl.
     """
     mult  = property_docs.FAIR_VALUE_MULTIPLIER
     share = OLD_LEASE_OWNER_SHARE
-    # Effective value per property: sale_price when sold; else (market OR land
-    # RRR fair value) + summed floor costings, halved for old statutory leases.
+    # Effective value per property: sale_price when sold; else land + building,
+    # halved for old statutory leases. Land is the hand-entered market_land_value
+    # or the RRR estimate; building is the summed floor costings. Must stay in
+    # step with _property_row(), which computes the same thing in Python.
     val_expr = (
         f"CASE WHEN p.sold THEN p.sale_price ELSE "
-        f"(COALESCE(p.market_value, p.area * p.rrr * {mult}) + COALESCE(fv.bval, 0)) "
+        f"(COALESCE(p.market_land_value, p.area * p.rrr * {mult}) + COALESCE(fv.bval, 0)) "
         f"* CASE WHEN p.is_old_lease THEN {share} ELSE 1 END END"
     )
     cur = conn.cursor()
@@ -4597,16 +4600,24 @@ def _property_row(r: dict, docs: list, owners: list, floors: list,
                   natures: list, images: list) -> dict:
     area = _num(r["area"])
     rrr  = _num(r["rrr"])
-    # Land value from the circle rate (unchanged); building value from floors.
+    # The register values a property as LAND + BUILDING, both entered by hand.
+    #
+    #   land     = market_land_value, else the RRR circle-rate estimate
+    #   building = the summed per-floor costings
+    #   total    = land + building
+    #
+    # Both halves of `land` are land-only by definition, so the fallback is a
+    # like-for-like substitution. That's the point of the market_land_value
+    # rename: the old `market_value` didn't say whether it included the building,
+    # and the floors were added on top regardless, so a whole-property figure
+    # double-counted it.
     fair = round(area * rrr * property_docs.FAIR_VALUE_MULTIPLIER, 2) \
         if area is not None and rrr is not None else None
+    market_land = _num(r["market_land_value"])
+    land_value  = market_land if market_land is not None else fair
     building_value = round(sum(f["floor_value"] for f in floors
                                if f["floor_value"] is not None), 2) if floors else 0.0
-    market = _num(r["market_value"])
-    # Displayed total: hand-entered market value (or land fair value) plus the
-    # summed floor costings for building-like types.
-    base = market if market is not None else (fair or 0.0)
-    total = round((base or 0.0) + (building_value or 0.0), 2)
+    total = round((land_value or 0.0) + (building_value or 0.0), 2)
     is_old_lease = bool(r["is_old_lease"])
     # Old statutory lease: the sitting tenant holds ~50%, so only the owner's
     # half flows into portfolio totals (full value shown alongside).
@@ -4616,8 +4627,8 @@ def _property_row(r: dict, docs: list, owners: list, floors: list,
     required = [d["slug"] for d in property_docs.doc_types_for(r["property_type"])
                 if not d["optional"]]
     return {
-        "purchase_price":   _num(r["purchase_price"]),
-        "market_value":     market,
+        "purchase_price":     _num(r["purchase_price"]),
+        "market_land_value":  market_land,   # hand-entered; land only
         "owners":           owners,
         "natures":          natures,
         "floors":           floors,
@@ -4649,9 +4660,10 @@ def _property_row(r: dict, docs: list, owners: list, floors: list,
         "stamp_value":      _num(r["stamp_value"]),
         "lawyer_fees":      _num(r["lawyer_fees"]),
         "rrr":              rrr,
-        "fair_value":       fair,
+        "fair_value":       fair,            # RRR estimate — the land fallback
+        "land_value":       land_value,      # the land half actually used in `total`
         "building_value":   building_value or None,
-        "total_value":      total,
+        "total_value":      total,           # land_value + building_value
         "value_effective":  effective,   # feeds portfolio totals (halved if old lease)
         "sold":             r["sold"],
         "sale_price":       _num(r["sale_price"]),
@@ -4829,7 +4841,7 @@ class PropertyRequest(BaseModel):
     stamp_value:      Optional[float] = None
     lawyer_fees:      Optional[float] = None
     purchase_price:   Optional[float] = None
-    market_value:     Optional[float] = None
+    market_land_value: Optional[float] = None  # LAND only; floors are valued separately
     rrr:              Optional[float] = None
     notes:            Optional[str]   = None
     owners:           Optional[List[PropertyOwnerIn]]  = None   # default: holder_id @ 100%
@@ -4948,7 +4960,7 @@ def create_property(request: Request, body: PropertyRequest,
                     survey_no, gps_link, area, built_up_area, area_unit, property_no,
                     acquisition_date, ownership, tenure, is_old_lease, has_parking,
                     parking_count, seller_name, seller_address, stamp_value, lawyer_fees,
-                    purchase_price, market_value, rrr, notes, created_by, updated_by)
+                    purchase_price, market_land_value, rrr, notes, created_by, updated_by)
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                        %s,%s,%s,%s,%s,%s,%s) RETURNING id""",
             (body.name.strip(), body.property_type, body.holder_id, body.village,
@@ -4957,7 +4969,7 @@ def create_property(request: Request, body: PropertyRequest,
              body.area_unit, body.property_no, body.acquisition_date or None,
              body.ownership, body.tenure, body.is_old_lease, body.has_parking,
              body.parking_count, body.seller_name, body.seller_address, body.stamp_value,
-             body.lawyer_fees, body.purchase_price, body.market_value, body.rrr,
+             body.lawyer_fees, body.purchase_price, body.market_land_value, body.rrr,
              body.notes, user_id, user_id),
         )
         pid = cur.fetchone()["id"]
@@ -4998,7 +5010,7 @@ def update_property(prop_id: int, request: Request, body: PropertyRequest,
                    built_up_area=%s, area_unit=%s, property_no=%s, acquisition_date=%s,
                    ownership=%s, tenure=%s, is_old_lease=%s, has_parking=%s,
                    parking_count=%s, seller_name=%s, seller_address=%s, stamp_value=%s,
-                   lawyer_fees=%s, purchase_price=%s, market_value=%s, rrr=%s, notes=%s,
+                   lawyer_fees=%s, purchase_price=%s, market_land_value=%s, rrr=%s, notes=%s,
                    updated_by=%s, updated_at=NOW()
                WHERE id=%s RETURNING id""",
             (body.name.strip(), body.property_type, body.holder_id, body.village,
@@ -5007,7 +5019,7 @@ def update_property(prop_id: int, request: Request, body: PropertyRequest,
              body.area_unit, body.property_no, body.acquisition_date or None,
              body.ownership, body.tenure, body.is_old_lease, body.has_parking,
              body.parking_count, body.seller_name, body.seller_address, body.stamp_value,
-             body.lawyer_fees, body.purchase_price, body.market_value, body.rrr,
+             body.lawyer_fees, body.purchase_price, body.market_land_value, body.rrr,
              body.notes, user_id, prop_id),
         )
         if not cur.fetchone():

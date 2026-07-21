@@ -39,8 +39,9 @@ interface Property {
   has_parking: boolean; parking_count: number | null;
   seller_name: string | null; seller_address: string | null;
   stamp_value: number | null; lawyer_fees: number | null;
-  purchase_price: number | null; market_value: number | null;
-  rrr: number | null; fair_value: number | null; building_value: number | null;
+  purchase_price: number | null; market_land_value: number | null;
+  rrr: number | null; fair_value: number | null; land_value: number | null;
+  building_value: number | null;
   total_value: number | null; value_effective: number | null;
   sold: boolean; sale_price: number | null; sale_date: string | null;
   notes: string | null;
@@ -64,7 +65,7 @@ interface PropertyForm {
   acquisition_date: string; ownership: string; tenure: string; is_old_lease: boolean;
   has_parking: boolean; parking_count: string;
   seller_name: string; seller_address: string; stamp_value: string; lawyer_fees: string;
-  purchase_price: string; market_value: string; rrr: string; notes: string;
+  purchase_price: string; market_land_value: string; rrr: string; notes: string;
 }
 const EMPTY_FORM: PropertyForm = {
   id: null, name: '', property_type: 'land',
@@ -74,7 +75,7 @@ const EMPTY_FORM: PropertyForm = {
   acquisition_date: '', ownership: '', tenure: '', is_old_lease: false,
   has_parking: false, parking_count: '',
   seller_name: '', seller_address: '', stamp_value: '', lawyer_fees: '',
-  purchase_price: '', market_value: '', rrr: '', notes: '',
+  purchase_price: '', market_land_value: '', rrr: '', notes: '',
 };
 
 function ownersLabel(p: Property): string {
@@ -279,7 +280,7 @@ export default function PropertiesPage() {
       has_parking: form.has_parking, parking_count: form.has_parking ? num(form.parking_count) : null,
       seller_name: form.seller_name || null, seller_address: form.seller_address || null,
       stamp_value: num(form.stamp_value), lawyer_fees: num(form.lawyer_fees),
-      purchase_price: num(form.purchase_price), market_value: num(form.market_value),
+      purchase_price: num(form.purchase_price), market_land_value: num(form.market_land_value),
       rrr: num(form.rrr), notes: form.notes || null,
     };
     fetch(`${API_URL}/api/v1/properties${form.id != null ? `/${form.id}` : ''}`, {
@@ -442,12 +443,25 @@ export default function PropertiesPage() {
     stamp_value: p.stamp_value != null ? String(p.stamp_value) : '',
     lawyer_fees: p.lawyer_fees != null ? String(p.lawyer_fees) : '',
     purchase_price: p.purchase_price != null ? String(p.purchase_price) : '',
-    market_value: p.market_value != null ? String(p.market_value) : '',
+    market_land_value: p.market_land_value != null ? String(p.market_land_value) : '',
     rrr: p.rrr != null ? String(p.rrr) : '', notes: p.notes ?? '',
   });
 
+  // Live mirror of the backend's valuation (_property_row in main.py): the total
+  // is land + building, where land is the hand-entered market land value falling
+  // back to the RRR estimate, and building is the summed floor costings. Kept in
+  // the form so the number you're about to save is visible before you save it.
   const formFair = form && form.area && form.rrr
     ? Number(form.area) * Number(form.rrr) * fairMult : null;
+  const formFloors = form && isBuildingLike(form.property_type)
+    ? form.floors.reduce((s, f) => {
+        const basis = Number(f.built_up_area || f.area);
+        const rate  = Number(f.rate_per_unit);
+        return s + (basis && rate ? basis * rate : 0);
+      }, 0)
+    : 0;
+  const formLand  = form && form.market_land_value ? Number(form.market_land_value) : formFair;
+  const formTotal = (formLand ?? 0) + formFloors;
   const dataDocs = (pid: number): PropDoc[] =>
     data?.properties.find(x => x.id === pid)?.documents ?? [];
 
@@ -633,7 +647,7 @@ export default function PropertiesPage() {
         <PropertyFormModal
           form={form} setForm={setForm} isAdmin={isAdmin} busy={busy}
           mainHolders={mainHolders} parentHolders={parentHolders} natureTypes={natureTypes}
-          fairMult={fairMult} formFair={formFair} formErr={formErr} formSaved={formSaved}
+          fairMult={fairMult} formFair={formFair} formFloors={formFloors} formLand={formLand} formTotal={formTotal} formErr={formErr} formSaved={formSaved}
           docTypesFor={docTypesFor} docLabelFor={docLabelFor} dataDocs={dataDocs}
           newNature={newNature} setNewNature={setNewNature} saveNature={saveNature}
           onClose={() => setForm(null)} onSave={saveProperty}
@@ -691,18 +705,22 @@ function PropertyTable({ rows, onOpen, sold, lease, emptyText }: {
                 onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen(p); } }}
                 className="border-t border-rule cursor-pointer hover:bg-page focus:bg-page focus:outline-none transition-colors">
               <td className="px-3 py-2.5">
-                <div className="flex items-center gap-2">
+                {/* Name first, with the tags riding alongside it at a smaller
+                    size — they're qualifiers on the name, not competing with it. */}
+                <div className="flex items-center gap-1.5">
                   <span className="font-medium text-ink">{p.name}</span>
-                  <span className={`text-[10px] uppercase tracking-wide px-1.5 py-px rounded border shrink-0 ${
+                  <span className={`text-[9px] leading-none uppercase tracking-wide px-1 py-0.5 rounded border shrink-0 ${
                     p.property_type === 'land'
                       ? 'border-emerald-500/40 text-emerald-500'
                       : 'border-sky-500/40 text-sky-500'}`}>
                     {p.property_type}
                   </span>
-                  {sold  && <span className="text-[10px] uppercase tracking-wide px-1.5 py-px rounded border border-amber-500/40 text-amber-500 shrink-0">sold</span>}
-                  {lease && <span className="text-[10px] uppercase tracking-wide px-1.5 py-px rounded border border-violet-500/40 text-violet-400 shrink-0">old lease</span>}
+                  {sold  && <span className="text-[9px] leading-none uppercase tracking-wide px-1 py-0.5 rounded border border-amber-500/40 text-amber-500 shrink-0">sold</span>}
+                  {lease && <span className="text-[9px] leading-none uppercase tracking-wide px-1 py-0.5 rounded border border-violet-500/40 text-violet-400 shrink-0">old lease</span>}
                   {p.images.length > 0 && (
-                    <span className="text-[10px] text-ghost shrink-0">{p.images.length}📷</span>
+                    <span className="text-[9px] leading-none text-ghost shrink-0" title={`${p.images.length} photo(s)`}>
+                      {p.images.length}📷
+                    </span>
                   )}
                 </div>
               </td>
@@ -848,12 +866,17 @@ function PropertyModal({ p, isAdmin, busy, docTypesFor, docLabelFor, onClose, on
           </Field>
           <Field label="RRR (circle rate)">{fmtINR(p.rrr)}</Field>
           <Field label="Fair value (land)">{fmtINR(p.fair_value)}</Field>
-          {p.building_value != null && <Field label="Building value">{fmtINR(p.building_value)}</Field>}
-          <Field label="Market value">{fmtINR(p.market_value)}</Field>
+          {/* The two halves of the total, in the order they add up. `land_value`
+              is whichever land figure was actually used — the entered one when
+              present, the RRR estimate otherwise — so it's labelled to say which. */}
+          <Field label={p.market_land_value != null ? 'Land value (entered)' : 'Land value (RRR estimate)'}>
+            {fmtINR(p.land_value)}
+          </Field>
+          {p.building_value != null && <Field label="Building value (floors)">{fmtINR(p.building_value)}</Field>}
           {p.is_old_lease ? (
-            <Field label="Value (full · owner 50%)">{fmtINR(p.total_value)} · {fmtINR(p.value_effective)}</Field>
+            <Field label="Total value (full · owner 50%)">{fmtINR(p.total_value)} · {fmtINR(p.value_effective)}</Field>
           ) : (
-            <Field label="Total value">{fmtINR(p.total_value)}</Field>
+            <Field label="Total value (land + floors)">{fmtINR(p.total_value)}</Field>
           )}
           <Field label="Purchase price">{fmtINR(p.purchase_price)}</Field>
           {p.sold && <Field label="Sold">{p.sale_date} · {fmtINR(p.sale_price)}</Field>}
@@ -985,12 +1008,12 @@ function PropertyModal({ p, isAdmin, busy, docTypesFor, docLabelFor, onClose, on
 // Add / edit form modal.
 // ---------------------------------------------------------------------------
 function PropertyFormModal({ form, setForm, isAdmin, busy, mainHolders, parentHolders, natureTypes,
-  fairMult, formFair, formErr, formSaved, docTypesFor, docLabelFor, dataDocs,
+  fairMult, formFair, formFloors, formLand, formTotal, formErr, formSaved, docTypesFor, docLabelFor, dataDocs,
   newNature, setNewNature, saveNature, onClose, onSave, onUpload, onDeleteDoc,
   onUploadImage }: {
   form: PropertyForm; setForm: (f: PropertyForm | null) => void; isAdmin: boolean; busy: string | null;
   mainHolders: Holder[]; parentHolders: Holder[]; natureTypes: NatureType[];
-  fairMult: number; formFair: number | null; formErr: string | null; formSaved: boolean;
+  fairMult: number; formFair: number | null; formFloors: number; formLand: number | null; formTotal: number; formErr: string | null; formSaved: boolean;
   docTypesFor: (t: PropertyType) => DocType[]; docLabelFor: (slug: string) => string;
   dataDocs: (pid: number) => PropDoc[];
   newNature: string; setNewNature: (s: string) => void; saveNature: () => void;
@@ -1134,8 +1157,28 @@ function PropertyFormModal({ form, setForm, isAdmin, busy, mainHolders, parentHo
             <input value={form.rrr} onChange={e => set({ rrr: e.target.value })} type="number" min="0" step="any" className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" /></label>
           <div className="flex flex-col gap-1"><span className="text-ghost">Land fair value ({fairMult}× RRR × area)</span>
             <span className="px-2.5 py-1.5 text-ink font-semibold tabular-nums">{fmtINR(formFair)}</span></div>
-          <label className="flex flex-col gap-1"><span className="text-ghost">Market value (₹, optional)</span>
-            <input value={form.market_value} onChange={e => set({ market_value: e.target.value })} type="number" min="0" step="any" className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" /></label>
+          <label className="flex flex-col gap-1">
+            <span className="text-ghost">Market land value (₹, optional)</span>
+            <input value={form.market_land_value} onChange={e => set({ market_land_value: e.target.value })} type="number" min="0" step="any" className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" />
+            <span className="text-[11px] text-ghost">
+              Land only — the floors below are valued separately and added on top.
+              Leave blank to use the {fairMult}× RRR fair value.
+            </span>
+          </label>
+
+          {/* The saved total, computed the same way the backend will compute it.
+              Sits above the floor rows so the arithmetic is visible while you
+              enter them; it re-adds on every keystroke. */}
+          <div className="sm:col-span-2 border border-rule rounded px-3 py-2.5 bg-page flex flex-wrap items-baseline gap-x-2 gap-y-1">
+            <span className="text-ghost">Total value</span>
+            <span className="text-base font-semibold text-ink tabular-nums">{fmtINR(formTotal || null)}</span>
+            <span className="text-[11px] text-ghost">
+              = land {fmtINR(formLand)}
+              {form.market_land_value ? ' (entered)' : ' (RRR estimate)'}
+              {' + '}floors {fmtINR(formFloors || null)}
+              {form.is_old_lease && <> · old lease, {fmtINR(formTotal / 2)} counts toward the portfolio</>}
+            </span>
+          </div>
 
           {/* Seller */}
           <div className="sm:col-span-2 border-t border-rule pt-3 mt-1">
