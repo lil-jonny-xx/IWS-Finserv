@@ -222,6 +222,126 @@ button:not(:disabled):active {
   .marquee-dup { display: none; }
 }
 
+/* ── Page shell ────────────────────────────────────────────────────────────────
+   One container for every page, replacing the five different caps that were in
+   use (1536 / 1280 / 1152 / 1024 px) and made the content column jump width as
+   you moved between sections.
+
+   Two things make it read as natural rather than either cramped or stretched:
+
+   1. The gutter scales with the viewport instead of stepping at one breakpoint,
+      so the content is never glued to the edge on a phone nor marooned in the
+      middle of a monitor. It grows 16px -> 48px and then stops.
+   2. The cap is generous enough for the real tables. The widest (MFTable) asks
+      for 1900px; at the old 1536px cap it scrolled sideways *while several
+      hundred pixels of margin sat empty beside it*. 2200px minus gutters clears
+      it, so on a large screen the table simply fits.
+
+   Above ~2200px the layout stops growing on purpose — a data table stretched
+   across an ultrawide reads worse, not better. */
+:root {
+  --shell-gutter: clamp(1rem, 2.5vw, 3rem);
+  --shell-max: 2200px;
+}
+
+.shell {
+  width: 100%;
+  max-width: var(--shell-max);
+  margin-inline: auto;
+  padding-inline: var(--shell-gutter);
+}
+
+/* Text- and form-led pages, where a full-width measure would be a wall of
+   characters. Overrides only the cap — the gutter still matches, so the left
+   edge stays on the same line as every other page. */
+.shell-narrow { --shell-max: 72rem; }
+
+/* ── Privacy glass ─────────────────────────────────────────────────────────────
+   A frosted pane laid over the headline totals so a figure can't be read over
+   your shoulder. backdrop-filter blurs the card *behind* the pane, which is what
+   makes it read as glass rather than as a grey box — the numbers stay where they
+   are and dissolve in place.
+
+   Both filters carry the -webkit- prefix: Safari still ships backdrop-filter
+   prefixed, and unprefixed alone degrades to a flat translucent panel there.
+
+   Revealing doesn't unmount the pane, it fades it out and relaxes the blur to 0,
+   so the figures resolve into focus instead of popping. */
+.privacy-glass {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: inherit;
+  cursor: pointer;
+  -webkit-backdrop-filter: blur(14px) saturate(135%);
+  backdrop-filter: blur(14px) saturate(135%);
+  background: color-mix(in oklch, var(--card) 42%, transparent);
+  /* Lit top edge, shaded bottom — the cue that sells a pane of glass. */
+  box-shadow:
+    inset 0  1px 0 color-mix(in oklch, white 45%, transparent),
+    inset 0 -1px 0 color-mix(in oklch, var(--ink) 8%, transparent);
+  transition:
+    opacity 340ms var(--default-transition-timing-function),
+    -webkit-backdrop-filter 340ms var(--default-transition-timing-function),
+    backdrop-filter 340ms var(--default-transition-timing-function);
+}
+
+/* Revealed: out of the way visually, and out of the tab order via the tabIndex
+   the component sets — pointer-events none stops it swallowing clicks on
+   anything interactive underneath. */
+.privacy-glass[data-revealed='true'] {
+  opacity: 0;
+  pointer-events: none;
+  -webkit-backdrop-filter: blur(0) saturate(100%);
+  backdrop-filter: blur(0) saturate(100%);
+}
+
+.privacy-glass-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.7rem;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--dim);
+  background: color-mix(in oklch, var(--card) 70%, transparent);
+  border: 1px solid color-mix(in oklch, var(--rule) 70%, transparent);
+  opacity: 0.85;
+  transition: opacity 200ms var(--default-transition-timing-function),
+              color 200ms var(--default-transition-timing-function);
+}
+.privacy-glass:hover .privacy-glass-hint,
+.privacy-glass:focus-visible .privacy-glass-hint {
+  opacity: 1;
+  color: var(--ink);
+}
+.privacy-glass:focus-visible {
+  outline: 2px solid var(--prime);
+  outline-offset: 2px;
+}
+
+/* Dark mode: the white top-edge highlight reads as a grey smear on a dark card,
+   so it's dialled back and the pane leans darker than the surface, not lighter. */
+@media (prefers-color-scheme: dark) {
+  .privacy-glass {
+    background: color-mix(in oklch, var(--page) 45%, transparent);
+    box-shadow:
+      inset 0  1px 0 color-mix(in oklch, white 12%, transparent),
+      inset 0 -1px 0 color-mix(in oklch, black 20%, transparent);
+  }
+}
+
+/* No backdrop-filter (older Firefox with the flag off): fall back to an opaque
+   panel. Less pretty, but it must never leave the figures legible. */
+@supports not ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {
+  .privacy-glass { background: var(--card); }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;

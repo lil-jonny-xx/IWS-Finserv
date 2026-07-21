@@ -3,7 +3,14 @@
 AMFI NAV Worker — IWS MIS Portal
 Fetches daily NAV for tracked MFs using amfi_code.
 Auto-resolves missing amfi_codes via isin_resolver.
-Schedule: Daily at 10 PM IST (4:30 PM UTC) via cron
+
+Two modes:
+  (default)   full sweep of every tracked fund — cron 02:30 UTC (08:00 IST)
+  --catchup   only funds behind the newest NAV date — cron hourly
+
+Slow AMCs publish to mfapi.in well after the 08:00 IST sweep, which left those
+holdings showing the previous business day's NAV until the next morning. Catch-up
+mode chases just that gap and no-ops once every fund is level.
 """
 import os
 import sys
@@ -132,6 +139,40 @@ def get_tracked(conn) -> list:
     return rows
 
 
+def get_laggards(conn) -> list:
+    """Securities whose newest NAV is behind the newest NAV any tracked fund has.
+
+    Catch-up mode only. The daily 08:00 IST run sweeps everything; by the time it
+    finishes, the funds that published on time define the "leader" date and the slow
+    AMCs sit behind it. Chasing only that gap keeps the hourly poll proportional to
+    the problem — 6 requests today, 0 once they catch up — instead of re-fetching all
+    35 every hour. It also self-disables on market holidays: nobody publishes, so
+    every fund is level with the leader and there is nothing to chase.
+
+    Deliberately NOT anchored to "yesterday" — on a holiday that would put every fund
+    behind and turn the hourly job into a 35-request-per-hour spin.
+    """
+    cursor = conn.cursor()
+    cursor.execute("""
+        WITH latest AS (
+            SELECT sm.id, sm.isin, sm.amfi_code, sm.security_name,
+                   MAX(nh.nav_date) AS newest
+            FROM   security_master sm
+            JOIN   nav_history nh ON nh.security_id = sm.id
+            WHERE  sm.amfi_code IS NOT NULL
+              AND  sm.isin IS NOT NULL
+            GROUP  BY sm.id, sm.isin, sm.amfi_code, sm.security_name
+        )
+        SELECT id, isin, amfi_code, security_name, newest
+        FROM   latest
+        WHERE  newest < (SELECT MAX(newest) FROM latest)
+        ORDER  BY security_name
+    """)
+    rows = cursor.fetchall()
+    cursor.close()
+    return rows
+
+
 def save_nav(conn, security_id, nav_date, nav):
     """Upsert NAV into nav_history."""
     cursor = conn.cursor()
@@ -169,10 +210,16 @@ def log_run(conn, status, processed, failed, started, error=None):
     cursor.close()
 
 
-def run():
+def run(catchup=False):
     started   = now_utc()
     today     = date.today()
-    logger.info(f"=== AMFI NAV Worker starting for {today} ===")
+
+    # Catch-up runs hourly and is idle most of the time. Defer the banner until we
+    # know there is work, so 20-odd no-op passes a day don't bury the daily run's
+    # output in the shared log. A failure still surfaces: cron_wrapper alerts on a
+    # non-zero exit regardless of what was logged.
+    if not catchup:
+        logger.info(f"=== AMFI NAV Worker starting for {today} (daily) ===")
 
     conn      = None
     processed = 0
@@ -182,29 +229,46 @@ def run():
     try:
         conn = get_db()
 
-        # Skip if already ran today
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT COUNT(*) AS c FROM nav_history WHERE nav_date = %s",
-            (today,)
-        )
-        existing = cursor.fetchone()["c"]
-        cursor.close()
+        # Skip if already ran today.
+        #
+        # Catch-up mode must bypass this. The check counts rows *dated* today, not rows
+        # *written* today — normally a no-op because NAVs carry the previous business
+        # day's date, but once the late-evening publishes land (NAV dated today) it
+        # trips and would kill every remaining hourly run of the day, stranding exactly
+        # the slow AMCs this mode exists to chase.
+        if not catchup:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COUNT(*) AS c FROM nav_history WHERE nav_date = %s",
+                (today,)
+            )
+            existing = cursor.fetchone()["c"]
+            cursor.close()
 
-        if existing > 0:
-            logger.info(f"Already ran today ({existing} records). Skipping.")
-            return
+            if existing > 0:
+                logger.info(f"Already ran today ({existing} records). Skipping.")
+                return
 
-        # Auto-resolve any missing amfi_codes first
-        logger.info("Checking for missing amfi_codes...")
-        resolve_all_missing(conn)
+        if catchup:
+            # Skip amfi_code resolution and the unresolved-MF guard: both are
+            # daily-sweep concerns, and the guard emails on every trip — hourly that
+            # would be 24 identical alerts a day.
+            tracked = get_laggards(conn)
+            if not tracked:
+                return  # silent: all funds level with newest NAV
+            logger.info(f"=== AMFI NAV Worker starting for {today} (catch-up) ===")
+            logger.info(f"Catch-up: {len(tracked)} fund(s) behind newest NAV date")
+        else:
+            # Auto-resolve any missing amfi_codes first
+            logger.info("Checking for missing amfi_codes...")
+            resolve_all_missing(conn)
 
-        # Guard: alert on any held MF that resolution couldn't map (no NAV source)
-        check_unresolved_held_mfs(conn)
+            # Guard: alert on any held MF that resolution couldn't map (no NAV source)
+            check_unresolved_held_mfs(conn)
 
-        # Get tracked securities
-        tracked = get_tracked(conn)
-        logger.info(f"Tracking {len(tracked)} securities")
+            # Get tracked securities
+            tracked = get_tracked(conn)
+            logger.info(f"Tracking {len(tracked)} securities")
 
         if not tracked:
             logger.info("No securities with amfi_code yet. Run CAS parser first.")
@@ -225,6 +289,14 @@ def run():
                     skipped += 1
                     continue
 
+                # Catch-up polls the same laggards every hour until they publish.
+                # Writing an unchanged NAV would rewrite holding rows and trigger a
+                # full metrics recompute on every one of those empty passes.
+                if catchup and entry["date"] <= sec["newest"]:
+                    logger.info(f"⏳ {name[:45]} | still {entry['date']} — not published yet")
+                    skipped += 1
+                    continue
+
                 save_nav(conn, sec_id, entry["date"], entry["nav"])
                 update_holding(conn, sec_id, entry["nav"])
                 logger.info(f"✅ {name[:45]} | {entry['nav']} | {entry['date']}")
@@ -238,6 +310,10 @@ def run():
         conn.commit()
 
         logger.info(f"=== Done: {processed} saved | {skipped} skipped | {failed} failed ===")
+
+        # Nothing moved — skip the metrics chain rather than recompute identical numbers.
+        if catchup and processed == 0:
+            return
 
     except Exception as e:
         logger.error(f"AMFI Worker FAILED: {e}")
@@ -275,4 +351,4 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    run(catchup="--catchup" in sys.argv[1:])

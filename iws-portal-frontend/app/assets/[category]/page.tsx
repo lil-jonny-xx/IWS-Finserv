@@ -1,6 +1,7 @@
 'use client';
 import { use, useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
+import { Glass } from '@/app/components/PrivacyGlass';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
 import { DYNAMIC_CATEGORY_LABELS } from '@/app/lib/manualCategories';
 
@@ -166,8 +167,8 @@ export default function ManualAssetPage({ params }: { params: Promise<{ category
   const totalPnl     = hasAnyCost && data ? data.total_value - totalCost : null;
 
   return (
-    <main id="main-content" className="min-h-screen bg-page p-4 sm:p-8">
-      <div className="max-w-screen-2xl mx-auto">
+    <main id="main-content" className="min-h-screen bg-page py-4 sm:py-8">
+      <div className="shell">
         <div className="flex flex-wrap justify-between items-start gap-3 mb-6">
           <div>
             <h1 className="text-2xl sm:text-3xl font-bold text-ink">{title}</h1>
@@ -195,7 +196,8 @@ export default function ManualAssetPage({ params }: { params: Promise<{ category
 
         {data && (
           <div className="fade-in">
-            <div className="bg-card rounded-lg border border-rule px-5 sm:px-6 py-4 mb-6 flex flex-wrap gap-8 items-end">
+            <Glass className="mb-6">
+            <div className="bg-card rounded-lg border border-rule px-5 sm:px-6 py-4 flex flex-wrap gap-8 items-end">
               <div>
                 <p className="text-[11px] uppercase tracking-wide text-ghost">Total Value</p>
                 <p className="text-2xl font-bold text-ink tabular-nums">{fmtINR(data.total_value)}</p>
@@ -224,7 +226,7 @@ export default function ManualAssetPage({ params }: { params: Promise<{ category
                 </a>
               )}
             </div>
-
+            </Glass>
             {data.count === 0 ? (
               <div className="bg-card rounded-lg border border-rule px-5 py-16 text-center text-sm text-ghost">
                 No {title} entries yet. Add one from the{' '}

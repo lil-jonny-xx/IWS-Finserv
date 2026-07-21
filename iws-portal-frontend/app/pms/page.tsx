@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
+import { Glass } from '@/app/components/PrivacyGlass';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
 import { useDragScroll } from '@/app/components/DragScroll';
 
@@ -341,8 +342,8 @@ export default function PmsPage() {
   const t = data?.totals;
 
   return (
-    <main id="main-content" className="min-h-screen bg-page p-4 sm:p-8">
-      <div className="max-w-screen-2xl mx-auto">
+    <main id="main-content" className="min-h-screen bg-page py-4 sm:py-8">
+      <div className="shell">
 
         <div className="flex flex-wrap justify-between items-start gap-3 mb-6">
           <div>
@@ -377,7 +378,8 @@ export default function PmsPage() {
 
         {data && t && (
           <>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-5">
+            <Glass className="mb-5">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
               <TotalCard label="Total Invested" value={`₹${inr(t.equity_cost)}`}
                 sub={`Excludes ₹${inr(t.cash_total)} uninvested cash`} />
               <TotalCard label="Equity" value={`₹${inr(t.equity_total)}`}
@@ -389,6 +391,7 @@ export default function PmsPage() {
               <TotalCard label="Total (Equity + Cash)" value={`₹${inr(t.total)}`}
                 sub={`Cash ₹${inr(t.cash_total)}`} />
             </div>
+            </Glass>
 
             {showEntityCol && data.by_entity.length > 1 && (
               <EntityMetricsTable rows={data.by_entity} />

@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
+import { Glass } from '@/app/components/PrivacyGlass';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
 import MarketRail from '@/app/components/MarketRail';
 
@@ -386,6 +387,11 @@ function OverviewSection({ data, include, onInclude, ovBusy }: {
       <div className="bg-card rounded-lg border border-rule p-5 sm:p-6">
         <h2 className="text-base font-semibold text-ink mb-5">Portfolio Overview</h2>
 
+        {/* Glassed together: the headline value, the composition donut and the
+            stats row are one disclosure. The asset-class breakdown below stays
+            legible — it's the equivalent of a holdings table, which is out of
+            scope for the privacy pane. */}
+        <Glass label="portfolio totals">
         <div className="flex flex-wrap items-center gap-8 mb-6">
           {/* Big value */}
           <div>
@@ -406,6 +412,7 @@ function OverviewSection({ data, include, onInclude, ovBusy }: {
           <Stat label="Avg CAGR" value={fmtPct(summary.weighted_cagr) + (summary.weighted_cagr != null ? ' p.a.' : '')} color={cagrColor} />
           <Stat label="Entities" value={entities.length.toString()} />
         </div>
+        </Glass>
 
         {/* Asset class breakdown table */}
         {asset_class_breakdown.length > 0 && (
@@ -511,7 +518,7 @@ export default function DashboardPage() {
           layout), as do identity and Sign out (TopBar) — this page no longer
           carries its own header. */}
 
-      <main className="max-w-screen-xl mx-auto px-4 sm:px-6 py-6">
+      <main className="shell py-6">
         {error && (
           <div className="mb-6 rounded-lg border border-peril/30 bg-peril/5 px-4 py-3 text-sm text-peril">
             {error}

@@ -32,9 +32,11 @@ export default function GlobalNav() {
   return (
     <header
       style={{ background: 'var(--card)', borderBottom: '1px solid var(--rule)' }}
-      className="px-4 sm:px-6 py-3"
+      // Horizontal padding belongs to .shell now, so the logo lines up with the
+      // page content below rather than sitting on its own inset.
+      className="py-3"
     >
-      <div className="max-w-screen-xl mx-auto flex items-center gap-3 min-w-0">
+      <div className="shell flex items-center gap-3 min-w-0">
         <a href="/dashboard" className="flex items-center gap-3 shrink-0" aria-label="Overview">
           <Image src="/logo.png" alt="" width={342} height={346} priority className="h-10 w-auto" />
           <span className="text-sm font-semibold text-ink hidden sm:block">Rajani MIS</span>

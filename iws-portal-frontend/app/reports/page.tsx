@@ -96,7 +96,7 @@ export default function ReportsPage() {
     <div className="min-h-screen" style={{ background: 'var(--page)' }}>
       {/* Section tabs are global — see components/GlobalNav in the root layout. */}
 
-      <main id="main-content" className="max-w-5xl mx-auto px-4 py-6">
+      <main id="main-content" className="shell shell-narrow py-6">
         <div className="flex items-center justify-between mb-6">
           <div>
             <h1 className="text-lg font-bold" style={{ color: 'var(--ink)' }}>Portfolio Reports</h1>
