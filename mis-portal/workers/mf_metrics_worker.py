@@ -237,17 +237,56 @@ def _fifo_unit_lots(txns: list[tuple]) -> list[tuple]:
 
 def load_unit_balances(conn) -> dict:
     """
-    Signed net units per (entity_id, security_id, folio_number) from the ledger.
+    Signed net units per (entity_id, security_id, folio_number) for the CURRENT LOT.
     Used to detect a holding whose transaction history does not reconcile with
     its stored quantity (e.g. a corrupted/incomplete CAS parse). Such a ledger
     yields garbage cost/P&L/XIRR, so the worker suppresses those metrics rather
-    than publishing nonsense (see DHR ICICI Liquid, folio 42429283/13).
+    than publishing nonsense.
+
+    "Current lot" = transactions after the folio's last full exit. The parser writes
+    balance_units = NULL on a transaction that takes the position to zero, so that
+    row marks the boundary. Summing across the *whole* history instead would drag in
+    pre-exit lots, and any gap in that older history — common, since a CAS only
+    covers the period it was generated for — makes the sum diverge from a quantity
+    that is actually correct.
+
+    A liquid-fund folio with several full exits and an incomplete early history was
+    misreported as corrupt for months on exactly this: the all-time sum went sharply
+    negative while the current lot reconciled to the stored quantity on the nose, and
+    its CAGR/XIRR were suppressed the whole time. Same current-lot rule already
+    governs first_invested_date.
     """
     cur = conn.cursor()
+    # Ordered by (transaction_date, id) rather than date alone: an exit and a
+    # re-entry can share a date (switch-out/switch-in), and a date-only comparison
+    # would discard the re-entry. Every folio emits a row — a folio sitting fully
+    # exited nets 0, which correctly reconciles against a zero quantity instead of
+    # dropping out of the map and reading as unreconcilable.
     cur.execute("""
-        SELECT entity_id, security_id, folio_number, COALESCE(SUM(units), 0) AS net_units
-        FROM   mf_transaction
-        GROUP  BY entity_id, security_id, folio_number
+        WITH seq AS (
+            SELECT entity_id, security_id, folio_number, units, balance_units,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY entity_id, security_id, folio_number
+                       ORDER BY transaction_date, id
+                   ) AS rn
+            FROM   mf_transaction
+        ),
+        exits AS (
+            -- Last row that zeroed the folio: units present, running balance NULL.
+            SELECT entity_id, security_id, folio_number, MAX(rn) AS exit_rn
+            FROM   seq
+            WHERE  units IS NOT NULL AND balance_units IS NULL
+            GROUP  BY entity_id, security_id, folio_number
+        )
+        SELECT s.entity_id, s.security_id, s.folio_number,
+               COALESCE(SUM(s.units) FILTER (WHERE s.rn > COALESCE(x.exit_rn, 0)), 0)
+                   AS net_units
+        FROM   seq s
+        LEFT   JOIN exits x
+               ON  x.entity_id   = s.entity_id
+               AND x.security_id = s.security_id
+               AND x.folio_number IS NOT DISTINCT FROM s.folio_number
+        GROUP  BY s.entity_id, s.security_id, s.folio_number
     """)
     rows = cur.fetchall()
     cur.close()

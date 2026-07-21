@@ -236,6 +236,55 @@ def upsert_security(conn, isin, name, sec_type, asset_class, amfi_code=None):
     return row["id"], row["amfi_code"]
 
 
+_FOLIO_SUFFIX_RE = re.compile(r"\s*/\s*\d+\s*$")
+
+
+def folio_base(folio: str) -> str:
+    """Folio stripped of its trailing ' / NN' registrar sub-code."""
+    return _FOLIO_SUFFIX_RE.sub("", (folio or "").strip()).strip()
+
+
+def canonical_folio(cur, entity_id, security_id, folio: str) -> str:
+    """Resolve an incoming folio to the spelling already on record for this position.
+
+    CAS statements render the same folio inconsistently between generations — with a
+    trailing registrar sub-code (' / NN') in one, bare in the next. folio_number is
+    part of both idx_holding_folio_unique and the mf_transaction uniqueness key, so
+    the alternate spelling does not update the existing rows, it inserts a parallel
+    set: a second holding silently double-counting the position, plus a duplicate copy
+    of the whole transaction history. This has happened in production and is invisible
+    until totals are reconciled — nothing errors.
+
+    Matching on the base folio and reusing the stored spelling keeps existing rows
+    addressable without rewriting hundreds of historical rows to a new canonical form,
+    and without changing the folio the UI displays. Falls back to the incoming value
+    for a folio genuinely seen for the first time.
+    """
+    base = folio_base(folio)
+    if not base:
+        return (folio or "").strip()
+
+    for table in ("holding", "mf_transaction"):
+        cur.execute(f"""
+            SELECT folio_number
+            FROM   {table}
+            WHERE  entity_id = %s AND security_id = %s
+              AND  regexp_replace(folio_number, '\\s*/\\s*\\d+\\s*$', '') = %s
+            LIMIT  1
+        """, (entity_id, security_id, base))
+        row = cur.fetchone()
+        if row and row["folio_number"]:
+            stored = row["folio_number"]
+            if stored.strip() != (folio or "").strip():
+                logger.info(
+                    f"Folio spelling normalised: '{folio.strip()}' -> '{stored}' "
+                    f"(entity={entity_id}, security={security_id})"
+                )
+            return stored
+
+    return folio.strip()
+
+
 def upsert_folio(cur, folio_number, entity_id, scheme_name):
     cur.execute("""
         INSERT INTO folio_mapping (folio_number, entity_id, mf_scheme)
@@ -407,7 +456,13 @@ def run(pdf_path: str, password: str, entity_id_override: int | None = None):
                         f"ISIN: {isin} | AMFI: {saved_amfi or 'N/A'}"
                     )
 
-                    upsert_folio(cur, folio_num, eid, scheme.scheme)
+                    # Reuse the folio spelling already stored for this position, so a
+                    # re-rendered folio updates the existing rows instead of forking a
+                    # duplicate holding + transaction history. Must run before every
+                    # write below — all of them key on folio_number.
+                    folio_key = canonical_folio(cur, eid, security_id, folio_num)
+
+                    upsert_folio(cur, folio_key, eid, scheme.scheme)
 
                     units    = scheme.close or Decimal("0")
                     cost     = scheme.valuation.cost if scheme.valuation else Decimal("0")
@@ -425,12 +480,12 @@ def run(pdf_path: str, password: str, entity_id_override: int | None = None):
                     )
 
                     upsert_holding(
-                        cur, eid, security_id, folio_num,
+                        cur, eid, security_id, folio_key,
                         units, cost, avg_cost, first_date, nav
                     )
 
                     for txn in scheme.transactions:
-                        if insert_transaction(cur, eid, security_id, folio_num, txn):
+                        if insert_transaction(cur, eid, security_id, folio_key, txn):
                             txn_count += 1
 
                     logger.info(
