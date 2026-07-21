@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useState, useCallback, useRef, Fragment } from 'react';
 import { useRouter } from 'next/navigation';
+import { Glass } from '@/app/components/PrivacyGlass';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
@@ -279,8 +280,8 @@ export default function UnlistedPage() {
   const totalShares = companies.reduce((s, c) => s + c.shares, 0);
 
   return (
-    <main id="main-content" className="min-h-screen bg-page p-4 sm:p-8">
-      <div className="max-w-screen-2xl mx-auto">
+    <main id="main-content" className="min-h-screen bg-page py-4 sm:py-8">
+      <div className="shell">
         <div className="flex flex-wrap justify-between items-start gap-3 mb-6">
           <div>
             <h1 className="text-2xl sm:text-3xl font-bold text-ink">Unlisted &amp; Startups</h1>
@@ -308,7 +309,8 @@ export default function UnlistedPage() {
 
         {assets && (
           <div className="fade-in">
-            <div className="bg-card rounded-lg border border-rule px-5 sm:px-6 py-4 mb-6 flex flex-wrap gap-8 items-end">
+            <Glass className="mb-6">
+            <div className="bg-card rounded-lg border border-rule px-5 sm:px-6 py-4 flex flex-wrap gap-8 items-end">
               <div>
                 <p className="text-[11px] uppercase tracking-wide text-ghost">Total Value</p>
                 <p className="text-2xl font-bold text-ink tabular-nums">{fmtINR(totalValue)}</p>
@@ -328,6 +330,7 @@ export default function UnlistedPage() {
                 <p className="text-base font-semibold text-ink tabular-nums">{companies.length}</p>
               </div>
             </div>
+            </Glass>
 
             {companies.length === 0 ? (
               <div className="bg-card rounded-lg border border-rule px-5 py-16 text-center text-sm text-ghost">

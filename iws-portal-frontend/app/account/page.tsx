@@ -93,8 +93,8 @@ export default function AccountPage() {
   );
 
   return (
-    <main id="main-content" className="min-h-screen bg-page p-4 sm:p-8">
-      <div className="max-w-screen-2xl mx-auto">
+    <main id="main-content" className="min-h-screen bg-page py-4 sm:py-8">
+      <div className="shell">
         <div className="flex flex-wrap justify-between items-start gap-3 mb-6">
           <div>
             <h1 className="text-2xl sm:text-3xl font-bold text-ink">Account</h1>

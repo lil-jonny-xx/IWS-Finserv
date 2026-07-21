@@ -14,6 +14,7 @@ import { useCallback, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import BenchmarkTicker from './BenchmarkTicker';
 import { useMe } from '@/app/lib/useMe';
+import { PrivacyToggle } from './components/PrivacyGlass';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -53,7 +54,17 @@ export default function TopBar() {
       <div className="min-w-0 flex-1">
         <BenchmarkTicker />
       </div>
-      <div className="flex items-center gap-3 px-4 py-1.5 text-xs shrink-0">
+      {/* The ticker runs full-bleed on the left; the controls sit on the same
+          right-hand gutter as the page content, so the bar reads as part of the
+          same grid rather than floating past it. */}
+      <div
+        className="flex items-center gap-3 pl-4 py-1.5 text-xs shrink-0"
+        style={{ paddingRight: 'var(--shell-gutter)' }}
+      >
+        {/* Reveals/re-covers every glass pane on the page at once. Sits with the
+            session controls because, like Sign out, it belongs to the viewer
+            rather than to whatever page they happen to be on. */}
+        <PrivacyToggle />
         {user?.full_name || user?.email ? (
           <span className="hidden sm:block" style={{ opacity: 0.6 }}>
             {user.full_name || user.email}

@@ -1,6 +1,7 @@
 'use client';
 import { useEffect, useState, useMemo, Fragment } from 'react';
 import { useRouter } from 'next/navigation';
+import { Glass } from '@/app/components/PrivacyGlass';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -133,7 +134,7 @@ export default function RealisedGainsPage() {
     <div className="min-h-screen" style={{ background: 'var(--page)' }}>
       {/* Section tabs are global — see components/GlobalNav in the root layout. */}
 
-      <main className="max-w-6xl mx-auto px-4 py-6">
+      <main className="shell py-6">
         <div className="mb-4 flex items-end justify-between">
           <div>
             <h1 className="text-lg font-bold" style={{ color: 'var(--ink)' }}>
@@ -145,7 +146,10 @@ export default function RealisedGainsPage() {
               {' '}Switches are {switches === 'exclude' ? 'excluded' : 'included'}.
             </p>
           </div>
-          <div className="text-right">
+          {/* Narrow block, so the pane gets a little breathing room around the
+              figures rather than clamping to the text. */}
+          <Glass label="P&amp;L" className="shrink-0">
+          <div className="text-right px-2 py-1">
             <div className="text-xs" style={{ color: 'var(--ghost)' }}>Total realised P&amp;L</div>
             <div className="text-base font-bold" style={{ color: totalPnl >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
               ₹{inr(totalPnl)}
@@ -158,6 +162,7 @@ export default function RealisedGainsPage() {
               </div>
             )}
           </div>
+          </Glass>
         </div>
 
         <div className="mb-6 flex flex-wrap items-center gap-x-6 gap-y-2">

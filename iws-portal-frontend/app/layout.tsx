@@ -5,6 +5,7 @@ export const dynamic = 'force-dynamic';
 import "./globals.css";
 import StickyChrome from "./components/StickyChrome";
 import IdleTimeout from "./IdleTimeout";
+import { PrivacyProvider } from "./components/PrivacyGlass";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -38,9 +39,13 @@ export default function RootLayout({
         >
           Skip to main content
         </a>
-        <StickyChrome />
-        <IdleTimeout />
-        {children}
+        {/* Wraps the chrome as well as the page: the eye toggle lives in TopBar
+            and the panes live inside {children}, so both need the same provider. */}
+        <PrivacyProvider>
+          <StickyChrome />
+          <IdleTimeout />
+          {children}
+        </PrivacyProvider>
       </body>
     </html>
   );
