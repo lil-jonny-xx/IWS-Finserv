@@ -69,12 +69,13 @@ export default function LoginPage() {
           width={342}
           height={346}
           priority
-          className="h-16 w-auto mx-auto mb-3"
+          className="h-28 sm:h-32 w-auto mx-auto mb-4"
         />
-        <p className="text-center text-xs font-semibold text-ghost tracking-widest uppercase mb-2">
+        {/* The wordmark carries the heading now that the "Sign in" title is gone —
+            the page still needs one h1, and the button already says what to do. */}
+        <h1 className="text-center text-xs font-semibold text-ghost tracking-widest uppercase mb-6">
           Rajani MIS
-        </p>
-        <h1 className="text-2xl font-bold text-ink mb-6 text-center">Sign in</h1>
+        </h1>
         <form
           onSubmit={handleSubmit}
           className="space-y-4"

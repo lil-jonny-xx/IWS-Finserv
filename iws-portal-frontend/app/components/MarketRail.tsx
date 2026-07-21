@@ -127,8 +127,10 @@ function Pct({ v }: { v: number | null }) {
   if (v == null) return <span className="text-ghost">—</span>;
   const up = v >= 0;
   return (
+    // Hair space, not a full one: the arrow + gap is pure overhead in a 320px
+    // rail, and the full space was enough to push Commodities past the edge.
     <span style={{ color: up ? 'var(--gain)' : 'var(--peril)' }}>
-      {up ? '▲' : '▼'} {Math.abs(v * 100).toFixed(2)}%
+      {up ? '▲' : '▼'}&#8202;{Math.abs(v * 100).toFixed(2)}%
     </span>
   );
 }
@@ -173,25 +175,30 @@ export default function MarketRail() {
 
   return (
     <aside className="bg-card rounded-lg border border-rule overflow-hidden" aria-label="Market data">
-      <div className="px-4 py-3 border-b border-rule">
+      <div className="px-3 py-3 border-b border-rule">
         <h2 className="text-sm font-semibold text-ink">Markets</h2>
       </div>
 
       {sections.map(sec => (
         <section key={sec.title}>
-          <h3 className="px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-ghost bg-page border-y border-rule flex items-baseline justify-between">
+          <h3 className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-ghost bg-page border-y border-rule flex items-baseline justify-between">
             <span>{sec.title}</span>
             {sec.note && <span className="font-normal normal-case tracking-normal">{sec.note}</span>}
           </h3>
+          {/* Commodities is the widest section — longest labels plus both percent
+              columns — and the aside clips rather than scrolls, so it was losing
+              the right edge of YTD. Padding below is tightened to fit; this
+              wrapper is the backstop so a future long label scrolls, not vanishes. */}
+          <div className="overflow-x-auto">
           <table className="w-full text-xs" style={{ fontVariantNumeric: 'tabular-nums' }}>
             {/* Column headers per segment rather than once for the whole rail —
                 the last two columns mean different things in different sections. */}
             <thead>
               <tr className="text-[9px] uppercase tracking-wide text-ghost">
-                <th scope="col" className="px-4 pt-2 pb-1 text-left font-normal">
+                <th scope="col" className="px-3 pt-2 pb-1 text-left font-normal">
                   <span className="sr-only">Series</span>
                 </th>
-                <th scope="col" className="px-2 pt-2 pb-1 text-right font-normal">
+                <th scope="col" className="px-1.5 pt-2 pb-1 text-right font-normal">
                   <span className="sr-only">Latest</span>
                 </th>
                 {sec.allPeriodic ? (
@@ -199,11 +206,11 @@ export default function MarketRail() {
                   // Caveat: Loans & Deposits mixes cadence — US_FD_12M is monthly but
                   // US_MORTGAGE30 is a weekly print — so "Monthly" is loose there. The
                   // row's own stamp is a day rather than a month, which shows which.
-                  <th scope="col" colSpan={2} className="px-4 pt-2 pb-1 text-right font-normal">Monthly</th>
+                  <th scope="col" colSpan={2} className="pl-1.5 pr-3 pt-2 pb-1 text-right font-normal">Monthly</th>
                 ) : (
                   <>
-                    <th scope="col" className="px-2 pt-2 pb-1 text-right font-normal">Wk</th>
-                    <th scope="col" className="px-4 pt-2 pb-1 text-right font-normal">YTD</th>
+                    <th scope="col" className="px-1.5 pt-2 pb-1 text-right font-normal">Wk</th>
+                    <th scope="col" className="pl-1.5 pr-3 pt-2 pb-1 text-right font-normal">YTD</th>
                   </>
                 )}
               </tr>
@@ -211,30 +218,31 @@ export default function MarketRail() {
             <tbody>
               {sec.rows.map(r => (
                 <tr key={r.code} className="border-b border-rule/50 last:border-0">
-                  <td className="px-4 py-2 text-dim whitespace-nowrap">{SHORT[r.code] ?? r.label}</td>
-                  <td className="px-2 py-2 text-right font-medium text-ink whitespace-nowrap">
+                  <td className="px-3 py-2 text-dim whitespace-nowrap">{SHORT[r.code] ?? r.label}</td>
+                  <td className="px-1.5 py-2 text-right font-medium text-ink whitespace-nowrap">
                     {fmtValue(scaled(r.current, r.code), r.unit)}
                   </td>
                   {PERIODIC.has(r.code) ? (
                     // A monthly/weekly reading has no meaningful week/YTD move — showing
                     // one would imply it ticks. Label the period it's from instead.
-                    <td className="px-2 py-2 pr-4 text-right text-ghost whitespace-nowrap" colSpan={2}>
+                    <td className="pl-1.5 pr-3 py-2 text-right text-ghost whitespace-nowrap" colSpan={2}>
                       {asOfLabel(r.as_of, MONTHLY.has(r.code))}
                     </td>
                   ) : (
                     <>
-                      <td className="px-2 py-2 text-right whitespace-nowrap"><Pct v={r.week_pct} /></td>
-                      <td className="px-4 py-2 text-right whitespace-nowrap"><Pct v={r.ytd_pct} /></td>
+                      <td className="px-1.5 py-2 text-right whitespace-nowrap"><Pct v={r.week_pct} /></td>
+                      <td className="pl-1.5 pr-3 py-2 text-right whitespace-nowrap"><Pct v={r.ytd_pct} /></td>
                     </>
                   )}
                 </tr>
               ))}
             </tbody>
           </table>
+          </div>
         </section>
       ))}
 
-      <p className="px-4 py-2 text-[10px] text-ghost border-t border-rule">
+      <p className="px-3 py-2 text-[10px] text-ghost border-t border-rule">
         YTD measured from 31-Mar. Live via Yahoo Finance; inflation from the IMF, US rates from FRED.
       </p>
     </aside>

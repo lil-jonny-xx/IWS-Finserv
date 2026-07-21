@@ -36,7 +36,7 @@ export default function GlobalNav() {
     >
       <div className="max-w-screen-xl mx-auto flex items-center gap-3 min-w-0">
         <a href="/dashboard" className="flex items-center gap-3 shrink-0" aria-label="Overview">
-          <Image src="/logo.png" alt="" width={342} height={346} priority className="h-8 w-auto" />
+          <Image src="/logo.png" alt="" width={342} height={346} priority className="h-10 w-auto" />
           <span className="text-sm font-semibold text-ink hidden sm:block">Rajani MIS</span>
         </a>
         {/* Visible at every width — this is now the only section nav, where the
