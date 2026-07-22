@@ -200,7 +200,9 @@ def map_type(scheme_type):
         "FOF":       ("MF_FOF",       "EQUITY"),
         "LIQUID":    ("MF_LIQUID",    "FIXED_INCOME"),
         "ELSS":      ("MF_ELSS",      "EQUITY"),
-        "GOLD":      ("GOLD_ETF",     "ALTERNATES"),
+        # Precious metals, not Alternates — same GOLD_SILVER bucket the dashboard
+        # donut and the XLSX reports use for broker-held gold/silver ETFs.
+        "GOLD":      ("GOLD_ETF",     "GOLD_SILVER"),
         "ETF":       ("MF_ETF",       "EQUITY"),
         "ARBITRAGE": ("MF_ARBITRAGE", "ARBITRAGE"),
     }

@@ -14,6 +14,19 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+# Split/bonus lot adjustment. Imported lazily-safe: this module is also used in
+# contexts where the corporate_action table may not exist yet, and load_actions()
+# returns {} in that case rather than raising.
+from workers.corporate_actions import (  # noqa: E402
+    load_actions as _ca_load, apply_actions as _ca_apply,
+)
+# Shared gold/silver/commodity classifier — the same one that tags equity_holding
+# and drives the Gold/Silver page, so realised gains bucket the way holdings do.
+from equity.asset_class import (  # noqa: E402
+    classify_asset_class as _ac_classify, load_overrides as _ac_overrides,
+    GOLD_SILVER_COMMODITY as _AC_COMMODITY,
+)
+
 REPORTS_DIR = "/var/www/mis-portal/reports"
 
 # Canonical master template — every generated workbook is cloned from this so the output
@@ -813,6 +826,10 @@ def build_individual_report(conn, entity_id: int, entity_name: str, as_of: date)
     mf_rows  = _fetch_mf_holdings(conn, entity_id)
     # Merge same stock held across multiple brokers (Combined view logic)
     eq_rows  = _merge_equity_by_symbol(_fetch_equity_holdings(conn, entity_id))
+    # Gold / silver / commodity holdings are excluded from _fetch_equity_holdings,
+    # so they need their own fetch — otherwise broker-held gold ETFs (GOLDBEES &c)
+    # never reach this report at all.
+    comm_rows  = _merge_equity_by_symbol(_fetch_commodity_holdings(conn, entity_id))
     pms_items  = _pms_report_rows(_fetch_pms_holdings(conn, entity_id))
     cash_items = _broker_cash_report_rows(_fetch_broker_cash(conn, entity_id))
     bank_items = _bank_account_report_rows(conn, _fetch_bank_accounts(conn, entity_id), as_of)
@@ -895,6 +912,23 @@ def build_individual_report(conn, entity_id: int, entity_name: str, as_of: date)
     # The section that used to sit here read manual_input category "properties",
     # which has been empty since the register moved to the `property` table.
 
+    # ── Commodities & Precious Metals ─────────────────────────────────────────
+    # Gold / silver ETFs are precious metals, not Alternates — same bucket the
+    # dashboard donut (GOLD_SILVER) and the combined report use. Broker-held
+    # ETFs and manually-entered ones sit under one heading.
+    gold_etf_man = man_by_cat.get("gold_etf", [])
+    if comm_rows or gold_etf_man:
+        row = _write_section(ws, row, "COMMODITIES & PRECIOUS METALS")
+        data_start = row
+        alt = False
+        for h in comm_rows:
+            _write_data_row(ws, row, h, alt); row += 1; alt = not alt
+        for m in gold_etf_man:
+            _write_data_row(ws, row, m, alt); row += 1; alt = not alt
+        _write_total_row(ws, row, "Total Commodities", (data_start, row - 1)); row += 1
+
+    _write_total_row(ws, row, "C. TOTAL COMMODITIES & PRECIOUS METALS", None); row += 2
+
     # ── Alternates ────────────────────────────────────────────────────────────
     row = _write_section(ws, row, "ALTERNATES")
 
@@ -902,7 +936,6 @@ def build_individual_report(conn, entity_id: int, entity_name: str, as_of: date)
         ("overseas_fund",   "Overseas Funds"),
         ("overseas_equity", "Overseas Direct Equity"),
         ("forex",           "Forex / Foreign Cash"),
-        ("gold_etf",        "Gold / Silver ETF"),
         ("unlisted",        "Unlisted Equity"),
         ("startup",         "Startups"),
     ]:
@@ -915,13 +948,13 @@ def build_individual_report(conn, entity_id: int, entity_name: str, as_of: date)
             _write_data_row(ws, row, m, i % 2 == 1); row += 1
         _write_total_row(ws, row, f"Total {label}", (data_start, row - 1)); row += 1
 
-    _write_total_row(ws, row, "C. TOTAL ALTERNATES", None); row += 2
+    _write_total_row(ws, row, "D. TOTAL ALTERNATES", None); row += 2
 
     # ── Below-the-line ────────────────────────────────────────────────────────
     for cat, label in [
-        ("funds_transit",  "D. Funds in Transit"),
-        ("broker_balance", "E. Broker Balance"),
-        ("bank",           "F. Funds in Bank"),
+        ("funds_transit",  "E. Funds in Transit"),
+        ("broker_balance", "F. Broker Balance"),
+        ("bank",           "G. Funds in Bank"),
     ]:
         items = man_by_cat.get(cat, [])
         # Fold automated broker cash (broker_cash) into the Broker Balance line.
@@ -1859,7 +1892,7 @@ def _is_long_term_equity(buy_dt: date, sell_dt: date) -> bool:
     return sell_dt > anniversary
 
 
-def _fifo_realised_grouped(seq: list, fy_start: date) -> list:
+def _fifo_realised_grouped(seq: list, fy_start: date, actions: dict | None = None) -> list:
     """
     FIFO realised P&L for ONE entity's chronological Indian-equity trade stream.
 
@@ -1889,6 +1922,11 @@ def _fifo_realised_grouped(seq: list, fy_start: date) -> list:
     """
     lots: dict = defaultdict(deque)   # sec -> deque([[buy_date, qty, price], ...])
     out: list = []
+    # Pending split/bonus events per security, consumed as the timeline reaches them.
+    # Without this a 1:1 bonus makes the holder sell twice what the books show, and the
+    # sell is dropped as "unknown" — the quantity is real, it just never arrived as a
+    # BUY because the depository credited it. See workers/corporate_actions.py.
+    pending = {s: list(v) for s, v in (actions or {}).items()}
 
     for t in seq:
         sec = t["sec"]
@@ -1896,6 +1934,11 @@ def _fifo_realised_grouped(seq: list, fy_start: date) -> list:
         px  = float(t["price"] or 0)
         if qty <= 1e-9:
             continue
+
+        # Must run BEFORE the trade is processed: every lot currently open was bought
+        # before this date, and anything bought after the ex-date was already scaled.
+        if pending.get(sec):
+            _ca_apply(lots[sec], pending[sec], t["date"])
 
         if t["kind"] == "buy":
             lots[sec].append([t["date"], qty, px])
@@ -1926,14 +1969,14 @@ def _fifo_realised_grouped(seq: list, fy_start: date) -> list:
             continue
 
         if remaining > 1e-9:                       # not enough basis to cover the sell
-            out.append({"group": "Equity", "security_name": t["name"],
+            out.append({"group": t.get("group", "Equity"), "security_name": t["name"],
                         "purchase_amount": None, "sale_date": t["date"],
                         "sale_amount": sale_amount, "pnl": None,
                         "st_pnl": None, "lt_pnl": None, "return_pct": None})
         else:
             pnl = st_pnl + lt_pnl
             ret = (pnl / purchase_amount) if purchase_amount else None
-            out.append({"group": "Equity", "security_name": t["name"],
+            out.append({"group": t.get("group", "Equity"), "security_name": t["name"],
                         "purchase_amount": purchase_amount, "sale_date": t["date"],
                         "sale_amount": sale_amount, "pnl": pnl,
                         "st_pnl": st_pnl, "lt_pnl": lt_pnl, "return_pct": ret})
@@ -1966,6 +2009,28 @@ def _fx_rate_on(conn, currency: str, on_date: date) -> Optional[float]:
     return float(row["rate"]) if row else None
 
 
+# asset_class → realised-sheet subgroup. Driven off security_master.asset_class
+# rather than security_type so the sheet buckets the same way the holdings
+# sections do: gold/silver funds are precious metals, not Equity, and debt/liquid
+# both land in Fixed Income (the old MF_DEBT-only test filed liquid under Equity).
+# Arbitrage stays Equity — that is how it is taxed, which is what this sheet is for.
+_MF_REALISED_GROUP = {
+    "FIXED_INCOME": "Fixed Income",
+    "GOLD_SILVER":  "Commodities",
+    "ALTERNATES":   "Alternates",
+}
+
+
+def _mf_realised_group(asset_class: Optional[str], security_type: Optional[str]) -> str:
+    ac = (asset_class or "").upper().strip()
+    if ac in _MF_REALISED_GROUP:
+        return _MF_REALISED_GROUP[ac]
+    if ac:
+        return "Equity"
+    # asset_class missing (pre-classification rows) — fall back to the old test.
+    return "Fixed Income" if security_type == "MF_DEBT" else "Equity"
+
+
 def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
                           since_inception: bool = False,
                           include_switches: bool = True) -> list:
@@ -1996,7 +2061,7 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
 
     # ---- MF ----
     cur.execute(f"""
-        SELECT t.security_id, sm.security_name, sm.security_type,
+        SELECT t.security_id, sm.security_name, sm.security_type, sm.asset_class,
                t.transaction_date AS d, t.transaction_type AS tt, t.amount, t.units
         FROM mf_transaction t JOIN security_master sm ON sm.id = t.security_id
         WHERE t.entity_id IN ({ph})
@@ -2013,7 +2078,7 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
             kind = "buy" if r["tt"] in BUY else ("sell" if r["tt"] in SELL else None)
             if not kind:
                 continue
-            grp = "Fixed Income" if r["security_type"] == "MF_DEBT" else "Equity"
+            grp = _mf_realised_group(r["asset_class"], r["security_type"])
             seq.append({"date": r["d"], "kind": kind, "units": r["units"],
                         "amount": r["amount"], "name": r["security_name"], "group": grp})
         _add(_avg_cost_realised(seq, fy), "Mutual Funds")
@@ -2028,7 +2093,7 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
     # equity_trade_ledger. Ordering within a date falls back to insert order (id).
     try:
         cur.execute(f"""
-            SELECT t.entity_id, t.security_id, sm.security_name,
+            SELECT t.entity_id, t.security_id, sm.security_name, sm.isin,
                    t.transaction_date AS d, t.transaction_type AS tt,
                    t.price, t.quantity AS units
             FROM stock_transaction t JOIN security_master sm ON sm.id = t.security_id
@@ -2039,6 +2104,18 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
         srows = cur.fetchall()
     except Exception:
         conn.rollback(); srows = []
+    try:
+        ca_actions = _ca_load(cur)
+    except Exception:
+        conn.rollback(); ca_actions = {}
+    # Gold/silver ETFs and SGBs live in stock_transaction like any other scrip —
+    # security_master carries no asset_class for them (equity_holding does, and a
+    # fully-sold position is pruned from there), so classify from symbol/ISIN with
+    # the shared classifier, admin overrides included.
+    try:
+        _ac_ovr = _ac_overrides(cur)
+    except Exception:
+        conn.rollback(); _ac_ovr = {}
     eq_by_entity: dict = defaultdict(list)
     for r in srows:
         eq_by_entity[r["entity_id"]].append(r)
@@ -2049,10 +2126,12 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
             kind = "buy" if tt in ("BUY", "B", "PURCHASE") else ("sell" if tt in ("SELL", "S", "SALE") else None)
             if not kind:
                 continue
+            cls = _ac_classify(r["security_name"], r["isin"], _ac_ovr)
             seq.append({"date": r["d"], "kind": kind, "units": r["units"],
                         "price": r["price"], "name": r["security_name"],
-                        "group": "Equity", "sec": r["security_id"]})
-        _add(_fifo_realised_grouped(seq, fy), "Equity")
+                        "group": "Commodities" if cls in _AC_COMMODITY else "Equity",
+                        "sec": r["security_id"]})
+        _add(_fifo_realised_grouped(seq, fy, ca_actions), "Equity")
 
     # ---- Foreign equity (equity_trade_ledger; native cash flows → INR at trade-date FX) ----
     # Switches do not exist for brokers, so include_switches is irrelevant here.
@@ -2395,7 +2474,8 @@ def _render_realised_block(ws, start_row: int, label: str, rows: list, as_of: da
     _KNOWN = ["Equity", "Mutual Funds", "Foreign Equity", "PMS"]
     _present = {_cat(r) for r in rows}
     categories = [c for c in _KNOWN if c in _present] + sorted(_present - set(_KNOWN))
-    _GROUP_ORDER = ["Fixed Income", "Equity", "Foreign Equity", "PMS", "Alternates"]
+    _GROUP_ORDER = ["Fixed Income", "Equity", "Foreign Equity", "PMS",
+                    "Commodities", "Alternates"]
 
     def _sub_header(text):
         r = state["row"]
@@ -2494,14 +2574,14 @@ def _fetch_property_register(conn):
     """Every property with its holder, valuation inputs and effective fair value.
 
     The value expression mirrors _fetch_property_overview_rows in main.py exactly:
-    sale_price once sold; else hand-entered market_value, else area x RRR x the
-    fair-value multiplier; plus summed floor costings; halved for an old statutory
-    lease. Getting any of those wrong would put a number in the register that the
-    Properties page contradicts.
+    sale_price once sold; else land (hand-entered market_land_value, else
+    area x RRR x the fair-value multiplier) plus summed floor costings; halved for
+    an old statutory lease. Getting any of those wrong would put a number in the
+    register that the Properties page contradicts.
     """
     val_expr = (
         f"CASE WHEN p.sold THEN p.sale_price ELSE "
-        f"(COALESCE(p.market_value, p.area * p.rrr * {FAIR_VALUE_MULTIPLIER}) "
+        f"(COALESCE(p.market_land_value, p.area * p.rrr * {FAIR_VALUE_MULTIPLIER}) "
         f" + COALESCE(fv.bval, 0)) "
         f"* CASE WHEN p.is_old_lease THEN {OLD_LEASE_OWNER_SHARE} ELSE 1 END END"
     )
@@ -2516,7 +2596,7 @@ def _fetch_property_register(conn):
         SELECT p.name, p.property_type, e.name AS holder_name, p.ownership,
                p.village, p.taluka, p.address, p.survey_no, p.property_no,
                p.area, p.area_unit, p.built_up_area, p.tenure, p.is_old_lease,
-               p.acquisition_date, p.purchase_price, p.rrr, p.market_value,
+               p.acquisition_date, p.purchase_price, p.rrr, p.market_land_value,
                p.sold, p.sale_date, p.sale_price, p.notes,
                {val_expr} AS fair_value
         FROM   property p

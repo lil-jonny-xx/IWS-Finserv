@@ -172,12 +172,13 @@ function ColorNum({ n, fmt }: { n: number | null | undefined; fmt: (v: number) =
 
 // ── constants ─────────────────────────────────────────────────────────────────
 
-const ASSET_CLASS_ORDER = ['EQUITY', 'HYBRID', 'ARBITRAGE', 'ALTERNATES', 'FIXED_INCOME'] as const;
+const ASSET_CLASS_ORDER = ['EQUITY', 'HYBRID', 'ARBITRAGE', 'GOLD_SILVER', 'ALTERNATES', 'FIXED_INCOME'] as const;
 const ASSET_CLASS_LABELS: Record<string, string> = {
   EQUITY:       'Equity',
   HYBRID:       'Hybrid',
   ARBITRAGE:    'Arbitrage',
   FIXED_INCOME: 'Fixed Income',
+  GOLD_SILVER:  'Gold / Silver',
   ALTERNATES:   'Alternates',
 };
 const SEC_TYPE_LABELS: Record<string, string> = {

@@ -50,6 +50,11 @@ def _keyword_class(sym: str):
         return SILVER
     if "GOLD" in sym:
         return GOLD
+    # Older SGB rows carry no ISIN, so the IN0* rule cannot see them. The tranche
+    # symbol is always SGB + month/year (SGBJUN28, SGBJUL28IV) — require a digit so
+    # a plain "SGB"-named company would not match.
+    if sym.startswith("SGB") and any(ch.isdigit() for ch in sym):
+        return GOLD
     if "URANIUM" in sym:
         return COMMODITY
     return None
@@ -78,9 +83,13 @@ def classify_asset_class(symbol: str, isin: str, overrides: "dict | None" = None
     if isin_u.startswith("IN0"):
         return GOLD
 
-    kw = _keyword_class(sym)
-    if kw:
-        return kw
+    # INE* is a company share, INF* a fund/ETF, IN0* an SGB. So an INE ISIN rules
+    # out the keyword fallback: SKYGOLD is Sky Gold Ltd (a jewellery manufacturer),
+    # not a gold ETF, and would otherwise be filed under precious metals.
+    if not isin_u.startswith("INE"):
+        kw = _keyword_class(sym)
+        if kw:
+            return kw
 
     return EQUITY
 
