@@ -173,8 +173,18 @@ def sync_trades(cur, broker_module, broker, entity_id, entity_code, commit, stat
             skip += 1
             continue
         tid = r["trade_id"] if r["trade_id"] and r["trade_id"] not in ("0", "None") else None
-        sref = f"{broker}:" + (tid or hashlib.md5(
-            f"{entity_id}|{r['symbol']}|{r['date']}|{r['side']}|{r['qty']}|{r['price']}".encode()).hexdigest()[:16])
+        # A broker trade_id is unique per ACCOUNT PER DAY, never globally — zerodha
+        # 12479400 is BOTH HHR's BEL sell (2024-07-01) and DHR's SBIN sell (2026-02-20).
+        # Keying on it alone made the dedup below drop whichever entity was imported
+        # second, silently: three real HHR trades were lost that way, and the loss is
+        # invisible afterwards because the row that would prove it was never inserted.
+        # Scope by entity+date. The md5 branch already carries entity_id, so it stays
+        # byte-identical — changing it would orphan the existing hash-keyed rows and
+        # re-import every one of them as new. See db_migrate_source_ref_scope.py.
+        sref = (f"{broker}:{entity_id}:{r['date']}:{tid}" if tid else
+                f"{broker}:" + hashlib.md5(
+                    f"{entity_id}|{r['symbol']}|{r['date']}|{r['side']}|{r['qty']}|{r['price']}"
+                    .encode()).hexdigest()[:16])
         cur.execute("SELECT 1 FROM stock_transaction WHERE source_ref=%s", (sref,))
         if cur.fetchone():
             dup += 1

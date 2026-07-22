@@ -109,6 +109,18 @@ def plan_for_holding(cur, h, tol):
         return "zero-qty"
     if not isin:
         return "no-isin"
+    # Only reconstruct against a holding the broker feed confirmed TODAY. as_of_date is
+    # written solely by the daily full sync from the live feed, so a stale value means
+    # the broker has stopped listing the position (sold) or the sync hasn't run yet —
+    # in both cases h["quantity"] is a leftover, not a fact, and synthesising a BUY for
+    # it invents shares that were already gone. Worse, that synthetic BUY then vouches
+    # for the very holding it came from and blocks the sync's exit-prune forever (DHR
+    # TATACOMM / HHR PACEDIGITK, sold 2026-07-17, plugged six minutes later off the
+    # not-yet-refreshed row). The sync's prune now ignores 'reconstructed' rows, but
+    # not creating the bogus lot in the first place also keeps FIFO cost basis honest.
+    as_of = h.get("as_of_date")
+    if as_of is None or as_of < datetime.now().date():
+        return f"stale-holding (as_of {as_of or 'never'} — refusing to reconstruct)"
 
     cur.execute("""SELECT st.id, st.transaction_date d, st.transaction_type side,
                           st.quantity q, st.source src

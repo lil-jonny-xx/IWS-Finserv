@@ -447,8 +447,14 @@ def import_file(cur, broker, ent_id, kind, path, commit, recon, isin_map=None):
         amount = r["qty"] * r["price"]
         charges = sum(x for x in (r["brokerage"], r["stt"], r["other"]) if x) or None
         total_cost = amount + (charges or 0)
-        sref = f"{broker}:" + (r["trade_id"] or hashlib.md5(
-            f"{ent_id}|{r['symbol']}|{r['date']}|{r['side']}|{r['qty']}|{r['price']}".encode()).hexdigest()[:16])
+        # Scoped by entity+date: a broker trade_id repeats across accounts, so a bare
+        # {broker}:{trade_id} key made this importer skip another entity's trade as a
+        # "duplicate". Keep the md5 branch byte-identical (it already carries ent_id) —
+        # see broker_txn_sync_worker and db_migrate_source_ref_scope.py.
+        sref = (f"{broker}:{ent_id}:{r['date']}:{r['trade_id']}" if r["trade_id"] else
+                f"{broker}:" + hashlib.md5(
+                    f"{ent_id}|{r['symbol']}|{r['date']}|{r['side']}|{r['qty']}|{r['price']}"
+                    .encode()).hexdigest()[:16])
         cur.execute("SELECT 1 FROM stock_transaction WHERE source_ref = %s", (sref,))
         if cur.fetchone():
             dupes += 1
@@ -485,6 +491,12 @@ def import_file(cur, broker, ent_id, kind, path, commit, recon, isin_map=None):
     print(f"  {verb} {inserted}, skipped {skipped} (incomplete/F&O), {dupes} dupes{extra}")
     if recon:
         reconcile(cur, broker, ent_id, net)
+    # Returned so callers other than the CLI (the /trades upload endpoint) can report
+    # the outcome instead of scraping stdout. main() ignores this.
+    return {"inserted": inserted, "skipped": skipped, "dupes": dupes,
+            "superseded": superseded, "committed": bool(commit),
+            "net_by_symbol": {k: v for k, v in sorted(net.items()) if abs(v) > 1e-9},
+            "last_trade_date": max_tdate.isoformat() if max_tdate else None}
 
 
 def reconcile(cur, broker, ent_id, net):

@@ -179,8 +179,14 @@ def main():
         exch   = str(r[cols["exchange"]]).strip() if cols.get("exchange") and not pd.isna(r[cols["exchange"]]) else None
         tid    = str(r[cols["trade_id"]]).strip() if cols.get("trade_id") and not pd.isna(r[cols["trade_id"]]) else None
         amount = qty * price
-        source_ref = f"{args.broker}:" + (tid or hashlib.md5(
-            f"{entity_id}|{symbol}|{tdate}|{side}|{qty}|{price}".encode()).hexdigest()[:16])
+        # Scoped by entity+date: a broker trade_id repeats across accounts, so a bare
+        # {broker}:{trade_id} key made this importer skip another entity's trade as a
+        # "duplicate". Keep the md5 branch byte-identical (it already carries entity_id)
+        # — see broker_txn_sync_worker and db_migrate_source_ref_scope.py.
+        source_ref = (f"{args.broker}:{entity_id}:{tdate}:{tid}" if tid else
+                      f"{args.broker}:" + hashlib.md5(
+                          f"{entity_id}|{symbol}|{tdate}|{side}|{qty}|{price}"
+                          .encode()).hexdigest()[:16])
 
         cur.execute("SELECT 1 FROM stock_transaction WHERE source_ref = %s", (source_ref,))
         if cur.fetchone():

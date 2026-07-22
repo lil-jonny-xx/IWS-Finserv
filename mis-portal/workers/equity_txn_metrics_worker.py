@@ -118,14 +118,24 @@ def fy_start_price(cur, entity_id, broker, isin):
     return f(row["market_value"]) or 0.0, f(row["quantity"]) or 0.0
 
 
-def fifo_lots(txns):
+def fifo_lots(txns, actions=None):
     """Reconstruct the cost lots making up the CURRENT position via FIFO:
     sells consume the oldest buys, so what remains is the held shares with the real
-    dates/prices they were bought at. Returns [(date, qty, price)]."""
+    dates/prices they were bought at. Returns [(date, qty, price)].
+
+    `actions` is this security's [(ex_date, ratio), ...] from corporate_actions.
+    Without it a bonus issue leaves the lot quantity at the pre-bonus figure while the
+    holding shows the post-bonus one, so cost basis (and every metric derived from it)
+    is overstated by the ratio.
+    """
     from collections import deque
+    from workers.corporate_actions import apply_actions
     lots = deque()
+    pending = list(actions or [])
     for t in txns:
         q, p, d = f(t["q"]), f(t["p"]), t["d"]
+        if pending:
+            apply_actions(lots, pending, d)
         if t["side"] == "BUY":
             lots.append([d, q, p])
         else:
@@ -183,8 +193,12 @@ def ran_negative(txns) -> bool:
     return False
 
 
-def compute(cur, h):
-    """Return dict of metric updates for one holding row h."""
+def compute(cur, h, ca_by_isin=None):
+    """Return dict of metric updates for one holding row h.
+
+    `ca_by_isin` is the split/bonus map from workers.corporate_actions; passed in once
+    per run rather than re-queried per holding.
+    """
     eid, broker, isin = h["entity_id"], h["broker"], h["isin"]
     cost = f(h["cost"]) or 0.0
     cmv = f(h["current_market_value"])
@@ -235,12 +249,17 @@ def compute(cur, h):
     # Tolerance: 2% of quantity; the 1-share absolute slack only applies to larger
     # positions — for a 2-share holding a ±1 mismatch is a 50% error, and lots built
     # from such history are wrong.
+    # Net is taken from the CA-ADJUSTED lots, not from raw txn arithmetic. A 1:1 bonus
+    # leaves raw net at half the real holding, which fails this very tolerance check and
+    # silently skips the position — so the gate has to see the same adjusted world the
+    # lots do, or applying corporate actions would fix nothing here.
     lots = []
     if txns:
-        net_q = sum((f(t["q"]) if t["side"] == "BUY" else -f(t["q"])) for t in txns)
+        cand = fifo_lots(txns, (ca_by_isin or {}).get(isin))
+        net_q = sum(q for _, q, _ in cand)
         tol = max(1.0, 0.02 * qty) if qty >= 50 else 0.02 * qty + 1e-6
         if abs(net_q - qty) <= tol:
-            lots = fifo_lots(txns)
+            lots = cand
 
     first_dt = h["first_invested_date"]
     if lots:                                          # current held-lot start = true inception
@@ -424,10 +443,17 @@ def main():
     metric_cols = ("xirr_inception_pct", "cagr_inception_pct", "pnl_ytd", "returns_ytd_pct")
     methods = {"fifo-flow": 0, "2-point": 0, "none": 0}
     filled = {c: 0 for c in (*metric_cols, "first_invested_date")}
-    print(f"{'COMMIT' if args.commit else 'DRY-RUN'} — {len(rows)} holding(s)\n")
+    try:
+        from workers.corporate_actions import load_actions_by_isin
+        ca_by_isin = load_actions_by_isin(cur)
+    except Exception as e:
+        print(f"(corporate actions unavailable: {e})")
+        ca_by_isin = {}
+    print(f"{'COMMIT' if args.commit else 'DRY-RUN'} — {len(rows)} holding(s), "
+          f"{len(ca_by_isin)} security(ies) with split/bonus history\n")
     print(f"{'ENT':5}{'BROKER':10}{'SYMBOL':16}{'method':10}{'XIRR%':>9}{'CAGR%':>9}{'YTD P&L':>12}")
     for h in rows:
-        u = compute(cur, h)
+        u = compute(cur, h, ca_by_isin)
         methods[u["method"]] = methods.get(u["method"], 0) + 1
         # Owned metric columns are written every run INCLUDING NULLs so stale values
         # clear when a holding stops qualifying; first_invested_date only when improved.

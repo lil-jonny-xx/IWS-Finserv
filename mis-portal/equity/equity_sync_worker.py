@@ -45,6 +45,12 @@ from equity.models import EquityHolding
 # equity/db_migrate_foreign_equity.py.
 FOREIGN_BROKER_LABELS = {"ibkr", "vested", "dbs"}
 
+# Days a domestic holding may be absent from the broker feed before the prune stops
+# deferring to the trade ledger and deletes it anyway. Long enough to ride out a
+# multi-day feed outage or a token expiry; short enough that a sell which never
+# reaches stock_transaction can't keep a sold position on the page indefinitely.
+PRUNE_STALE_DAYS = 7
+
 
 def _holding_table(foreign: bool) -> str:
     return "foreign_equity_holding" if foreign else "equity_holding"
@@ -882,15 +888,35 @@ def sync_entity_broker(
     # e.g. DHR's angel_one CRIZAC-EQ / NCC-EQ, sold 2026-06-12, still displayed a
     # month later. Realised gains are unaffected: the sells live in stock_transaction.
     #
-    # Two guards make this safe against a genuinely-held position that a flaky feed
+    # Three guards make this safe against a genuinely-held position that a flaky feed
     # transiently omits (which the non-empty early-return above does NOT catch — that
     # only stops a fully-blank read):
     #   1. Ledger cross-check — only delete when the books also say the position is
-    #      closed (net BUY-SELL qty <= 0 for that security). A holding the ledger
-    #      still shows as owned (e.g. HHR zerodha PGINVIT: bought 25k, sold 10k, net
-    #      15k, but dropped from the zerodha feed since 2026-06-30) is KEPT. If it was
-    #      truly sold, the sell reaches the ledger and it prunes on a later run.
-    #   2. Domestic only — foreign brokers (IBKR Flex etc.) have flaky/paused feeds
+    #      closed (net BUY-SELL qty <= 0 for that security). If it was truly sold, the
+    #      sell reaches the ledger and it prunes on a later run.
+    #      'reconstructed' rows need care here. reconstruct_history.py derives them
+    #      FROM equity_holding.quantity, so counting them blindly makes the guard
+    #      circular — a holding vouches for itself via a trade it invented. That is
+    #      exactly how DHR TATACOMM and HHR PACEDIGITK survived: sold in full on
+    #      2026-07-17, then plugged with a synthetic BUY six minutes later off the
+    #      not-yet-refreshed holding row, which blocked every subsequent prune.
+    #      But a plug is legitimate when the real books net NEGATIVE — more sells than
+    #      buys proves history is genuinely missing buys (pre-NRI-transfer shares, e.g.
+    #      SDR NATIONALUM: real net -8,340, plug +8,500), and there the plug is real
+    #      evidence of ownership. So the discriminator is the sign of the real net:
+    #        net_real  = 0  -> books balance on their own; any plug is self-referential
+    #                          noise sitting on top of a closed position -> prunable
+    #        net_real  < 0  -> history known-incomplete, the plug supplies real shares
+    #                          -> defer to net_all and KEEP if that is still positive
+    #        net_real  > 0  -> genuinely still held -> keep
+    #   2. Staleness override — the ledger guard defends against a feed hiccup, not
+    #      against weeks of absence. Once a row has been missing from the feed for
+    #      PRUNE_STALE_DAYS, the broker is believed over the books: HHR PGINVIT was
+    #      dropped by Zerodha on 2026-06-30 and sat visible for three weeks because
+    #      its sells never reached the ledger at all (the txn sync missed 06-25..07-02
+    #      and Kite only retains the current day's trades, so they are unrecoverable
+    #      via API). A never-arriving sell must not pin a position forever.
+    #   3. Domestic only — foreign brokers (IBKR Flex etc.) have flaky/paused feeds
     #      and their trades aren't in stock_transaction, so the ledger guard can't
     #      vouch for them; leave foreign_equity_holding to its own path.
     present_isins   = [h.isin for h in holdings if h.isin]
@@ -898,20 +924,37 @@ def sync_entity_broker(
     if not foreign and present_symbols:
         cur.execute(
             """
+            WITH ledger AS (
+                SELECT eh.id AS holding_id,
+                       COALESCE(SUM(CASE WHEN st.transaction_type = 'BUY'
+                                         THEN st.quantity ELSE -st.quantity END), 0) AS net_all,
+                       COALESCE(SUM(CASE WHEN st.source IS DISTINCT FROM 'reconstructed'
+                                         THEN (CASE WHEN st.transaction_type = 'BUY'
+                                                    THEN st.quantity ELSE -st.quantity END)
+                                         ELSE 0 END), 0) AS net_real
+                  FROM equity_holding eh
+                  LEFT JOIN security_master sm ON sm.isin IS NOT DISTINCT FROM eh.isin
+                  LEFT JOIN stock_transaction st
+                         ON st.security_id = sm.id AND st.entity_id = eh.entity_id
+                 WHERE eh.entity_id = %s AND eh.broker = %s
+                 GROUP BY eh.id
+            )
             DELETE FROM equity_holding eh
-             WHERE eh.entity_id = %s AND eh.broker = %s
+             USING ledger l
+             WHERE l.holding_id = eh.id
+               AND eh.entity_id = %s AND eh.broker = %s
                AND (eh.isin IS NULL OR eh.isin <> ALL(%s::text[]))
                AND eh.symbol <> ALL(%s::text[])
-               AND COALESCE((
-                     SELECT SUM(CASE WHEN st.transaction_type = 'BUY'
-                                     THEN st.quantity ELSE -st.quantity END)
-                       FROM stock_transaction st
-                       JOIN security_master sm ON sm.id = st.security_id
-                      WHERE st.entity_id = eh.entity_id
-                        AND sm.isin IS NOT DISTINCT FROM eh.isin
-                   ), 0) <= 0
+               AND (
+                     l.net_real = 0                        -- real books balance -> closed
+                  OR (l.net_real < 0 AND l.net_all <= 0)   -- incomplete history, plug included
+                  OR eh.as_of_date IS NULL
+                  OR eh.as_of_date < %s                    -- feed-absent too long to defer
+                   )
             """,
-            (entity_id, broker_label, present_isins, present_symbols),
+            (entity_id, broker_label, entity_id, broker_label,
+             present_isins, present_symbols,
+             today - timedelta(days=PRUNE_STALE_DAYS)),
         )
         pruned = cur.rowcount
         if pruned:
