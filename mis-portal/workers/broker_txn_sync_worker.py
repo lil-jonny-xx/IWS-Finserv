@@ -123,8 +123,27 @@ def entity_map(cur):
 
 
 def last_trade_date(cur, entity_id, broker):
-    cur.execute("SELECT MAX(transaction_date) d FROM stock_transaction WHERE entity_id=%s AND source=%s",
-                (entity_id, broker))
+    """Latest AUTHORITATIVE trade date for this account — the high-water mark the
+    incremental fetch window starts from.
+
+    Live-captured rows are excluded even though they carry source=<broker>: the
+    order-update daemon writes them with source_ref '<broker>:live:<order_id>'.
+    Counting them lets a single live fill close the window on an EARLIER day the API
+    has not returned yet. Dhan's tradebook is T+1, so the sequence is routine: a fill
+    on day 1 is missed live, the API does not expose it until day 2, and one live fill
+    on day 2 would move this high-water mark past day 1 and strand it permanently —
+    the sync would report "up to date" while the trade is simply gone.
+
+    Re-fetching a day that already has live rows is safe by design: the API row lands
+    under a different source_ref, and sync_trades then supersedes the live rows it
+    covers (see the '{broker}:live:%' delete), so the trade is booked exactly once at
+    its authoritative price. Snapshot and reconstructed rows carry their own `source`
+    values and are already outside this filter.
+    """
+    cur.execute("""SELECT MAX(transaction_date) d FROM stock_transaction
+                   WHERE entity_id = %s AND source = %s
+                     AND COALESCE(source_ref, '') NOT LIKE %s""",
+                (entity_id, broker, f"{broker}:live:%"))
     r = cur.fetchone()
     return r["d"] if r and r["d"] else None
 
