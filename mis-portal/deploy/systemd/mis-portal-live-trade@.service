@@ -23,7 +23,13 @@ ExecStart=/var/www/.venv/bin/python -m workers.live_trade_daemon --account %i
 # 'always' makes systemd the reconnect for every broker. An explicit `systemctl stop`
 # (the stop timer) is not a restart trigger, so market-hours bounding still holds.
 Restart=always
-RestartSec=5
+# 15s, not 5s: the daemon now exits 75 on an auth-class WS failure (see _exit_if_auth_fatal)
+# so a rotated token is picked up by a fresh process. At 5s the StartLimitBurst=20/300s
+# budget was spent in 100 seconds, which is too little for a transient broker-side blip to
+# clear. At 15s the retries span the full 5-minute window; if the token is genuinely dead
+# the unit then STOPS rather than looping all session, and staleness_monitor's
+# check_live_capture reports "socket never opened" that evening.
+RestartSec=15
 StandardOutput=append:/var/log/mis-portal-live-trade.log
 StandardError=append:/var/log/mis-portal-live-trade.log
 

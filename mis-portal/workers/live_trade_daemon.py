@@ -49,6 +49,65 @@ logger = logging.getLogger(__name__)
 
 LIVE_CHANNEL = "live_trades"
 
+# WS-layer failures that mean "this token is dead", as opposed to a transient network
+# drop worth retrying. Every broker library auto-reconnects using the token it was
+# constructed with, so an invalidated token is retried forever from memory: on
+# 2026-07-20 the daily 06:30 IST Zerodha re-login invalidated the running daemons'
+# access_token and all five sat in a 403 loop for ~1,000 attempts across the entire
+# session. systemd reported the units active, the processes were healthy, the Dhan
+# heartbeat ticked — and not one fill could have been captured.
+#
+# Exiting is the fix: systemd's Restart=always gives us a NEW process, which re-reads
+# the rotated token from the store. If the token is genuinely dead the unit burns its
+# StartLimitBurst and stops, which check_live_capture() in staleness_monitor reports
+# that evening as "launched but the socket never opened". Visibly down beats
+# invisibly dead.
+#
+# Deliberately no bare "token" — it matches benign disconnect text. Keep signatures
+# specific enough that a network blip is never treated as fatal.
+_AUTH_FATAL_HINTS = ("403", "forbidden", "unauthor", "tokenexception",
+                     "invalid access", "invalid api", "api_key", "invalid session")
+
+
+def _is_auth_fatal(code, reason) -> bool:
+    """True when a WS failure means the token is dead rather than the network blipped.
+
+    Split out from the exit path so it can be tested against real log strings without
+    killing the process — the false-positive cost is high (a network blip would kill a
+    healthy daemon every time it hiccuped).
+    """
+    text = f"{code} {reason}".lower()
+    return any(h in text for h in _AUTH_FATAL_HINTS)
+
+
+def _exit_if_auth_fatal(ctx, code, reason) -> bool:
+    """Kill the process on an auth-class WS failure so systemd relaunches it clean."""
+    if not _is_auth_fatal(code, reason):
+        return False
+    logger.error(
+        f"AUTH-FATAL {ctx['entity_code']}/{ctx['broker']}: {code} {reason} — the token this "
+        f"process holds has been invalidated (most likely by the daily re-login). Exiting so "
+        f"systemd restarts with the current token; reconnecting in-process would retry the "
+        f"dead token all session."
+    )
+    # os._exit, not sys.exit: KiteTicker runs a Twisted reactor and Angel a
+    # websocket-client loop, both of which swallow SystemExit inside their callbacks.
+    os._exit(75)   # EX_TEMPFAIL
+
+
+def note_order_event(ctx, status=None, symbol=None):
+    """Log every order-update frame the socket delivers, before any fill filtering.
+
+    Without this, 'no fills today' is ambiguous between "no trades were placed" and
+    "the socket delivered nothing" — which is exactly why Angel and Dhan could not be
+    signed off: both connect cleanly and have never produced a single fill, and the
+    log could not tell us which. One greppable line per frame settles it:
+        grep 'order-event .*/angel_one' /var/log/mis-portal-live-trade.log
+    """
+    ctx["events_seen"] = ctx.get("events_seen", 0) + 1
+    logger.info(f"order-event {ctx['entity_code']}/{ctx['broker']} "
+                f"#{ctx['events_seen']} status={status!r} symbol={symbol!r}")
+
 
 # ---------------------------------------------------------------------------
 # Shared infrastructure
@@ -312,6 +371,7 @@ def record_fill(ctx, fill: dict):
         ctx["redis"].publish(LIVE_CHANNEL, json.dumps(event))
     except Exception as e:
         logger.error(f"redis publish failed for {sref}: {e}")
+    ctx["fills_recorded"] = ctx.get("fills_recorded", 0) + 1
     holding_outcome = ctx.pop("_holding_outcome", None)
     logger.info(f"FILL {ctx['entity_code']}/{ctx['broker']} {side} {fill.get('symbol')} "
                 f"{qty} @ {price} (order {order_id})"
@@ -337,6 +397,7 @@ def run_zerodha(ctx):
 
     def on_order_update(ws, data):
         try:
+            note_order_event(ctx, data.get("status"), data.get("tradingsymbol"))
             # Kite pushes an event per status change; the fill is final on COMPLETE.
             if (data.get("status") or "").upper() != "COMPLETE":
                 return
@@ -364,9 +425,12 @@ def run_zerodha(ctx):
 
     def on_close(ws, code, reason):
         logger.warning(f"closed zerodha/{ctx['entity_code']}: {code} {reason}")
+        # Kite surfaces the rejected upgrade on both callbacks; whichever fires first wins.
+        _exit_if_auth_fatal(ctx, code, reason)
 
     def on_error(ws, code, reason):
         logger.error(f"error zerodha/{ctx['entity_code']}: {code} {reason}")
+        _exit_if_auth_fatal(ctx, code, reason)
 
     kws.on_order_update = on_order_update
     kws.on_connect      = on_connect
@@ -421,7 +485,9 @@ def run_angel(ctx):
             logger.info(f"angel raw order msg {ctx['entity_code']}: {str(message)[:800]}")
             data = json.loads(message) if isinstance(message, str) else message
             payload = data.get("orderData", data) if isinstance(data, dict) else {}
-            if (payload.get("orderstatus") or payload.get("status") or "").lower() not in ("complete", "filled"):
+            status = payload.get("orderstatus") or payload.get("status")
+            note_order_event(ctx, status, payload.get("tradingsymbol"))
+            if (status or "").lower() not in ("complete", "filled"):
                 return
             record_fill(ctx, {
                 "symbol":   payload.get("tradingsymbol"),
@@ -438,7 +504,10 @@ def run_angel(ctx):
 
     sws.on_open  = lambda w: logger.info(f"connected: angel_one/{ctx['entity_code']}")
     sws.on_data  = on_data
-    sws.on_error = lambda w, e: logger.error(f"angel error: {e}")
+    def _angel_error(w, e):
+        logger.error(f"angel error {ctx['entity_code']}: {e}")
+        _exit_if_auth_fatal(ctx, "", e)
+    sws.on_error = _angel_error
     sws.on_close = lambda w, *a_: logger.warning("angel closed")
     sws.connect()
 
@@ -467,6 +536,7 @@ def run_dhan(ctx):
         try:
             logger.info(f"dhan raw order msg {ctx['entity_code']}: {str(order_update)[:800]}")
             data = order_update.get("Data", order_update) if isinstance(order_update, dict) else {}
+            note_order_event(ctx, data.get("Status"), data.get("Symbol"))
             # Dhan v2 order-alert Data keys are PascalCase; Status 'TRADED' == filled;
             # TxnType is 'B'/'S'; ids OrderNo (Dhan) / ExchOrderNo (exchange).
             if (data.get("Status") or "").upper() != "TRADED":
@@ -499,7 +569,9 @@ def run_dhan(ctx):
             while True:
                 await asyncio.sleep(300)
                 mins = int((datetime.now() - started).total_seconds() // 60)
-                logger.info(f"dhan/{ctx['entity_code']} listening — alive {mins}m, no fills yet")
+                logger.info(f"dhan/{ctx['entity_code']} listening — alive {mins}m, "
+                            f"events {ctx.get('events_seen', 0)}, "
+                            f"fills {ctx.get('fills_recorded', 0)}")
 
         hb = asyncio.ensure_future(_heartbeat())
         try:
@@ -558,6 +630,13 @@ def main():
     except KeyboardInterrupt:
         logger.info("stopped")
     finally:
+        # Printed on every exit, including the stop timer's SIGTERM, so each session
+        # leaves a countable verdict per account rather than silence. "events 0" means
+        # the socket delivered nothing at all — the distinction that Angel and Dhan
+        # could never be signed off without.
+        logger.info(f"session-summary {ctx['entity_code']}/{ctx['broker']}: "
+                    f"events {ctx.get('events_seen', 0)}, fills recorded "
+                    f"{ctx.get('fills_recorded', 0)}")
         conn.close()
 
 

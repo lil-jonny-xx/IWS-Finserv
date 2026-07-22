@@ -5,6 +5,19 @@ Requires=mis-portal-live-trade-stop.service
 [Timer]
 # 10:05 UTC = 15:35 IST — a few minutes after the 15:30 NSE close.
 OnCalendar=Mon..Fri *-*-* 10:05:00
+# 00:50 UTC, EVERY day — a hard barrier before the 01:00 UTC (06:30 IST) token refresh.
+# A daemon holds its access_token in memory for the life of the process, so one that is
+# still running when the daily re-login fires is instantly and permanently dead: the
+# broker invalidates the old token and the client library then auto-reconnects with it
+# forever. That is exactly what happened on 2026-07-20 — the sockets dropped at 01:36
+# UTC and all five Zerodha daemons sat in a 403 loop for ~1,000 attempts across the
+# whole session, with systemd still reporting every unit active.
+#
+# Weekdays-only was the hole: the weekday stop cannot bound a process that started
+# outside the weekday window (a boot, a manual start, the start timer's Persistent=true
+# catch-up), and such a process survives straight into the next refresh. Running the
+# stop daily means no daemon can ever outlive its token, regardless of how it started.
+OnCalendar=*-*-* 00:50:00
 AccuracySec=30
 Persistent=false
 
