@@ -1295,6 +1295,14 @@ _EQUITY_HOLDING_COLS = """
     eh.cost,
     eh.current_price,
     eh.current_market_value,
+    -- Today's unsettled leg, carried alongside `quantity` rather than inside it.
+    -- Present on foreign_equity_holding too (always NULL there) because this list is
+    -- shared by the equity, foreign-equity and gold/silver queries — a column on one
+    -- table and not the other renders all of those tabs empty.
+    eh.intraday_qty,
+    eh.intraday_avg_cost,
+    eh.intraday_value,
+    eh.intraday_as_of,
     eh.currency,
     eh.fx_rate,
     eh.avg_cost_native,

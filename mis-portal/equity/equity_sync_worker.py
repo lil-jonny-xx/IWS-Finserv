@@ -945,6 +945,11 @@ def sync_entity_broker(
                AND eh.entity_id = %s AND eh.broker = %s
                AND (eh.isin IS NULL OR eh.isin <> ALL(%s::text[]))
                AND eh.symbol <> ALL(%s::text[])
+               -- A position bought today is deliberately absent from the holdings feed
+               -- (it settles tomorrow), and a brand-new one is carried here as a
+               -- zero-quantity row purely to hold its intraday line. Both look exactly
+               -- like an exited holding to the tests below, so exclude them outright.
+               AND eh.intraday_qty IS NULL
                AND (
                      l.net_real = 0                        -- real books balance -> closed
                   OR (l.net_real < 0 AND l.net_all <= 0)   -- incomplete history, plug included
@@ -1032,6 +1037,17 @@ def main():
         refresh_broker_cash(conn, emap)
     except Exception as e:
         logger.error(f"Broker cash refresh failed: {e}")
+        conn.rollback()
+
+    # Today's unsettled buys/sells. Must run AFTER the holdings upsert above: it reads
+    # the settled quantity each broker just wrote, and for Angel it subtracts today's
+    # leg back out of it (Angel is the only feed that reports a same-day buy as
+    # settled). Runs before the exposure recompute so a brand-new position's row exists.
+    try:
+        from equity.intraday_positions import sync_intraday_positions
+        sync_intraday_positions(conn, emap, BROKER_ENTITY_MAP)
+    except Exception as e:
+        logger.error(f"Intraday position sync failed: {e}")
         conn.rollback()
 
     # Recalculate exposure_pct across all brokers per entity now that all syncs are done.

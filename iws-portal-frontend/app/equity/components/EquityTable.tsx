@@ -16,6 +16,12 @@ export interface EquityHoldingRow {
   cost: number;
   current_price?: number;
   current_market_value?: number;
+  // Bought today and not settled yet, so the broker does not call it a holding.
+  // Carried beside `quantity`, never inside it — see equity/intraday_positions.py.
+  intraday_qty?: number;
+  intraday_avg_cost?: number;
+  intraday_value?: number;
+  intraday_as_of?: string;
   currency?: string;
   fx_rate?: number;
   avg_cost_native?: number;
@@ -297,6 +303,13 @@ function mergeBySymbol(holdings: EquityHoldingRow[]): EquityHoldingRow[] {
       }
     }
 
+    // Same instrument bought today at two brokers: the settling legs add up, exactly
+    // as the settled ones do.
+    const intraQty = rows.some(h => h.intraday_qty != null)
+                     ? rows.reduce((s, h) => s + (h.intraday_qty ?? 0), 0) : undefined;
+    const intraVal = rows.some(h => h.intraday_value != null)
+                     ? rows.reduce((s, h) => s + (h.intraday_value ?? 0), 0) : undefined;
+
     const brokers = [...new Set(rows.map(h => h.broker))];
 
     const displaySymbol = rows.find(r => r.symbol)?.symbol ?? rows[0].isin ?? '';
@@ -309,6 +322,8 @@ function mergeBySymbol(holdings: EquityHoldingRow[]): EquityHoldingRow[] {
       quantity: qty,
       avg_cost: qty > 0 ? cost / qty : 0,
       cost,
+      intraday_qty: intraQty,
+      intraday_value: intraVal,
       current_price: rows.find(h => h.current_price != null)?.current_price,
       current_market_value: cmv,
       prev_week_value: prevWeek,
@@ -770,7 +785,18 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
                           <td className="px-3 py-3 text-xs font-medium text-dim whitespace-nowrap align-top">{h.entity_name ?? '—'}</td>
                         )}
                         <td className="px-3 py-3 text-xs text-ghost whitespace-nowrap align-top">{h.exchange ?? '—'}</td>
-                        <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{h.quantity.toFixed(0)}</td>
+                        <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">
+                          {h.quantity.toFixed(0)}
+                          {/* Settling leg on its own line: bought today, credited to demat
+                              next session. Kept visually distinct from the settled figure
+                              so the two are never read as one number. */}
+                          {!!h.intraday_qty && (
+                            <p className="text-[10px] text-amber-600 dark:text-amber-500 mt-0.5 font-medium"
+                               title={`Bought today, settles next session — not yet reported as a holding by ${(h.brokers ?? [h.broker]).join(', ')}`}>
+                              {h.intraday_qty > 0 ? '+' : ''}{h.intraday_qty.toFixed(0)} settling
+                            </p>
+                          )}
+                        </td>
                         <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">
                           {fmtINR(h.avg_cost)}
                           {h.currency && h.currency !== 'INR' && h.avg_cost_native != null && (
@@ -786,6 +812,11 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
                           {fmtINR(h.current_market_value)}
                           {h.currency && h.currency !== 'INR' && h.current_market_value_native != null && (
                             <p className="text-[10px] text-ghost mt-0.5">{fmtNative(h.current_market_value_native, h.currency)}</p>
+                          )}
+                          {!!h.intraday_value && (
+                            <p className="text-[10px] text-amber-600 dark:text-amber-500 mt-0.5 font-medium">
+                              {h.intraday_value > 0 ? '+' : ''}{fmtINR(h.intraday_value)}
+                            </p>
                           )}
                         </td>
                         <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">{fmtINR(h.prev_week_value)}</td>

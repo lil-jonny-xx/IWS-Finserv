@@ -166,6 +166,41 @@ def fetch_holdings(entity_code: str) -> list[dict]:
     return holdings
 
 
+def fetch_positions(entity_code: str) -> list[dict]:
+    """Today's UNSETTLED delivery activity, normalised to the shared position shape.
+
+    A CNC buy made today is not in `holdings()` at all — it lives here until it
+    settles, then arrives as `t1_quantity` the next session. `overnight_quantity`
+    is what keeps the two from ever counting the same shares twice: a row carried
+    over from a previous session has it non-zero, and is excluded here because the
+    holdings feed already owns it.
+
+    Restricted to CNC. MIS/NRML legs are intraday or derivative exposure that never
+    becomes a holding, and the rest of the pipeline already skips F&O.
+
+    Kite positions carry no ISIN — the caller resolves it from the symbol.
+    """
+    kite = _kite_client(entity_code)
+    net  = (kite.positions() or {}).get("net") or []
+    out  = []
+    for p in net:
+        if p.get("product") != "CNC":
+            continue
+        qty = int(p.get("quantity") or 0)
+        if qty == 0 or int(p.get("overnight_quantity") or 0) != 0:
+            continue
+        out.append({
+            "symbol":   p.get("tradingsymbol"),
+            "isin":     None,
+            "quantity": Decimal(str(qty)),
+            "avg_cost": Decimal(str(p.get("average_price") or 0)),
+            "ltp":      Decimal(str(p.get("last_price") or 0)),
+            "exchange": p.get("exchange") or "NSE",
+        })
+    logger.info(f"[{entity_code}] Zerodha: fetched {len(out)} unsettled position(s)")
+    return out
+
+
 def fetch_trades(entity_code: str) -> list[dict]:
     """Today's executed trades from Kite. Kite only retains the CURRENT trading
     day's trades, so this must run after market close each day to not miss fills.

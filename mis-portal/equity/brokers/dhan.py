@@ -294,6 +294,39 @@ def fetch_cash_balance(entity_code: str) -> Decimal:
 # Normalise to EquityHolding dataclass
 # ---------------------------------------------------------------------------
 
+def fetch_positions(entity_code: str) -> list[dict]:
+    """Today's UNSETTLED delivery activity, normalised to the shared position shape.
+
+    Dhan's holdings feed does not carry a same-day buy at all (verified live: a
+    100 NCC buy was absent from `get_holdings` the same afternoon), so it sits here
+    until it settles into `t1Qty` — which `totalQty` already includes — the next
+    session. The carryForward quantities are what stop the two overlapping: a leg
+    held from a previous session has them non-zero and belongs to the holdings feed.
+
+    Restricted to CNC, and ISIN is resolved by the caller from the symbol.
+    """
+    resp = _dhan_client(entity_code).get_positions()
+    rows = (resp or {}).get("data") or []
+    out  = []
+    for p in rows:
+        if (p.get("productType") or "").upper() != "CNC":
+            continue
+        qty = int(p.get("netQty") or 0)
+        cf  = int(p.get("carryForwardBuyQty") or 0) + int(p.get("carryForwardSellQty") or 0)
+        if qty == 0 or cf != 0:
+            continue
+        out.append({
+            "symbol":   p.get("tradingSymbol"),
+            "isin":     None,
+            "quantity": Decimal(str(qty)),
+            "avg_cost": Decimal(str(p.get("costPrice") or p.get("buyAvg") or 0)),
+            "ltp":      None,          # Dhan positions carry no LTP — priced from the holding
+            "exchange": "NSE" if str(p.get("exchangeSegment", "")).startswith("NSE") else "BSE",
+        })
+    logger.info(f"[{entity_code}] Dhan: fetched {len(out)} unsettled position(s)")
+    return out
+
+
 def normalise(entity_id: int, entity_code: str, raw: list[dict]) -> list[EquityHolding]:
     """
     Convert Dhan holding dicts to EquityHolding objects.

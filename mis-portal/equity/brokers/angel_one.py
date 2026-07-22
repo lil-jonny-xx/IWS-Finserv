@@ -160,6 +160,50 @@ def _fetch_holdings(entity_code: str) -> list[dict]:
     return holdings
 
 
+def fetch_positions(entity_code: str) -> list[dict]:
+    return _call_with_reauth(entity_code, lambda: _fetch_positions(entity_code))
+
+
+def _fetch_positions(entity_code: str) -> list[dict]:
+    """Today's UNSETTLED delivery activity, normalised to the shared position shape.
+
+    Angel differs from the other two and the difference matters: it folds a same-day
+    buy straight into the holdings `quantity`, so the shares appear settled the
+    moment they are bought. Reporting them here as well would double-count them —
+    the caller therefore SUBTRACTS this quantity from the Angel holding to recover
+    the genuinely settled figure, which is what makes all three brokers present the
+    same trade the same way.
+
+    cfbuyqty/cfsellqty are the carry-forward legs; non-zero means the position
+    predates today and is already reflected in holdings on its own.
+    """
+    resp = _smart_client(entity_code).position()
+    if not resp.get("status"):
+        raise RuntimeError(
+            f"[{entity_code}] Angel One positions failed: {resp.get('message')}"
+        )
+    out = []
+    for p in (resp.get("data") or []):
+        if (p.get("producttype") or "").upper() != "DELIVERY":
+            continue
+        qty = int(float(p.get("netqty") or 0))
+        cf  = int(float(p.get("cfbuyqty") or 0)) + int(float(p.get("cfsellqty") or 0))
+        if qty == 0 or cf != 0:
+            continue
+        out.append({
+            "symbol":   p.get("tradingsymbol"),
+            "isin":     None,
+            "quantity": Decimal(str(qty)),
+            "avg_cost": Decimal(str(p.get("avgnetprice") or 0)),
+            "ltp":      Decimal(str(p.get("ltp") or 0)),
+            "exchange": p.get("exchange") or "NSE",
+            # Angel already counts these shares inside holdings.quantity.
+            "already_in_holdings": True,
+        })
+    logger.info(f"[{entity_code}] Angel One: fetched {len(out)} unsettled position(s)")
+    return out
+
+
 def fetch_trades(entity_code: str) -> list[dict]:
     return _call_with_reauth(entity_code, lambda: _fetch_trades(entity_code))
 
