@@ -20,7 +20,12 @@ interface RealisedRow {
 }
 
 // Section order on the page; any category not listed falls in after these, sorted.
-const CATEGORY_ORDER = ['Equity', 'Mutual Funds', 'Foreign Equity', 'PMS'];
+// Commodities is not a `category` the API returns — it is a `group`, carried on rows
+// the backend classified as gold/silver (ETFs, SGBs, gold funds). It is promoted to a
+// section of its own here so the page splits the same way the XLSX realised sheet
+// does, instead of burying precious metals inside Equity and Mutual Funds.
+const CATEGORY_ORDER = ['Equity', 'Commodities', 'Mutual Funds', 'Foreign Equity', 'PMS'];
+const GROUP_AS_SECTION = new Set(['Commodities']);
 
 function inr(v: number | null): string {
   if (v == null) return '—';
@@ -176,7 +181,11 @@ export default function RealisedGainsPage() {
   const sections = useMemo(() => {
     const map = new Map<string, RealisedRow[]>();
     for (const r of rows) {
-      const c = r.category || r.group || 'Other';
+      // A gold/silver row keeps its own category for every other view, but here the
+      // group wins so it lands in the Commodities section rather than under Equity.
+      const c = (r.group && GROUP_AS_SECTION.has(r.group))
+        ? r.group
+        : (r.category || r.group || 'Other');
       if (!map.has(c)) map.set(c, []);
       map.get(c)!.push(r);
     }
