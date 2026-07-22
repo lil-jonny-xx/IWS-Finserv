@@ -207,11 +207,24 @@ def normalise(entity_id: int, entity_code: str, raw: list[dict]) -> list[EquityH
     """
     result = []
     for h in raw:
-        qty = Decimal(str(h["quantity"]))
+        # Kite splits an owned holding across `quantity` (settled, sitting in demat)
+        # and `t1_quantity` (bought the previous session, being credited today). Both
+        # are owned, and Kite quotes `average_price` and `pnl` over the SUM — verified
+        # against a live row: TVSHLTD quantity 35 + t1 20, opening_quantity 55, and
+        # pnl 40319.50 = (14810.10 - 14077.02) * 55, not * 35. So the sum keeps the
+        # cost basis valid.
+        #
+        # Counting only `quantity` understated every position for the full day after a
+        # buy, and dropped a brand-new one entirely (quantity 0 fell into the skip
+        # below). Angel One reports the whole position in `quantity` and Dhan in
+        # `totalQty` (= dpQty + t1Qty), so Zerodha was the only feed losing the
+        # unsettled leg. NOTE: none of the three report a SAME-day buy as a holding —
+        # that only lands here the next session.
+        qty = Decimal(str(h["quantity"])) + Decimal(str(h.get("t1_quantity") or 0))
         avg = Decimal(str(h["average_price"]))
         ltp = Decimal(str(h["last_price"]))
 
-        # Skip zero-quantity holdings (demat positions fully sold but not settled)
+        # Nothing owned on either leg — a demat position fully sold but not yet settled.
         if qty <= 0:
             continue
 
