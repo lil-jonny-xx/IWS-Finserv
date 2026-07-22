@@ -513,8 +513,48 @@ def run_angel(ctx):
 
 
 # ---------------------------------------------------------------------------
-# Dhan (dhanhq OrderUpdate) — connection wired; needs live-session verify
+# Dhan (dhanhq OrderUpdate) — verified against a live session 2026-07-22
 # ---------------------------------------------------------------------------
+_DHAN_SIDE = {"B": "BUY", "S": "SELL", "BUY": "BUY", "SELL": "SELL"}
+
+
+def _dhan_event(order_update):
+    """Normalise one Dhan order-update into (status, symbol, fill|None).
+
+    Dhan wraps the payload in a `Data` envelope and sends **camelCase** keys inside
+    it (status / symbol / txnType / tradedQty / avgTradedPrice / orderNo), not the
+    PascalCase the docs show. Reading PascalCase made every lookup None, so the
+    TRADED test never matched and the socket recorded 0 fills while looking
+    perfectly healthy ("events 4, fills 0"). Keys are folded to lowercase and read
+    case-blind so either casing works if Dhan ever changes it.
+
+    Only a final 'Traded' yields a fill. The intermediate 'Part-Traded' events carry
+    a RUNNING CUMULATIVE tradedQty (37 -> 88 -> 100 of a 100-lot order), so acting on
+    the last one alone books the order exactly once at its average price; acting on
+    each would triple-count it.
+
+    `exchange` is the venue ('NSE'); `segment` is a one-letter code ('E') and is only
+    a fallback — passing the segment as the exchange would mis-tag the security.
+    """
+    raw = order_update.get("Data", order_update) if isinstance(order_update, dict) else {}
+    if not isinstance(raw, dict):
+        return None, None, None
+    d = {str(k).lower(): v for k, v in raw.items()}
+    status, symbol = d.get("status"), d.get("symbol") or d.get("displayname")
+    if (status or "").upper() != "TRADED":
+        return status, symbol, None
+    return status, symbol, {
+        "symbol":   symbol,
+        "isin":     d.get("isin"),
+        "side":     _DHAN_SIDE.get((d.get("txntype") or "").upper()),
+        "qty":      d.get("tradedqty"),
+        "price":    d.get("avgtradedprice") or d.get("tradedprice"),
+        "order_id": d.get("orderno") or d.get("exchorderno"),
+        "ts":       None,
+        "exchange": d.get("exchange") or d.get("segment"),
+    }
+
+
 def run_dhan(ctx):
     import asyncio
     from dhanhq.orderupdate import OrderUpdate
@@ -530,27 +570,13 @@ def run_dhan(ctx):
     from dhanhq.dhan_context import DhanContext
     ou = OrderUpdate(DhanContext(client_id, access_token))
 
-    _SIDE = {"B": "BUY", "S": "SELL", "BUY": "BUY", "SELL": "SELL"}
-
     def handler(order_update):   # dhanhq invokes on_update SYNCHRONOUSLY — must NOT be async
         try:
             logger.info(f"dhan raw order msg {ctx['entity_code']}: {str(order_update)[:800]}")
-            data = order_update.get("Data", order_update) if isinstance(order_update, dict) else {}
-            note_order_event(ctx, data.get("Status"), data.get("Symbol"))
-            # Dhan v2 order-alert Data keys are PascalCase; Status 'TRADED' == filled;
-            # TxnType is 'B'/'S'; ids OrderNo (Dhan) / ExchOrderNo (exchange).
-            if (data.get("Status") or "").upper() != "TRADED":
-                return
-            record_fill(ctx, {
-                "symbol":   data.get("Symbol"),
-                "isin":     data.get("Isin"),
-                "side":     _SIDE.get((data.get("TxnType") or "").upper()),
-                "qty":      data.get("TradedQty"),
-                "price":    data.get("AvgTradedPrice"),
-                "order_id": data.get("OrderNo") or data.get("ExchOrderNo"),
-                "ts":       None,
-                "exchange": data.get("Segment"),
-            })
+            status, symbol, fill = _dhan_event(order_update)
+            note_order_event(ctx, status, symbol)
+            if fill is not None:
+                record_fill(ctx, fill)
         except Exception as e:
             logger.error(f"dhan handler error: {e}")
 
