@@ -55,6 +55,28 @@ const emptyForm = {
   trade_date: '', quantity: '', price: '', notes: '',
 };
 
+// Brokers whose exports the importer can parse. Deliberately narrower than BROKERS
+// above — 'other' is a manual-entry bucket with no file format behind it.
+const IMPORT_BROKERS = [
+  { value: 'zerodha',   label: 'Zerodha (tradebook CSV / Console XLSX)' },
+  { value: 'angel_one', label: 'Angel One (Trades_History XLSX)' },
+  { value: 'dhan',      label: 'Dhan (TRADE_HISTORY CSV)' },
+  { value: 'vested',    label: 'Vested (Transactions XLSX)' },
+];
+
+interface ImportResult {
+  entity_name: string; broker: string; filename: string; committed: boolean;
+  inserted: number; skipped: number; dupes: number; superseded: number;
+  last_trade_date: string | null;
+}
+
+interface CorporateAction {
+  id: number; action_type: string; ex_date: string; ratio: number;
+  old_isin: string | null; new_isin: string | null; source: string;
+  evidence: string | null; security_name: string; isin: string | null;
+  entities: string[];
+}
+
 export default function TradesPage() {
   const router = useRouter();
   const [user, setUser]         = useState<User | null>(null);
@@ -64,6 +86,11 @@ export default function TradesPage() {
   const [form, setForm]         = useState({ ...emptyForm });
   const [busy, setBusy]         = useState(false);
   const [msg, setMsg]           = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+  const [actions, setActions]   = useState<CorporateAction[] | null>(null);
+  const [impForm, setImpForm]   = useState({ entity_id: '', broker: 'zerodha' });
+  const [impFile, setImpFile]   = useState<File | null>(null);
+  const [impResult, setImpResult] = useState<ImportResult | null>(null);
+  const [impBusy, setImpBusy]   = useState(false);
 
   useEffect(() => {
     fetch(`${API_URL}/api/v1/me`, { credentials: 'include' })
@@ -90,6 +117,44 @@ export default function TradesPage() {
   }, [router, filterId]);
 
   useEffect(() => { if (user?.role === 'admin') loadTrades(); }, [user, loadTrades]);
+
+  const loadActions = useCallback(() => {
+    fetch(`${API_URL}/api/v1/corporate-actions`, { credentials: 'include' })
+      .then(r => (r.ok ? r.json() : { actions: [] }))
+      .then(d => setActions(d.actions ?? []))
+      .catch(() => setActions([]));
+  }, []);
+
+  useEffect(() => { if (user?.role === 'admin') loadActions(); }, [user, loadActions]);
+
+  // Upload runs preview-then-commit: the operator sees the new/duplicate split before
+  // anything is written, because a silent double-import is the costly mistake here.
+  const runImport = (commit: boolean) => {
+    if (!impFile || !impForm.entity_id) {
+      setMsg({ kind: 'err', text: 'Pick an entity and a file first.' });
+      return;
+    }
+    setImpBusy(true); setMsg(null);
+    const fd = new FormData();
+    fd.append('entity_id', impForm.entity_id);
+    fd.append('broker', impForm.broker);
+    fd.append('kind', 'tradebook');
+    fd.append('file', impFile);
+    fetch(`${API_URL}/api/v1/trades/tradebook/${commit ? 'commit' : 'preview'}`, {
+      method: 'POST', credentials: 'include', body: fd,
+    })
+      .then(async r => {
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.detail || 'Import failed.');
+        setImpResult(d);
+        if (commit) {
+          setMsg({ kind: 'ok', text: `Imported ${d.inserted} trade(s) from ${d.filename}.` });
+          loadTrades();
+        }
+      })
+      .catch(err => setMsg({ kind: 'err', text: err.message }))
+      .finally(() => setImpBusy(false));
+  };
 
   const set = (k: keyof typeof emptyForm) =>
     (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) =>
@@ -226,6 +291,130 @@ export default function TradesPage() {
                 </p>
               )}
             </form>
+
+            {/* ---------------- monthly tradebook / ledger import ---------------- */}
+            <div className="bg-card rounded-lg border border-rule px-5 sm:px-6 py-5 mb-6">
+              <p className="text-sm font-semibold text-ink mb-1">Import a tradebook</p>
+              <p className="text-xs text-ghost mb-4">
+                For the monthly broker export. Preview first — it reports how many rows are new
+                versus already held, and writes nothing. Re-uploading an overlapping export is
+                safe: every fill is keyed by broker, entity, date and trade&nbsp;id, so the
+                overlap is skipped rather than double-counted.
+              </p>
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 items-end">
+                <div>
+                  <label className={labelCls}>Entity</label>
+                  <select className={inputCls} value={impForm.entity_id}
+                          onChange={e => setImpForm(f => ({ ...f, entity_id: e.target.value }))}>
+                    <option value="">—</option>
+                    {entities.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
+                  </select>
+                </div>
+                <div className="col-span-2">
+                  <label className={labelCls}>Broker / format</label>
+                  <select className={inputCls} value={impForm.broker}
+                          onChange={e => setImpForm(f => ({ ...f, broker: e.target.value }))}>
+                    {IMPORT_BROKERS.map(b => <option key={b.value} value={b.value}>{b.label}</option>)}
+                  </select>
+                </div>
+                <div className="col-span-2">
+                  <label className={labelCls}>File (.csv / .xlsx, max 15 MB)</label>
+                  <input type="file" accept=".csv,.xlsx,.xlsm,.xls"
+                         onChange={e => { setImpFile(e.target.files?.[0] ?? null); setImpResult(null); }}
+                         className="block w-full text-xs text-dim file:mr-3 file:py-1.5 file:px-3
+                                    file:rounded file:border file:border-rule file:text-xs
+                                    file:bg-page file:text-ink hover:file:border-prime" />
+                </div>
+              </div>
+              <div className="flex items-center gap-3 mt-4">
+                <button type="button" disabled={impBusy || !impFile} onClick={() => runImport(false)}
+                        className="text-sm px-3 py-1.5 rounded border border-rule text-ink
+                                   hover:border-prime disabled:opacity-40 transition-colors">
+                  {impBusy ? 'Working…' : 'Preview'}
+                </button>
+                <button type="button" disabled={impBusy || !impResult} onClick={() => runImport(true)}
+                        className="text-sm px-3 py-1.5 rounded bg-prime text-white
+                                   disabled:opacity-40 transition-opacity">
+                  Import
+                </button>
+                {impResult && (
+                  <span className="text-xs text-dim">
+                    <strong className="text-ink">{impResult.inserted.toLocaleString('en-IN')}</strong> new
+                    {' · '}{impResult.dupes.toLocaleString('en-IN')} already held
+                    {' · '}{impResult.skipped.toLocaleString('en-IN')} skipped
+                    {impResult.superseded > 0 && <> · {impResult.superseded} synthetic row(s) replaced</>}
+                    {impResult.last_trade_date && <> · latest {impResult.last_trade_date}</>}
+                    {!impResult.committed && <em className="text-ghost"> — preview only</em>}
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {/* ---------------- corporate actions ---------------- */}
+            <div className="bg-card rounded-lg border border-rule overflow-hidden mb-6">
+              <div className="px-5 py-3 border-b border-rule">
+                <p className="text-sm font-semibold text-ink">
+                  Corporate actions{' '}
+                  {actions ? <span className="font-normal text-ghost">({actions.length})</span> : null}
+                </p>
+                <p className="text-xs text-ghost mt-0.5">
+                  Splits and bonus issues, each verified against market data before being recorded.
+                  Bonus shares are credited by the depository, so they appear in no tradebook and no
+                  broker feed — without these rows a later sale looks like selling stock that was
+                  never bought.
+                </p>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-[11px] uppercase tracking-wide text-ghost border-b border-rule">
+                      <th className="px-5 py-2 font-medium">Ex-date</th>
+                      <th className="px-3 py-2 font-medium">Stock</th>
+                      <th className="px-3 py-2 font-medium">Action</th>
+                      <th className="px-3 py-2 font-medium text-right">Ratio</th>
+                      <th className="px-3 py-2 font-medium">Holders</th>
+                      <th className="px-3 py-2 font-medium">ISIN change</th>
+                      <th className="px-3 py-2 font-medium">Verified from</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {actions === null && (
+                      <tr><td colSpan={7} className="px-5 py-10 text-center text-ghost text-sm">Loading…</td></tr>
+                    )}
+                    {actions !== null && actions.length === 0 && (
+                      <tr><td colSpan={7} className="px-5 py-10 text-center text-ghost text-sm">
+                        No corporate actions recorded yet.
+                      </td></tr>
+                    )}
+                    {actions?.map(a => (
+                      <tr key={a.id} className="border-b border-rule last:border-0">
+                        <td className="px-5 py-2 whitespace-nowrap text-dim">{a.ex_date}</td>
+                        <td className="px-3 py-2">
+                          <span className="text-ink font-medium">{a.security_name}</span>
+                          {a.isin && <span className="text-[11px] text-ghost ml-1.5">{a.isin}</span>}
+                        </td>
+                        <td className="px-3 py-2">
+                          <span className={`text-xs px-1.5 py-0.5 rounded ${
+                            a.action_type === 'bonus'
+                              ? 'bg-prime/10 text-prime' : 'bg-amber-500/10 text-amber-600'
+                          }`}>{a.action_type}</span>
+                        </td>
+                        <td className="px-3 py-2 text-right tabular-nums text-ink">
+                          {Number(a.ratio).toLocaleString('en-IN', { maximumFractionDigits: 4 })}×
+                        </td>
+                        <td className="px-3 py-2 text-xs text-dim">{a.entities?.join(', ') || '—'}</td>
+                        <td className="px-3 py-2 text-[11px] text-ghost whitespace-nowrap">
+                          {a.old_isin && a.new_isin && a.old_isin !== a.new_isin
+                            ? `${a.old_isin} → ${a.new_isin}` : '—'}
+                        </td>
+                        <td className="px-3 py-2 text-xs text-ghost max-w-[30ch] truncate"
+                            title={a.evidence ?? ''}>{a.source}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
 
             <div className="bg-card rounded-lg border border-rule overflow-hidden">
               <div className="px-5 py-3 border-b border-rule flex items-center justify-between gap-3">

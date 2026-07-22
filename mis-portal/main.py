@@ -6773,6 +6773,100 @@ def get_realised_gains(
         release_db_connection(conn)
 
 
+@app.get("/api/v1/dividends")
+@limiter.limit("120/minute")
+def get_dividends(
+    request: Request,
+    period: str = "inception",
+    authorization: Optional[str] = Header(None),
+):
+    """Dividend income per entity/security/ex-date, with feed-coverage context.
+
+    period — "fy" (current Indian FY) or "inception" (default, whole history).
+
+    Indian dividends never pass through the broker: the company credits the
+    shareholder's bank directly, so these rows are DERIVED (ex-date and rate/share
+    from market data x quantity replayed from the trade ledger) rather than recorded
+    cash. Two consequences the UI has to be able to state honestly, so both are
+    returned alongside the rows:
+
+      * `coverage` — how many securities the market-data feed could resolve. A scrip
+        with no ticker (SME boards, SGBs, renamed symbols) contributes nothing, and
+        without this count "no dividends" and "no data" would look identical.
+      * `variance_pct` on a row — set by the monthly validation pass that scores the
+        computed figure against an imported broker dividend report. Non-null means
+        the estimate has actually been checked against an authority.
+
+    Figures are GROSS. Dividends above Rs 5,000/yr attract 10% TDS, so the amount
+    credited to the bank is lower.
+    """
+    conn = None
+    try:
+        _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Entity visibility is uniform across the portal (see get_realised_gains).
+        where, params = ["d.source = 'computed'"], []
+        if period == "fy":
+            today = date.today()
+            fy_start = date(today.year if today.month >= 4 else today.year - 1, 4, 1)
+            where.append("d.ex_date >= %s")
+            params.append(fy_start)
+
+        cur.execute(f"""
+            SELECT e.entity_name, sm.security_name, d.ex_date, d.quantity,
+                   d.rate_per_share, d.amount, d.fy, d.variance_pct, d.feed
+              FROM dividend d
+              JOIN entity e           ON e.id = d.entity_id
+              JOIN security_master sm ON sm.id = d.security_id
+             WHERE {' AND '.join(where)}
+             ORDER BY d.ex_date DESC, e.entity_name, sm.security_name
+        """, params)
+        rows = [{
+            "entity":         r["entity_name"],
+            "security_name":  r["security_name"],
+            "ex_date":        str(r["ex_date"]),
+            "quantity":       float(r["quantity"]),
+            "rate_per_share": float(r["rate_per_share"]),
+            "amount":         float(r["amount"]),
+            "fy":             r["fy"],
+            "variance_pct":   float(r["variance_pct"]) if r["variance_pct"] is not None else None,
+            "feed":           r["feed"],
+        } for r in cur.fetchall()]
+
+        cur.execute("""
+            SELECT COUNT(*) FILTER (WHERE resolved)       AS resolved,
+                   COUNT(*) FILTER (WHERE NOT resolved)   AS unresolved
+              FROM dividend_coverage
+        """)
+        cov = cur.fetchone() or {}
+        # Name the unmatched scrips so the gap is inspectable, not just a number.
+        cur.execute("""
+            SELECT symbol FROM dividend_coverage
+             WHERE NOT resolved AND symbol IS NOT NULL
+             ORDER BY symbol LIMIT 40
+        """)
+        unresolved_names = [r["symbol"] for r in cur.fetchall()]
+        cur.close()
+
+        return {
+            "rows": rows,
+            "coverage": {
+                "resolved":   int(cov.get("resolved") or 0),
+                "unresolved": int(cov.get("unresolved") or 0),
+                "unresolved_symbols": unresolved_names,
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/dividends: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
 # ---------------------------------------------------------------------------
 # Reports
 # ---------------------------------------------------------------------------
@@ -7564,5 +7658,186 @@ def delete_manual_trade(trade_id: int, request: Request,
         if conn:
             conn.rollback()
         raise
+    finally:
+        release_db_connection(conn)
+
+
+TRADEBOOK_BROKERS = {"zerodha", "angel_one", "dhan", "vested"}
+MAX_TRADEBOOK_BYTES = 15 * 1024 * 1024
+TRADEBOOK_EXTS = (".csv", ".xlsx", ".xlsm", ".xls")
+
+
+async def _tradebook_ingest(cursor, conn, entity_id: int, broker: str, kind: str,
+                            file: UploadFile, commit: bool):
+    """Shared body for the tradebook preview/commit endpoints.
+
+    Runs the SAME importer the CLI uses (workers.import_tradebooks_multi.import_file)
+    rather than a parallel implementation, so an upload through the UI and a batch run
+    from the shell cannot drift apart in how they dedupe or supersede.
+    """
+    broker = (broker or "").strip().lower()
+    if broker not in TRADEBOOK_BROKERS:
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown broker '{broker}'. "
+                                   f"Expected one of: {', '.join(sorted(TRADEBOOK_BROKERS))}")
+    if kind not in ("tradebook", "ledger"):
+        raise HTTPException(status_code=400, detail="kind must be 'tradebook' or 'ledger'")
+
+    cursor.execute("SELECT entity_name FROM entity WHERE id = %s", (entity_id,))
+    ent = cursor.fetchone()
+    if not ent:
+        raise HTTPException(status_code=404, detail="Entity not found")
+
+    name = os.path.basename(file.filename or "")
+    if not name.lower().endswith(TRADEBOOK_EXTS):
+        raise HTTPException(status_code=422,
+                            detail=f"Expected {', '.join(TRADEBOOK_EXTS)} — got '{name}'")
+
+    data = await file.read(MAX_TRADEBOOK_BYTES + 1)
+    if not data:
+        raise HTTPException(status_code=422, detail="Uploaded file is empty.")
+    if len(data) > MAX_TRADEBOOK_BYTES:
+        raise HTTPException(status_code=413, detail="File too large (max 15 MB).")
+
+    tmp_dir = os.path.join(UPLOADS_ROOT, ".incoming")
+    os.makedirs(tmp_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=tmp_dir, suffix=os.path.splitext(name)[1] or ".csv")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        from workers.import_tradebooks_multi import import_file, build_bridge
+        # Angel One and Dhan identify stocks by name only; without the bridge every row
+        # would mint a fresh ISIN-less security_master row and split its FIFO lot pool.
+        isin_map = None
+        if broker in ("angel_one", "dhan") or (
+                broker == "zerodha" and name.lower().endswith((".xlsx", ".xlsm"))):
+            try:
+                isin_map = build_bridge(cursor, broker, entity_id, [tmp])
+            except Exception as e:
+                logger.warning(f"tradebook bridge failed ({broker}/{entity_id}): {e}")
+                isin_map = {}
+        out = import_file(cursor, broker, entity_id, kind, tmp, commit,
+                          recon=False, isin_map=isin_map) or {}
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+    if not commit:
+        conn.rollback()          # preview must leave no trace, including new securities
+    return {"entity_id": entity_id, "entity_name": ent["entity_name"],
+            "broker": broker, "kind": kind, "filename": name, **out}
+
+
+# ----------------------------------------------------------- corporate actions
+@app.get("/api/v1/corporate-actions")
+@limiter.limit("120/minute")
+def list_corporate_actions(request: Request, entity_id: List[int] = Query(default=[]),
+                           authorization: Optional[str] = Header(None)):
+    """Splits and bonus issues, with the holders they affect.
+
+    These are shown because they are otherwise invisible: bonus quantity is credited
+    by the depository, so it appears in no tradebook and no broker feed. A position
+    that grows without a matching BUY is only explicable by one of these rows.
+    """
+    conn = None
+    try:
+        _require_auth(request, authorization)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT to_regclass('public.corporate_action') AS t")
+        if not (cursor.fetchone() or {}).get("t"):
+            return {"actions": [], "note": "corporate_action table not yet created"}
+
+        where, params = "ca.verified", []
+        if entity_id:
+            where += " AND st.entity_id = ANY(%s)"
+            params.append(list(entity_id))
+        cursor.execute(f"""
+            SELECT ca.id, ca.action_type, ca.ex_date, ca.ratio,
+                   ca.old_isin, ca.new_isin, ca.source, ca.evidence,
+                   sm.security_name, sm.isin,
+                   COALESCE(json_agg(DISTINCT e.entity_name)
+                            FILTER (WHERE e.entity_name IS NOT NULL), '[]') AS entities
+              FROM corporate_action ca
+              JOIN security_master sm ON sm.id = ca.security_id
+              LEFT JOIN stock_transaction st ON st.security_id = ca.security_id
+              LEFT JOIN entity e ON e.id = st.entity_id
+             WHERE {where}
+             GROUP BY ca.id, sm.security_name, sm.isin
+             ORDER BY ca.ex_date DESC""", params)
+        return {"actions": [dict(r) for r in cursor.fetchall()]}
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/trades/tradebook/preview")
+@limiter.limit("20/minute")
+async def tradebook_preview(request: Request,
+                            entity_id: int = Form(...),
+                            broker: str = Form(...),
+                            kind: str = Form("tradebook"),
+                            file: UploadFile = File(...),
+                            authorization: Optional[str] = Header(None)):
+    """Parse an uploaded tradebook/ledger and report what WOULD be imported.
+
+    Preview-then-commit, deliberately: an import that silently double-counts is the
+    expensive failure here, so the operator sees the new/duplicate split before
+    anything is written. Duplicates are counted against source_ref, which is scoped
+    {broker}:{entity}:{date}:{trade_id} — broker trade ids repeat across days, so the
+    date has to be part of the key or genuine trades get dropped as dupes.
+    """
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        _require_admin(cursor, payload)
+        return await _tradebook_ingest(cursor, conn, entity_id, broker, kind, file,
+                                       commit=False)
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/trades/tradebook/preview: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/trades/tradebook/commit")
+@limiter.limit("10/minute")
+async def tradebook_commit(request: Request,
+                           entity_id: int = Form(...),
+                           broker: str = Form(...),
+                           kind: str = Form("tradebook"),
+                           file: UploadFile = File(...),
+                           authorization: Optional[str] = Header(None)):
+    """Import an uploaded tradebook/ledger for real. Admin only."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        _require_admin(cursor, payload)
+        out = await _tradebook_ingest(cursor, conn, entity_id, broker, kind, file,
+                                      commit=True)
+        conn.commit()
+        logger.info(f"Tradebook import by {payload['email']}: entity={entity_id} "
+                    f"broker={broker} inserted={out.get('inserted')}")
+        return out
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/trades/tradebook/commit: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
     finally:
         release_db_connection(conn)
