@@ -171,6 +171,9 @@ LIVE_TAIL_LINES = 60000     # a full day is ~5k lines (Dhan heartbeats dominate)
 # Angel have no recurring heartbeat (one-shot "connected:" only), so mid-session death
 # is NOT detectable for them from the log — see the note in check_live_capture.
 LIVE_DHAN_QUIET_MIN = 15
+# Order statuses that mean the order is done and a fill should have been booked:
+# Zerodha 'COMPLETE', Angel One 'complete', Dhan 'Traded'. Compared lower-cased.
+LIVE_TERMINAL_STATUSES = ("complete", "traded")
 
 # ---------------------------------------------------------------------------
 # 6. Fills that never reached the ledger — holdings moved, no trade explains it
@@ -520,6 +523,87 @@ def check_live_capture():
     return out
 
 
+def check_live_fill_mapping():
+    """(account, detail) where order-update frames arrived but no fill was booked.
+
+    The blind spot that let the Dhan camelCase bug run undetected: the socket
+    connected, authenticated and heartbeated "events 4, fills 0" all session, so
+    systemd, the token check and check_live_capture all stayed green while every real
+    trade was dropped. It took placing a trade and noticing it missing to find it.
+
+    Three tells, all read from the daemons' own log:
+
+      * `status=None` on an order-event — the frame arrived but the mapper could not
+        read it, i.e. the payload's shape or key casing changed under us. This is the
+        one that catches a casing bug, and it has to be read from the raw event
+        rather than inferred from a terminal-status test, because that same bug is
+        what blanks the status in the first place.
+      * a terminal status with no FILL line for that account — the status parsed but
+        the fill did not book (a missing qty/price is the usual cause).
+      * 'skipping incomplete fill' — record_fill rejected a fill outright.
+
+    Deliberately NOT alerting on the bare "events > 0, fills 0" heartbeat: an order
+    that is placed and then cancelled produces events and no fill, which is correct,
+    and alerting on it would fire every time someone changes their mind. Accounts
+    whose daemon never connected are skipped — check_live_capture owns that, and
+    reporting both would double up on one fault.
+    """
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    ist = now + timedelta(hours=5, minutes=30)
+    if ist.weekday() >= 5:
+        return []
+    end_h, end_m = LIVE_SESSION_END_UTC
+    if (now.hour, now.minute) < (end_h, end_m):
+        return []          # session still open — a fill may yet be booked
+
+    if not Path(LIVE_LOG).exists():
+        return []          # check_live_capture already reports a missing log
+    try:
+        lines = _tail_lines(LIVE_LOG, LIVE_TAIL_LINES)
+    except Exception:
+        return []          # ditto for an unreadable one
+
+    today  = now.strftime("%Y-%m-%d")
+    todays = [ln for ln in lines if ln.startswith(today)]
+    if not todays:
+        return []
+
+    out = []
+    for slug, broker, entity in LIVE_ACCOUNTS:
+        ev_marker   = f"order-event {entity}/{broker} "
+        fill_marker = f"FILL {entity}/{broker} "
+        events = [ln for ln in todays if ev_marker in ln]
+        if not events:
+            continue       # no frames at all is check_live_capture's business
+        fills = sum(1 for ln in todays if fill_marker in ln)
+        # A replayed frame logs "dup fill <broker>:live:<id> — skip" instead of FILL;
+        # the trade IS booked, so it must not read as a mapping failure.
+        dups  = sum(1 for ln in todays if f"dup fill {broker}:live:" in ln)
+
+        unparsed = sum(1 for ln in events if "status=None" in ln)
+        if unparsed:
+            out.append((slug, f"{unparsed} of {len(events)} order-update frames arrived "
+                              f"with an unreadable status — the mapper cannot parse this "
+                              f"broker's payload, so fills are being dropped silently. "
+                              f"Compare a 'raw order msg' line against the field names in "
+                              f"the handler; a key-casing change does exactly this"))
+            continue
+
+        terminal = sum(1 for ln in events
+                       if any(f"status='{s}" in ln.lower() for s in LIVE_TERMINAL_STATUSES))
+        if terminal and not fills and not dups:
+            out.append((slug, f"{terminal} order(s) reached a terminal status but no fill "
+                              f"was booked — the status parsed, the fill did not. Check the "
+                              f"log for 'skipping incomplete fill' (missing qty/price)"))
+
+    incomplete = sum(1 for ln in todays if "skipping incomplete fill" in ln)
+    if incomplete:
+        out.append(("live_trade_daemon",
+                    f"{incomplete} fill(s) rejected as incomplete today — a required field "
+                    f"(qty, price, side or order id) was missing from the broker payload"))
+    return out
+
+
 def check_unexplained_holdings():
     """(position, detail) where the broker feed's quantity moved but no trade explains it.
 
@@ -695,6 +779,7 @@ def main():
         ("PMS feeds that have gone stale", check_pms_stale()),
         ("Hand-entered figures overdue for a refresh", check_manual_stale()),
         ("Live trade daemons that did not listen this session", check_live_capture()),
+        ("Live order events that arrived but booked no fill", check_live_fill_mapping()),
         ("Holdings that moved with no trade to explain it", check_unexplained_holdings()),
     ]
     findings = [(title, items) for title, items in sections if items]
