@@ -28,6 +28,13 @@ iws-portal-frontend/.next/
 .next/
 iws-portal-frontend/.env.local
 
+# Repo-root npm install (anime.js, for the landing page). Separate from the portal
+# build — iws-portal-frontend has its own package.json and lockfile. Leading slash
+# so these match ONLY at the root and never shadow a real app's manifest.
+/node_modules/
+/package.json
+/package-lock.json
+
 # Nginx default page
 html/
 .agents/.claude/
