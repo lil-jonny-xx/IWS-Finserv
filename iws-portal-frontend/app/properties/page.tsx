@@ -40,11 +40,15 @@ interface Property {
   has_parking: boolean; parking_count: number | null;
   seller_name: string | null; seller_address: string | null;
   stamp_value: number | null; lawyer_fees: number | null;
+  purchase_brokerage: number | null;
   purchase_price: number | null; market_land_value: number | null;
+  valuation_1_amount: number | null; valuation_2_amount: number | null;
   rrr: number | null; fair_value: number | null; land_value: number | null;
   building_value: number | null;
   total_value: number | null; value_effective: number | null;
   sold: boolean; sale_price: number | null; sale_date: string | null;
+  sale_lawyer_fees: number | null; sale_brokerage: number | null;
+  capital_gains: number | null;
   notes: string | null;
   documents: PropDoc[]; missing_required: string[];
 }
@@ -66,7 +70,10 @@ interface PropertyForm {
   acquisition_date: string; ownership: string; tenure: string; is_old_lease: boolean;
   has_parking: boolean; parking_count: string;
   seller_name: string; seller_address: string; stamp_value: string; lawyer_fees: string;
-  purchase_price: string; market_land_value: string; rrr: string; notes: string;
+  purchase_brokerage: string;
+  purchase_price: string; market_land_value: string;
+  valuation_1_amount: string; valuation_2_amount: string;
+  rrr: string; notes: string;
 }
 const EMPTY_FORM: PropertyForm = {
   id: null, name: '', property_type: 'land',
@@ -76,7 +83,10 @@ const EMPTY_FORM: PropertyForm = {
   acquisition_date: '', ownership: '', tenure: '', is_old_lease: false,
   has_parking: false, parking_count: '',
   seller_name: '', seller_address: '', stamp_value: '', lawyer_fees: '',
-  purchase_price: '', market_land_value: '', rrr: '', notes: '',
+  purchase_brokerage: '',
+  purchase_price: '', market_land_value: '',
+  valuation_1_amount: '', valuation_2_amount: '',
+  rrr: '', notes: '',
 };
 
 function ownersLabel(p: Property): string {
@@ -138,6 +148,8 @@ export default function PropertiesPage() {
   const [sellFor, setSellFor]     = useState<Property | null>(null);
   const [sellPrice, setSellPrice] = useState('');
   const [sellDate, setSellDate]   = useState('');
+  const [sellLawyer, setSellLawyer]       = useState('');
+  const [sellBrokerage, setSellBrokerage] = useState('');
   const [sellErr, setSellErr]     = useState<string | null>(null);
   const fileRef                 = useRef<HTMLInputElement | null>(null);
   const imgRef                  = useRef<HTMLInputElement | null>(null);
@@ -281,7 +293,9 @@ export default function PropertiesPage() {
       has_parking: form.has_parking, parking_count: form.has_parking ? num(form.parking_count) : null,
       seller_name: form.seller_name || null, seller_address: form.seller_address || null,
       stamp_value: num(form.stamp_value), lawyer_fees: num(form.lawyer_fees),
+      purchase_brokerage: num(form.purchase_brokerage),
       purchase_price: num(form.purchase_price), market_land_value: num(form.market_land_value),
+      valuation_1_amount: num(form.valuation_1_amount), valuation_2_amount: num(form.valuation_2_amount),
       rrr: num(form.rrr), notes: form.notes || null,
     };
     fetch(`${API_URL}/api/v1/properties${form.id != null ? `/${form.id}` : ''}`, {
@@ -303,13 +317,20 @@ export default function PropertiesPage() {
     const price = Number(sellPrice);
     if (!price || price <= 0) { setSellErr('Enter the sale amount.'); return; }
     setSellErr(null); setBusy('sell');
+    const num = (s: string): number | null => (s.trim() === '' ? null : Number(s));
     fetch(`${API_URL}/api/v1/properties/${sellFor.id}/sell`, {
       method: 'POST', credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sale_price: price, sale_date: sellDate || null }),
+      body: JSON.stringify({
+        sale_price: price, sale_date: sellDate || null,
+        sale_lawyer_fees: num(sellLawyer), sale_brokerage: num(sellBrokerage),
+      }),
     })
       .then(r => { if (!r.ok) return r.json().then((e: { detail?: string }) => { throw new Error(e.detail || 'Could not mark sold'); }); return r.json(); })
-      .then(() => { setSellFor(null); setSellPrice(''); setSellDate(''); loadProperties(); })
+      .then(() => {
+        setSellFor(null); setSellPrice(''); setSellDate('');
+        setSellLawyer(''); setSellBrokerage(''); loadProperties();
+      })
       .catch(e => setSellErr(e.message))
       .finally(() => setBusy(null));
   };
@@ -443,8 +464,11 @@ export default function PropertiesPage() {
     seller_name: p.seller_name ?? '', seller_address: p.seller_address ?? '',
     stamp_value: p.stamp_value != null ? String(p.stamp_value) : '',
     lawyer_fees: p.lawyer_fees != null ? String(p.lawyer_fees) : '',
+    purchase_brokerage: p.purchase_brokerage != null ? String(p.purchase_brokerage) : '',
     purchase_price: p.purchase_price != null ? String(p.purchase_price) : '',
     market_land_value: p.market_land_value != null ? String(p.market_land_value) : '',
+    valuation_1_amount: p.valuation_1_amount != null ? String(p.valuation_1_amount) : '',
+    valuation_2_amount: p.valuation_2_amount != null ? String(p.valuation_2_amount) : '',
     rrr: p.rrr != null ? String(p.rrr) : '', notes: p.notes ?? '',
   });
 
@@ -468,7 +492,7 @@ export default function PropertiesPage() {
 
   const openCardActions = (p: Property) => ({
     onEdit: () => { setCard(null); setFormErr(null); setFormSaved(false); editForm(p); },
-    onSell: () => { setCard(null); setSellErr(null); setSellPrice(''); setSellDate(''); setSellFor(p); },
+    onSell: () => { setCard(null); setSellErr(null); setSellPrice(''); setSellDate(''); setSellLawyer(''); setSellBrokerage(''); setSellFor(p); },
     onDelete: () => deleteProperty(p),
   });
 
@@ -627,6 +651,36 @@ export default function PropertiesPage() {
                 <input value={sellDate} type="date" onChange={e => setSellDate(e.target.value)}
                        className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" />
               </label>
+              <div className="grid grid-cols-2 gap-3">
+                <label className="flex flex-col gap-1">
+                  <span className="text-ghost">Lawyer fees (₹)</span>
+                  <input value={sellLawyer} onChange={e => setSellLawyer(e.target.value)} type="number" min="0" step="any"
+                         className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-ghost">Brokerage (₹)</span>
+                  <input value={sellBrokerage} onChange={e => setSellBrokerage(e.target.value)} type="number" min="0" step="any"
+                         className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" />
+                </label>
+              </div>
+              {/* Live preview of the derived capital gain the backend will store-as-null
+                  and compute on read: sale − purchase − sale costs. */}
+              {sellFor.purchase_price != null && Number(sellPrice) > 0 && (
+                <div className="border border-rule rounded px-3 py-2 bg-page flex flex-wrap items-baseline gap-x-2">
+                  <span className="text-ghost">Capital gain</span>
+                  {(() => {
+                    const gain = Number(sellPrice) - sellFor.purchase_price!
+                      - (Number(sellLawyer) || 0) - (Number(sellBrokerage) || 0);
+                    return (
+                      <span className="text-sm font-semibold tabular-nums"
+                            style={{ color: gain >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
+                        {gain >= 0 ? '+' : ''}{fmtINR(gain)}
+                      </span>
+                    );
+                  })()}
+                  <span className="text-[11px] text-ghost">= sale − purchase {fmtINR(sellFor.purchase_price)} − sale costs</span>
+                </div>
+              )}
             </div>
             {sellErr && <p role="alert" className="text-xs text-red-500 mt-3">{sellErr}</p>}
             <div className="flex justify-end gap-2 mt-5">
@@ -882,8 +936,27 @@ function PropertyModal({ p, isAdmin, busy, docTypesFor, docLabelFor, onClose, on
             <Field label="Total value (land + floors)">{fmtINR(p.total_value)}</Field>
           )}
           <Field label="Purchase price">{fmtINR(p.purchase_price)}</Field>
+          {p.valuation_1_amount != null && <Field label="Valuation 1">{fmtINR(p.valuation_1_amount)}</Field>}
+          {p.valuation_2_amount != null && <Field label="Valuation 2">{fmtINR(p.valuation_2_amount)}</Field>}
           {p.sold && <Field label="Sold">{p.sale_date} · {fmtINR(p.sale_price)}</Field>}
         </div>
+
+        {/* Sale — proceeds, the costs that netted the deal, and the derived gain. */}
+        {p.sold && (
+          <div className="px-4 sm:px-6 pb-4 border-t border-rule pt-3 grid grid-cols-2 sm:grid-cols-4 gap-x-4 gap-y-2">
+            <p className="col-span-2 sm:col-span-4 text-[10px] uppercase tracking-wide text-ghost">Sale</p>
+            <Field label="Sale price">{fmtINR(p.sale_price)}</Field>
+            <Field label="Lawyer fees (sale)">{fmtINR(p.sale_lawyer_fees)}</Field>
+            <Field label="Brokerage (sale)">{fmtINR(p.sale_brokerage)}</Field>
+            <Field label="Capital gain">
+              {p.capital_gains != null ? (
+                <span style={{ color: p.capital_gains >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
+                  {p.capital_gains >= 0 ? '+' : ''}{fmtINR(p.capital_gains)}
+                </span>
+              ) : '—'}
+            </Field>
+          </div>
+        )}
 
         {p.notes && (
           <div className="px-4 sm:px-6 pb-4">
@@ -893,13 +966,14 @@ function PropertyModal({ p, isAdmin, busy, docTypesFor, docLabelFor, onClose, on
         )}
 
         {/* Seller */}
-        {(p.seller_name || p.seller_address || p.stamp_value != null || p.lawyer_fees != null) && (
+        {(p.seller_name || p.seller_address || p.stamp_value != null || p.lawyer_fees != null || p.purchase_brokerage != null) && (
           <div className="px-4 sm:px-6 pb-4 border-t border-rule pt-3 grid grid-cols-2 sm:grid-cols-4 gap-x-4 gap-y-2">
             <p className="col-span-2 sm:col-span-4 text-[10px] uppercase tracking-wide text-ghost">Purchased from seller</p>
             <Field label="Seller">{p.seller_name || '—'}</Field>
             <Field label="Seller address">{p.seller_address || '—'}</Field>
             <Field label="Stamp value">{fmtINR(p.stamp_value)}</Field>
             <Field label="Lawyer fees">{fmtINR(p.lawyer_fees)}</Field>
+            {p.purchase_brokerage != null && <Field label="Brokerage">{fmtINR(p.purchase_brokerage)}</Field>}
           </div>
         )}
 
@@ -1195,8 +1269,23 @@ function PropertyFormModal({ form, setForm, isAdmin, busy, mainHolders, parentHo
                 <input value={form.stamp_value} onChange={e => set({ stamp_value: e.target.value })} type="number" min="0" step="any" className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" /></label>
               <label className="flex flex-col gap-1"><span className="text-ghost">Lawyer fees (₹)</span>
                 <input value={form.lawyer_fees} onChange={e => set({ lawyer_fees: e.target.value })} type="number" min="0" step="any" className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" /></label>
+              <label className="flex flex-col gap-1"><span className="text-ghost">Brokerage on purchase (₹)</span>
+                <input value={form.purchase_brokerage} onChange={e => set({ purchase_brokerage: e.target.value })} type="number" min="0" step="any" className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" /></label>
             </div>
             <p className="text-[11px] text-ghost mt-1.5">The agreement / sale deed itself uploads under Documents below (Seller Agreement Deed / Gift Deed).</p>
+          </div>
+
+          {/* Independent valuations — each figure pairs with its own uploaded
+              report (Valuation Report 1 / 2, under Documents below). */}
+          <div className="sm:col-span-2 border-t border-rule pt-3">
+            <p className="text-[11px] uppercase tracking-wide text-ghost mb-2">Independent valuations (optional)</p>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <label className="flex flex-col gap-1"><span className="text-ghost">Valuation 1 amount (₹)</span>
+                <input value={form.valuation_1_amount} onChange={e => set({ valuation_1_amount: e.target.value })} type="number" min="0" step="any" className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" /></label>
+              <label className="flex flex-col gap-1"><span className="text-ghost">Valuation 2 amount (₹)</span>
+                <input value={form.valuation_2_amount} onChange={e => set({ valuation_2_amount: e.target.value })} type="number" min="0" step="any" className="bg-page border border-rule rounded px-2.5 py-1.5 text-ink" /></label>
+            </div>
+            <p className="text-[11px] text-ghost mt-1.5">Upload each valuer&apos;s report under Documents below (Valuation Report 1 / Valuation Report 2). These figures are informational and don&apos;t change the portfolio total.</p>
           </div>
 
           {/* Floors */}

@@ -37,7 +37,8 @@ DOC_TYPES = [
     {"slug": "property_access",        "label": "Property Access",                       "scope": "land", "optional": True,  "parent": None},
     {"slug": "zone_change_application","label": "Application Paper for Zone Change",     "scope": "land", "optional": True,  "parent": None},
     {"slug": "receipts_echallans",     "label": "Receipts & e-Challans Paid",            "scope": "land", "optional": True,  "parent": None},
-    {"slug": "valuation_report",       "label": "Valuation Report",                      "scope": "land", "optional": True,  "parent": None},
+    {"slug": "valuation_report",       "label": "Valuation Report 1",                    "scope": "land", "optional": True,  "parent": None},
+    {"slug": "valuation_report_2",     "label": "Valuation Report 2",                    "scope": "land", "optional": True,  "parent": None},
     # ---- building extras --------------------------------------------------
     {"slug": "construction_approval",  "label": "Approval for Construction of Project",  "scope": "building", "optional": False, "parent": None},
     {"slug": "construction_licence",   "label": "Construction Licence",                  "scope": "building", "optional": False, "parent": None},
