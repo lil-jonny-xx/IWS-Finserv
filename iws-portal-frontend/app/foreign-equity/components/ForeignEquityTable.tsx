@@ -249,6 +249,28 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
   const rows     = sortRows(filtered, sortKey, sortDir);
   const colCount = 3 + (showEntityCol ? 1 : 0) + 10;
 
+  // Mirror the Equity page: a broker/search filter recomputes the summary strip
+  // from the shown rows, so the metrics move with the filter instead of staying
+  // on the all-broker API totals. Manually-entered foreign equity (`extra`) has no
+  // broker, so it's folded in only for the unfiltered view.
+  const filteredView   = !!(filterBroker || search);
+  const sumCost        = filteredView ? filtered.reduce((s, h) => s + (h.cost ?? 0), 0)
+                                      : (totals.total_cost ?? 0) + (extra?.cost ?? 0);
+  const sumValue       = filteredView ? filtered.reduce((s, h) => s + (h.current_market_value ?? 0), 0)
+                                      : (totals.total_current_market_value ?? 0) + (extra?.value ?? 0);
+  const sumPnlInc      = filteredView ? filtered.reduce((s, h) => s + (h.pnl_inception ?? 0), 0)
+                                      : (totals.total_pnl_inception ?? 0) + (extra?.pnl ?? 0);
+  const sumPnlDay      = filteredView ? filtered.reduce((s, h) => s + (h.pnl_daily ?? 0), 0)
+                                      : (totals.total_pnl_daily ?? 0);
+  const holdingsCount  = filteredView ? filtered.length : holdings.length + (extra?.count ?? 0);
+  // Cash for the selected broker (summed across entities in scope); all-broker
+  // otherwise. cashByCurrency/cashByBroker breakdowns are scoped to the broker too.
+  const brokerCashAgg = new Map<string, number>();
+  for (const c of cashByBroker) brokerCashAgg.set(c.broker, (brokerCashAgg.get(c.broker) ?? 0) + (c.balance ?? 0));
+  const cashShown       = filterBroker ? (brokerCashAgg.get(filterBroker) ?? 0) : (totals.cash_balance ?? 0);
+  const cashByBrokerView   = filterBroker ? cashByBroker.filter(c => c.broker === filterBroker) : cashByBroker;
+  const cashByCurrencyView = filterBroker ? cashByCurrency.filter(c => c.broker === filterBroker) : cashByCurrency;
+
   const base = 'px-3 py-2.5 text-xs font-medium text-ghost bg-card border-b border-rule whitespace-nowrap sticky top-0 z-10';
   // Render helper (not a component) so header cells share the sort closure without
   // tripping react-hooks/static-components.
@@ -298,22 +320,27 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
         <div className="flex flex-wrap gap-x-8 gap-y-3">
           <div>
             <p className="text-xs text-ghost mb-0.5">Total Cost</p>
-            <p className="text-sm font-semibold text-ink tabular-nums">{fmtMoney(convTotal((totals.total_cost ?? 0) + (extra?.cost ?? 0)), totalsCcy)}</p>
+            <p className="text-sm font-semibold text-ink tabular-nums">{fmtMoney(convTotal(sumCost), totalsCcy)}</p>
           </div>
           <div>
             <p className="text-xs text-ghost mb-0.5">Current Value</p>
-            <p className="text-sm font-semibold text-ink tabular-nums">{fmtMoney(convTotal((totals.total_current_market_value ?? 0) + (extra?.value ?? 0)), totalsCcy)}</p>
+            <p className="text-sm font-semibold text-ink tabular-nums">{fmtMoney(convTotal(sumValue), totalsCcy)}</p>
           </div>
-          {totals.cash_balance != null && totals.cash_balance > 0 && (
+          {cashShown != null && cashShown > 0 && (
             <div>
-              <p className="text-xs text-ghost mb-0.5">Cash Balance</p>
-              <p className="text-sm font-semibold text-ink tabular-nums">{fmtMoney(convTotal(totals.cash_balance), totalsCcy)}</p>
+              <p className="text-xs text-ghost mb-0.5">
+                Cash Balance
+                {filterBroker && (
+                  <span className="ml-1 text-ghost">({BROKER_LABELS[filterBroker] ?? filterBroker})</span>
+                )}
+              </p>
+              <p className="text-sm font-semibold text-ink tabular-nums">{fmtMoney(convTotal(cashShown), totalsCcy)}</p>
             </div>
           )}
-          {cashByBroker.length > 0 && (() => {
+          {cashByBrokerView.length > 0 && !filterBroker && (() => {
             // Sum INR cash per foreign broker (IBKR / Vested / DBS) across entities in scope.
             const agg = new Map<string, number>();
-            for (const c of cashByBroker) agg.set(c.broker, (agg.get(c.broker) ?? 0) + (c.balance ?? 0));
+            for (const c of cashByBrokerView) agg.set(c.broker, (agg.get(c.broker) ?? 0) + (c.balance ?? 0));
             const items = [...agg.entries()].filter(([, v]) => Math.abs(v) > 0.5)
               .sort((a, b) => b[1] - a[1]);
             if (!items.length) return null;
@@ -334,11 +361,11 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
               </div>
             );
           })()}
-          {cashByCurrency.length > 0 && (() => {
+          {cashByCurrencyView.length > 0 && (() => {
             // Sum native balances per currency across the entities in scope. A negative
             // (e.g. a GBP margin loan funding a GBP ETF) shows in the peril colour.
             const agg = new Map<string, number>();
-            for (const c of cashByCurrency)
+            for (const c of cashByCurrencyView)
               agg.set(c.currency, (agg.get(c.currency) ?? 0) + (c.balance_native ?? 0));
             const items = [...agg.entries()].filter(([, v]) => v !== 0)
               .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
@@ -360,35 +387,27 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
               </div>
             );
           })()}
-          {(() => {
-            const day = totals.total_pnl_daily ?? 0;
-            if (day === 0) return null;
-            return (
-              <div>
-                <p className="text-xs text-ghost mb-0.5">P&amp;L (Today)</p>
-                <p className="text-sm font-semibold tabular-nums"
-                  style={{ color: day >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
-                  {day >= 0 ? '+' : ''}{fmtMoney(convTotal(day), totalsCcy)}
-                </p>
-              </div>
-            );
-          })()}
-          {(() => {
-            const pnl = (totals.total_pnl_inception ?? 0) + (extra?.pnl ?? 0);
-            if (pnl === 0) return null;
-            return (
-              <div>
-                <p className="text-xs text-ghost mb-0.5">P&amp;L (Inception)</p>
-                <p className="text-sm font-semibold tabular-nums"
-                  style={{ color: pnl >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
-                  {pnl >= 0 ? '+' : ''}{fmtMoney(convTotal(pnl), totalsCcy)}
-                </p>
-              </div>
-            );
-          })()}
+          {sumPnlDay !== 0 && (
+            <div>
+              <p className="text-xs text-ghost mb-0.5">P&amp;L (Today)</p>
+              <p className="text-sm font-semibold tabular-nums"
+                style={{ color: sumPnlDay >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
+                {sumPnlDay >= 0 ? '+' : ''}{fmtMoney(convTotal(sumPnlDay), totalsCcy)}
+              </p>
+            </div>
+          )}
+          {sumPnlInc !== 0 && (
+            <div>
+              <p className="text-xs text-ghost mb-0.5">P&amp;L (Inception)</p>
+              <p className="text-sm font-semibold tabular-nums"
+                style={{ color: sumPnlInc >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
+                {sumPnlInc >= 0 ? '+' : ''}{fmtMoney(convTotal(sumPnlInc), totalsCcy)}
+              </p>
+            </div>
+          )}
           <div>
             <p className="text-xs text-ghost mb-0.5">Holdings</p>
-            <p className="text-sm font-semibold text-ink tabular-nums">{holdings.length + (extra?.count ?? 0)}</p>
+            <p className="text-sm font-semibold text-ink tabular-nums">{holdingsCount}</p>
           </div>
           {display === 'native' && (
             <div className="self-end">

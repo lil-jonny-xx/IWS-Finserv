@@ -621,6 +621,19 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
                                  : totals.total_current_market_value;
   const viewCount   = isFiltered ? view.length : holdings.length;
 
+  // When a single broker is selected, the page-level cash figures (all brokers)
+  // would contradict the filtered holdings — so swap in just that broker's cash,
+  // summed across the entities in scope. 'combined' is a view, not a broker.
+  const brokerFilterActive = !!(filterBroker && filterBroker !== 'combined');
+  const selectedBrokerCash = brokerFilterActive
+    ? (cashBrokers.find(b => b.broker === filterBroker)?.total ?? 0)
+    : null;
+  const cashBalanceShown  = brokerFilterActive ? selectedBrokerCash
+                          : (!isFiltered ? totals.cash_balance ?? null : null);
+  const valuePlusCashShown = brokerFilterActive
+    ? (viewValue ?? 0) + (selectedBrokerCash ?? 0)
+    : totals.value_plus_cash;
+
   // FY columns are driven by the data (see fyLabelsOf) — derived from ALL holdings,
   // not the filtered view, so the columns don't appear/disappear as you filter.
   const fyLabels = useMemo(() => fyLabelsOf(holdings), [holdings]);
@@ -649,15 +662,20 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
             <p className="text-xs text-ghost mb-0.5">Current Value</p>
             <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(viewValue)}</p>
           </div>
-          {!isFiltered && totals.cash_balance != null && totals.cash_balance > 0 && (
+          {cashBalanceShown != null && cashBalanceShown > 0 && (
             <>
               <div>
-                <p className="text-xs text-ghost mb-0.5">Cash Balance</p>
-                <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(totals.cash_balance)}</p>
+                <p className="text-xs text-ghost mb-0.5">
+                  Cash Balance
+                  {brokerFilterActive && (
+                    <span className="ml-1 text-ghost">({BROKER_LABELS[filterBroker!] ?? filterBroker})</span>
+                  )}
+                </p>
+                <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(cashBalanceShown)}</p>
               </div>
               <div>
                 <p className="text-xs text-ghost mb-0.5">Value + Cash</p>
-                <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(totals.value_plus_cash)}</p>
+                <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(valuePlusCashShown)}</p>
               </div>
             </>
           )}
@@ -706,12 +724,10 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
               </p>
             </div>
           )}
-          {!isFiltered && totals.portfolio_income != null && totals.portfolio_income > 0 && (
-            <div title="Dividends & interest received (from broker ledgers)">
-              <p className="text-xs text-ghost mb-0.5">Dividends/Int</p>
-              <p className="text-sm font-semibold text-ink tabular-nums">{fmtINR(totals.portfolio_income)}</p>
-            </div>
-          )}
+          {/* The old "Dividends/Int" broker-ledger figure was removed — it conflated
+              dividends with interest and drew from a different (ledger) basis than the
+              derived per-stock dividends, which read as contradictory. Dividends now
+              live only in the dedicated DividendsCard above the table. */}
           <div>
             <p className="text-xs text-ghost mb-0.5">Holdings</p>
             <p className="text-sm font-semibold text-ink tabular-nums">{viewCount}</p>
