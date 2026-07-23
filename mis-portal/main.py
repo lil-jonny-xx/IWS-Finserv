@@ -4667,6 +4667,9 @@ def _property_row(r: dict, docs: list, owners: list, floors: list,
         "seller_address":   r["seller_address"],
         "stamp_value":      _num(r["stamp_value"]),
         "lawyer_fees":      _num(r["lawyer_fees"]),
+        "purchase_brokerage": _num(r["purchase_brokerage"]),
+        "valuation_1_amount": _num(r["valuation_1_amount"]),
+        "valuation_2_amount": _num(r["valuation_2_amount"]),
         "rrr":              rrr,
         "fair_value":       fair,            # RRR estimate — the land fallback
         "land_value":       land_value,      # the land half actually used in `total`
@@ -4676,6 +4679,19 @@ def _property_row(r: dict, docs: list, owners: list, floors: list,
         "sold":             r["sold"],
         "sale_price":       _num(r["sale_price"]),
         "sale_date":        r["sale_date"].isoformat() if r["sale_date"] else None,
+        "sale_lawyer_fees": _num(r["sale_lawyer_fees"]),
+        "sale_brokerage":   _num(r["sale_brokerage"]),
+        # Capital gain is derived, never stored: sale − purchase − sale costs
+        # (lawyer + brokerage). Null unless sold with both a sale and purchase price.
+        "capital_gains": (
+            round(
+                float(r["sale_price"]) - float(r["purchase_price"])
+                - float(r["sale_lawyer_fees"] or 0) - float(r["sale_brokerage"] or 0),
+                2,
+            )
+            if r["sold"] and r["sale_price"] is not None and r["purchase_price"] is not None
+            else None
+        ),
         "notes":            r["notes"],
         "documents":        docs,
         "missing_required": [s for s in required if s not in uploaded],
@@ -4848,8 +4864,11 @@ class PropertyRequest(BaseModel):
     seller_address:   Optional[str]   = None
     stamp_value:      Optional[float] = None
     lawyer_fees:      Optional[float] = None
+    purchase_brokerage: Optional[float] = None  # brokerage paid on purchase
     purchase_price:   Optional[float] = None
     market_land_value: Optional[float] = None  # LAND only; floors are valued separately
+    valuation_1_amount: Optional[float] = None  # independent valuer #1 (report = valuation_report)
+    valuation_2_amount: Optional[float] = None  # independent valuer #2 (report = valuation_report_2)
     rrr:              Optional[float] = None
     notes:            Optional[str]   = None
     owners:           Optional[List[PropertyOwnerIn]]  = None   # default: holder_id @ 100%
@@ -4968,17 +4987,19 @@ def create_property(request: Request, body: PropertyRequest,
                     survey_no, gps_link, area, built_up_area, area_unit, property_no,
                     acquisition_date, ownership, tenure, is_old_lease, has_parking,
                     parking_count, seller_name, seller_address, stamp_value, lawyer_fees,
-                    purchase_price, market_land_value, rrr, notes, created_by, updated_by)
+                    purchase_brokerage, purchase_price, market_land_value,
+                    valuation_1_amount, valuation_2_amount, rrr, notes, created_by, updated_by)
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                       %s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                       %s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
             (body.name.strip(), body.property_type, body.holder_id, body.village,
              body.address, body.taluka, body.survey_no,
              (body.gps_link or "").strip() or None, body.area, body.built_up_area,
              body.area_unit, body.property_no, body.acquisition_date or None,
              body.ownership, body.tenure, body.is_old_lease, body.has_parking,
              body.parking_count, body.seller_name, body.seller_address, body.stamp_value,
-             body.lawyer_fees, body.purchase_price, body.market_land_value, body.rrr,
-             body.notes, user_id, user_id),
+             body.lawyer_fees, body.purchase_brokerage, body.purchase_price,
+             body.market_land_value, body.valuation_1_amount, body.valuation_2_amount,
+             body.rrr, body.notes, user_id, user_id),
         )
         pid = cur.fetchone()["id"]
         _save_property_children(cur, pid, body)
@@ -5018,8 +5039,9 @@ def update_property(prop_id: int, request: Request, body: PropertyRequest,
                    built_up_area=%s, area_unit=%s, property_no=%s, acquisition_date=%s,
                    ownership=%s, tenure=%s, is_old_lease=%s, has_parking=%s,
                    parking_count=%s, seller_name=%s, seller_address=%s, stamp_value=%s,
-                   lawyer_fees=%s, purchase_price=%s, market_land_value=%s, rrr=%s, notes=%s,
-                   updated_by=%s, updated_at=NOW()
+                   lawyer_fees=%s, purchase_brokerage=%s, purchase_price=%s,
+                   market_land_value=%s, valuation_1_amount=%s, valuation_2_amount=%s,
+                   rrr=%s, notes=%s, updated_by=%s, updated_at=NOW()
                WHERE id=%s RETURNING id""",
             (body.name.strip(), body.property_type, body.holder_id, body.village,
              body.address, body.taluka, body.survey_no,
@@ -5027,8 +5049,9 @@ def update_property(prop_id: int, request: Request, body: PropertyRequest,
              body.area_unit, body.property_no, body.acquisition_date or None,
              body.ownership, body.tenure, body.is_old_lease, body.has_parking,
              body.parking_count, body.seller_name, body.seller_address, body.stamp_value,
-             body.lawyer_fees, body.purchase_price, body.market_land_value, body.rrr,
-             body.notes, user_id, prop_id),
+             body.lawyer_fees, body.purchase_brokerage, body.purchase_price,
+             body.market_land_value, body.valuation_1_amount, body.valuation_2_amount,
+             body.rrr, body.notes, user_id, prop_id),
         )
         if not cur.fetchone():
             raise HTTPException(status_code=404, detail="Property not found")
@@ -5099,6 +5122,8 @@ def delete_property(prop_id: int, request: Request,
 class PropertySellRequest(BaseModel):
     sale_price: float
     sale_date:  Optional[str] = None   # YYYY-MM-DD, defaults to today
+    sale_lawyer_fees: Optional[float] = None   # lawyer/conveyancing fees on sale
+    sale_brokerage:   Optional[float] = None   # brokerage paid on sale
 
 
 @app.post("/api/v1/properties/{prop_id}/sell")
@@ -5124,9 +5149,11 @@ def sell_property(prop_id: int, request: Request, body: PropertySellRequest,
         user_id = _property_user_id(cur, payload)
         cur.execute(
             """UPDATE property SET sold = TRUE, sale_price = %s, sale_date = %s,
+                   sale_lawyer_fees = %s, sale_brokerage = %s,
                    updated_by = %s, updated_at = NOW()
                WHERE id = %s RETURNING name""",
-            (body.sale_price, sale_date, user_id, prop_id),
+            (body.sale_price, sale_date, body.sale_lawyer_fees, body.sale_brokerage,
+             user_id, prop_id),
         )
         row = cur.fetchone()
         if not row:
@@ -6687,12 +6714,16 @@ def get_realised_gains(
     request: Request,
     period: str = "fy",
     switches: str = "include",
+    group: str = "entity",
     authorization: Optional[str] = Header(None),
 ):
     """Realised gains across all entities (uniform visibility).
 
     period   — "fy" (default, FY-to-date) or "inception" (whole history).
     switches — "include" (default) or "exclude" (drop SWITCH_IN/SWITCH_OUT).
+    group    — "entity" (default) or "broker". In "broker" mode equity/foreign
+               lots are FIFO-matched per demat, so every row carries `broker`
+               (null for MF / PMS / real estate, which have no demat account).
     """
     conn = None
     try:
@@ -6712,15 +6743,18 @@ def get_realised_gains(
 
         since_inception  = (period == "inception")
         include_switches = (switches != "exclude")
+        by_broker        = (group == "broker")
         out = []
         for e in entities:
             for r in _fetch_realised_gains(
                 conn, [e["id"]], date.today(),
                 since_inception=since_inception,
                 include_switches=include_switches,
+                by_broker=by_broker,
             ):
                 out.append({
                     "entity":          e["entity_name"],
+                    "broker":          r.get("broker"),
                     "category":        r.get("category", r["group"]),
                     "group":           r["group"],
                     "security_name":   r["security_name"],
@@ -6759,6 +6793,7 @@ def get_realised_gains(
             pnl  = (sale - cost) if sale is not None and cost is not None else None
             out.append({
                 "entity":          r["holder_name"],
+                "broker":          None,
                 "category":        "Real Estate",
                 "group":           "Real Estate",
                 "security_name":   r["name"],
@@ -6786,11 +6821,17 @@ def get_realised_gains(
 def get_dividends(
     request: Request,
     period: str = "inception",
+    scope: str = "domestic",
+    entity_id: List[int] = Query(default=[]),
     authorization: Optional[str] = Header(None),
 ):
     """Dividend income per entity/security/ex-date, with feed-coverage context.
 
-    period — "fy" (current Indian FY) or "inception" (default, whole history).
+    period    — "fy" (current Indian FY) or "inception" (default, whole history).
+    scope     — "domestic" (default, INR scrips paid to the bank) or "foreign"
+                (Vested/US holdings, derived the same way, amount converted to INR).
+    entity_id — repeatable; scope the rows to these entities (empty = all). Lets the
+                equity / foreign-equity pages draw a per-entity dividend pie.
 
     Indian dividends never pass through the broker: the company credits the
     shareholder's bank directly, so these rows are DERIVED (ex-date and rate/share
@@ -6815,7 +6856,17 @@ def get_dividends(
         cur = conn.cursor()
 
         # Entity visibility is uniform across the portal (see get_realised_gains).
+        # Domestic vs foreign split on the stored currency: INR rows are the Indian
+        # bank-credited scrips; anything else is a foreign holding (amount already in
+        # INR, rate/share native).
         where, params = ["d.source = 'computed'"], []
+        if scope == "foreign":
+            where.append("COALESCE(d.currency, 'INR') <> 'INR'")
+        else:
+            where.append("COALESCE(d.currency, 'INR') = 'INR'")
+        if entity_id:
+            where.append("d.entity_id = ANY(%s)")
+            params.append(list(entity_id))
         if period == "fy":
             today = date.today()
             fy_start = date(today.year if today.month >= 4 else today.year - 1, 4, 1)
@@ -6823,8 +6874,8 @@ def get_dividends(
             params.append(fy_start)
 
         cur.execute(f"""
-            SELECT e.entity_name, sm.security_name, d.ex_date, d.quantity,
-                   d.rate_per_share, d.amount, d.fy, d.variance_pct, d.feed
+            SELECT d.entity_id, e.entity_name, sm.security_name, d.ex_date, d.quantity,
+                   d.rate_per_share, d.amount, d.currency, d.fy, d.variance_pct, d.feed
               FROM dividend d
               JOIN entity e           ON e.id = d.entity_id
               JOIN security_master sm ON sm.id = d.security_id
@@ -6832,12 +6883,14 @@ def get_dividends(
              ORDER BY d.ex_date DESC, e.entity_name, sm.security_name
         """, params)
         rows = [{
+            "entity_id":      r["entity_id"],
             "entity":         r["entity_name"],
             "security_name":  r["security_name"],
             "ex_date":        str(r["ex_date"]),
             "quantity":       float(r["quantity"]),
             "rate_per_share": float(r["rate_per_share"]),
             "amount":         float(r["amount"]),
+            "currency":       r["currency"] or "INR",
             "fy":             r["fy"],
             "variance_pct":   float(r["variance_pct"]) if r["variance_pct"] is not None else None,
             "feed":           r["feed"],
