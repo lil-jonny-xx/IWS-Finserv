@@ -7,6 +7,7 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
 interface RealisedRow {
   entity: string;
+  broker?: string | null;  // set only in the demat (group=broker) fetch; null for MF/PMS/real estate
   category: string;
   group: string;
   security_name: string;
@@ -17,6 +18,18 @@ interface RealisedRow {
   st_pnl: number | null;   // Indian equity only: short-term slice (held ≤ 12 months)
   lt_pnl: number | null;   // Indian equity only: long-term slice (held > 12 months)
   return_pct: number | null;
+}
+
+// Demat/broker display names. Anything without a demat (MF, PMS, real estate) is
+// bucketed under this dash so the demat views still account for every rupee.
+const NO_DEMAT = 'No demat (MF / PMS / property)';
+const BROKER_LABEL: Record<string, string> = {
+  zerodha: 'Zerodha', angel_one: 'Angel One', dhan: 'Dhan',
+  ibkr: 'Interactive Brokers', vested: 'Vested', dbs: 'DBS Wealth',
+};
+function dematLabel(b: string | null | undefined): string {
+  if (!b) return NO_DEMAT;
+  return BROKER_LABEL[b] ?? b;
 }
 
 // Section order on the page; any category not listed falls in after these, sorted.
@@ -84,7 +97,8 @@ function Toggle<T extends string>({ label, value, onChange, options }: {
 
 type Period = 'fy' | 'inception';
 type Switches = 'include' | 'exclude';
-type View = 'detail' | 'entity' | 'yoy' | 'dividends';
+type View = 'detail' | 'entity' | 'yoy' | 'demat' | 'dividends';
+type DematBreak = 'total' | 'entity' | 'yoy';   // sub-view inside the demat tab
 
 interface DividendRow {
   entity: string;
@@ -113,6 +127,13 @@ export default function RealisedGainsPage() {
 
   const [divRows, setDivRows] = useState<DividendRow[]>([]);
   const [divCov, setDivCov] = useState<DividendCoverage | null>(null);
+
+  // Demat (group=broker) rows are a separate fetch: FIFO is re-matched per broker,
+  // so these numbers can differ slightly from the per-entity rows for a stock held
+  // at two brokers. Refetched when the Period/Switches toggles change.
+  const [dematRows, setDematRows] = useState<RealisedRow[]>([]);
+  const [dematBreak, setDematBreak] = useState<DematBreak>('total');
+  const [dematLoaded, setDematLoaded] = useState(false);
 
   // Year-on-year is meaningless against a single FY, so that view always pulls the
   // whole history regardless of the Period toggle (which is hidden while it's active).
@@ -163,6 +184,27 @@ export default function RealisedGainsPage() {
     })();
     return () => { cancelled = true; };
   }, [view, divCov, router]);
+
+  // Demat/broker rows — fetched only while the demat tab is open. Its year-on-year
+  // sub-view always spans the whole history (like the main YoY), so it pulls
+  // inception regardless of the Period toggle.
+  const dematPeriod: Period = dematBreak === 'yoy' ? 'inception' : period;
+  useEffect(() => {
+    if (view !== 'demat') return;
+    let cancelled = false;
+    setDematLoaded(false);
+    (async () => {
+      const res = await fetch(
+        `${API_URL}/api/v1/realised-gains?group=broker&period=${dematPeriod}&switches=${switches}`,
+        { credentials: 'include' },
+      );
+      if (cancelled) return;
+      if (res.status === 401) { router.push('/'); return; }
+      if (res.ok) setDematRows(await res.json());
+      setDematLoaded(true);
+    })();
+    return () => { cancelled = true; };
+  }, [view, dematPeriod, switches, router]);
 
   // Show the loading state while a toggle change refetches.
   const changePeriod = (p: Period) => { setLoading(true); setPeriod(p); };
@@ -261,6 +303,69 @@ export default function RealisedGainsPage() {
     return { ents, fys, cell, rowTotal, colTotal, total };
   }, [divRows]);
 
+  // ── Demat views ──────────────────────────────────────────────────────────────
+  const dematTotal = dematRows.reduce((s, r) => s + (r.pnl ?? 0), 0);
+
+  // By demat: one row per broker, with ST/LT where the broker carries Indian equity.
+  const byDemat = useMemo(() => {
+    const m = new Map<string, { pnl: number; st: number; lt: number; n: number; hasStLt: boolean }>();
+    for (const r of dematRows) {
+      const k = dematLabel(r.broker);
+      const cur = m.get(k) ?? { pnl: 0, st: 0, lt: 0, n: 0, hasStLt: false };
+      cur.pnl += r.pnl ?? 0;
+      cur.st  += r.st_pnl ?? 0;
+      cur.lt  += r.lt_pnl ?? 0;
+      cur.n   += 1;
+      if (r.st_pnl != null || r.lt_pnl != null) cur.hasStLt = true;
+      m.set(k, cur);
+    }
+    // The no-demat bucket always sorts last; real brokers by P&L desc.
+    return [...m.entries()].sort((a, b) => {
+      if (a[0] === NO_DEMAT) return 1;
+      if (b[0] === NO_DEMAT) return -1;
+      return b[1].pnl - a[1].pnl;
+    });
+  }, [dematRows]);
+
+  // Demat × entity matrix (broker rows, entity columns).
+  const dematByEntity = useMemo(() => {
+    const brokers = [...new Set(dematRows.map(r => dematLabel(r.broker)))]
+      .sort((a, b) => (a === NO_DEMAT ? 1 : b === NO_DEMAT ? -1 : a.localeCompare(b)));
+    const ents = [...new Set(dematRows.map(r => r.entity || '—'))].sort();
+    const grid = new Map<string, Map<string, number>>();
+    for (const r of dematRows) {
+      const b = dematLabel(r.broker);
+      if (!grid.has(b)) grid.set(b, new Map());
+      const em = grid.get(b)!;
+      const k = r.entity || '—';
+      em.set(k, (em.get(k) ?? 0) + (r.pnl ?? 0));
+    }
+    const cell = (b: string, e: string) => grid.get(b)?.get(e) ?? 0;
+    const rowTotal = (b: string) => [...(grid.get(b)?.values() ?? [])].reduce((s, v) => s + v, 0);
+    const colTotal = (e: string) => brokers.reduce((s, b) => s + cell(b, e), 0);
+    return { brokers, ents, cell, rowTotal, colTotal };
+  }, [dematRows]);
+
+  // Demat × financial-year matrix (broker rows, FY columns).
+  const dematByYoy = useMemo(() => {
+    const brokers = [...new Set(dematRows.map(r => dematLabel(r.broker)))]
+      .sort((a, b) => (a === NO_DEMAT ? 1 : b === NO_DEMAT ? -1 : a.localeCompare(b)));
+    const grid = new Map<string, Map<string, number>>();
+    for (const r of dematRows) {
+      const fy = fyOf(r.sale_date);
+      if (fy === '—') continue;
+      const b = dematLabel(r.broker);
+      if (!grid.has(b)) grid.set(b, new Map());
+      const fm = grid.get(b)!;
+      fm.set(fy, (fm.get(fy) ?? 0) + (r.pnl ?? 0));
+    }
+    const fys = [...new Set([...grid.values()].flatMap(m => [...m.keys()]))].sort().reverse();
+    const cell = (b: string, fy: string) => grid.get(b)?.get(fy) ?? 0;
+    const rowTotal = (b: string) => [...(grid.get(b)?.values() ?? [])].reduce((s, v) => s + v, 0);
+    const colTotal = (fy: string) => brokers.reduce((s, b) => s + cell(b, fy), 0);
+    return { brokers, fys, cell, rowTotal, colTotal };
+  }, [dematRows]);
+
   return (
     <div className="min-h-screen" style={{ background: 'var(--page)' }}>
       {/* Section tabs are global — see components/GlobalNav in the root layout. */}
@@ -269,9 +374,13 @@ export default function RealisedGainsPage() {
         <div className="mb-4 flex items-end justify-between">
           <div>
             <h1 className="text-lg font-bold" style={{ color: 'var(--ink)' }}>
-              {view === 'dividends' ? 'Dividends (all years)' : `Realised Gains (${
-                view === 'yoy' ? 'year on year'
-                  : effectivePeriod === 'inception' ? 'since inception' : 'FY to date'})`}
+              {view === 'dividends' ? 'Dividends (all years)'
+                : view === 'demat' ? `Realised Gains by demat (${
+                    dematBreak === 'yoy' ? 'year on year'
+                      : dematPeriod === 'inception' ? 'since inception' : 'FY to date'})`
+                : `Realised Gains (${
+                    view === 'yoy' ? 'year on year'
+                      : effectivePeriod === 'inception' ? 'since inception' : 'FY to date'})`}
             </h1>
             {view === 'dividends' ? (
               <p className="text-xs mt-0.5" style={{ color: 'var(--ghost)' }}>
@@ -303,11 +412,15 @@ export default function RealisedGainsPage() {
           ) : (
           <Glass label="P&amp;L" className="shrink-0">
           <div className="text-right px-2 py-1">
-            <div className="text-xs" style={{ color: 'var(--ghost)' }}>Total realised P&amp;L</div>
-            <div className="text-base font-bold" style={{ color: totalPnl >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
-              ₹{inr(totalPnl)}
+            <div className="text-xs" style={{ color: 'var(--ghost)' }}>
+              {view === 'demat' ? 'Total realised P&L (by demat)' : 'Total realised P&L'}
             </div>
-            {hasStLt && (
+            {(() => { const hp = view === 'demat' ? dematTotal : totalPnl; return (
+            <div className="text-base font-bold" style={{ color: hp >= 0 ? 'var(--gain)' : 'var(--peril)' }}>
+              ₹{inr(hp)}
+            </div>
+            ); })()}
+            {hasStLt && view !== 'demat' && (
               <div className="text-xs mt-0.5" style={{ color: 'var(--ghost)' }}>
                 <span style={{ color: totalSt >= 0 ? 'var(--gain)' : 'var(--peril)' }}>ST ₹{inr(totalSt)}</span>
                 {' · '}
@@ -336,13 +449,27 @@ export default function RealisedGainsPage() {
               { v: 'detail',    label: 'Detail' },
               { v: 'entity',    label: 'By entity' },
               { v: 'yoy',       label: 'Year on year' },
+              { v: 'demat',     label: 'By demat' },
               { v: 'dividends', label: 'Dividends' },
             ]}
           />
+          {/* Demat sub-view: total per broker, or crossed with entity / financial year. */}
+          {view === 'demat' && (
+            <Toggle<DematBreak>
+              label="Break by"
+              value={dematBreak}
+              onChange={setDematBreak}
+              options={[
+                { v: 'total',  label: 'Total' },
+                { v: 'entity', label: 'By entity' },
+                { v: 'yoy',    label: 'Year on year' },
+              ]}
+            />
+          )}
           {/* Hidden rather than disabled in the YoY view: that view always spans the
               whole history, so offering a period control that does nothing would be
               worse than not offering one. */}
-          {view !== 'yoy' && view !== 'dividends' && (
+          {view !== 'yoy' && view !== 'dividends' && !(view === 'demat' && dematBreak === 'yoy') && (
             <Toggle<Period>
               label="Period"
               value={period}
@@ -431,6 +558,146 @@ export default function RealisedGainsPage() {
                       <td className="px-3 py-2 text-right font-bold" style={{ color: 'var(--gain)' }}>
                         ₹{inr(divYoy.total)}
                       </td>
+                    </tr>
+                  </tbody>
+                </table>
+                </div>
+              </div>
+            )}
+          </>
+          )
+        ) : view === 'demat' ? (
+          !dematLoaded ? (
+            <div className="py-16 text-center text-xs" style={{ color: 'var(--ghost)' }}>Loading…</div>
+          ) : dematRows.length === 0 ? (
+            <div className="py-16 text-center rounded-xl" style={{ background: 'var(--card)', border: '1px solid var(--rule)' }}>
+              <p className="text-sm font-medium mb-1" style={{ color: 'var(--dim)' }}>No realised gains to break down by demat</p>
+              <p className="text-xs" style={{ color: 'var(--ghost)' }}>They appear as stocks are sold across your broker accounts.</p>
+            </div>
+          ) : (
+          <>
+            <p className="text-xs mb-3" style={{ color: 'var(--ghost)' }}>
+              Realised P&amp;L is re-matched FIFO within each demat, so a stock held at two
+              brokers is netted against its own lots at each — these figures can differ
+              slightly from the per-entity view. Mutual funds, PMS and property have no
+              demat and sit under &ldquo;{NO_DEMAT}&rdquo;.
+            </p>
+            {dematBreak === 'total' ? (
+              <div style={{ background: 'var(--card)', border: '1px solid var(--rule)', borderRadius: 10, overflow: 'hidden' }}>
+                <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr style={{ background: 'var(--page)', color: 'var(--dim)' }}>
+                      <th className="px-3 py-2 text-left font-semibold">Demat / broker</th>
+                      <th className="px-3 py-2 text-right font-semibold">Sales</th>
+                      <th className="px-3 py-2 text-right font-semibold">Realised P&amp;L</th>
+                      <th className="px-3 py-2 text-right font-semibold">Short-term</th>
+                      <th className="px-3 py-2 text-right font-semibold">Long-term</th>
+                      <th className="px-3 py-2 text-right font-semibold">Share</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {byDemat.map(([b, v]) => (
+                      <tr key={b} style={{ borderTop: '1px solid var(--rule)' }}>
+                        <td className="px-3 py-2 font-medium" style={{ color: 'var(--ink)' }}>{b}</td>
+                        <td className="px-3 py-2 text-right" style={{ color: 'var(--ghost)' }}>{v.n}</td>
+                        <td className="px-3 py-2 text-right font-medium" style={pnlStyle(v.pnl)}>₹{inr(v.pnl)}</td>
+                        <td className="px-3 py-2 text-right" style={pnlStyle(v.hasStLt ? v.st : null)}>
+                          {v.hasStLt ? `₹${inr(v.st)}` : '—'}</td>
+                        <td className="px-3 py-2 text-right" style={pnlStyle(v.hasStLt ? v.lt : null)}>
+                          {v.hasStLt ? `₹${inr(v.lt)}` : '—'}</td>
+                        <td className="px-3 py-2 text-right" style={{ color: 'var(--ghost)' }}>
+                          {(() => {
+                            const denom = byDemat.reduce((s, [, x]) => s + Math.abs(x.pnl), 0);
+                            return denom ? `${((Math.abs(v.pnl) / denom) * 100).toFixed(1)}%` : '—';
+                          })()}
+                        </td>
+                      </tr>
+                    ))}
+                    <tr style={{ borderTop: '2px solid var(--rule)', background: 'var(--page)' }}>
+                      <td className="px-3 py-2 font-bold" style={{ color: 'var(--ink)' }}>Total</td>
+                      <td className="px-3 py-2 text-right font-bold" style={{ color: 'var(--dim)' }}>{dematRows.length}</td>
+                      <td className="px-3 py-2 text-right font-bold" style={pnlStyle(dematTotal)}>₹{inr(dematTotal)}</td>
+                      <td className="px-3 py-2" /><td className="px-3 py-2" />
+                      <td className="px-3 py-2 text-right font-bold" style={{ color: 'var(--dim)' }}>100%</td>
+                    </tr>
+                  </tbody>
+                </table>
+                </div>
+              </div>
+            ) : dematBreak === 'entity' ? (
+              <div style={{ background: 'var(--card)', border: '1px solid var(--rule)', borderRadius: 10, overflow: 'hidden' }}>
+                <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr style={{ background: 'var(--page)', color: 'var(--dim)' }}>
+                      <th className="px-3 py-2 text-left font-semibold whitespace-nowrap">Demat / broker</th>
+                      {dematByEntity.ents.map(e => (
+                        <th key={e} className="px-3 py-2 text-right font-semibold whitespace-nowrap">{e}</th>
+                      ))}
+                      <th className="px-3 py-2 text-right font-semibold">Total</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {dematByEntity.brokers.map(b => (
+                      <tr key={b} style={{ borderTop: '1px solid var(--rule)' }}>
+                        <td className="px-3 py-2 font-medium whitespace-nowrap" style={{ color: 'var(--ink)' }}>{b}</td>
+                        {dematByEntity.ents.map(e => {
+                          const v = dematByEntity.cell(b, e);
+                          return (
+                            <td key={e} className="px-3 py-2 text-right" style={v === 0 ? { color: 'var(--ghost)' } : pnlStyle(v)}>
+                              {v === 0 ? '—' : `₹${inr(v)}`}
+                            </td>
+                          );
+                        })}
+                        <td className="px-3 py-2 text-right font-medium" style={pnlStyle(dematByEntity.rowTotal(b))}>₹{inr(dematByEntity.rowTotal(b))}</td>
+                      </tr>
+                    ))}
+                    <tr style={{ borderTop: '2px solid var(--rule)', background: 'var(--page)' }}>
+                      <td className="px-3 py-2 font-bold" style={{ color: 'var(--ink)' }}>Total</td>
+                      {dematByEntity.ents.map(e => (
+                        <td key={e} className="px-3 py-2 text-right font-bold" style={pnlStyle(dematByEntity.colTotal(e))}>₹{inr(dematByEntity.colTotal(e))}</td>
+                      ))}
+                      <td className="px-3 py-2 text-right font-bold" style={pnlStyle(dematTotal)}>₹{inr(dematTotal)}</td>
+                    </tr>
+                  </tbody>
+                </table>
+                </div>
+              </div>
+            ) : (
+              <div style={{ background: 'var(--card)', border: '1px solid var(--rule)', borderRadius: 10, overflow: 'hidden' }}>
+                <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr style={{ background: 'var(--page)', color: 'var(--dim)' }}>
+                      <th className="px-3 py-2 text-left font-semibold whitespace-nowrap">Demat / broker</th>
+                      {dematByYoy.fys.map(fy => (
+                        <th key={fy} className="px-3 py-2 text-right font-semibold whitespace-nowrap">FY {fy}</th>
+                      ))}
+                      <th className="px-3 py-2 text-right font-semibold">Total</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {dematByYoy.brokers.map(b => (
+                      <tr key={b} style={{ borderTop: '1px solid var(--rule)' }}>
+                        <td className="px-3 py-2 font-medium whitespace-nowrap" style={{ color: 'var(--ink)' }}>{b}</td>
+                        {dematByYoy.fys.map(fy => {
+                          const v = dematByYoy.cell(b, fy);
+                          return (
+                            <td key={fy} className="px-3 py-2 text-right" style={v === 0 ? { color: 'var(--ghost)' } : pnlStyle(v)}>
+                              {v === 0 ? '—' : `₹${inr(v)}`}
+                            </td>
+                          );
+                        })}
+                        <td className="px-3 py-2 text-right font-medium" style={pnlStyle(dematByYoy.rowTotal(b))}>₹{inr(dematByYoy.rowTotal(b))}</td>
+                      </tr>
+                    ))}
+                    <tr style={{ borderTop: '2px solid var(--rule)', background: 'var(--page)' }}>
+                      <td className="px-3 py-2 font-bold" style={{ color: 'var(--ink)' }}>Total</td>
+                      {dematByYoy.fys.map(fy => (
+                        <td key={fy} className="px-3 py-2 text-right font-bold" style={pnlStyle(dematByYoy.colTotal(fy))}>₹{inr(dematByYoy.colTotal(fy))}</td>
+                      ))}
+                      <td className="px-3 py-2 text-right font-bold" style={pnlStyle(dematTotal)}>₹{inr(dematTotal)}</td>
                     </tr>
                   </tbody>
                 </table>

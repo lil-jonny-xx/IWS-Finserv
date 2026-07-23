@@ -2033,7 +2033,8 @@ def _mf_realised_group(asset_class: Optional[str], security_type: Optional[str])
 
 def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
                           since_inception: bool = False,
-                          include_switches: bool = True) -> list:
+                          include_switches: bool = True,
+                          by_broker: bool = False) -> list:
     """
     Realised gains for the given entity/entities.
     MF — auto from mf_transaction (REDEMPTION/SWITCH_OUT vs avg cost).
@@ -2044,6 +2045,11 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
     include_switches  — when True (default), SWITCH_IN/SWITCH_OUT count as buys/sells;
                         when False they are dropped entirely (only real
                         PURCHASE/REDEMPTION flows feed cost basis and realisations).
+    by_broker         — when True, FIFO/avg-cost lots are partitioned per demat
+                        (broker), so a stock held at two brokers realises against
+                        its own lots at each. Every emitted row carries `broker`
+                        (None for MF / real estate, which have no demat). The
+                        default per-entity view leaves broker None and is unchanged.
     """
     fy = date(1900, 1, 1) if since_inception else _fy_start(as_of)
     out: list = []
@@ -2054,12 +2060,15 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
     # Mutual Funds vs …). It is intentionally separate from `group` (Fixed Income /
     # Equity / Alternates) which the XLSX realised sheet buckets by, so MF and stock
     # rows stay distinguishable on the page without disturbing the report.
-    def _add(rows, category):
+    def _add(rows, category, broker=None):
         for r in rows:
             r["category"] = category
+            r["broker"]   = broker
             out.append(r)
 
     # ---- MF ----
+    # Mutual funds are held via CAS folios/AMCs, not a broker demat, so they carry
+    # no broker even in the by_broker view.
     cur.execute(f"""
         SELECT t.security_id, sm.security_name, sm.security_type, sm.asset_class,
                t.transaction_date AS d, t.transaction_type AS tt, t.amount, t.units
@@ -2095,7 +2104,15 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
         cur.execute(f"""
             SELECT t.entity_id, t.security_id, sm.security_name, sm.isin,
                    t.transaction_date AS d, t.transaction_type AS tt,
-                   t.price, t.quantity AS units
+                   t.price, t.quantity AS units,
+                   -- Imported tradebook rows leave `broker` NULL and carry the executing
+                   -- broker in `source` (zerodha/angel_one/dhan); only live/snapshot/manual
+                   -- rows populate `broker` directly. Derive it the same way the rest of the
+                   -- codebase does (fy_returns_worker, equity_txn_metrics_worker) so the demat
+                   -- view isn't dominated by a "No demat" bucket of every imported trade.
+                   COALESCE(t.broker,
+                            CASE WHEN t.source IN ('zerodha','angel_one','dhan')
+                                 THEN t.source END) AS broker
             FROM stock_transaction t JOIN security_master sm ON sm.id = t.security_id
             WHERE t.entity_id IN ({ph})
               AND COALESCE(t.currency, 'INR') = 'INR'
@@ -2116,10 +2133,15 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
         _ac_ovr = _ac_overrides(cur)
     except Exception:
         conn.rollback(); _ac_ovr = {}
+    # Per-entity by default; per (entity, broker) in the demat view so a stock held
+    # at two brokers FIFO-matches against its own lots at each. The broker is not part
+    # of the FIFO lot key itself — partitioning the input stream already keeps the
+    # brokers' lots apart.
     eq_by_entity: dict = defaultdict(list)
     for r in srows:
-        eq_by_entity[r["entity_id"]].append(r)
-    for txns in eq_by_entity.values():
+        key = (r["entity_id"], r["broker"]) if by_broker else (r["entity_id"], None)
+        eq_by_entity[key].append(r)
+    for (_eid, bk), txns in eq_by_entity.items():
         seq = []
         for r in txns:
             tt = (r["tt"] or "").upper()
@@ -2131,7 +2153,7 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
                         "price": r["price"], "name": r["security_name"],
                         "group": "Commodities" if cls in _AC_COMMODITY else "Equity",
                         "sec": r["security_id"]})
-        _add(_fifo_realised_grouped(seq, fy, ca_actions), "Equity")
+        _add(_fifo_realised_grouped(seq, fy, ca_actions), "Equity", broker=bk)
 
     # ---- Foreign equity (equity_trade_ledger; native cash flows → INR at trade-date FX) ----
     # Switches do not exist for brokers, so include_switches is irrelevant here.
@@ -2140,7 +2162,7 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
     try:
         cur.execute(f"""
             SELECT symbol, isin, trade_date AS d, side,
-                   quantity AS units, currency, cash_flow_native
+                   quantity AS units, currency, cash_flow_native, broker
             FROM equity_trade_ledger
             WHERE entity_id IN ({ph})
             ORDER BY symbol, trade_date
@@ -2150,8 +2172,9 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
         conn.rollback(); frows = []
     fe_by_sec: dict = defaultdict(list)
     for r in frows:
-        fe_by_sec[(r["symbol"], r["isin"])].append(r)
-    for txns in fe_by_sec.values():
+        key = (r["symbol"], r["isin"], r["broker"]) if by_broker else (r["symbol"], r["isin"], None)
+        fe_by_sec[key].append(r)
+    for (_sym, _isin, bk), txns in fe_by_sec.items():
         seq = []
         for r in txns:
             side = (r["side"] or "").upper()
@@ -2164,7 +2187,7 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
             amt_inr = abs(float(r["cash_flow_native"] or 0)) * fx
             seq.append({"date": r["d"], "kind": kind, "units": r["units"],
                         "amount": amt_inr, "name": r["symbol"], "group": "Foreign Equity"})
-        _add(_avg_cost_realised(seq, fy), "Foreign Equity")
+        _add(_avg_cost_realised(seq, fy), "Foreign Equity", broker=bk)
 
     # ---- PMS (pms_realised; broker-provided realised P&L, already computed) ----
     # No avg-cost: the statement gives cost/proceeds/P&L per lot directly. INR only.
