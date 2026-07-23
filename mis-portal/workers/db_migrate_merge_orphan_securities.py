@@ -89,6 +89,42 @@ MANUAL_REJECT = {
 }
 
 
+# Angel/Dhan rows the prefix matcher structurally cannot reach: acronym tickers
+# (STATE BANK OF INDIA -> SBIN) and truncated names, where the canonical ticker
+# shares no prefix with the descriptive name. Keyed by orphan security_name ->
+# canonical ISIN. This only PROPOSES the pairing; every one still has to clear the
+# same price-agreement gate as a token match before it is merged, so a wrong entry
+# here is caught, not trusted (that is why traps like "Tata Motors" -> TATAMOTORS
+# and the HDFC/Kotak gold ETFs are deliberately left out — the gate would reject
+# them anyway, but there is no reason to propose them). Truncated spellings of one
+# stock both point at the same ISIN so they collapse together.
+MANUAL_BRIDGE = {
+    "STATE BANK OF INDIA":              "INE062A01020",  # SBIN
+    "KOTAK MAHINDRA BANK LTD":          "INE237A01028",  # KOTAKBANK
+    "VA TECH WABAG":                    "INE956G01038",  # WABAG
+    "VA Tech Wabag":                    "INE956G01038",
+    "Hindustan Zinc":                   "INE267A01025",  # HINDZINC
+    "POWER FIN CORP LTD.":              "INE134E01011",  # PFC
+    "Bank of Maharashtra":              "INE457A01014",  # MAHABANK
+    "Indian Energy Exchange":           "INE022Q01020",  # IEX
+    "Great Eastern Shipping Company":   "INE017A01032",  # GESHIP
+    "Gokaldas Exports":                 "INE887G01027",  # GOKEX
+    "Motilal Oswal Financial Services": "INE338I01027",  # MOTILALOFS
+    "MAZAGON DOCK SHIPBUI":             "INE249Z01020",  # MAZDOCK
+    "BAJAJ HOUSING FINANCE LTD":        "INE377Y01014",  # BAJAJHFL
+    "Bajaj Housing Finance":            "INE377Y01014",
+    "MAHINDRA LOGISTIC LIMITED":        "INE766P01016",  # MAHLOG
+    "MAHINDRA LOGISTIC LI":             "INE766P01016",
+    "THE SOUTH INDIAN BAN":             "INE683A01023",  # SOUTHBANK
+    "HINDUSTAN CONSTRUCTION CO":        "INE549A01026",  # HCC
+    "HINDUSTAN CONSTRUCTI":             "INE549A01026",
+    "NIPPONAMC - NETFSILV":             "INF204KC1402",  # SILVERBEES
+    "Nippon Silver ETF (SILVERBEES)":   "INF204KC1402",
+    "Jammu & Kashmir Bank":             "INE168A01041",  # J&KBANK
+    "TechNVision Ventures":             "INE314H01012",  # TECHNVISN
+}
+
+
 def get_conn():
     return psycopg2.connect(
         host=os.getenv("DB_HOST", "localhost"),
@@ -234,6 +270,7 @@ def main():
 
     orphans = load_orphans(cur)
     canon = load_canonicals(cur)
+    canon_by_isin = {c["isin"]: c for c in canon}
     print(f"{len(orphans)} ISIN-less securities with INR trades; "
           f"{len(canon)} canonical securities to match against\n")
 
@@ -241,6 +278,12 @@ def main():
     for o in orphans:
         na = _alnum(o["security_name"])
         hits = [c for c in canon if _token_match(na, _norm_sym(c["security_name"]))]
+        # Acronym / truncated-name rows the prefix matcher can't reach: fall back to
+        # the explicit ISIN bridge. Still routed through the price gate below.
+        if not hits and o["security_name"] in MANUAL_BRIDGE:
+            c = canon_by_isin.get(MANUAL_BRIDGE[o["security_name"]])
+            if c:
+                hits = [c]
         if not hits:
             no_match.append(o)
             continue
@@ -312,6 +355,18 @@ def main():
         # entry for the same ex-date.
         cur.execute("DELETE FROM dividend WHERE security_id=%s", (o["id"],))
         cur.execute("DELETE FROM dividend_coverage WHERE security_id=%s", (o["id"],))
+        # Corporate actions (splits/bonuses) belong to the stock — move them to the
+        # canonical, guarding its (security_id, ex_date, action_type) unique key, then
+        # drop any leftover duplicate. Without this the FK from corporate_action blocks
+        # the shell delete and aborts the whole transaction (it did, for BEL).
+        cur.execute("""
+            UPDATE corporate_action ca SET security_id=%s
+             WHERE ca.security_id=%s
+               AND NOT EXISTS (SELECT 1 FROM corporate_action c2
+                                WHERE c2.security_id=%s AND c2.ex_date=ca.ex_date
+                                  AND c2.action_type=ca.action_type)
+        """, (c["id"], o["id"], c["id"]))
+        cur.execute("DELETE FROM corporate_action WHERE security_id=%s", (o["id"],))
         # Only drop the now-empty shell if nothing else still points at it; several
         # other tables (holding, daily_snapshot, mf_transaction, …) carry the same FK.
         cur.execute("""
@@ -323,6 +378,7 @@ def main():
                  + (SELECT COUNT(*) FROM manual_valuation   WHERE security_id=%(i)s)
                  + (SELECT COUNT(*) FROM ppf_transaction    WHERE security_id=%(i)s)
                  + (SELECT COUNT(*) FROM reconciliation_ticket WHERE security_id=%(i)s)
+                 + (SELECT COUNT(*) FROM corporate_action   WHERE security_id=%(i)s)
                  AS refs
         """, {"i": o["id"]})
         if (cur.fetchone()["refs"] or 0) == 0:
