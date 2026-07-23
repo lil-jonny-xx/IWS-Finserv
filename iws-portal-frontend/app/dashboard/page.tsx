@@ -388,9 +388,9 @@ function OverviewSection({ data, include, onInclude, ovBusy }: {
         <h2 className="text-base font-semibold text-ink mb-5">Portfolio Overview</h2>
 
         {/* Glassed together: the headline value, the composition donut and the
-            stats row are one disclosure. The asset-class breakdown below stays
-            legible — it's the equivalent of a holdings table, which is out of
-            scope for the privacy pane. */}
+            stats row are one disclosure. The asset-class breakdown below carries
+            its own pane so its per-class values and P&L are covered too — the eye
+            toggle in the top bar reveals both at once. */}
         <Glass label="portfolio totals">
         <div className="flex flex-wrap items-center gap-8 mb-6">
           {/* Big value */}
@@ -416,7 +416,7 @@ function OverviewSection({ data, include, onInclude, ovBusy }: {
 
         {/* Asset class breakdown table */}
         {asset_class_breakdown.length > 0 && (
-          <div className="mt-6 pt-5 border-t border-rule">
+          <Glass label="asset class breakdown" className="mt-6 pt-5 border-t border-rule">
             <p className="text-[11px] text-ghost font-medium mb-3 uppercase tracking-wide">Asset Class Breakdown</p>
             <div className="space-y-2">
               {asset_class_breakdown.map(c => (
@@ -438,7 +438,7 @@ function OverviewSection({ data, include, onInclude, ovBusy }: {
                 </div>
               ))}
             </div>
-          </div>
+          </Glass>
         )}
       </div>
 
