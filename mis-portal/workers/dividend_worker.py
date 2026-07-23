@@ -102,7 +102,24 @@ def candidate_tickers(symbol: str):
     return [f"{base}.NS", f"{base}.BO"]
 
 
-def fetch_dividend_events(symbol: str):
+# Yahoo exchange suffix per foreign trading currency. US tickers carry no suffix;
+# the others map to their home exchange (LSE .L, SGX .SI, HKEX .HK, Swiss .SW).
+# UAE (AED) has no reliable Yahoo dividend feed, so it resolves to nothing.
+_FOREIGN_SUFFIX = {"USD": "", "GBP": ".L", "SGD": ".SI", "HKD": ".HK", "CHF": ".SW"}
+
+
+def candidate_foreign_tickers(symbol: str, currency: str):
+    """Yahoo tickers to try for a foreign holding, keyed off its trading currency."""
+    base = (symbol or "").strip().upper()
+    if not base:
+        return []
+    suffix = _FOREIGN_SUFFIX.get((currency or "USD").upper())
+    if suffix is None:      # a currency we have no exchange mapping for
+        return []
+    return [f"{base}{suffix}"] if suffix else [base]
+
+
+def fetch_dividend_events(symbol: str, candidates=None):
     """Returns (events, ticker, status).
 
     status distinguishes two very different things that an empty dividend series
@@ -118,12 +135,13 @@ def fetch_dividend_events(symbol: str):
     only for symbols that returned no dividends.
     """
     import yfinance as yf
+    cands = candidates if candidates is not None else candidate_tickers(symbol)
     # Pass 1: dividends from ANY candidate listing. This must exhaust every candidate
     # before concluding "pays none" — Yahoo sometimes carries the dividend history on
     # the BSE listing when the NSE one has prices but no corporate actions. Returning
     # early on the first ticker that merely *exists* silently dropped those events
     # (5 events / Rs 1.26L when this was first written the wrong way round).
-    for tk in candidate_tickers(symbol):
+    for tk in cands:
         try:
             s = yf.Ticker(tk).dividends
         except Exception:
@@ -141,7 +159,7 @@ def fetch_dividend_events(symbol: str):
 
     # Pass 2: no dividends anywhere — but is the symbol real? A valid ticker has price
     # history; an invalid one has nothing. Only now can the two be told apart.
-    for tk in candidate_tickers(symbol):
+    for tk in cands:
         try:
             if len(yf.Ticker(tk).history(period="1mo")):
                 return [], tk, "no-dividends"
@@ -272,19 +290,118 @@ def quantity_on(conn, entity_id: int, security_id: int, ex_date: date) -> float:
     return q
 
 
-def upsert_dividend(cur, entity_id, security_id, ex_date, qty, rate, amount, feed):
+def fx_to_inr(conn, currency: str, on_date: date) -> float | None:
+    """Currency→INR on a date: nearest rate on/before, else the earliest we have.
+    Mirrors report_generator._fx_rate_on so foreign dividends convert on the same
+    basis the realised-gains engine uses."""
+    if not currency or currency.upper() == "INR":
+        return 1.0
+    cur = conn.cursor()
+    try:
+        cur.execute("""SELECT rate FROM fx_rate
+                       WHERE from_currency=%s AND to_currency='INR' AND rate_date<=%s
+                       ORDER BY rate_date DESC LIMIT 1""", (currency, on_date))
+        row = cur.fetchone()
+        if not row:
+            cur.execute("""SELECT rate FROM fx_rate
+                           WHERE from_currency=%s AND to_currency='INR'
+                           ORDER BY rate_date ASC LIMIT 1""", (currency,))
+            row = cur.fetchone()
+    finally:
+        cur.close()
+    return float(row["rate"]) if row else None
+
+
+def load_foreign_traded_securities(conn, entity_ids):
+    """Every (entity, security) pair traded in a foreign currency — Harsh's Vested/US
+    book lives in stock_transaction with currency<>'INR' and a security_master row
+    whose security_name is the US ticker (AAPL, AMZN…). Same shape as
+    load_traded_securities so the derivation loop is identical."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT st.entity_id, e.entity_name, sm.id AS security_id,
+               sm.security_name AS ticker,
+               COALESCE(st.currency, 'USD') AS currency,
+               MIN(st.transaction_date) AS first_trade
+          FROM stock_transaction st
+          JOIN security_master sm ON sm.id = st.security_id
+          JOIN entity e           ON e.id = st.entity_id
+         WHERE COALESCE(st.currency, 'INR') <> 'INR'
+           AND (%s::int[] IS NULL OR st.entity_id = ANY(%s::int[]))
+         GROUP BY st.entity_id, e.entity_name, sm.id, sm.security_name, st.currency
+         ORDER BY e.entity_name, sm.security_name
+    """, (entity_ids, entity_ids))
+    rows = cur.fetchall()
+    cur.close()
+    return rows
+
+
+def _yahoo_us_ticker(ticker: str) -> str:
+    """Yahoo writes US class shares with a dash, not a dot (BRK.B → BRK-B)."""
+    return (ticker or "").strip().upper().replace(".", "-")
+
+
+def run_foreign(conn, cur, entity_ids, commit, stats):
+    """Derive foreign (currency<>INR) dividends into the same `dividend` table.
+    amount is stored in INR (converted at the ex-date rate) so it sums with the
+    domestic rows; rate_per_share and currency stay native so the API can split the
+    domestic vs foreign views. Runs inside the caller's transaction."""
+    pairs = load_foreign_traded_securities(conn, entity_ids)
+    logger.info(f"{len(pairs)} foreign (entity, security) pair(s) with trade history")
+    feed_cache: dict[str, tuple] = {}
+    for p in pairs:
+        ccy = (p["currency"] or "USD").upper()
+        key = f"{ccy}:{p['ticker']}"
+        if key not in feed_cache:
+            cands = candidate_foreign_tickers(_yahoo_us_ticker(p["ticker"]), ccy)
+            feed_cache[key] = fetch_dividend_events(p["ticker"], candidates=cands)
+        events, _ticker, status = feed_cache[key]
+        if status == "unresolved" or not events:
+            if status == "unresolved":
+                stats["unresolved"] += 1
+            continue
+        for ex_date, rate in events:
+            if p["first_trade"] and ex_date <= p["first_trade"]:
+                continue
+            qty = quantity_on(conn, p["entity_id"], p["security_id"], ex_date)
+            if qty <= 0:
+                stats["zero_qty"] += 1
+                continue
+            fx = fx_to_inr(conn, ccy, ex_date)
+            if fx is None:
+                continue  # no rate — cannot express in INR
+            amount_inr = round(qty * rate * fx, 2)
+            stats["events"] += 1
+            stats["rows"] += 1
+            stats["amount"] += amount_inr
+            if commit:
+                upsert_dividend(cur, p["entity_id"], p["security_id"], ex_date,
+                                qty, rate, amount_inr, "yfinance", currency=ccy)
+            else:
+                logger.info(f"  {p['entity_name']:<12} {p['ticker']:<10} {ex_date} "
+                            f"{qty:>10,.2f} x {rate:>8.4f} {ccy} @ {fx:.2f} = Rs {amount_inr:>12,.2f}")
+
+
+def upsert_dividend(cur, entity_id, security_id, ex_date, qty, rate, amount, feed,
+                    currency="INR"):
+    """Write one computed dividend. `amount` is ALWAYS INR (so figures sum across
+    domestic and foreign); `rate_per_share` is in `currency` — INR for Indian scrips,
+    the native currency (e.g. USD) for foreign ones. `currency` tags which it is, and
+    is what the API scopes on to split the domestic vs foreign views."""
     cur.execute("""
         INSERT INTO dividend (entity_id, security_id, ex_date, quantity, rate_per_share,
                               amount, currency, fy, source, feed, updated_at)
-        VALUES (%s,%s,%s,%s,%s,%s,'INR',%s,'computed',%s,NOW())
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'computed',%s,NOW())
         ON CONFLICT (entity_id, security_id, ex_date, source) DO UPDATE
            SET quantity = EXCLUDED.quantity,
                rate_per_share = EXCLUDED.rate_per_share,
                amount = EXCLUDED.amount,
+               currency = EXCLUDED.currency,
                fy = EXCLUDED.fy,
                feed = EXCLUDED.feed,
                updated_at = NOW()
-    """, (entity_id, security_id, ex_date, qty, rate, amount, fy_label(ex_date), feed))
+    """, (entity_id, security_id, ex_date, qty, rate, amount, currency,
+          fy_label(ex_date), feed))
 
 
 def record_coverage(cur, security_id, symbol, ticker, events, note=None):
@@ -377,6 +494,10 @@ def run(entities=None, commit=False, limit=None, seed=True):
             else:
                 logger.info(f"  {p['entity_name']:<12} {sym:<16} {ex_date} "
                             f"{qty:>10,.0f} x {rate:>8.4f} = Rs {amount:>12,.2f}")
+
+    # Foreign (Vested/US) dividends into the same table — the start-of-run DELETE
+    # already cleared them, so this rebuilds them in the same transaction.
+    run_foreign(conn, cur, entity_ids, commit, stats)
 
     if commit:
         conn.commit()

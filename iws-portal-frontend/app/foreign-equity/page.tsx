@@ -2,6 +2,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
+import DividendsCard from '@/app/components/DividendsCard';
 import ForeignEquityTable, { type EquityHoldingRow, type EquityTotals, type CashCurrencyRow, type CashBrokerRow } from './components/ForeignEquityTable';
 import { asOf, asOfDate } from '@/app/lib/asOf';
 
@@ -551,6 +552,9 @@ export default function ForeignEquityPage() {
                 </button>
               </div>
             )}
+            <div className="mb-5">
+              <DividendsCard scope="foreign" entityIds={selectedIds} />
+            </div>
             {activity && <ForeignTradedToday data={activity} showEntityCol={showEntityCol} />}
             <ForeignEquityTable
               holdings={data.holdings}

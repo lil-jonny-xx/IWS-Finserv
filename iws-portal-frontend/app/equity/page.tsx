@@ -2,6 +2,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
+import DividendsCard from '@/app/components/DividendsCard';
 import EquityTable, { type EquityHoldingRow, type EquityTotals, type CashBrokerRow } from './components/EquityTable';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
@@ -409,6 +410,9 @@ export default function EquityPage() {
                 </button>
               </div>
             )}
+            <div className="mb-5">
+              <DividendsCard scope="domestic" entityIds={selectedIds} />
+            </div>
             {activity && <TradedToday data={activity} showEntityCol={showEntityCol} />}
             <EquityTable
               holdings={data.holdings}
