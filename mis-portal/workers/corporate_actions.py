@@ -126,6 +126,43 @@ def candidates_oversold(cur):
     return cur.fetchall()
 
 
+def candidates_unrecorded_split(cur):
+    """Currently-held INR equities whose Yahoo split history (security_split, the table
+    that back-adjusts the price series) contains an event NOT in corporate_action.
+
+    This is the gap the other two signals structurally miss: a same-ISIN split that
+    never went oversold (a reconstruct plug absorbed the credited quantity, e.g.
+    HDFCAMC / NESTLEIND's 2nd split) and never handed over to a new ISIN. Held-only so
+    we don't chase splits on positions long exited. Returns security rows; each is still
+    put through live Yahoo verification below, which also drops foreign name-collisions
+    (the Indian `.NS` ticker carries no such event)."""
+    cur.execute("""
+        SELECT DISTINCT sm.id, sm.security_name, sm.isin
+        FROM security_split ss
+        JOIN security_symbol_map m ON m.resolved_symbol = ss.yahoo_symbol
+        JOIN security_master sm ON sm.security_name = m.symbol
+        JOIN equity_holding eh ON eh.isin = sm.isin AND eh.quantity > 0
+                              AND COALESCE(eh.currency, 'INR') = 'INR'
+        WHERE ss.ratio >= %s
+          AND sm.isin LIKE 'IN%%'                                   -- Indian listing only
+          AND NOT EXISTS (SELECT 1 FROM corporate_action ca
+                          WHERE ca.security_id = sm.id AND abs(ca.ex_date - ss.split_date) <= 15)
+          -- ISIN-handover twin already carries the action (signal 1 owns those): the
+          -- held row is the post-split ISIN, its trades need no scaling. Same issuer
+          -- stem (first 9 ISIN chars) on another row that HAS an action ⇒ skip.
+          AND NOT EXISTS (SELECT 1 FROM security_master s2 JOIN corporate_action ca2 ON ca2.security_id = s2.id
+                          WHERE s2.id <> sm.id AND substr(s2.isin,1,9) = substr(sm.isin,1,9))
+          -- foreign name-collision: a same-name sibling that is foreign (no ISIN / non-IN)
+          -- means the Yahoo split line belongs to the foreign listing, not this one
+          -- (Indian 'META' vs US Meta Platforms).
+          AND NOT EXISTS (SELECT 1 FROM security_master s3
+                          WHERE s3.security_name = sm.security_name AND s3.id <> sm.id
+                            AND (s3.isin IS NULL OR s3.isin NOT LIKE 'IN%%'))
+        ORDER BY sm.security_name
+    """, (MIN_RATIO,))
+    return cur.fetchall()
+
+
 def yahoo_splits(symbol, lo, hi):
     """Split/bonus events for a symbol between lo and hi. Returns [(date, ratio)]."""
     try:
@@ -234,6 +271,24 @@ def apply_actions(lots, pending, upto):
     return n
 
 
+def cumulative_ratio_after(actions, d):
+    """Product of ratios for actions whose ex_date is strictly AFTER date `d`.
+
+    A share bought on `d` becomes this many shares today, so it is the factor that
+    lifts a raw fill onto the FULLY split-adjusted basis — the basis a back-adjusted
+    price series (Yahoo) and the current broker share count both live on. Unlike
+    apply_actions (which scales lazily at each ex-date as a ledger is replayed), this
+    is the whole-history factor: use it to reconcile a net quantity against the held
+    quantity, or to restate an FY-end open lot for splits that fall AFTER the FY but
+    which the price series has already priced in.
+    """
+    r = 1.0
+    for ex, ratio in (actions or []):
+        if ratio and ratio > 0 and ex > d:
+            r *= float(ratio)
+    return r
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -296,6 +351,36 @@ def main():
             unverified.append((f"{r['security_name']} ({r['isin']})",
                                f"oversold {float(r['net']):,.0f}, no split on Yahoo "
                                f"{lo}..{hi} — transfer-in or missing history"))
+
+    # ---- signal 3: held security with an unrecorded Yahoo split ------------------
+    # Verified live against the INDIAN listing (name + .NS/.BO), which both re-confirms
+    # the event and drops foreign name-collisions (e.g. Indian 'META' vs US Meta, whose
+    # split history belongs to the US line). The window spans the security's whole trade
+    # life so every unrecorded event in it is caught; the shared dedup below collapses
+    # Yahoo's near-duplicate records (paired ex-dates a few days apart).
+    us = candidates_unrecorded_split(cur)
+    print(f"held securities with an unrecorded split: {len(us)}\n")
+    for r in us:
+        sid = r["id"] if isinstance(r, dict) else r[0]
+        name = r["security_name"] if isinstance(r, dict) else r[1]
+        isin = r["isin"] if isinstance(r, dict) else r[2]
+        cur.execute("""SELECT MIN(transaction_date) a, MAX(transaction_date) b
+                       FROM stock_transaction WHERE security_id=%s""", (sid,))
+        span = cur.fetchone()
+        a = span["a"] if isinstance(span, dict) else span[0]
+        b = span["b"] if isinstance(span, dict) else span[1]
+        if not a:
+            continue
+        lo, hi = a - timedelta(days=WINDOW_DAYS), b + timedelta(days=WINDOW_DAYS)
+        ev = yahoo_splits(name, lo, hi)
+        if ev:
+            for d, ratio in ev:
+                verified.append((sid, name, d, ratio, None, isin,
+                                 f"Yahoo split {ratio:g}x on {d}; held, unrecorded"))
+        else:
+            unverified.append((f"{name} ({isin})",
+                               f"security_split present but Indian listing shows no split "
+                               f"in {lo}..{hi} — foreign collision or stale split row"))
 
     # Dedupe. Two separate collapses are needed:
     #   (a) the two signals frequently find the SAME event, keyed exactly;

@@ -100,8 +100,16 @@ def current_lot_start(rows):
     return lot_start
 
 
-def plan_for_holding(cur, h, tol):
-    """Return a reconstruction plan dict for one holding, or a skip-reason string."""
+def plan_for_holding(cur, h, tol, actions=None):
+    """Return a reconstruction plan dict for one holding, or a skip-reason string.
+
+    `actions` is this security's [(ex_date, ratio), ...] from corporate_actions. It
+    matters because the held quantity is on the post-split basis while the ledger
+    records raw fills: a bonus/split that the depository credited (never a BUY) makes
+    the raw net fall short of the held qty by exactly the split factor. Without
+    accounting for it here the gap looks real and we would synthesise a plug that is,
+    in truth, the split papered over (the HDFCAMC 2:1 / NESTLEIND ×20 case). Scaling
+    the net by the split factor closes that phantom gap so no bogus lot is minted."""
     eid, broker, isin = h["entity_id"], h["broker"], h["isin"]
     qty = f(h["quantity"]) or 0.0
     cost = f(h["cost"]) or 0.0
@@ -147,8 +155,12 @@ def plan_for_holding(cur, h, tol):
     # points it finds are the ones the gap is measured against.
     lot_start = current_lot_start(real + kept_snap)
 
+    from workers.corporate_actions import cumulative_ratio_after
     def net(rs):
-        return sum((f(r["q"]) if r["side"] == "BUY" else -f(r["q"])) for r in rs)
+        # Each fill scaled onto the held (fully split-adjusted) basis: a share bought
+        # before an ex-date is cumulative_ratio_after(...) shares today.
+        return sum((f(r["q"]) if r["side"] == "BUY" else -f(r["q"]))
+                   * cumulative_ratio_after(actions, r["d"]) for r in rs)
 
     base_net = net(real) + net(kept_snap)
     gap = qty - base_net
@@ -163,11 +175,18 @@ def plan_for_holding(cur, h, tol):
     # No current lot (ledger ends flat) -> the shares have no trade explaining them at
     # all, so anchor them to the last known activity rather than the first-ever buy.
     date = (lot_start or max_real) if side == "BUY" else max_real
+    # `gap` is in the HELD (fully split-adjusted) basis. If the synthetic row is dated
+    # before a split/bonus, the FIFO engines will scale it forward at the ex-date, so
+    # express it in that pre-event basis now (qty ÷factor, price ×factor) or it would be
+    # re-multiplied and overshoot the held quantity — the transfer-in opening lots that
+    # predate the tradebook for split stocks (NESTLEIND ×10, RELIANCE 2x). factor is 1
+    # when no split falls after `date`, leaving the ordinary case untouched.
+    factor = cumulative_ratio_after(actions, date)
     return {
         "entity": h["entity_name"], "symbol": h["symbol"], "isin": isin, "broker": broker,
         "held": qty, "real_net": net(real), "base_net": base_net, "gap": gap,
-        "side": side, "qty": abs(gap), "date": date, "price": round(avg_cost, 4),
-        "max_real": max_real,
+        "side": side, "qty": abs(gap) / factor, "date": date,
+        "price": round(avg_cost * factor, 4), "max_real": max_real,
     }
 
 
@@ -215,6 +234,11 @@ def main():
     print(f"{'COMMIT' if args.commit else 'DRY-RUN'} — entities {entities}"
           + (f", broker={args.broker}" if args.broker else "") + "\n")
 
+    # Split/bonus map so a depository-credited quantity event is not mistaken for a
+    # reconciliation gap and plugged (see plan_for_holding).
+    from workers.corporate_actions import load_actions_by_isin
+    ca_by_isin = load_actions_by_isin(q2)
+
     plans, skips = [], {}
     for ent in entities:
         cur.execute("SELECT id FROM entity WHERE entity_name=%s", (ent,))
@@ -230,7 +254,7 @@ def main():
         sql += " ORDER BY h.broker, h.symbol"
         cur.execute(sql, params)
         for h in cur.fetchall():
-            res = plan_for_holding(q2, h, args.tol)
+            res = plan_for_holding(q2, h, args.tol, ca_by_isin.get(h["isin"]))
             if isinstance(res, dict):
                 res["entity_id"] = eid
                 plans.append(res)

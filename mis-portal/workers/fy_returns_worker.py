@@ -51,6 +51,9 @@ load_dotenv("/var/www/mis-portal/.env", override=True)
 
 from workers.equity_txn_metrics_worker import fifo_lots, f  # noqa: E402  (reuse, don't re-implement)
 from workers.fy_price_backfill import fy_boundaries, fy_label  # noqa: E402
+from workers.corporate_actions import (  # noqa: E402
+    load_actions_by_isin, cumulative_ratio_after,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -133,8 +136,13 @@ def splits_for(cur, ysym) -> list[tuple[date, float]]:
 
 
 def fy_return_equity(cur, h, ysym, start_anchor: date, end_anchor: date, ledger_start,
-                     split_dates: list[date] | None = None):
-    """One completed FY for one equity holding. None when it can't be known."""
+                     split_dates: list[date] | None = None, actions=None):
+    """One completed FY for one equity holding. None when it can't be known.
+
+    `actions` is this security's recorded [(ex_date, ratio), ...] corporate actions.
+    When present they are applied so the ledger lots share the price series' fully
+    split-adjusted basis, which is what lets a split-affected year be computed at all
+    (see the split gate below)."""
     # The broker's history has to cover the start of the year, or the opening
     # position is a guess.
     if ledger_start is None or ledger_start > start_anchor:
@@ -153,7 +161,10 @@ def fy_return_equity(cur, h, ysym, start_anchor: date, end_anchor: date, ledger_
     # records (off-market transfers, bonuses, inter-account moves), and the lots
     # are wrong. 2% tolerance, with a 1-share floor only for larger positions.
     qty = f(h["quantity"]) or 0.0
-    net = sum(((f(t["q"]) or 0.0) if t["side"] == "BUY" else -(f(t["q"]) or 0.0)) for t in all_txns)
+    # Net on the held (fully split-adjusted) basis: a pre-split fill counts for
+    # ratio× shares today, so a depository-credited bonus/split doesn't read as a gap.
+    net = sum((((f(t["q"]) or 0.0) if t["side"] == "BUY" else -(f(t["q"]) or 0.0))
+               * cumulative_ratio_after(actions, t["d"])) for t in all_txns)
     tol = max(1.0, 0.02 * qty) if qty >= 50 else 0.02 * qty + 1e-6
     if abs(net - qty) > tol:
         return None
@@ -162,9 +173,16 @@ def fy_return_equity(cur, h, ysym, start_anchor: date, end_anchor: date, ledger_
     if not txns:
         return None
 
-    lots = fifo_lots(txns)
+    # fifo_lots applies any split whose ex-date falls within the replayed window
+    # (lazily, at the first trade on/after it). Splits AFTER the FY end are not seen
+    # by the replay, yet the price series is ALREADY back-adjusted for them, so restate
+    # the surviving lots onto that same fully-adjusted basis (qty ×ratio, price ÷ratio).
+    lots = fifo_lots(txns, actions)
     if not lots:
         return None   # flat at FY end
+    r_future = cumulative_ratio_after(actions, end_anchor)
+    if r_future != 1.0:
+        lots = [(d, q * r_future, p / r_future) for d, q, p in lots]
 
     # Split gate. Yahoo restates every historical close for later splits; our ledger
     # keeps fills at their raw executed price. The two bases only ever meet on an
@@ -179,8 +197,15 @@ def fy_return_equity(cur, h, ysym, start_anchor: date, end_anchor: date, ledger_
     # split, papered over. Adjusting the real lots around that plug double-counts and
     # the reconciliation gate then rejects the holding anyway. Recovering these years
     # needs corporate actions recorded as ledger events, not a factor applied on read.
+    # A recorded corporate action has already been applied above (lots are on the
+    # adjusted basis), so it is SAFE — the gate only needs to fire for a split Yahoo
+    # shows but which is NOT recorded, where the raw in-year lot and the adjusted price
+    # still disagree. Match recorded ex-dates within a few days of the Yahoo date.
+    recorded = [ex for ex, _ in (actions or [])]
+    unrecorded = [sd for sd, _ in (split_dates or [])
+                  if not any(abs((sd - ex).days) <= 5 for ex in recorded)]
     in_year = [d for d, _, _ in lots if d > start_anchor]
-    if in_year and any(sd > min(in_year) for sd, _ in (split_dates or [])):
+    if in_year and any(sd > min(in_year) for sd in unrecorded):
         return None
 
     p_start = price_at(cur, ysym, start_anchor)
@@ -306,6 +331,10 @@ def main():
     cur.execute("SELECT symbol, resolved_symbol FROM security_symbol_map")
     ymap = {r["symbol"]: r["resolved_symbol"] for r in cur.fetchall()}
 
+    # Recorded splits/bonuses, applied so a split-affected year is computable rather
+    # than blanked (see fy_return_equity).
+    ca_by_isin = load_actions_by_isin(cur)
+
     # ---- equity
     cur.execute("""SELECT id, entity_id, broker, symbol, isin, quantity
                    FROM equity_holding
@@ -324,7 +353,8 @@ def main():
             split_cache[ysym] = splits_for(cur, ysym)
         out = {}
         for s, e in fys:
-            r = fy_return_equity(cur, h, ysym, s, e, ledger_cache[key], split_cache[ysym])
+            r = fy_return_equity(cur, h, ysym, s, e, ledger_cache[key], split_cache[ysym],
+                                 ca_by_isin.get(h["isin"]))
             if r:
                 out[fy_label(s.year)] = r
         eq_rows += 1
