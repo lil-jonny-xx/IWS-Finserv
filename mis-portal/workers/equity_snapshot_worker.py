@@ -148,13 +148,39 @@ def _synthetic_exists(cur, source_ref: str) -> bool:
 REAL_TRADE_LOOKBACK_DAYS = 6
 
 
-def _real_trade_recent(cur, entity_id, security_id, today) -> bool:
+def _real_trade_recent(cur, entity_id, security_id, isin, symbol, today) -> bool:
+    """True if a real (non-snapshot) broker fill for THIS instrument was recorded
+    recently — the authoritative record a snapshot must not duplicate.
+
+    Matches the instrument THREE ways, not just by security_id, because a same-day
+    delivery buy is booked by the broker's *trades* API before the stock reaches the
+    *holdings* feed (delivery settles T+1). The Zerodha/Angel trades feed carries no
+    ISIN, and the holdings-based ISIN backfill is still blind to a brand-new position,
+    so that real fill can land on a DIFFERENT security row — typically a NULL-ISIN one
+    named after the raw trading symbol (e.g. 'NCC') rather than the ISIN-resolved
+    canonical row ('NCC LIMITED') the snapshot sees the next morning. Keying the guard
+    only on security_id then misses the fill and re-books the settled buy as a phantom
+    (seen 2026-07-23: NCC + BHARAT ELECTRONICS). So we also match by shared ISIN and by
+    broker symbol == security_name to catch the fill wherever it landed. A later orphan
+    merge collapses the duplicate row, but by then the phantom is already written."""
+    isin = (isin or "").strip() or None
+    sym  = (symbol or "").strip().upper() or None
     cur.execute(
-        "SELECT 1 FROM stock_transaction "
-        "WHERE entity_id = %s AND security_id = %s "
-        "AND source NOT IN ('snapshot', 'snapshot_open') "
-        "AND transaction_date >= %s LIMIT 1",
-        (entity_id, security_id, today - timedelta(days=REAL_TRADE_LOOKBACK_DAYS)),
+        """
+        SELECT 1 FROM stock_transaction st
+        JOIN   security_master sm ON sm.id = st.security_id
+        WHERE  st.entity_id = %s
+          AND  st.source NOT IN ('snapshot', 'snapshot_open')
+          AND  st.transaction_date >= %s
+          AND  (
+                 st.security_id = %s
+              OR (%s IS NOT NULL AND sm.isin = %s)
+              OR (%s IS NOT NULL AND UPPER(sm.security_name) = %s)
+              )
+        LIMIT 1
+        """,
+        (entity_id, today - timedelta(days=REAL_TRADE_LOOKBACK_DAYS),
+         security_id, isin, isin, sym, sym),
     )
     return cur.fetchone() is not None
 
@@ -299,9 +325,11 @@ def detect_trades(cur, entity_id, broker, holdings, prev, captured_at, today):
             continue
         sec_id = _get_or_create_security(cur, isin, symbol, exch, False)
         # Fallback only: if the real broker feed already recorded a fill for this
-        # security recently, it's the authoritative source — don't duplicate it with
-        # an approximate snapshot row (see _real_trade_recent).
-        if _real_trade_recent(cur, entity_id, sec_id, today):
+        # instrument recently, it's the authoritative source — don't duplicate it with
+        # an approximate snapshot row. Matched by security_id OR ISIN OR symbol so a
+        # fill sitting on a soon-to-be-merged duplicate security still counts (see
+        # _real_trade_recent).
+        if _real_trade_recent(cur, entity_id, sec_id, isin, symbol, today):
             continue
         _insert_trade(cur, entity_id, sec_id, today, side, qty, price,
                       "snapshot", source_ref, exch, broker)
