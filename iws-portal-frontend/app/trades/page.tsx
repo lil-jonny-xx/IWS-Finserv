@@ -15,11 +15,21 @@ interface ManualTrade {
   notes: string | null; created_at: string;
 }
 
+// API-fed brokers sync holdings automatically — a manual entry here only fills gaps
+// their feed can't see (demerger/bonus allotments, pre-history transfers) and adjusts
+// the existing holding's cost basis. The non-API dematerialised brokers below have no
+// feed, so a manual position at one is materialised as its own live-priced Equity row
+// (see manual_positions_worker) — kept in sync with main.py NON_API_BROKERS.
 const BROKERS = [
-  { value: 'zerodha',   label: 'Zerodha' },
-  { value: 'angel_one', label: 'Angel One' },
-  { value: 'dhan',      label: 'Dhan' },
-  { value: 'other',     label: 'Other / Off-market' },
+  { value: 'zerodha',        label: 'Zerodha (API)' },
+  { value: 'angel_one',      label: 'Angel One (API)' },
+  { value: 'dhan',           label: 'Dhan (API)' },
+  { value: 'sbi_securities', label: 'SBI Securities' },
+  { value: 'hdfc_securities',label: 'HDFC Securities' },
+  { value: 'icici_direct',   label: 'ICICI Direct' },
+  { value: 'kotak',          label: 'Kotak Securities' },
+  { value: 'motilal_oswal',  label: 'Motilal Oswal' },
+  { value: 'other',          label: 'Other / Off-market' },
 ];
 
 // kind drives BUY/SELL on the backend; shown as a badge in the table via the

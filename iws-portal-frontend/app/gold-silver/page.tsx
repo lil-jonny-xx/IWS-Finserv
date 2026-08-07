@@ -70,7 +70,7 @@ function fmtPct(n: number | null | undefined): string {
 }
 function gainClass(n: number | null | undefined): string {
   if (n == null || n === 0) return 'text-dim';
-  return n > 0 ? 'text-gain' : 'text-loss';
+  return n > 0 ? 'text-gain' : 'text-peril';
 }
 
 
@@ -165,6 +165,7 @@ function HoldingsSection({
   const tExp   = sumOf(g => g.exposure_pct);
   const tYtd   = sumOf(g => g.pnl_ytd);
   const tPnl   = sumOf(g => g.pnl_inception);
+  const tPnlWk = sumOf(g => g.pnl_weekly_change);
   const tRet   = tPnl != null && tCost != null && tCost !== 0 ? (tPnl / tCost) * 100 : null;
   // Percentages are value-weighted, never averaged — same rule as the Equity footer.
   const wTotal = (key: 'returns_ytd_pct' | 'cagr_inception_pct') => {
@@ -208,6 +209,7 @@ function HoldingsSection({
               <th className="px-4 py-2.5 font-medium text-right">Exp %</th>
               <th className="px-4 py-2.5 font-medium text-right border-l border-rule">P&amp;L YTD</th>
               <th className="px-4 py-2.5 font-medium text-right">P&amp;L (₹)</th>
+              <th className="px-4 py-2.5 font-medium text-right">P&amp;L Wkly Chg</th>
               <th className="px-4 py-2.5 font-medium text-right border-l border-rule">YTD %</th>
               <th className="px-4 py-2.5 font-medium text-right">Return</th>
               <th className="px-4 py-2.5 font-medium text-right">CAGR</th>
@@ -255,6 +257,7 @@ function HoldingsSection({
                     <td className="px-4 py-3 text-right tabular-nums text-dim">{g.exposure_pct != null ? g.exposure_pct.toFixed(2) + '%' : '—'}</td>
                     <td className={`px-4 py-3 text-right tabular-nums border-l border-rule ${gainClass(g.pnl_ytd)}`}>{fmtINR(g.pnl_ytd)}</td>
                     <td className={`px-4 py-3 text-right tabular-nums ${gainClass(g.pnl_inception)}`}>{fmtINR(g.pnl_inception)}</td>
+                    <td className={`px-4 py-3 text-right tabular-nums ${gainClass(g.pnl_weekly_change)}`}>{fmtINR(g.pnl_weekly_change)}</td>
                     <td className={`px-4 py-3 text-right tabular-nums border-l border-rule ${gainClass(g.returns_ytd_pct)}`}>{fmtPct(g.returns_ytd_pct)}</td>
                     <td className={`px-4 py-3 text-right tabular-nums ${gainClass(g.returns_inception_pct)}`}>{fmtPct(g.returns_inception_pct)}</td>
                     <td className={`px-4 py-3 text-right tabular-nums ${gainClass(g.cagr_inception_pct)}`}>{fmtPct(g.cagr_inception_pct)}</td>
@@ -281,6 +284,7 @@ function HoldingsSection({
                       <td className="px-4 py-2 text-right tabular-nums text-ghost">{h.exposure_pct != null ? h.exposure_pct.toFixed(2) + '%' : '—'}</td>
                       <td className={`px-4 py-2 text-right tabular-nums border-l border-rule ${gainClass(h.pnl_ytd)}`}>{fmtINR(h.pnl_ytd)}</td>
                       <td className={`px-4 py-2 text-right tabular-nums ${gainClass(h.pnl_inception)}`}>{fmtINR(h.pnl_inception)}</td>
+                      <td className={`px-4 py-2 text-right tabular-nums ${gainClass(h.pnl_weekly_change)}`}>{fmtINR(h.pnl_weekly_change)}</td>
                       <td className={`px-4 py-2 text-right tabular-nums border-l border-rule ${gainClass(h.returns_ytd_pct)}`}>{fmtPct(h.returns_ytd_pct)}</td>
                       <td className={`px-4 py-2 text-right tabular-nums ${gainClass(h.returns_inception_pct)}`}>{fmtPct(h.returns_inception_pct)}</td>
                       <td className={`px-4 py-2 text-right tabular-nums ${gainClass(h.cagr_inception_pct)}`}>{fmtPct(h.cagr_inception_pct)}</td>
@@ -307,6 +311,7 @@ function HoldingsSection({
               <td className="px-4 py-3 text-right tabular-nums text-dim">{tExp != null ? tExp.toFixed(2) + '%' : '—'}</td>
               <td className={`px-4 py-3 text-right tabular-nums border-l border-rule ${gainClass(tYtd)}`}>{fmtINR(tYtd)}</td>
               <td className={`px-4 py-3 text-right tabular-nums ${gainClass(tPnl)}`}>{fmtINR(tPnl)}</td>
+              <td className={`px-4 py-3 text-right tabular-nums ${gainClass(tPnlWk)}`}>{fmtINR(tPnlWk)}</td>
               <td className={`px-4 py-3 text-right tabular-nums border-l border-rule ${gainClass(tRetYtd)}`}>{fmtPct(tRetYtd)}</td>
               <td className={`px-4 py-3 text-right tabular-nums ${gainClass(tRet)}`}>{fmtPct(tRet)}</td>
               <td className={`px-4 py-3 text-right tabular-nums ${gainClass(tCagr)}`}>{fmtPct(tCagr)}</td>

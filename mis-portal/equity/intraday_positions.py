@@ -28,20 +28,55 @@ logger = logging.getLogger(__name__)
 
 def _resolve_isin(cur, entity_id, broker, symbol):
     """ISIN for a position. Broker position payloads omit it, and matching on name
-    alone forks a second security row, so try the holding first (same account, same
-    symbol), then the security master, then give up and match on symbol only."""
+    alone forks a second security row, so work from the most specific signal to the
+    least: this account's own holding, then the same ticker held anywhere else, then
+    the security master by name (exact, then as a leading word).
+
+    Returning None here is expensive, not neutral: the caller inserts a placeholder
+    row with a NULL ISIN, and once the position settles the broker feed delivers it
+    WITH an ISIN — so the symbol shows twice until the ghost prune catches it a week
+    later. Three symbols forked that way on 2026-07-22 (NCC, BEL, GODREJIND), each
+    for a different reason, which is why there are four attempts and not one.
+    """
+    # '-EQ' is Angel's NSE series tag, not part of the instrument's identity.
+    base = symbol[:-3] if symbol and symbol.upper().endswith("-EQ") else symbol
+
+    # 1. This account already holds it — same entity, same broker, same ticker.
     cur.execute("SELECT isin FROM equity_holding WHERE entity_id=%s AND broker=%s "
                 "AND UPPER(symbol)=UPPER(%s) AND isin IS NOT NULL LIMIT 1",
-                (entity_id, broker, symbol))
+                (entity_id, broker, base))
     r = cur.fetchone()
     if r and r["isin"]:
         return r["isin"]
-    # '-EQ' is Angel's NSE series tag, not part of the instrument's identity.
-    base = symbol[:-3] if symbol and symbol.upper().endswith("-EQ") else symbol
+
+    # 2. Anyone else holds the same ticker. On the Indian exchanges a trading symbol
+    #    maps to one instrument, so another entity's or broker's row is a reliable
+    #    read — and it is the only one of these four that would have caught all three
+    #    of the 2026-07-22 forks (BEL has no security_master name row at all, and
+    #    GODREJIND's was created hours after the position was processed).
+    cur.execute("SELECT isin FROM equity_holding WHERE UPPER(symbol)=UPPER(%s) "
+                "AND isin IS NOT NULL GROUP BY isin ORDER BY count(*) DESC LIMIT 1",
+                (base,))
+    r = cur.fetchone()
+    if r and r["isin"]:
+        return r["isin"]
+
+    # 3. Security master, exact name.
     cur.execute("SELECT isin FROM security_master WHERE UPPER(security_name)=UPPER(%s) "
                 "AND isin IS NOT NULL LIMIT 1", (base,))
     r = cur.fetchone()
-    return r["isin"] if r else None
+    if r and r["isin"]:
+        return r["isin"]
+
+    # 4. Security master, ticker as a leading word ('NCC' -> 'NCC LIMITED'). The
+    #    trailing space is the word boundary that keeps 'BEL' off 'BELRISE
+    #    INDUSTRIES'; an ambiguous match resolves to nothing rather than to a guess.
+    cur.execute("SELECT DISTINCT isin FROM security_master WHERE security_name ILIKE %s "
+                "AND isin IS NOT NULL LIMIT 2", (f"{base} %",))
+    rows = cur.fetchall()
+    if len(rows) == 1:
+        return rows[0]["isin"]
+    return None
 
 
 def sync_intraday_positions(conn, entity_map, broker_entity_map):

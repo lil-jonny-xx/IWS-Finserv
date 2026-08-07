@@ -17,6 +17,12 @@ interface EquityResponse {
   holdings: EquityHoldingRow[];
   totals: EquityTotals;
   cash_by_broker?: CashBrokerRow[];
+  // Non-API demat positions (SBI Securities, …) reconstructed from the manual trade
+  // register and Kite-priced. Rendered in their own section; grand_totals combines
+  // both sections (+ cash) for the true page-level portfolio figure.
+  manual_holdings?: EquityHoldingRow[];
+  manual_totals?: EquityTotals;
+  grand_totals?: EquityTotals;
 }
 
 // One row per entity + security + side — the API folds a day's fills together, so
@@ -414,12 +420,49 @@ export default function EquityPage() {
               <DividendsCard scope="domestic" entityIds={selectedIds} />
             </div>
             {activity && <TradedToday data={activity} showEntityCol={showEntityCol} />}
+
+            {/* Manual positions — non-API demats (SBI Securities, off-market) entered in
+                the Trade Register and live-priced via Zerodha Kite. Kept in their own
+                section so they're never confused with the broker-fed holdings below, but
+                folded into the portfolio total via grand_totals. */}
+            {data.manual_holdings && data.manual_holdings.length > 0 && data.manual_totals && (
+              <div className="mb-6">
+                <div className="mb-2">
+                  <h2 className="text-sm font-semibold text-ink">Manual positions</h2>
+                  <p className="text-xs text-ghost">
+                    Off-market / non-API demats — reconstructed from the trade register, priced live via Zerodha
+                  </p>
+                </div>
+                <EquityTable
+                  holdings={data.manual_holdings}
+                  totals={data.manual_totals}
+                  cashByBroker={[]}
+                  showEntityCol={showEntityCol}
+                />
+              </div>
+            )}
+
+            {data.manual_holdings && data.manual_holdings.length > 0 && (
+              <h2 className="text-sm font-semibold text-ink mb-2">Holdings</h2>
+            )}
             <EquityTable
               holdings={data.holdings}
               totals={data.totals}
               cashByBroker={data.cash_by_broker ?? []}
               showEntityCol={showEntityCol}
             />
+
+            {/* Grand total across broker-fed holdings + manual positions + cash — shown
+                only when there are manual positions, otherwise the table's own total is
+                already the whole picture. */}
+            {data.manual_holdings && data.manual_holdings.length > 0 && data.grand_totals && (
+              <div className="mt-4 flex flex-wrap items-center justify-end gap-x-6 gap-y-1 bg-card rounded-lg border border-rule px-5 py-3">
+                <span className="text-xs text-ghost">Total equity — all demats + cash</span>
+                <span className="text-sm font-semibold text-ink">
+                  ₹{(data.grand_totals.value_plus_cash ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+                </span>
+              </div>
+            )}
           </div>
         )}
 

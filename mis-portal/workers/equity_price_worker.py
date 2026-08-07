@@ -388,6 +388,46 @@ def build_adapter(broker: str, cred: dict):
     return cls(cred)
 
 
+def price_manual_positions(conn, creds: dict, holdings: list[dict]) -> tuple[list[dict], dict]:
+    """Live-price non-API-broker (manual) equity_holding rows via Zerodha Kite.
+
+    Positions at brokers with no adapter (SBI Securities, HDFC Securities, …) are
+    entered by hand and reported by no feed, so the per-broker loop can't price them.
+    Kite's ltp() prices any NSE/BSE instrument regardless of where it is held, so a
+    single Zerodha token (any entity's) values them all in one batch. Returns
+    (update dicts for update_holdings_batch, {symbol: ltp}).
+    """
+    manual = [h for h in holdings if h["broker"] not in ADAPTER_MAP]
+    if not manual:
+        return [], {}
+    cred = creds.get("zerodha")
+    if not cred:
+        logger.warning(
+            f"{len(manual)} manual position(s) unpriced — no Zerodha token for Kite quotes."
+        )
+        return [], {}
+    try:
+        ltp_map = ZerodhaAdapter(cred).get_ltp(manual)
+    except Exception as e:
+        logger.error(f"manual positions: Kite quote error — {e}")
+        return [], {}
+
+    updates, missing = [], 0
+    for h in manual:
+        ltp = ltp_map.get(h["symbol"])
+        if ltp is None:
+            missing += 1
+            continue
+        m = compute_metrics(h, ltp)
+        m["id"] = h["id"]
+        updates.append(m)
+    logger.info(
+        f"manual positions: priced {len(updates)}/{len(manual)} via Kite"
+        + (f" ({missing} unmatched symbol(s))" if missing else "")
+    )
+    return updates, ltp_map
+
+
 # ---------------------------------------------------------------------------
 # Metrics computation
 # ---------------------------------------------------------------------------
@@ -745,10 +785,13 @@ def run():
             logger.info("No equity holdings in DB yet — nothing to update.")
             return
 
-        # Group holdings by broker
+        # Group holdings by broker. Only API-fed brokers have an adapter here; manual
+        # (non-API) positions are priced separately via Kite below, so leave them out
+        # of this loop rather than logging a "no credentials" warning for each.
         by_broker: dict[str, list[dict]] = {}
         for h in holdings:
-            by_broker.setdefault(h["broker"], []).append(h)
+            if h["broker"] in ADAPTER_MAP:
+                by_broker.setdefault(h["broker"], []).append(h)
 
         all_ltp: dict[str, float] = {}   # symbol → price (across brokers)
         updates: list[dict] = []
@@ -792,6 +835,11 @@ def run():
                 )
 
             mark_broker_synced(conn, broker)
+
+        # Manual (non-API-broker) positions — priced via Kite in one batch.
+        manual_updates, manual_ltp = price_manual_positions(conn, creds, holdings)
+        updates.extend(manual_updates)
+        all_ltp.update(manual_ltp)
 
         if updates:
             update_holdings_batch(conn, updates)

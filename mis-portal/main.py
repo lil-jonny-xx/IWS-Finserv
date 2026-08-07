@@ -1336,6 +1336,12 @@ def _row_to_holding(r: dict) -> dict:
         "entity_id":             r["entity_id"],
         "entity_name":           r.get("entity_name"),
         "broker":                r["broker"],
+        # True for a non-API-fed demat (SBI Securities, …) whose position is
+        # reconstructed from the manual trade register and Kite-priced. The Equity
+        # page renders these in their own "Manual positions" section; they are still
+        # part of the page/Overview totals. Purely derived from broker — not a DB
+        # column, so it can't trip the shared _EQUITY_HOLDING_COLS foreign-table trap.
+        "is_manual":             r["broker"] in NON_API_BROKERS,
         "symbol":                r["symbol_override"] or r["symbol"],
         "isin":                  r["isin"],
         "exchange":              r["exchange"],
@@ -1478,13 +1484,35 @@ def get_equity_holdings(
             pr_row = cur.fetchone()
         cur.close()
 
-        holdings = [_row_to_holding(r) for r in rows]
-        totals   = _equity_totals(rows)
+        # Split feed-fed holdings from manual (non-API demat) positions. The latter are
+        # entered by hand and Kite-priced; the Equity page renders them in their own
+        # "Manual positions" section. They stay part of the portfolio via `grand_totals`
+        # (and Overview aggregates equity_holding directly, so they're already counted
+        # there). Broker cash belongs to the API brokers, so it sits with `totals`.
+        feed_rows   = [r for r in rows if r["broker"] not in NON_API_BROKERS]
+        manual_rows = [r for r in rows if r["broker"] in NON_API_BROKERS]
+
+        holdings        = [_row_to_holding(r) for r in feed_rows]
+        manual_holdings = [_row_to_holding(r) for r in manual_rows]
+        totals          = _equity_totals(feed_rows)
+        manual_totals   = _equity_totals(manual_rows)
 
         cash_total = round(sum(float(c["balance"] or 0) for c in cash_rows), 2)
         totals["cash_balance"] = cash_total
         totals["value_plus_cash"] = round(
             float(totals.get("total_current_market_value") or 0) + cash_total, 2
+        )
+        # Manual section has no broker cash of its own; keep the fields present so the
+        # shared EquityTable renders a clean subtotal (and hides the XIRR strip via null).
+        manual_totals["cash_balance"] = 0.0
+        manual_totals["value_plus_cash"] = manual_totals.get("total_current_market_value") or 0.0
+        manual_totals["portfolio_xirr_pct"] = None
+
+        # Grand totals across BOTH sections (+ cash) — the true page-level portfolio figure.
+        grand = _equity_totals(rows)
+        grand["cash_balance"] = cash_total
+        grand["value_plus_cash"] = round(
+            float(grand.get("total_current_market_value") or 0) + cash_total, 2
         )
 
         totals["portfolio_xirr_pct"] = (
@@ -1504,6 +1532,9 @@ def get_equity_holdings(
             "total_holdings": len(holdings),
             "totals":         totals,
             "holdings":       holdings,
+            "manual_holdings": manual_holdings,
+            "manual_totals":   manual_totals,
+            "grand_totals":    grand,
             "cash_balance":   cash_total,
             "cash_by_broker": [
                 {
@@ -3035,6 +3066,11 @@ def _fetch_property_overview_rows(conn, entity_id: Optional[int] = None,
     them behind the "include parent companies" toggle. grp is a flat flag on
     property_entity, not an ownership tree.
 
+    Holders tagged grp='external' are third parties outside the organisation who
+    co-own a building with us. They exist so a property's ownership split adds up
+    to 100% and so the co-owner is named on the record; their pct share is NEVER
+    part of our book and no toggle folds it in.
+
     Holders are
     property_entity rows, not system entities: where a holder mirrors a system
     entity (same name) its rows carry that entity id so the entity filter and
@@ -3059,7 +3095,11 @@ def _fetch_property_overview_rows(conn, entity_id: Optional[int] = None,
         f"* CASE WHEN p.is_old_lease THEN {share} ELSE 1 END END"
     )
     cur = conn.cursor()
-    grp_where = "" if include_parents else "WHERE pe.grp <> 'parent'"
+    # grp='external' holders are outside-the-organisation co-owners, recorded only so
+    # a jointly-held property's split totals 100%. Their share is never ours, so it is
+    # excluded unconditionally — unlike 'parent', which the toggle can fold back in.
+    grp_where = ("WHERE pe.grp <> 'external'" if include_parents
+                 else "WHERE pe.grp NOT IN ('parent', 'external')")
     cur.execute(f"""
         WITH fv AS (
             SELECT property_id,
@@ -3129,7 +3169,8 @@ def get_overview(
       include_art                — Art / Collectibles (ART bucket)
       include_parent_properties  — only meaningful with include_property: also
                                    count properties held by parent companies
-                                   (property_entity.grp = 'parent')
+                                   (property_entity.grp = 'parent'). Never pulls in
+                                   grp='external' co-owners, who are not ours at all.
     Defaults keep the historical behaviour, so an un-parameterised call returns
     exactly what it always did.
 
@@ -4466,6 +4507,15 @@ class PropertyEntityRequest(BaseModel):
     name:       str
     short_code: Optional[str] = None
     grp:        str = "parent"     # "Others" additions default under Parent Companies
+    # grp values:
+    #   main     — our own entities (mirror system entities by name)
+    #   parent   — group/parent companies, opt-in to portfolio totals via a toggle
+    #   external — third-party co-owners outside the organisation; named on the
+    #              property so joint ownership totals 100%, never counted as ours
+
+
+# Where a newly created holder sorts among the pills. External co-owners sit last.
+_PROPERTY_ENTITY_SORT = {"main": 900, "parent": 900, "external": 950}
 
 
 @app.post("/api/v1/property-entities")
@@ -4481,14 +4531,16 @@ def create_property_entity(request: Request, body: PropertyEntityRequest,
         name = body.name.strip()
         if not name:
             raise HTTPException(status_code=422, detail="name is required")
-        if body.grp not in ("main", "parent"):
-            raise HTTPException(status_code=422, detail="grp must be main or parent")
+        if body.grp not in ("main", "parent", "external"):
+            raise HTTPException(status_code=422,
+                                detail="grp must be main, parent or external")
         user_id = _property_user_id(cur, payload)
         cur.execute(
             """INSERT INTO property_entity (name, short_code, grp, is_custom, sort_order, created_by)
-               VALUES (%s,%s,%s,TRUE,900,%s)
+               VALUES (%s,%s,%s,TRUE,%s,%s)
                ON CONFLICT (name) DO NOTHING RETURNING id""",
-            (name, (body.short_code or "").strip() or None, body.grp, user_id),
+            (name, (body.short_code or "").strip() or None, body.grp,
+             _PROPERTY_ENTITY_SORT.get(body.grp, 900), user_id),
         )
         row = cur.fetchone()
         if not row:
@@ -6708,6 +6760,118 @@ def save_benchmarks(
 # Realised gains (FY-to-date; MF auto from CAS, equity from imported trades)
 # ---------------------------------------------------------------------------
 
+def _fy_label_for(d: date) -> str:
+    y = d.year if d.month >= 4 else d.year - 1
+    return f"FY{str(y)[2:]}-{str(y + 1)[2:]}"
+
+
+def _fy_repr_date(fy_label: str) -> date:
+    """A date guaranteed to fall inside the labelled FY (its 1 April), so the
+    frontend's sale-date FY bucketing files the row in the right year."""
+    yy = int(fy_label[2:4])
+    return date(2000 + yy, 4, 1)
+
+
+def _statement_authority_rows(conn, out, entities, since_inception: bool, by_broker: bool):
+    """Make realised gains defer to imported broker P&L statements wherever one covers
+    an (entity, broker, FY): the statement's own realised is the broker's authority, so
+    this appends a 'Broker statement adj.' row that moves that slice's EQUITY total to
+    the statement figure, plus a 'Derivatives' row carrying the statement's F&O realised
+    (which we have no engine for). The raw per-scrip FIFO rows are left untouched — only
+    the aggregated totals shift, and the adjustment stays visible in Detail.
+
+    Applied in whatever frame the caller asked for: per (entity, broker, FY) in the demat
+    (by_broker) view, per (entity, FY) otherwise — so By-entity / YoY / headline all read
+    the statement figure where one exists and our FIFO only fills the gaps."""
+    from collections import defaultdict
+    from workers.report_generator import _fetch_realised_gains
+    today = date.today()
+    cur_fy = _fy_label_for(today)
+    cur = conn.cursor()
+    extra: list = []
+
+    def mkrow(entity, broker, fy, pnl, category, name):
+        return {
+            "entity": entity, "broker": broker, "category": category, "group": category,
+            "security_name": name, "purchase_amount": None,
+            "sale_date": _fy_repr_date(fy).isoformat(), "sale_amount": None,
+            "pnl": round(float(pnl), 2), "st_pnl": None, "lt_pnl": None,
+            "return_pct": None, "is_statement": True,
+        }
+
+    for e in entities:
+        eid, ename = e["id"], e["entity_name"]
+        cur.execute("SELECT broker, fy_label, segment_totals FROM broker_pnl_statement WHERE entity_id=%s", (eid,))
+        stmt_eq, stmt_fno = {}, {}
+        for r in cur.fetchall():
+            fy = r["fy_label"]
+            if not fy:
+                continue
+            st = r["segment_totals"] or {}
+            eqv = (st.get("EQ") or {}).get("realised")
+            fnov = (st.get("FnO") or {}).get("realised")
+            if eqv is not None:
+                stmt_eq[(r["broker"], fy)] = float(eqv)
+            if fnov:
+                stmt_fno[(r["broker"], fy)] = float(fnov)
+        if not stmt_eq and not stmt_fno:
+            continue
+
+        # our per-(broker, FY) equity realised — the reference the statement overrides.
+        our_bk = defaultdict(float)
+        for r in _fetch_realised_gains(conn, [eid], today, since_inception=True, by_broker=True):
+            if r.get("category") not in ("Equity", "Commodities"):
+                continue
+            sd = r.get("sale_date")
+            if not sd:
+                continue
+            our_bk[(r.get("broker"), _fy_label_for(sd))] += (r.get("pnl") or 0)
+
+        keys = set(stmt_eq) | set(stmt_fno)
+        if not since_inception:
+            keys = {k for k in keys if k[1] == cur_fy}
+
+        if by_broker:
+            for (bk, fy) in sorted(keys, key=lambda x: (str(x[0]), x[1])):
+                if (bk, fy) in stmt_eq:
+                    adj = stmt_eq[(bk, fy)] - our_bk.get((bk, fy), 0.0)
+                    if abs(adj) >= 0.5:
+                        extra.append(mkrow(ename, bk, fy, adj, "Broker statement adj.",
+                                           f"Broker statement — {bk} {fy}"))
+                if (bk, fy) in stmt_fno:
+                    extra.append(mkrow(ename, bk, fy, stmt_fno[(bk, fy)], "Derivatives",
+                                       f"F&O — {bk} {fy}"))
+        else:
+            # entity frame: per FY the authoritative total = sum over brokers of the
+            # statement figure where present, else our per-broker FIFO. Adjust our
+            # per-entity equity FIFO (already in `out`) up to that.
+            our_ent = defaultdict(float)
+            for r in out:
+                if r.get("entity") != ename or r.get("category") not in ("Equity", "Commodities"):
+                    continue
+                sd = r.get("sale_date")
+                if not sd:
+                    continue
+                try:
+                    our_ent[_fy_label_for(date.fromisoformat(sd[:10]))] += (r.get("pnl") or 0)
+                except ValueError:
+                    continue
+            fys = {fy for (_b, fy) in keys}
+            for fy in sorted(fys):
+                brokers = {b for (b, f) in our_bk if f == fy} | {b for (b, f) in stmt_eq if f == fy}
+                auth = sum(stmt_eq[(b, fy)] if (b, fy) in stmt_eq else our_bk.get((b, fy), 0.0)
+                           for b in brokers)
+                adj = auth - our_ent.get(fy, 0.0)
+                if abs(adj) >= 0.5:
+                    extra.append(mkrow(ename, None, fy, adj, "Broker statement adj.",
+                                       f"Broker statement — {fy}"))
+                fno_sum = sum(v for (b, f), v in stmt_fno.items() if f == fy)
+                if abs(fno_sum) >= 0.5:
+                    extra.append(mkrow(ename, None, fy, fno_sum, "Derivatives", f"F&O — {fy}"))
+    cur.close()
+    return extra
+
+
 @app.get("/api/v1/realised-gains")
 @limiter.limit("120/minute")
 def get_realised_gains(
@@ -6806,11 +6970,242 @@ def get_realised_gains(
                 "return_pct":      (pnl / cost) if pnl is not None and cost else None,
             })
         cur.close()
+
+        # Believe the documents: where a broker P&L statement covers an (entity, broker,
+        # FY), its realised is authoritative — append adjustment / derivatives rows so
+        # every view (By entity, YoY, Detail, By demat, headline) reflects it. Best-effort;
+        # a failure here must not take down the whole report.
+        try:
+            out.extend(_statement_authority_rows(conn, out, entities, since_inception, by_broker))
+        except Exception as e:
+            conn.rollback()
+            logger.warning(f"statement authority overlay skipped: {e}")
+
         return out
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error in GET /api/v1/realised-gains: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+MAX_PNL_BYTES = 10 * 1024 * 1024   # 10 MB — a broker P&L statement is tens of KB
+
+
+def _pnl_save_and_parse(entity_id: int, file: UploadFile, data: bytes):
+    """Persist a broker P&L statement upload and parse it. Returns (stored_path, parsed)."""
+    from equity import broker_pnl_statement as bps
+    head = data[:400].decode("utf-8", "ignore")
+    if bps.detect(file.filename or "", head) is None and not (file.filename or "").lower().endswith((".xlsx", ".csv")):
+        raise HTTPException(status_code=422, detail="Unsupported file — expected a Zerodha/Angel/Dhan P&L .xlsx or .csv.")
+    folder = os.path.join(UPLOADS_ROOT, "pnl-statements", str(entity_id))
+    os.makedirs(folder, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(file.filename or "pnl.xlsx"))
+    stored = os.path.join(folder, f"{datetime.utcnow():%Y%m%d%H%M%S}_{safe}")
+    with open(stored, "wb") as fh:
+        fh.write(data)
+    os.chmod(stored, 0o600)
+    try:
+        parsed = bps.parse(stored)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    parsed["stored_path"] = stored
+    return stored, parsed
+
+
+def _pnl_preview_payload(conn, entity_id: int, parsed: dict) -> dict:
+    """Shape a parsed statement + its reconciliation against our FIFO for the review UI."""
+    from workers.reconcile_pnl_statements import reconcile_statement
+    reconciliation = None
+    if parsed.get("period_from") and parsed.get("period_to"):
+        try:
+            reconciliation = reconcile_statement(
+                conn, entity_id, parsed, broker=parsed["broker"],
+                period_from=parsed["period_from"], period_to=parsed["period_to"],
+                fy_label=parsed.get("fy_label"))
+        except Exception as e:
+            logger.warning(f"pnl reconcile failed: {e}")
+    return {
+        "broker": parsed["broker"], "client_id": parsed.get("client_id"),
+        "period_from": str(parsed["period_from"]) if parsed.get("period_from") else None,
+        "period_to": str(parsed["period_to"]) if parsed.get("period_to") else None,
+        "fy_label": parsed.get("fy_label"),
+        "segment_totals": parsed.get("segment_totals", {}),
+        "lines": parsed.get("lines", []),
+        "reconciliation": reconciliation,
+    }
+
+
+@app.post("/api/v1/realised-gains/pnl-statement/preview")
+@limiter.limit("20/minute")
+async def pnl_statement_preview(
+    request: Request,
+    entity_id: int = Form(...),
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None),
+):
+    """Parse an uploaded broker realised-P&L statement and reconcile it, per scrip,
+    against our FIFO engine — WITHOUT writing anything. The response drives the admin
+    review UI so the discrepancies (and their classification) are seen before commit.
+    Admin only."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        _require_admin(cur, payload)
+        cur.execute("SELECT entity_name FROM entity WHERE id = %s", (entity_id,))
+        ent = cur.fetchone()
+        if not ent:
+            raise HTTPException(status_code=404, detail="Entity not found")
+
+        data = await file.read(MAX_PNL_BYTES + 1)
+        if len(data) == 0:
+            raise HTTPException(status_code=422, detail="Uploaded file is empty.")
+        if len(data) > MAX_PNL_BYTES:
+            raise HTTPException(status_code=413, detail="File too large (max 10 MB).")
+
+        _stored, parsed = _pnl_save_and_parse(entity_id, file, data)
+        out = _pnl_preview_payload(conn, entity_id, parsed)
+        cur.close()
+        return {"entity_id": entity_id, "entity_name": ent["entity_name"], "committed": False, **out}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/realised-gains/pnl-statement/preview: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/realised-gains/pnl-statement/commit")
+@limiter.limit("20/minute")
+async def pnl_statement_commit(
+    request: Request,
+    entity_id: int = Form(...),
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None),
+):
+    """Ingest a broker P&L statement into broker_pnl_statement/broker_pnl_line as the
+    per-scrip realised oracle (re-uploading the same window replaces it). Does NOT
+    touch stock_transaction — corporate-action corrections are a separate, yfinance-
+    gated worker (backfill_from_statements). Admin only."""
+    from equity import broker_pnl_ingest
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        _require_admin(cur, payload)
+        cur.execute("SELECT entity_name FROM entity WHERE id = %s", (entity_id,))
+        ent = cur.fetchone()
+        if not ent:
+            raise HTTPException(status_code=404, detail="Entity not found")
+        cur.execute("SELECT id FROM users WHERE email = %s", (payload["email"],))
+        user_id = cur.fetchone()["id"]
+
+        data = await file.read(MAX_PNL_BYTES + 1)
+        if len(data) == 0:
+            raise HTTPException(status_code=422, detail="Uploaded file is empty.")
+        if len(data) > MAX_PNL_BYTES:
+            raise HTTPException(status_code=413, detail="File too large (max 10 MB).")
+
+        _stored, parsed = _pnl_save_and_parse(entity_id, file, data)
+        summary = broker_pnl_ingest.ingest(conn, entity_id, parsed, commit=True)
+        out = _pnl_preview_payload(conn, entity_id, parsed)
+        write_audit_log(conn, user_id, "PNL_STATEMENT_UPLOAD", "broker_pnl_statement", summary["statement_id"],
+                        f"{ent['entity_name']} {summary['broker']} {summary['fy_label']}: "
+                        f"{summary['lines_inserted']} lines "
+                        f"({'replaced' if summary['replaced'] else 'new'}) by {payload['email']}")
+        conn.commit()
+        cur.close()
+        return {"entity_id": entity_id, "entity_name": ent["entity_name"], "committed": True,
+                **summary, **out}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/realised-gains/pnl-statement/commit: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.get("/api/v1/realised-gains/pnl-statement")
+@limiter.limit("120/minute")
+def pnl_statement_list(request: Request, authorization: Optional[str] = Header(None)):
+    """List imported broker P&L statements (admin only) for the manage/delete UI."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        _require_admin(cur, payload)
+        cur.execute("""
+            SELECT s.id, s.entity_id, e.entity_name, s.broker, s.client_id,
+                   s.period_from, s.period_to, s.fy_label, s.segment_totals,
+                   s.created_at, count(l.id) AS n_lines
+            FROM broker_pnl_statement s
+            JOIN entity e ON e.id = s.entity_id
+            LEFT JOIN broker_pnl_line l ON l.statement_id = s.id
+            GROUP BY s.id, e.entity_name
+            ORDER BY s.entity_id, s.broker, s.period_from
+        """)
+        rows = [{
+            "id": r["id"], "entity_id": r["entity_id"], "entity_name": r["entity_name"],
+            "broker": r["broker"], "client_id": r["client_id"],
+            "period_from": str(r["period_from"]), "period_to": str(r["period_to"]),
+            "fy_label": r["fy_label"], "segment_totals": r["segment_totals"],
+            "n_lines": r["n_lines"], "created_at": str(r["created_at"]),
+        } for r in cur.fetchall()]
+        cur.close()
+        return rows
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/realised-gains/pnl-statement: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.delete("/api/v1/realised-gains/pnl-statement/{statement_id}")
+@limiter.limit("20/minute")
+def pnl_statement_delete(statement_id: int, request: Request, authorization: Optional[str] = Header(None)):
+    """Delete an imported statement (+ its lines, cascade). Admin only."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        _require_admin(cur, payload)
+        cur.execute("SELECT id FROM users WHERE email = %s", (payload["email"],))
+        user_id = cur.fetchone()["id"]
+        cur.execute("DELETE FROM broker_pnl_statement WHERE id = %s RETURNING id", (statement_id,))
+        if cur.fetchone() is None:
+            raise HTTPException(status_code=404, detail="Statement not found")
+        write_audit_log(conn, user_id, "PNL_STATEMENT_DELETE", "broker_pnl_statement", statement_id,
+                        f"deleted statement {statement_id} by {payload['email']}")
+        conn.commit()
+        cur.close()
+        return {"deleted": statement_id}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in DELETE /api/v1/realised-gains/pnl-statement/{statement_id}: {e}")
         raise HTTPException(status_code=500, detail="An unexpected error occurred.")
     finally:
         release_db_connection(conn)
@@ -7551,7 +7946,24 @@ def stream_live_trades(request: Request, authorization: Optional[str] = Header(N
 
 MANUAL_TRADE_BUY_KINDS  = {"buy", "transfer_in", "demerger", "ipo", "bonus", "rights"}
 MANUAL_TRADE_SELL_KINDS = {"sell", "transfer_out"}
-MANUAL_TRADE_BROKERS    = {"zerodha", "angel_one", "dhan", "other"}
+
+# Brokers whose holdings arrive over a live API feed (equity_sync / price worker
+# maintain their equity_holding rows). A manual trade booked against one of these
+# only adjusts the fed row's FIFO cost basis / realised gains (demerger, bonus,
+# pre-history transfer_in the feed can't see) — it never mints a separate row.
+API_FED_BROKERS = {"zerodha", "angel_one", "dhan"}
+
+# Brokers with NO API feed (SBI Securities, HDFC Securities, …). A manual position
+# at one of these is a genuinely separate demat that no feed reports, so it is
+# materialised into equity_holding by manual_positions_worker and priced live via
+# Zerodha Kite's instrument-quote API. Kept disjoint from API_FED_BROKERS so a
+# manual position can never double-count a stock already carried by a live feed —
+# see NON_API_BROKERS below, which drives both the materialisation scope and the
+# "Manual positions" section split on the Equity page.
+NON_API_BROKERS = {"sbi_securities", "hdfc_securities", "icici_direct",
+                   "kotak", "motilal_oswal", "other"}
+
+MANUAL_TRADE_BROKERS    = API_FED_BROKERS | NON_API_BROKERS
 
 
 class ManualTradeRequest(BaseModel):
@@ -7640,6 +8052,22 @@ def list_manual_trades(request: Request, entity_id: Optional[int] = None,
         release_db_connection(conn)
 
 
+def _materialise_manual_positions(entity_id: int, broker: str) -> None:
+    """Rebuild this entity's non-API-broker open positions right after a manual trade
+    is added or removed, so the "Manual positions" section reflects it immediately
+    instead of waiting for the nightly worker. No-op for API-fed brokers (their rows
+    come from the live feed). Best-effort: the trade is already committed, so a
+    materialisation hiccup must never fail the request — the nightly run will catch up.
+    Live price is filled by equity_price_worker's Kite pass on its next tick."""
+    if broker not in NON_API_BROKERS:
+        return
+    try:
+        from workers.manual_positions_worker import run as _run_manual_positions
+        _run_manual_positions(commit=True, entity_id=entity_id)
+    except Exception as e:
+        logger.warning(f"inline manual-position materialise failed (entity={entity_id}): {e}")
+
+
 @app.post("/api/v1/manual-trades")
 @limiter.limit("30/minute")
 def add_manual_trade(request: Request, body: ManualTradeRequest,
@@ -7682,8 +8110,14 @@ def add_manual_trade(request: Request, body: ManualTradeRequest,
         conn.commit()
         logger.info(f"Manual trade #{new_id} added by {payload['email']}: "
                     f"entity={body.entity_id} {broker} {side} {body.quantity} x {body.symbol} ({isin}) [{kind}]")
+        # For a non-API demat, rebuild the open position now so it shows on the Equity
+        # page immediately (Kite prices it on the next 60s tick during market hours).
+        _materialise_manual_positions(body.entity_id, broker)
+        manual = broker in NON_API_BROKERS
         return {"id": new_id, "isin": isin, "side": side,
-                "message": "Trade recorded. Metrics refresh on the next worker run (or within the day via the intraday runs)."}
+                "message": ("Trade recorded — position updated on the Equity page (live price on the next tick)."
+                            if manual else
+                            "Trade recorded. Metrics refresh on the next worker run (or within the day via the intraday runs).")}
     except HTTPException:
         if conn:
             conn.rollback()
@@ -7708,12 +8142,19 @@ def delete_manual_trade(trade_id: int, request: Request,
         cursor = conn.cursor()
         if _live_role(cursor, payload["email"]) != "admin":
             raise HTTPException(status_code=403, detail="Admin only")
-        cursor.execute("DELETE FROM stock_transaction WHERE id = %s AND source = 'manual' RETURNING id",
-                       (trade_id,))
-        if not cursor.fetchone():
+        cursor.execute(
+            "DELETE FROM stock_transaction WHERE id = %s AND source = 'manual' "
+            "RETURNING entity_id, broker",
+            (trade_id,),
+        )
+        deleted = cursor.fetchone()
+        if not deleted:
             raise HTTPException(status_code=404, detail="Manual trade not found (imported rows cannot be deleted here)")
         conn.commit()
         logger.info(f"Manual trade #{trade_id} deleted by {payload['email']}")
+        # Rebuild the entity's open positions so a removed buy/sell drops (or prunes)
+        # the affected non-API-broker row immediately.
+        _materialise_manual_positions(deleted["entity_id"], deleted["broker"])
         return {"deleted": trade_id}
     except HTTPException:
         if conn:

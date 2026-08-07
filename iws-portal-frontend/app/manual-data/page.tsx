@@ -50,7 +50,6 @@ const CATEGORIES: { value: string; label: string; group: string }[] = [
   { value: 'arbitrage_fund', label: 'MF — Arbitrage Fund',       group: 'Fixed Income' },
   { value: 'ppf',            label: 'PPF',                        group: 'Fixed Income' },
   { value: 'pms',            label: 'PMS',                        group: 'Equity' },
-  { value: 'direct_equity',  label: 'Direct Equity (Aggregated)', group: 'Equity' },
   { value: 'aif',            label: 'AIF',                        group: 'Equity' },
   { value: 'fno',            label: 'Futures & Options',          group: 'Equity' },
   { value: 'overseas_fund',  label: 'Overseas Fund',              group: 'Alternates' },
@@ -66,6 +65,17 @@ const CATEGORIES: { value: string; label: string; group: string }[] = [
   { value: 'broker_balance', label: 'Broker Balance',             group: 'Other' },
   { value: 'bank',           label: 'Bank Balance',               group: 'Other' },
 ];
+
+// Retired categories: no longer offered for new entries, but rows already carrying
+// one must still render and stay editable — dropping the <option> outright would
+// leave those selects with no matching value and silently mis-save them.
+//
+// direct_equity moved to the /trades register (2026-07-31): equity positions belong
+// in the trade book, where they feed FIFO cost basis, realised gains and XIRR, not
+// as a hand-typed aggregate. Existing rows are left in place and keep counting.
+const LEGACY_CATEGORIES: Record<string, string> = {
+  direct_equity: 'Direct Equity (Aggregated) — moved to Trades',
+};
 
 const CURRENCIES = ['INR', 'USD', 'GBP', 'AED', 'SGD', 'EUR', 'HKD'];
 
@@ -722,7 +732,8 @@ export default function ManualDataPage() {
     // empty row (e.g. picking "Art" and entering nothing) is rejected with a clear
     // message instead of saving a blank/garbage entry.
     for (const r of dirtyRows) {
-      const catLabel = CATEGORIES.find(c => c.value === r.category)?.label || r.category;
+      const catLabel = CATEGORIES.find(c => c.value === r.category)?.label
+        || LEGACY_CATEGORIES[r.category] || r.category;
       if (!r.label.trim()) {
         setError(`Please enter a name/label for the ${catLabel} entry before saving.`);
         return;
@@ -926,6 +937,13 @@ export default function ManualDataPage() {
                               {cats.map(c => <option key={c.value} value={c.value}>{c.label}</option>)}
                             </optgroup>
                           ))}
+                          {/* Only the row's own retired category is offered, so the
+                              select stays valid without letting anyone pick it afresh. */}
+                          {LEGACY_CATEGORIES[row.category] && (
+                            <optgroup label="Legacy">
+                              <option value={row.category}>{LEGACY_CATEGORIES[row.category]}</option>
+                            </optgroup>
+                          )}
                         </select>
                       </td>
 

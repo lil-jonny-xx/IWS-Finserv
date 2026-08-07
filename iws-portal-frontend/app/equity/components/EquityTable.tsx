@@ -43,6 +43,7 @@ export interface EquityHoldingRow {
   first_invested_date?: string;
   remarks?: string;
   brokers?: string[];  // set only in Combined view — all brokers holding this symbol
+  is_manual?: boolean; // non-API demat (SBI Securities, …) — rendered in its own section
 }
 
 // Growth for COMPLETED financial years, keyed "2025-26". The current FY is not in

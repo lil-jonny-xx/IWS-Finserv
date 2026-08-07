@@ -518,7 +518,7 @@ function TableHead({
 function FundName({ name, type }: { name: string; type: string }) {
   return (
     <div title={name}>
-      <p className="text-[10px] font-medium text-ink leading-snug line-clamp-3 max-w-[200px]">{name}</p>
+      <p className="text-[10px] font-medium text-ink leading-snug line-clamp-3 max-w-[320px]">{name}</p>
       <p className="text-[9px] text-ghost mt-0.5">{SEC_TYPE_LABELS[type] ?? type}</p>
     </div>
   );

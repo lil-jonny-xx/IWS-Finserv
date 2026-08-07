@@ -6,14 +6,25 @@
 // page (pms, gold_etf, unlisted, startup, properties, art, bank, forex,
 // overseas_equity) are deliberately absent — their entries surface on those
 // pages and must not spawn a duplicate tab.
+//
+// direct_equity was removed 2026-07-31 for the same reason: equity entered in the
+// /trades register is materialised into equity_holding by manual_positions_worker
+// and priced live on the Equity page, so a separate "Direct Equity (Manual)" tab
+// would be a second, staler view of the same asset class.
 export const DYNAMIC_CATEGORY_LABELS: Record<string, string> = {
   liquid_fund:    'Liquid Funds',
   debt_fund:      'Debt Funds',
   arbitrage_fund: 'Arbitrage Funds',
   ppf:            'PPF',
-  direct_equity:  'Direct Equity (Manual)',
   aif:            'AIF',
   overseas_fund:  'Overseas Funds',
   funds_transit:  'Funds in Transit',
   broker_balance: 'Broker Balance',
+};
+
+// Categories whose generic /assets/<category> page has been retired. The route is a
+// catch-all, so dropping the nav tab alone would leave the URL still serving a
+// stale second view; these redirect to the page that now owns the asset class.
+export const RETIRED_CATEGORY_REDIRECT: Record<string, string> = {
+  direct_equity: '/equity',
 };

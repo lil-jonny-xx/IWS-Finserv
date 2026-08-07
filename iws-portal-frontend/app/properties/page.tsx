@@ -11,8 +11,16 @@ type PropertyType = typeof PROPERTY_TYPES[number];
 const BUILDING_LIKE: PropertyType[] = ['building', 'apartment', 'godown', 'shop'];
 const isBuildingLike = (t: PropertyType) => BUILDING_LIKE.includes(t);
 
+// Glyph per property type, shown on the type tag in the Name column so the kind of
+// property reads at a glance without widening the table with a column of its own.
+const TYPE_ICON: Record<PropertyType, string> = {
+  land: '🌾', building: '🏢', apartment: '🏠', godown: '🏭', shop: '🏪',
+};
+
 interface User { role: string; full_name: string; entity_id?: number; }
-interface Holder { id: number; name: string; short_code: string | null; grp: 'main' | 'parent'; is_custom: boolean; }
+// grp: 'main'/'parent' are ours; 'external' is a third-party co-owner outside the
+// organisation, recorded so a joint split totals 100% but never counted as our asset.
+interface Holder { id: number; name: string; short_code: string | null; grp: 'main' | 'parent' | 'external'; is_custom: boolean; }
 interface NatureType { id: number; name: string; is_custom: boolean; }
 interface DocType { slug: string; label: string; scope: 'land' | 'building'; optional: boolean; parent: string | null; }
 interface PropDoc {
@@ -144,6 +152,8 @@ export default function PropertiesPage() {
   const [formErr, setFormErr]   = useState<string | null>(null);
   const [formSaved, setFormSaved] = useState(false);
   const [newEntity, setNewEntity] = useState('');
+  const [newExternal, setNewExternal] = useState('');
+  const [extErr, setExtErr] = useState<string | null>(null);
   const [newNature, setNewNature] = useState('');
   const [sellFor, setSellFor]     = useState<Property | null>(null);
   const [sellPrice, setSellPrice] = useState('');
@@ -198,6 +208,12 @@ export default function PropertiesPage() {
 
   const mainHolders   = useMemo(() => holders.filter(h => h.grp === 'main'), [holders]);
   const parentHolders = useMemo(() => holders.filter(h => h.grp === 'parent'), [holders]);
+  // Third parties outside the organisation who co-own a building with us. They are
+  // selectable as joint owners so the split totals 100% and the co-owner is named,
+  // but they get no filter pill — they hold none of our book.
+  const externalHolders = useMemo(() => holders.filter(h => h.grp === 'external'), [holders]);
+  const isExternal = useCallback(
+    (id: number | '') => externalHolders.some(h => h.id === id), [externalHolders]);
   // Parent companies collapse into a single tab; clicking it reveals their
   // individual holder tabs (which still filter as before).
   const [parentExpanded, setParentExpanded] = useState(false);
@@ -213,9 +229,62 @@ export default function PropertiesPage() {
     return all.filter(p => [...selHolders].some(h => ownedBy(p, h)));
   }, [data, selHolders]);
 
-  const active   = useMemo(() => visible.filter(p => !p.sold && !p.is_old_lease), [visible]);
-  const leaseList = useMemo(() => visible.filter(p => !p.sold && p.is_old_lease), [visible]);
-  const soldList = useMemo(() => visible.filter(p => p.sold), [visible]);
+  // ---- search / column filters / sort --------------------------------------
+  // All three applied to `visible` before it splits into the held / lease / sold
+  // tables, so the tables and the summary cards above them always describe the
+  // same set of properties.
+  const [search, setSearch]   = useState('');
+  const [filters, setFilters] = useState<Filters>({});
+  const [sort, setSort]       = useState<SortState>(null);
+
+  const searched = useMemo(() => {
+    const tokens = search.toLowerCase().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) return visible;
+    return visible.filter(p => {
+      const blob = searchBlob(p);
+      return tokens.every(t => blob.includes(t));
+    });
+  }, [visible, search]);
+
+  // `except` leaves one column out so its own dropdown can list the values still
+  // reachable under every OTHER filter — Excel's behaviour, and it stops you
+  // ticking your way into an empty table.
+  const passFilters = useCallback(
+    (p: Property, except?: ColKey) => COLS.every(
+      c => c.key === except || matchesFilter(p, c.key, c.kind, filters[c.key])),
+    [filters]);
+
+  const matched = useMemo(() => searched.filter(p => passFilters(p)), [searched, passFilters]);
+
+  const optionsFor = useCallback((key: ColKey) => {
+    const set = new Set<string>();
+    for (const p of searched) {
+      if (!passFilters(p, key)) continue;
+      for (const v of colValues(p, key)) set.add(v);
+    }
+    return [...set].sort((a, b) =>
+      a === DASH ? 1 : b === DASH ? -1 : a.localeCompare(b, 'en', { numeric: true }));
+  }, [searched, passFilters]);
+
+  const setFilter = useCallback((key: ColKey, f: ColFilter | null) => {
+    setFilters(prev => {
+      const next = { ...prev };
+      if (f === null || isEmptyFilter(f)) delete next[key]; else next[key] = f;
+      return next;
+    });
+  }, []);
+  const toggleSort = useCallback((key: ColKey) => {
+    setSort(prev => prev?.key !== key ? { key, dir: 'asc' }
+                  : prev.dir === 'asc' ? { key, dir: 'desc' } : null);
+  }, []);
+  const narrowed = Object.keys(filters).length > 0 || search.trim() !== '';
+  const clearAll = () => { setSearch(''); setFilters({}); };
+  // One bundle so all three tables get the same header controls.
+  const tableCtl = { sort, onSort: toggleSort, filters, setFilter, optionsFor };
+
+  const active   = useMemo(() => sortRows(matched.filter(p => !p.sold && !p.is_old_lease), sort), [matched, sort]);
+  const leaseList = useMemo(() => sortRows(matched.filter(p => !p.sold && p.is_old_lease), sort), [matched, sort]);
+  const soldList = useMemo(() => sortRows(matched.filter(p => p.sold), sort), [matched, sort]);
   const visibleTotal = useMemo(
     () => [...active, ...leaseList].reduce((s, p) => s + (p.value_effective ?? 0), 0),
     [active, leaseList]);
@@ -244,6 +313,42 @@ export default function PropertiesPage() {
       .finally(() => setBusy(null));
   };
 
+  // Records a third-party co-owner (a person or firm outside the organisation) so a
+  // jointly-held building's split can total 100%. Created as grp='external', which
+  // keeps them out of the filter pills and out of every portfolio total. On success
+  // the new owner is dropped straight into the joint-owner row that asked for it.
+  const saveExternalOwner = () => {
+    const name = newExternal.trim();
+    if (!name) return;
+    setExtErr(null); setBusy('external');
+    fetch(`${API_URL}/api/v1/property-entities`, {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, grp: 'external' }),
+    })
+      .then(async r => {
+        if (r.status === 409) throw new Error('That co-owner already exists — pick them from the list.');
+        if (!r.ok) throw new Error('Could not add co-owner.');
+        return r.json() as Promise<{ id: number; name: string }>;
+      })
+      .then(created => {
+        setHolders(prev => prev.some(h => h.id === created.id) ? prev
+          : [...prev, { id: created.id, name: created.name, short_code: null, grp: 'external', is_custom: true }]);
+        // Drop them into the first still-empty owner row, else append one.
+        setForm(f => {
+          if (!f) return f;
+          const blank = f.owners.findIndex(o => o.holder_id === '');
+          return blank >= 0
+            ? { ...f, owners: f.owners.map((x, j) => j === blank ? { ...x, holder_id: created.id } : x) }
+            : { ...f, owners: [...f.owners, { holder_id: created.id, pct: '' }] };
+        });
+        setNewExternal('');
+        loadStatic();
+      })
+      .catch(e => setExtErr(e.message))
+      .finally(() => setBusy(null));
+  };
+
   const saveNature = () => {
     const name = newNature.trim();
     if (!name) return;
@@ -269,8 +374,15 @@ export default function PropertiesPage() {
     const natures = form.natures.filter(n => n.nature_id !== '');
     const floors = isBuildingLike(form.property_type)
       ? form.floors.filter(f => f.floor_label.trim()) : [];
+    if (owners.every(o => isExternal(o.holder_id))) {
+      setFormErr('At least one owner must be one of our entities — an all-external property is not ours to record.');
+      return;
+    }
     setFormErr(null); setBusy('save');
-    const primary = [...owners].sort((a, b) => Number(b.pct) - Number(a.pct))[0];
+    // The primary holder is what the property files under, so it must be one of ours
+    // even when an external co-owner holds the larger share.
+    const byPct = [...owners].sort((a, b) => Number(b.pct) - Number(a.pct));
+    const primary = byPct.find(o => !isExternal(o.holder_id)) ?? byPct[0];
     const num = (s: string) => s ? Number(s) : null;
     const body = {
       name: form.name.trim(), property_type: form.property_type,
@@ -558,7 +670,12 @@ export default function PropertiesPage() {
               </div>
               <div>
                 <p className="text-[11px] uppercase tracking-wide text-ghost">Properties</p>
-                <p className="text-base font-semibold text-ink tabular-nums">{active.length + leaseList.length}</p>
+                <p className="text-base font-semibold text-ink tabular-nums">
+                  {active.length + leaseList.length}
+                  {narrowed && (
+                    <span className="text-xs font-normal text-ghost"> of {visible.filter(p => !p.sold).length}</span>
+                  )}
+                </p>
               </div>
               {leaseList.length > 0 && (
                 <div>
@@ -581,9 +698,37 @@ export default function PropertiesPage() {
             </div>
             </Glass>
 
+            {/* Search + the chips for whatever the column dropdowns are currently
+                holding back. Both narrow all three tables below at once. */}
+            <div className="mb-3 flex flex-wrap items-center gap-2">
+              <div className="relative">
+                <span aria-hidden="true" className="absolute left-2.5 top-1/2 -translate-y-1/2 text-ghost text-xs">⌕</span>
+                <input
+                  type="search" value={search} onChange={e => setSearch(e.target.value)}
+                  placeholder="Search name, village, taluka, address, survey / property no…"
+                  aria-label="Search properties"
+                  className="w-72 sm:w-96 bg-card border border-rule rounded pl-7 pr-3 py-1.5 text-xs text-ink placeholder:text-ghost focus:outline-none focus:border-dim transition-colors" />
+              </div>
+              {(Object.keys(filters) as ColKey[]).map(k => (
+                <button key={k} onClick={() => setFilter(k, null)}
+                        title="Remove this filter"
+                        className="text-[11px] border border-wire text-dim rounded px-2 py-1 hover:border-dim hover:text-ink transition-colors">
+                  {COLS.find(c => c.key === k)?.label}: {filterSummary(k, filters[k]!)} ✕
+                </button>
+              ))}
+              {narrowed && (
+                <button onClick={clearAll}
+                        className="text-[11px] text-ghost hover:text-ink underline underline-offset-2 transition-colors">
+                  Clear all
+                </button>
+              )}
+            </div>
+
             {/* Active properties — list view; a row click opens the full detail card. */}
-            <PropertyTable rows={active} onOpen={setCard}
-              emptyText={`No properties recorded${selHolders.size ? ' for this filter' : ''} yet.`} />
+            <PropertyTable rows={active} onOpen={setCard} {...tableCtl}
+              emptyText={narrowed
+                ? 'No properties match the search / filters.'
+                : `No properties recorded${selHolders.size ? ' for this filter' : ''} yet.`} />
 
             {leaseList.length > 0 && (
               <section className="mt-8">
@@ -597,7 +742,7 @@ export default function PropertiesPage() {
                   Pre-1990 rent-controlled leaseholds. The sitting tenant holds ~50% of the value, so only the
                   owner&apos;s half feeds the portfolio total (full value shown alongside).
                 </p>
-                <PropertyTable rows={leaseList} onOpen={setCard} lease />
+                <PropertyTable rows={leaseList} onOpen={setCard} lease {...tableCtl} />
               </section>
             )}
 
@@ -609,7 +754,7 @@ export default function PropertiesPage() {
                     {soldList.length}
                   </span>
                 </h2>
-                <PropertyTable rows={soldList} onOpen={setCard} sold />
+                <PropertyTable rows={soldList} onOpen={setCard} sold {...tableCtl} />
                 <p className="text-[11px] text-ghost mt-2">
                   Sold properties no longer count in the portfolio total — their sale price feeds Realised Gains and the overview.
                 </p>
@@ -703,10 +848,13 @@ export default function PropertiesPage() {
       {form && (
         <PropertyFormModal
           form={form} setForm={setForm} isAdmin={isAdmin} busy={busy}
-          mainHolders={mainHolders} parentHolders={parentHolders} natureTypes={natureTypes}
+          mainHolders={mainHolders} parentHolders={parentHolders} externalHolders={externalHolders} natureTypes={natureTypes}
           fairMult={fairMult} formFair={formFair} formFloors={formFloors} formLand={formLand} formTotal={formTotal} formErr={formErr} formSaved={formSaved}
           docTypesFor={docTypesFor} docLabelFor={docLabelFor} dataDocs={dataDocs}
           newNature={newNature} setNewNature={setNewNature} saveNature={saveNature}
+          newExternal={newExternal} extErr={extErr}
+          setNewExternal={s => { setNewExternal(s); setExtErr(null); }}
+          saveExternalOwner={saveExternalOwner}
           onClose={() => setForm(null)} onSave={saveProperty}
           onUpload={(slug, floorId) => startUpload(form.id!, slug, floorId)}
           onDeleteDoc={deleteDoc} onUploadImage={() => startImageUpload(form.id!)} />
@@ -721,32 +869,155 @@ export default function PropertiesPage() {
 // opens; the row itself carries only what you'd scan a sheet for.
 // ---------------------------------------------------------------------------
 const COLS = [
-  { key: 'name',     label: 'Name',          align: 'left'  },
-  { key: 'entity',   label: 'Entity',        align: 'left'  },
-  { key: 'village',  label: 'City/Village',  align: 'left'  },
-  { key: 'taluka',   label: 'Taluka',        align: 'left'  },
-  { key: 'area',     label: 'Area',          align: 'right' },
-  { key: 'propno',   label: 'Property No.',  align: 'left'  },
-  { key: 'acquired', label: 'Acquired',      align: 'left'  },
-  { key: 'purchase', label: 'Purchase',      align: 'right' },
-  { key: 'rrr',      label: 'RRR',           align: 'right' },
-  { key: 'value',    label: 'Value',         align: 'right' },
-  { key: 'docs',     label: 'Docs',          align: 'left'  },
+  { key: 'name',     label: 'Name',          align: 'left',  kind: 'text' },
+  { key: 'entity',   label: 'Entity',        align: 'left',  kind: 'text' },
+  { key: 'village',  label: 'City/Village',  align: 'left',  kind: 'text' },
+  { key: 'taluka',   label: 'Taluka',        align: 'left',  kind: 'text' },
+  { key: 'area',     label: 'Area',          align: 'right', kind: 'num'  },
+  { key: 'propno',   label: 'Property No.',  align: 'left',  kind: 'text' },
+  { key: 'acquired', label: 'Acquired',      align: 'left',  kind: 'date' },
+  { key: 'purchase', label: 'Purchase',      align: 'right', kind: 'num'  },
+  { key: 'rrr',      label: 'RRR',           align: 'right', kind: 'num'  },
+  { key: 'value',    label: 'Value',         align: 'right', kind: 'num'  },
+  { key: 'docs',     label: 'Docs',          align: 'left',  kind: 'text' },
 ] as const;
 
-function PropertyTable({ rows, onOpen, sold, lease, emptyText }: {
+type ColKey  = typeof COLS[number]['key'];
+type ColKind = typeof COLS[number]['kind'];
+/** Text columns carry a ticked value list (Excel's dropdown); numeric and date
+ *  columns carry a range instead — a checklist of every distinct rupee figure
+ *  would be unusable. `min`/`max` are the raw input strings either way. */
+interface ColFilter { values?: string[]; min?: string; max?: string }
+type Filters = Partial<Record<ColKey, ColFilter>>;
+type SortState = { key: ColKey; dir: 'asc' | 'desc' } | null;
+
+const DASH = '—';
+
+const isEmptyFilter = (f: ColFilter) =>
+  (!f.values || f.values.length === 0) && !f.min && !f.max;
+
+/** The values a text column offers and matches on. Entity is deliberately
+ *  multi-valued: a property with several owners must answer to each of them
+ *  separately, not to the joined "A 60% · B 40%" string the cell renders. */
+function colValues(p: Property, key: ColKey): string[] {
+  switch (key) {
+    case 'name':    return [p.name];
+    case 'entity':  return p.owners && p.owners.length ? p.owners.map(o => o.name) : [p.holder_name];
+    case 'village': return [p.village || DASH];
+    case 'taluka':  return [p.taluka || DASH];
+    case 'propno':  return [p.property_no || DASH];
+    case 'docs':    return [p.missing_required.length > 0 ? 'Missing required' : 'Complete'];
+    default:        return [];
+  }
+}
+/** Numeric and date columns read whatever the cell shows, which for a sold
+ *  property is the sale figures rather than the acquisition ones. */
+function colNumber(p: Property, key: ColKey): number | null {
+  switch (key) {
+    case 'area':     return p.area;
+    case 'purchase': return p.purchase_price;
+    case 'rrr':      return p.rrr;
+    case 'value':    return p.sold ? p.sale_price : p.value_effective;
+    default:         return null;
+  }
+}
+const colDate = (p: Property, key: ColKey) =>
+  key === 'acquired' ? (p.sold ? p.sale_date : p.acquisition_date) : null;
+
+function matchesFilter(p: Property, key: ColKey, kind: ColKind, f?: ColFilter): boolean {
+  if (!f) return true;
+  if (kind === 'text') {
+    if (!f.values || f.values.length === 0) return true;
+    return colValues(p, key).some(v => f.values!.includes(v));
+  }
+  if (!f.min && !f.max) return true;
+  if (kind === 'num') {
+    const n = colNumber(p, key);
+    if (n == null) return false;              // a blank cell is outside any range
+    if (f.min && n < Number(f.min)) return false;
+    if (f.max && n > Number(f.max)) return false;
+    return true;
+  }
+  const d = colDate(p, key);                  // ISO strings compare lexically
+  if (!d) return false;
+  if (f.min && d < f.min) return false;
+  if (f.max && d > f.max) return false;
+  return true;
+}
+
+function filterSummary(key: ColKey, f: ColFilter): string {
+  if (f.values && f.values.length) {
+    return f.values.length <= 2 ? f.values.join(', ') : `${f.values.length} selected`;
+  }
+  const kind = COLS.find(c => c.key === key)!.kind;
+  const fmt = (v: string) => kind === 'num' ? Number(v).toLocaleString('en-IN') : v;
+  if (f.min && f.max) return `${fmt(f.min)} – ${fmt(f.max)}`;
+  if (f.min) return `≥ ${fmt(f.min)}`;
+  return `≤ ${fmt(f.max!)}`;
+}
+
+/** Everything the search box looks through — the visible columns plus the
+ *  address / survey / nature detail that only the detail card shows. */
+function searchBlob(p: Property): string {
+  return [
+    p.name, p.village, p.taluka, p.address, p.survey_no, p.property_no,
+    p.holder_name, p.ownership, p.property_type, p.notes,
+    ...(p.owners ?? []).map(o => o.name),
+    ...(p.natures ?? []).map(n => n.name),
+  ].filter(Boolean).join(' ').toLowerCase();
+}
+
+/** Sort text on what the cell reads, so Entity orders by the full owner label.
+ *  Blanks sort last in both directions — they carry no position. */
+function colSortText(p: Property, key: ColKey): string | null {
+  if (key === 'entity') return ownersLabel(p);
+  const v = colValues(p, key)[0];
+  return v === DASH ? null : v ?? null;
+}
+function sortRows(rows: Property[], sort: SortState): Property[] {
+  if (!sort) return rows;
+  const kind = COLS.find(c => c.key === sort.key)!.kind;
+  const mul = sort.dir === 'asc' ? 1 : -1;
+  return [...rows].sort((a, b) => {
+    let cmp: number;
+    if (kind === 'num') {
+      const x = colNumber(a, sort.key), y = colNumber(b, sort.key);
+      if (x == null || y == null) return x == null && y == null ? 0 : x == null ? 1 : -1;
+      cmp = x - y;
+    } else if (kind === 'date') {
+      const x = colDate(a, sort.key), y = colDate(b, sort.key);
+      if (!x || !y) return !x && !y ? 0 : !x ? 1 : -1;
+      cmp = x < y ? -1 : x > y ? 1 : 0;
+    } else {
+      const x = colSortText(a, sort.key), y = colSortText(b, sort.key);
+      if (!x || !y) return !x && !y ? 0 : !x ? 1 : -1;
+      cmp = x.localeCompare(y, 'en', { numeric: true });
+    }
+    return cmp * mul;
+  });
+}
+
+interface TableCtl {
+  sort: SortState;
+  onSort: (key: ColKey) => void;
+  filters: Filters;
+  setFilter: (key: ColKey, f: ColFilter | null) => void;
+  optionsFor: (key: ColKey) => string[];
+}
+
+function PropertyTable({ rows, onOpen, sold, lease, emptyText, sort, onSort, filters, setFilter, optionsFor }: {
   rows: Property[]; onOpen: (p: Property) => void;
   sold?: boolean; lease?: boolean; emptyText?: string;
-}) {
+} & TableCtl) {
   return (
     <div className="bg-card rounded-lg border border-rule overflow-x-auto">
       <table className="w-full text-xs min-w-[1100px]">
         <thead>
           <tr className="border-b border-rule text-left text-[11px] uppercase tracking-wide text-ghost">
             {COLS.map(c => (
-              <th key={c.key} className={`px-3 py-2.5 ${c.align === 'right' ? 'text-right' : ''}`}>
-                {c.key === 'value' && sold ? 'Sale Price' : c.label}
-              </th>
+              <HeaderCell key={c.key} col={c} sold={!!sold}
+                sort={sort} onSort={onSort}
+                filter={filters[c.key]} setFilter={setFilter} optionsFor={optionsFor} />
             ))}
           </tr>
         </thead>
@@ -762,23 +1033,26 @@ function PropertyTable({ rows, onOpen, sold, lease, emptyText }: {
                 onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen(p); } }}
                 className="border-t border-rule cursor-pointer hover:bg-page focus:bg-page focus:outline-none transition-colors">
               <td className="px-3 py-2.5">
-                {/* Name first, with the tags riding alongside it at a smaller
-                    size — they're qualifiers on the name, not competing with it. */}
-                <div className="flex items-center gap-1.5">
+                {/* Name on its own line with the tags stacked underneath, so the
+                    whole identity of the property reads down one column instead of
+                    pushing the row wider. Tags wrap rather than overflow. */}
+                <div className="flex flex-col gap-1">
                   <span className="font-medium text-ink">{p.name}</span>
-                  <span className={`text-[9px] leading-none uppercase tracking-wide px-1 py-0.5 rounded border shrink-0 ${
-                    p.property_type === 'land'
-                      ? 'border-emerald-500/40 text-emerald-500'
-                      : 'border-sky-500/40 text-sky-500'}`}>
-                    {p.property_type}
-                  </span>
-                  {sold  && <span className="text-[9px] leading-none uppercase tracking-wide px-1 py-0.5 rounded border border-amber-500/40 text-amber-500 shrink-0">sold</span>}
-                  {lease && <span className="text-[9px] leading-none uppercase tracking-wide px-1 py-0.5 rounded border border-violet-500/40 text-violet-400 shrink-0">old lease</span>}
-                  {p.images.length > 0 && (
-                    <span className="text-[9px] leading-none text-ghost shrink-0" title={`${p.images.length} photo(s)`}>
-                      {p.images.length}📷
+                  <div className="flex flex-wrap items-center gap-1">
+                    <span className={`text-[9px] leading-none uppercase tracking-wide px-1 py-0.5 rounded border ${
+                      p.property_type === 'land'
+                        ? 'border-emerald-500/40 text-emerald-500'
+                        : 'border-sky-500/40 text-sky-500'}`}>
+                      <span aria-hidden="true">{TYPE_ICON[p.property_type]}</span> {p.property_type}
                     </span>
-                  )}
+                    {sold  && <span className="text-[9px] leading-none uppercase tracking-wide px-1 py-0.5 rounded border border-amber-500/40 text-amber-500">sold</span>}
+                    {lease && <span className="text-[9px] leading-none uppercase tracking-wide px-1 py-0.5 rounded border border-violet-500/40 text-violet-400">old lease</span>}
+                    {p.images.length > 0 && (
+                      <span className="text-[9px] leading-none text-ghost" title={`${p.images.length} photo(s)`}>
+                        {p.images.length}📷
+                      </span>
+                    )}
+                  </div>
                 </div>
               </td>
               <td className="px-3 py-2.5 text-dim">{ownersLabel(p)}</td>
@@ -805,6 +1079,162 @@ function PropertyTable({ rows, onOpen, sold, lease, emptyText }: {
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Column heading — click the label to sort, the funnel to filter. The panel is
+// position:fixed and anchored to the button rect because the table scrolls
+// horizontally inside its own box, which would otherwise clip an absolutely
+// positioned dropdown; it closes on any scroll so it can't drift off its column.
+// ---------------------------------------------------------------------------
+function HeaderCell({ col, sold, sort, onSort, filter, setFilter, optionsFor }: {
+  col: typeof COLS[number]; sold: boolean;
+  sort: SortState; onSort: (k: ColKey) => void;
+  filter?: ColFilter; setFilter: (k: ColKey, f: ColFilter | null) => void;
+  optionsFor: (k: ColKey) => string[];
+}) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos]   = useState<{ top: number; left: number } | null>(null);
+  const btnRef   = useRef<HTMLButtonElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+
+  const label  = col.key === 'value' && sold ? 'Sale Price' : col.label;
+  const sorted = sort?.key === col.key ? sort.dir : null;
+
+  const openPanel = () => {
+    const r = btnRef.current?.getBoundingClientRect();
+    if (!r) return;
+    const W = 256;
+    setPos({ top: r.bottom + 6, left: Math.max(8, Math.min(r.right - W, window.innerWidth - W - 8)) });
+    setOpen(true);
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    const close = () => setOpen(false);
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (!panelRef.current?.contains(t) && !btnRef.current?.contains(t)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    window.addEventListener('scroll', close, true);
+    window.addEventListener('resize', close);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+      window.removeEventListener('scroll', close, true);
+      window.removeEventListener('resize', close);
+    };
+  }, [open]);
+
+  return (
+    <th className={`px-3 py-2.5 ${col.align === 'right' ? 'text-right' : ''}`}
+        aria-sort={sorted ? (sorted === 'asc' ? 'ascending' : 'descending') : 'none'}>
+      <span className={`inline-flex items-center gap-1 ${col.align === 'right' ? 'flex-row-reverse' : ''}`}>
+        <button type="button" onClick={() => onSort(col.key)}
+                title={`Sort by ${label}`}
+                className={`uppercase tracking-wide hover:text-ink transition-colors ${sorted ? 'text-ink' : ''}`}>
+          {label}
+          {sorted && <span aria-hidden="true" className="ml-0.5 text-[9px]">{sorted === 'asc' ? '▲' : '▼'}</span>}
+        </button>
+        <button type="button" ref={btnRef} onClick={() => open ? setOpen(false) : openPanel()}
+                aria-label={`Filter by ${label}`} aria-expanded={open}
+                className={`leading-none p-0.5 rounded hover:text-ink transition-colors ${filter ? 'text-prime' : 'text-ghost'}`}>
+          <svg aria-hidden="true" width="9" height="9" viewBox="0 0 10 10" className="shrink-0">
+            <path d="M0.5 1h9L6 5v4L4 8V5z" fill={filter ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1" strokeLinejoin="round" />
+          </svg>
+        </button>
+      </span>
+
+      {open && pos && (
+        <div ref={panelRef} style={{ top: pos.top, left: pos.left, width: 256 }}
+             className="fixed z-40 bg-card border border-rule rounded-lg shadow-xl p-2 font-normal normal-case tracking-normal text-left">
+          <div className="flex gap-1 mb-2">
+            <button onClick={() => { onSort(col.key); setOpen(false); }}
+                    className="flex-1 text-[11px] border border-wire text-dim rounded px-2 py-1 hover:border-dim hover:text-ink transition-colors">
+              Sort {col.kind === 'text' ? 'A→Z / Z→A' : 'low↔high'}
+            </button>
+            <button onClick={() => { setFilter(col.key, null); setOpen(false); }}
+                    disabled={!filter}
+                    className="text-[11px] border border-wire text-dim rounded px-2 py-1 hover:border-dim hover:text-ink disabled:opacity-40 disabled:hover:border-wire transition-colors">
+              Clear
+            </button>
+          </div>
+          {col.kind === 'text'
+            ? <ValueList colKey={col.key} filter={filter} setFilter={setFilter} options={optionsFor(col.key)} />
+            : <RangeInputs colKey={col.key} kind={col.kind} filter={filter} setFilter={setFilter} />}
+        </div>
+      )}
+    </th>
+  );
+}
+
+/** Excel's tick list. No `values` entry means everything is on; unticking the
+ *  last remaining value returns to that state rather than leaving an empty
+ *  table you'd have to dig yourself out of. */
+function ValueList({ colKey, filter, setFilter, options }: {
+  colKey: ColKey; filter?: ColFilter;
+  setFilter: (k: ColKey, f: ColFilter | null) => void; options: string[];
+}) {
+  const [q, setQ] = useState('');
+  const sel   = filter?.values;
+  const shown = q ? options.filter(o => o.toLowerCase().includes(q.toLowerCase())) : options;
+  const isOn  = (v: string) => !sel || sel.includes(v);
+  const toggle = (v: string) => {
+    const base = sel ?? options;
+    const next = base.includes(v) ? base.filter(x => x !== v) : [...base, v];
+    setFilter(colKey, next.length === 0 || next.length === options.length ? null : { values: next });
+  };
+
+  return (
+    <>
+      {options.length > 8 && (
+        <input value={q} onChange={e => setQ(e.target.value)} placeholder="Find value…"
+               aria-label="Find value"
+               className="w-full bg-page border border-rule rounded px-2 py-1 text-xs text-ink placeholder:text-ghost mb-1.5 focus:outline-none focus:border-dim" />
+      )}
+      <div className="flex gap-2 px-1 pb-1.5 text-[11px]">
+        <button onClick={() => setFilter(colKey, null)} className="text-ghost hover:text-ink transition-colors">Select all</button>
+        <button onClick={() => setFilter(colKey, { values: shown })}
+                disabled={shown.length === options.length}
+                className="text-ghost hover:text-ink disabled:opacity-40 disabled:hover:text-ghost transition-colors">
+          Only these
+        </button>
+      </div>
+      <div className="max-h-56 overflow-y-auto">
+        {shown.length === 0 && <p className="px-1 py-2 text-[11px] text-ghost">No matching values.</p>}
+        {shown.map(v => (
+          <label key={v} className="flex items-center gap-2 px-1 py-1 rounded hover:bg-page cursor-pointer">
+            <input type="checkbox" checked={isOn(v)} onChange={() => toggle(v)} className="accent-current" />
+            <span className="text-xs text-dim truncate" title={v}>{v}</span>
+          </label>
+        ))}
+      </div>
+    </>
+  );
+}
+
+function RangeInputs({ colKey, kind, filter, setFilter }: {
+  colKey: ColKey; kind: ColKind; filter?: ColFilter;
+  setFilter: (k: ColKey, f: ColFilter | null) => void;
+}) {
+  const set = (part: Partial<ColFilter>) => setFilter(colKey, { min: filter?.min, max: filter?.max, ...part });
+  const type = kind === 'date' ? 'date' : 'number';
+  const cls  = 'w-full bg-page border border-rule rounded px-2 py-1 text-xs text-ink focus:outline-none focus:border-dim';
+  return (
+    <div className="grid grid-cols-2 gap-2 p-1">
+      <label className="text-[10px] uppercase tracking-wide text-ghost">
+        {kind === 'date' ? 'From' : 'Min'}
+        <input type={type} value={filter?.min ?? ''} onChange={e => set({ min: e.target.value })} className={`${cls} mt-1`} />
+      </label>
+      <label className="text-[10px] uppercase tracking-wide text-ghost">
+        {kind === 'date' ? 'To' : 'Max'}
+        <input type={type} value={filter?.max ?? ''} onChange={e => set({ max: e.target.value })} className={`${cls} mt-1`} />
+      </label>
     </div>
   );
 }
@@ -1084,16 +1514,20 @@ function PropertyModal({ p, isAdmin, busy, docTypesFor, docLabelFor, onClose, on
 // ---------------------------------------------------------------------------
 // Add / edit form modal.
 // ---------------------------------------------------------------------------
-function PropertyFormModal({ form, setForm, isAdmin, busy, mainHolders, parentHolders, natureTypes,
+function PropertyFormModal({ form, setForm, isAdmin, busy, mainHolders, parentHolders, externalHolders, natureTypes,
   fairMult, formFair, formFloors, formLand, formTotal, formErr, formSaved, docTypesFor, docLabelFor, dataDocs,
-  newNature, setNewNature, saveNature, onClose, onSave, onUpload, onDeleteDoc,
+  newNature, setNewNature, saveNature,
+  newExternal, setNewExternal, extErr, saveExternalOwner,
+  onClose, onSave, onUpload, onDeleteDoc,
   onUploadImage }: {
   form: PropertyForm; setForm: (f: PropertyForm | null) => void; isAdmin: boolean; busy: string | null;
-  mainHolders: Holder[]; parentHolders: Holder[]; natureTypes: NatureType[];
+  mainHolders: Holder[]; parentHolders: Holder[]; externalHolders: Holder[]; natureTypes: NatureType[];
   fairMult: number; formFair: number | null; formFloors: number; formLand: number | null; formTotal: number; formErr: string | null; formSaved: boolean;
   docTypesFor: (t: PropertyType) => DocType[]; docLabelFor: (slug: string) => string;
   dataDocs: (pid: number) => PropDoc[];
   newNature: string; setNewNature: (s: string) => void; saveNature: () => void;
+  newExternal: string; setNewExternal: (s: string) => void; extErr: string | null;
+  saveExternalOwner: () => void;
   onClose: () => void; onSave: () => void; onUpload: (slug: string, floorId?: number) => void;
   onDeleteDoc: (d: PropDoc) => void; onUploadImage: () => void;
 }) {
@@ -1147,6 +1581,11 @@ function PropertyFormModal({ form, setForm, isAdmin, busy, mainHolders, parentHo
                   <option value="">— select entity —</option>
                   <optgroup label="Entities">{mainHolders.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}</optgroup>
                   <optgroup label="Parent Companies">{parentHolders.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}</optgroup>
+                  {externalHolders.length > 0 && (
+                    <optgroup label="Outside co-owners">
+                      {externalHolders.map(h => <option key={h.id} value={h.id}>{h.name}</option>)}
+                    </optgroup>
+                  )}
                 </select>
                 <input value={o.pct} type="number" min="0" max="100" step="any" aria-label="Ownership %"
                        onChange={e => set({ owners: form.owners.map((x, j) => j === i ? { ...x, pct: e.target.value } : x) })}
@@ -1156,6 +1595,26 @@ function PropertyFormModal({ form, setForm, isAdmin, busy, mainHolders, parentHo
               </div>
             ))}
             <button onClick={() => set({ owners: [...form.owners, { holder_id: '', pct: '' }] })} className="self-start text-[11px] border border-wire text-dim px-2 py-0.5 rounded hover:border-dim hover:text-ink">+ Add joint owner</button>
+
+            {/* Outside co-owners: a person or firm beyond the organisation holding a
+                stake in the same building. Naming them lets the split reach 100%;
+                their share stays out of every portfolio total. */}
+            <div className="flex items-center gap-1.5 mt-1">
+              <input value={newExternal} onChange={e => setNewExternal(e.target.value)}
+                     onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); saveExternalOwner(); } }}
+                     placeholder="Outside co-owner's name…"
+                     aria-label="Outside co-owner name"
+                     className="text-[11px] bg-page border border-rule rounded px-2 py-1 text-ink flex-1" />
+              <button onClick={saveExternalOwner}
+                      disabled={busy === 'external' || !newExternal.trim()}
+                      className="text-[11px] border border-wire text-dim px-2 py-1 rounded hover:border-dim hover:text-ink disabled:opacity-40">
+                {busy === 'external' ? 'Adding…' : '+ Add outside co-owner'}
+              </button>
+            </div>
+            <p className="text-[10px] text-ghost normal-case">
+              Outside co-owners are recorded for the record only — their share never counts toward portfolio value.
+            </p>
+            {extErr && <p className="text-[11px] text-red-500 normal-case">{extErr}</p>}
           </div>
 
           {/* Nature (multi + area split + custom) */}

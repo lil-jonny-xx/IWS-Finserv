@@ -3,7 +3,7 @@ import { use, useEffect, useState, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { Glass } from '@/app/components/PrivacyGlass';
 import EntitySwitcher from '@/app/components/EntitySwitcher';
-import { DYNAMIC_CATEGORY_LABELS } from '@/app/lib/manualCategories';
+import { DYNAMIC_CATEGORY_LABELS, RETIRED_CATEGORY_REDIRECT } from '@/app/lib/manualCategories';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://iwsfinserv.com';
 
@@ -126,7 +126,15 @@ export default function ManualAssetPage({ params }: { params: Promise<{ category
 
   const title = titleFor(category);
 
+  // Retired category reached by a stale link or a typed URL — send it to the page
+  // that owns the asset class now, rather than rendering a second, staler view.
+  const retiredTo = RETIRED_CATEGORY_REDIRECT[category];
   useEffect(() => {
+    if (retiredTo) router.replace(retiredTo);
+  }, [retiredTo, router]);
+
+  useEffect(() => {
+    if (retiredTo) return;
     fetch(`${API_URL}/api/v1/me`, { credentials: 'include' })
       .then(r => { if (r.status === 401) { router.push('/'); return null; } return r.json(); })
       .then((u: User | null) => {
@@ -136,9 +144,10 @@ export default function ManualAssetPage({ params }: { params: Promise<{ category
           .then(r => r.ok ? r.json() : []).then((e: Entity[]) => setEntities(e)).catch(() => {});
       })
       .catch(() => router.push('/'));
-  }, [router]);
+  }, [router, retiredTo]);
 
   useEffect(() => {
+    if (retiredTo) return;
     const controller = new AbortController();
     if (!didInitialLoad.current) setLoading(true);
     setError(null);
