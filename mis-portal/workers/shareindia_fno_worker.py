@@ -8,7 +8,7 @@ we drive a browser via the shared _portal_scraper toolkit. The second FnO
 portal, Orbis (DHR / Dhruv), gets its own worker later on the same skeleton.
 
 Login is user id + password, then an emailed OTP. The OTP mail auto-forwards
-into the central collector inbox (***REMOVED***) and is read with the
+into the central collector inbox (address in .env) and is read with the
 shared Gmail token, exactly like the ICICI PMS worker (in:anywhere — forwarded
 mail often lands in Spam).
 
@@ -101,7 +101,7 @@ CFG = ps.PortalCfg(
 )
 RECON_DIR = CFG.download_dir / "recon"
 
-# OTP retrieval from the central collector inbox (***REMOVED***).
+# OTP retrieval from the central collector inbox (address in .env).
 WORKERS_DIR = Path(__file__).parent
 GMAIL_TOKEN_CENTRAL = str(WORKERS_DIR / os.environ.get(
     "GMAIL_TOKEN_CENTRAL", "gmail_token_central.json"))
@@ -368,8 +368,8 @@ def login(page, cfg: SIConfig) -> None:
             code = fetch_otp(otp_request_ts)
             if not code:
                 ps.shot(page, CFG, f"si_otp_timeout_{cfg.prefix}.png")
-                raise RuntimeError("No OTP mail arrived — check forwarding into iwsgoa04 "
-                                   "and the SHAREINDIA_OTP_FROM filter")
+                raise RuntimeError("No OTP mail arrived — check forwarding into the "
+                                   "collector inbox and the SHAREINDIA_OTP_FROM filter")
             _enter_otp(page, code)
             ps.shot(page, CFG, f"si_otp_entered_{cfg.prefix}.png")
             ps.click(page, [

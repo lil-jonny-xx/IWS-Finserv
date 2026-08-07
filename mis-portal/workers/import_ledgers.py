@@ -14,7 +14,8 @@ Sign convention for external_cashflow.amount_native (investor's perspective):
   deposit into broker = -outflow ; withdrawal to bank / dividend = +inflow.
 
 Auto-detects broker + entity from filename, applying the known Dhan mislabel fix
-(client ***REMOVED*** = HHR, not "Rajani Corp"). Dry-run by default; --commit to write.
+(one Dhan client id is exported under the wrong entity name — the id is read from
+$DHAN_HHR_CLIENT_ID). Dry-run by default; --commit to write.
 """
 import os
 import sys
@@ -32,6 +33,10 @@ from dotenv import load_dotenv
 
 warnings.filterwarnings("ignore")
 load_dotenv("/var/www/mis-portal/.env", override=True)
+
+# Used by detect() to spot the mislabelled Dhan export (see below). Kept out of
+# source so no broker account number is committed.
+_HHR_DHAN_CLIENT_ID = os.getenv("DHAN_HHR_CLIENT_ID", "").strip()
 
 INCOMING = "/var/www/mis-portal/data/incoming/tradebooks_ledgers/Tradebooks and Ledgers"
 
@@ -212,7 +217,10 @@ def detect(path):
            else "HHR" if b.startswith("YourStatement_H53686563") else None)
     if "dhan_ledger" in low:
         broker, kind = "dhan", "ledger"
-        if "***REMOVED***" in b or "rajani" in low:   # mislabel: this Dhan account is HHR
+        # Mislabelled export: these files are named for one entity but the Dhan
+        # client id in the filename belongs to HHR. The id is read from .env rather
+        # than hardcoded so no account number lives in the repo.
+        if (_HHR_DHAN_CLIENT_ID and _HHR_DHAN_CLIENT_ID in b) or "rajani" in low:
             ent = "HHR"
     elif "ledger-report" in low and low.endswith(".xls"):
         broker, kind = "dhan", "ledger"          # Dhan "Ledger Statement" .xls export

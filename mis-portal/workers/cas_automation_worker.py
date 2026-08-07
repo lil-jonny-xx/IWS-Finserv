@@ -2,7 +2,7 @@
 """
 CAS Automation Worker — IWS MIS Portal
 Orchestrates daily CAS fetch for all 6 entities via one central Gmail inbox.
-All entity emails (or their aliases) forward CAMS CAS emails to ***REMOVED***.
+All entity emails (or their aliases) forward CAMS CAS emails to the central collector inbox.
 
 Flow:
   1. Start a Gmail collector thread that polls for new CAS PDFs until 8 AM IST

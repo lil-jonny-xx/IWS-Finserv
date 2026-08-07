@@ -10,7 +10,7 @@ is a login-gated web portal with no investor API, so Playwright (headed via Xvfb
 
 Login is PAN + Password + OTP (2FA). Unlike Nuvama, this portal forces an OTP
 step. The OTP is delivered to the investor's registered mobile/email, and the
-registered email autoforwards to the central collector inbox (***REMOVED***)
+registered email autoforwards to the central collector inbox (address in .env)
 — the SAME inbox the CAS pipeline reads. So after clicking GENERATE OTP we poll
 that inbox (via gmail_worker) for the fresh ICICI OTP mail and read the code,
 exactly as cas_automation_worker waits for CAS PDFs.
@@ -90,7 +90,7 @@ _SCREENSHOT_DIR     = "/home/SAdmin/.cams-screenshots"
 NAV_TIMEOUT    = 60_000
 ACTION_TIMEOUT = 15_000
 
-# OTP retrieval from the central collector inbox (***REMOVED***).
+# OTP retrieval from the central collector inbox (address in .env).
 GMAIL_TOKEN_CENTRAL = str(WORKERS_DIR / os.environ.get(
     "GMAIL_TOKEN_CENTRAL", "gmail_token_central.json"))
 # Best-effort filters; tune against a real OTP mail. Sender substring + a code

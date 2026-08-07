@@ -100,3 +100,6 @@ iws-portal-frontend/tmp/
 
 # Tradebooks and Ledgers
 TRADEBOOKS&LEDGERS
+PLStatements
+# User roster for workers/seed_users.py — real names/emails, never commit
+mis-portal/seed_users.json

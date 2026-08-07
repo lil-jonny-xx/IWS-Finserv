@@ -9,7 +9,7 @@ Alerts failed at 01:01 and 01:30 UTC but succeeded at 04:30 UTC on both 07-07 an
 
 ## Root cause
 
-One shared Gmail OAuth token — `mis-portal/workers/gmail_token_central.json` (account ***REMOVED***) — is used by both:
+One shared Gmail OAuth token — `mis-portal/workers/gmail_token_central.json` (account held in .env) — is used by both:
 
 - **Readers:** `workers/gmail_worker.py` `_get_service()`, used by the CAS collector (`cas_automation_worker.py`), the ICICI PMS OTP reader (`icici_pms_worker.py`), and `manual_cas_retrigger.py`.
 - **Sender:** `workers/alert.py`, used by `cron_wrapper.py` to email cron failures.

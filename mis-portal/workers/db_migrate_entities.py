@@ -3,11 +3,11 @@
 DB Migration — Add new PANs and entities for Harsh and Stuti.
 Run once: python workers/db_migrate_entities.py
 
-New pan_groups: PAN_2 (Harsh), PAN_3 (Stuti)
+New pan_groups: PAN_2, PAN_3
 New entities:
-  - HHR  (***REMOVED***)  → PAN_2
+  - HHR   → PAN_2
   - IWSFC (IWS Fincorp)         → PAN_2
-  - SDR  (***REMOVED***)   → PAN_3
+  - SDR   → PAN_3
 """
 import os
 import sys
@@ -50,12 +50,12 @@ def main():
 
         # --- entities ---
         new_entities = [
-            ("HHR",   "***REMOVED***", pan2_id),
-            ("IWSFC", "IWS Fincorp",         pan2_id),
-            ("SDR",   "***REMOVED***",  pan3_id),
+            ("HHR",   pan2_id),
+            ("IWSFC", pan2_id),
+            ("SDR",   pan3_id),
         ]
 
-        for code, full_name, pg_id in new_entities:
+        for code, pg_id in new_entities:
             cur.execute("""
                 INSERT INTO entity (entity_name, pan_group_id)
                 VALUES (%s, %s)
@@ -64,7 +64,7 @@ def main():
             """, (code, pg_id))
             row = cur.fetchone()
             if row:
-                print(f"Entity added: id={row['id']} code={code} full_name={full_name}")
+                print(f"Entity added: id={row['id']} code={code}")
             else:
                 cur.execute("SELECT id FROM entity WHERE entity_name = %s", (code,))
                 existing = cur.fetchone()

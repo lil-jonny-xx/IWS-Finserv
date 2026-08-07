@@ -10,9 +10,14 @@ import logging
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+
+# This module is imported by workers that may not have loaded .env themselves, and
+# the recipient address is no longer hardcoded, so load it here to be sure.
+load_dotenv("/var/www/mis-portal/.env", override=False)
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +26,11 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
 ]
 TOKEN_FILE = Path(__file__).parent / "gmail_token_central.json"
-ALERT_TO   = os.environ.get("ALERT_EMAIL", "***REMOVED***")
+ALERT_TO   = os.environ.get("ALERT_EMAIL", "").strip()
+if not ALERT_TO:
+    # Loud rather than silent: an unset recipient used to fall back to a hardcoded
+    # address, which meant a misconfigured deploy still looked healthy.
+    logger.error("ALERT_EMAIL is not set — alert emails cannot be delivered.")
 
 
 def _get_service():

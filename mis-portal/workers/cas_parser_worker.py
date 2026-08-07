@@ -129,7 +129,7 @@ def extract_folio_holders(pdf_path: str, password: str) -> dict[str, str]:
 
     CAMS CAS layout (each scheme section):
         Folio No: 12276491 / 69
-        ***REMOVED***
+        <account holder name>
           Nominee 1: …
     The line immediately after "Folio No:" is the account holder name.
     """
