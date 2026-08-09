@@ -5,9 +5,18 @@ Call generate_reports(conn, generated_by_user_id) to create reports.
 """
 import os
 import re
-from datetime import date, datetime
+import sys
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Optional
 from collections import defaultdict, deque
+
+# Project root on sys.path so `workers.` / `equity.` resolve when this file is run
+# DIRECTLY (cron_wrapper spawns `python workers/report_generator.py` as a fresh
+# subprocess, which has neither the wrapper's sys.path nor a package context).
+# Without this the scheduled run dies on ModuleNotFoundError before it starts.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import openpyxl
@@ -153,9 +162,93 @@ def _merge_edp_rows(rows: list, cross_entity: bool = False) -> list:
     return sorted(merged, key=lambda r: -(float(r.get("current_market_value") or 0)))
 
 
+# ---------------------------------------------------------------------------
+# The "Mkt Value 31-Mar" column
+#
+# `holding.market_value_as_on` / `equity_holding.market_value_as_on` is NOT a 31-March
+# anchor despite the column header: every writer sets it to the CURRENT market value
+# (equity/models.py — "same as current_market_value; date stored separately"), so it
+# was identical to the Current Mkt Value column on 100% of rows in both tables. Two
+# columns, one number, one of them lying about which date it belongs to.
+#
+# So the reports derive the real thing here instead, from the same 31-March anchors the
+# FY-growth columns use (security_price_history / nav_history, backfilled by
+# fy_price_backfill). Where no anchor exists — an SME board Yahoo doesn't carry, a
+# holding bought after 31-March, a manual entry with no price series — the cell is left
+# BLANK rather than back-filled with today's value, which is the whole point.
+# ---------------------------------------------------------------------------
+
+def _feed_staleness(conn, as_of: date, entity_id: Optional[int] = None) -> list[str]:
+    """Per-feed 'as of' where it is BEHIND the report date, as ['IBKR 05-Aug (4d)', …].
+
+    Every sheet is stamped "As on <today>", but the feeds behind it do not all reach
+    today: a throttled IBKR Flex pull serves a days-old statement, DBS is a weekly CSV
+    someone has to upload, and a dead token freezes an entity indefinitely. Stamping the
+    report date over all of that is how a 26-day-old position came to read as current.
+    So the sheets now carry the real vintage of anything lagging, and say nothing when
+    every feed is current.
+
+    Reads as_of_date, which is the one column that means "the data is from this date"
+    (updated_at only means "a worker touched the row").
+    """
+    # Measured against the last TRADING day, not the calendar date: a report run on a
+    # Sunday finds every market feed showing Friday, which is current, not stale. Only
+    # a feed that missed the last session is worth a warning.
+    last_session = as_of
+    while last_session.weekday() >= 5:            # 5=Sat, 6=Sun
+        last_session -= timedelta(days=1)
+    scope = " AND entity_id = %(eid)s" if entity_id else ""
+    params = {"as_of": last_session, "eid": entity_id}
+    cur = conn.cursor()
+    out: list[str] = []
+    try:
+        # MIN, not MAX, at every level: this is a warning, so a feed is only as fresh as
+        # its stalest entity. Taking the max let DHR's current IBKR pull hide SDR's,
+        # which a dead Flex token had frozen 26 days earlier — exactly the kind of
+        # masking this note exists to prevent.
+        cur.execute(f"""
+            SELECT label, MIN(d) AS d FROM (
+                SELECT UPPER(broker) AS label, MIN(as_of_date) AS d
+                  FROM foreign_equity_holding WHERE as_of_date IS NOT NULL {scope}
+                 GROUP BY broker
+                UNION ALL
+                SELECT UPPER(broker), MIN(as_of_date)
+                  FROM equity_holding WHERE as_of_date IS NOT NULL {scope}
+                 GROUP BY broker
+                UNION ALL
+                SELECT 'MUTUAL FUNDS', MIN(as_of_date)
+                  FROM holding WHERE as_of_date IS NOT NULL {scope}
+            ) f
+            WHERE d < %(as_of)s
+            GROUP BY label ORDER BY MIN(d), label
+        """, params)
+        for r in cur.fetchall():
+            lag = (as_of - r["d"]).days       # reported against the real report date
+            out.append(f"{r['label']} {r['d'].strftime('%d-%b')} ({lag}d)")
+    except Exception:
+        conn.rollback()
+    finally:
+        cur.close()
+    return out
+
+
+def _staleness_note(conn, as_of: date, entity_id: Optional[int] = None) -> str:
+    """One-line suffix for a sheet title; empty string when every feed is current."""
+    stale = _feed_staleness(conn, as_of, entity_id)
+    return ("   |   DATA BEHIND THIS DATE: " + ", ".join(stale)) if stale else ""
+
+
+def _fy_mar31_for(as_of: Optional[date] = None) -> date:
+    """31-Mar opening the current FY. Defined here (not via _fy_mar31, declared later)
+    so the fetch helpers can default it without a forward reference."""
+    d = as_of or date.today()
+    return date(d.year if d.month >= 4 else d.year - 1, 3, 31)
+
+
 def _fetch_mf_holdings(conn, entity_id: Optional[int] = None):
     """Fetch MF holdings. DB security_type values: MF_DEBT, MF_EQUITY, MF_HYBRID."""
     cur = conn.cursor()
+    mar31 = _fy_mar31_for()
     q = """
         SELECT
             h.entity_id, e.entity_name,
@@ -163,7 +256,12 @@ def _fetch_mf_holdings(conn, entity_id: Optional[int] = None):
             h.invested_amount   AS cost,
             h.current_value,
             h.prev_week_value,
-            h.market_value_as_on,
+            -- Units held now, valued at the FY-opening NAV. 31-Mar is routinely a
+            -- holiday, so take the last NAV in a short window before it.
+            (SELECT nh.nav * h.quantity FROM nav_history nh
+              WHERE nh.security_id = h.security_id
+                AND nh.nav_date <= %(mar31)s AND nh.nav_date >= %(mar31)s - 10
+              ORDER BY nh.nav_date DESC LIMIT 1)   AS market_value_as_on,
             h.pnl_ytd, h.pnl_inception,
             h.returns_ytd_pct, h.returns_inception_pct, h.cagr_inception_pct,
             h.xirr_inception_pct,
@@ -176,9 +274,10 @@ def _fetch_mf_holdings(conn, entity_id: Optional[int] = None):
         ORDER BY sm.asset_class, sm.security_name
     """
     if entity_id:
-        cur.execute(q.format(where="WHERE h.entity_id = %s"), (entity_id,))
+        cur.execute(q.format(where="WHERE h.entity_id = %(eid)s"),
+                    {"mar31": mar31, "eid": entity_id})
     else:
-        cur.execute(q.format(where=""))
+        cur.execute(q.format(where=""), {"mar31": mar31})
     rows = cur.fetchall()
     cur.close()
     return rows
@@ -189,12 +288,20 @@ def _fetch_equity_holdings(conn, entity_id: Optional[int] = None):
     foreign_equity_holding — see _fetch_foreign_equity_holdings — and are reported
     in their own section so totals stay whole without mixing the two."""
     cur = conn.cursor()
+    mar31 = _fy_mar31_for()
     q = """
         SELECT
             eh.entity_id, e.entity_name,
             eh.broker, COALESCE(eh.symbol_override, eh.symbol) AS symbol, eh.isin,
             eh.cost, eh.current_market_value AS current_value,
-            eh.prev_week_value, eh.market_value_as_on,
+            eh.prev_week_value,
+            -- Shares held now, valued at the FY-opening close (see the note above
+            -- _fetch_mf_holdings). security_symbol_map resolves the broker ticker to
+            -- the Yahoo one the anchors are stored under.
+            (SELECT sph.close * eh.quantity
+               FROM security_symbol_map m
+               JOIN security_price_history sph ON sph.yahoo_symbol = m.resolved_symbol
+              WHERE m.symbol = eh.symbol AND sph.price_date = %(mar31)s) AS market_value_as_on,
             eh.pnl_ytd, eh.pnl_inception,
             eh.returns_ytd_pct, eh.returns_inception_pct, eh.cagr_inception_pct,
             eh.first_invested_date,
@@ -206,9 +313,10 @@ def _fetch_equity_holdings(conn, entity_id: Optional[int] = None):
         ORDER BY eh.symbol
     """
     if entity_id:
-        cur.execute(q.format(ent="AND eh.entity_id = %s"), (entity_id,))
+        cur.execute(q.format(ent="AND eh.entity_id = %(eid)s"),
+                    {"mar31": mar31, "eid": entity_id})
     else:
-        cur.execute(q.format(ent=""))
+        cur.execute(q.format(ent=""), {"mar31": mar31})
     rows = cur.fetchall()
     cur.close()
     return rows
@@ -219,12 +327,27 @@ def _fetch_foreign_equity_holdings(conn, entity_id: Optional[int] = None):
     Returns the INR-converted columns used by the by-broker rollup AND the native
     currency columns used by the Foreign Equity Print detail sheet."""
     cur = conn.cursor()
+    mar31 = _fy_mar31_for()
     q = """
         SELECT
             eh.entity_id, e.entity_name,
             eh.broker, COALESCE(eh.symbol_override, eh.symbol) AS symbol, eh.isin, eh.exchange,
             eh.cost, eh.current_market_value AS current_value,
-            eh.prev_week_value, eh.market_value_as_on,
+            eh.prev_week_value,
+            -- Shares held now at the FY-opening close, converted at the FY-opening FX
+            -- rate — the column is in ₹, so a year's currency move belongs in it.
+            -- symbol_override IS the Yahoo ticker for foreign rows (a bare LSE/SIX
+            -- ticker collides with a US fund), so no symbol map is involved.
+            (SELECT sph.close * eh.quantity * COALESCE(fx.rate, 1)
+               FROM security_price_history sph
+               LEFT JOIN LATERAL (
+                    SELECT r.rate FROM fx_rate r
+                     WHERE r.from_currency = COALESCE(eh.currency, 'USD')
+                       AND r.to_currency = 'INR'
+                       AND r.rate_date <= %(mar31)s AND r.rate_date >= %(mar31)s - 10
+                     ORDER BY r.rate_date DESC LIMIT 1) fx ON TRUE
+              WHERE sph.yahoo_symbol = COALESCE(NULLIF(eh.symbol_override,''), eh.symbol)
+                AND sph.price_date = %(mar31)s)      AS market_value_as_on,
             eh.pnl_ytd, eh.pnl_inception,
             eh.returns_ytd_pct, eh.returns_inception_pct, eh.cagr_inception_pct,
             eh.first_invested_date,
@@ -240,9 +363,10 @@ def _fetch_foreign_equity_holdings(conn, entity_id: Optional[int] = None):
         ORDER BY eh.broker, eh.symbol
     """
     if entity_id:
-        cur.execute(q.format(ent="AND eh.entity_id = %s"), (entity_id,))
+        cur.execute(q.format(ent="AND eh.entity_id = %(eid)s"),
+                    {"mar31": mar31, "eid": entity_id})
     else:
-        cur.execute(q.format(ent=""))
+        cur.execute(q.format(ent=""), {"mar31": mar31})
     rows = cur.fetchall()
     cur.close()
     return rows
@@ -255,26 +379,54 @@ def _fetch_commodity_holdings(conn, entity_id: Optional[int] = None):
     dedicated Commodities page — and reported on their own. Foreign rows use their
     INR-converted value columns so the grand totals stay whole."""
     cur = conn.cursor()
-    cols = """
+    mar31 = _fy_mar31_for()
+    # FY-opening value (see the note above _fetch_mf_holdings). Domestic rows resolve
+    # their Yahoo ticker through security_symbol_map; foreign rows carry it directly in
+    # symbol_override — hence the two spellings of the same subquery.
+    mv_dom = """
+            (SELECT sph.close * eh.quantity
+               FROM security_symbol_map m
+               JOIN security_price_history sph ON sph.yahoo_symbol = m.resolved_symbol
+              WHERE m.symbol = eh.symbol AND sph.price_date = %(mar31)s)
+    """
+    mv_fgn = """
+            (SELECT sph.close * eh.quantity * COALESCE(fx.rate, 1)
+               FROM security_price_history sph
+               LEFT JOIN LATERAL (
+                    SELECT r.rate FROM fx_rate r
+                     WHERE r.from_currency = COALESCE(eh.currency, 'USD')
+                       AND r.to_currency = 'INR'
+                       AND r.rate_date <= %(mar31)s AND r.rate_date >= %(mar31)s - 10
+                     ORDER BY r.rate_date DESC LIMIT 1) fx ON TRUE
+              WHERE sph.yahoo_symbol = COALESCE(NULLIF(eh.symbol_override,''), eh.symbol)
+                AND sph.price_date = %(mar31)s)
+    """
+
+    def cols(mv):
+        return f"""
             eh.entity_id, e.entity_name, eh.broker,
             COALESCE(eh.symbol_override, eh.symbol) AS symbol, eh.isin,
             COALESCE(eh.asset_class, 'commodity') AS asset_class,
             eh.cost, eh.current_market_value AS current_value,
-            eh.prev_week_value, eh.market_value_as_on,
+            eh.prev_week_value, {mv} AS market_value_as_on,
             eh.pnl_ytd, eh.pnl_inception,
             eh.returns_ytd_pct, eh.returns_inception_pct, eh.cagr_inception_pct,
             eh.first_invested_date, eh.weekly_change, eh.exposure_pct, eh.remarks
-    """
-    ent = "AND eh.entity_id = %s" if entity_id else ""
+        """
+
+    ent = "AND eh.entity_id = %(eid)s" if entity_id else ""
     q = f"""
-        SELECT {cols} FROM equity_holding eh JOIN entity e ON e.id = eh.entity_id
+        SELECT {cols(mv_dom)} FROM equity_holding eh JOIN entity e ON e.id = eh.entity_id
         WHERE COALESCE(eh.asset_class, 'equity') IN ('gold', 'silver', 'commodity') {ent}
         UNION ALL
-        SELECT {cols} FROM foreign_equity_holding eh JOIN entity e ON e.id = eh.entity_id
+        SELECT {cols(mv_fgn)} FROM foreign_equity_holding eh JOIN entity e ON e.id = eh.entity_id
         WHERE COALESCE(eh.asset_class, 'equity') IN ('gold', 'silver', 'commodity') {ent}
         ORDER BY broker, symbol
     """
-    cur.execute(q, ([entity_id, entity_id] if entity_id else []))
+    params = {"mar31": mar31}
+    if entity_id:
+        params["eid"] = entity_id
+    cur.execute(q, params)
     rows = cur.fetchall()
     cur.close()
     return rows
@@ -1091,7 +1243,8 @@ def build_combined_report(conn, as_of: date, ws=None):
     row = 1
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=NC)
     hdr = ws.cell(row=row, column=1,
-                  value=f"ALL ENTITIES — COMBINED PORTFOLIO MIS   |   As on {as_of.strftime('%d %b %Y')}")
+                  value=f"ALL ENTITIES — COMBINED PORTFOLIO MIS   |   As on {as_of.strftime('%d %b %Y')}"
+                        f"{_staleness_note(conn, as_of)}")
     hdr.font      = HDR_FONT
     hdr.fill      = HDR_FILL
     hdr.alignment = Alignment(horizontal="left", vertical="center")
@@ -1366,7 +1519,8 @@ def build_equity_daily_print(conn, entity_codes: list, as_of: date, ws=None):
     row = 1
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=NC_EDP)
     hdr = ws.cell(row=row, column=1,
-                  value=f"EQUITY DAILY PRINT — RAJANI GROUP   |   As on {as_of.strftime('%d %b %Y')}")
+                  value=f"EQUITY DAILY PRINT — RAJANI GROUP   |   As on {as_of.strftime('%d %b %Y')}"
+                        f"{_staleness_note(conn, as_of)}")
     hdr.font      = HDR_FONT
     hdr.fill      = HDR_FILL
     hdr.alignment = Alignment(horizontal="left", vertical="center")
@@ -1463,7 +1617,8 @@ def build_foreign_equity_print(conn, as_of: date, ws=None):
     row = 1
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=NC_FE)
     hdr = ws.cell(row=row, column=1,
-                  value=f"FOREIGN EQUITY — HOLDINGS DETAIL   |   As on {as_of.strftime('%d %b %Y')}")
+                  value=f"FOREIGN EQUITY — HOLDINGS DETAIL   |   As on {as_of.strftime('%d %b %Y')}"
+                        f"{_staleness_note(conn, as_of)}")
     hdr.font = HDR_FONT; hdr.fill = HDR_FILL
     hdr.alignment = Alignment(horizontal="left", vertical="center")
     ws.row_dimensions[row].height = 22
