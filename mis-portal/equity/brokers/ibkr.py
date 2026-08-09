@@ -452,6 +452,34 @@ def _cash_from_root(root: ET.Element) -> Decimal:
     return total
 
 
+def _asof_from_root(root: ET.Element) -> "date | None":
+    """The date this statement's positions and cash are actually AS OF — its period
+    end (`toDate`), NOT the day we happened to read it.
+
+    This matters because a throttled live fetch silently falls back to the last
+    on-disk statement (see _fetch_statement_xml), which can be several days old. If
+    the caller stamps `date.today()` on that data, a stale position reads as current
+    everywhere downstream — the portal, the reports, and the staleness monitor, for
+    which as_of_date is the ONLY staleness signal.
+
+    A login's statement can carry several FlexStatement elements (one per account,
+    all generated together); they share a period, so max() just picks that period end.
+    Returns None if the statement carries no parseable toDate, leaving the decision
+    to the caller."""
+    ends: list[date] = []
+    for el in root.iter("FlexStatement"):
+        raw = (el.attrib.get("toDate") or "").strip()
+        if not raw:
+            continue
+        try:
+            # Flex writes YYYYMMDD; some query configurations emit YYYY-MM-DD.
+            ends.append(date.fromisoformat(raw) if "-" in raw
+                        else date(int(raw[0:4]), int(raw[4:6]), int(raw[6:8])))
+        except Exception:
+            continue
+    return max(ends) if ends else None
+
+
 def _cash_by_ccy_from_root(root: ET.Element) -> "dict[str, Decimal]":
     """Ending cash per NATIVE currency (AED / USD / GBP …) from the Cash Report.
 
@@ -515,7 +543,7 @@ def _trades_from_root(root: ET.Element) -> list[dict]:
     return [el.attrib for el in root.iter("Trade")]
 
 
-def fetch_all(entity_code: str) -> "tuple[list[dict], Decimal, list[dict], list[str]]":
+def fetch_all(entity_code: str) -> "tuple[list[dict], Decimal, list[dict], list[str], 'date | None']":
     """Open positions, ending cash AND executed trades from ONE Flex statement per login.
 
     The daily QUERY_ID now bundles the Trades section (last 365 days) alongside Open
@@ -523,15 +551,22 @@ def fetch_all(entity_code: str) -> "tuple[list[dict], Decimal, list[dict], list[
     the back-to-back same-query regeneration that escalates 1001 → token-wide throttle →
     1025 lockout. This is the "make one call a day, get everything" path.
 
-    Returns (positions, cash_in_base_currency, trades, failed_prefixes). One login failing
-    does NOT discard the logins that succeeded, but the caller MUST treat a non-empty
-    failed_prefixes as a PARTIAL result: positions/cash/trades for an entity aggregate
-    across all its logins, so persisting a partial run would understate them.
+    Returns (positions, cash_in_base_currency, trades, failed_prefixes, as_of). One login
+    failing does NOT discard the logins that succeeded, but the caller MUST treat a
+    non-empty failed_prefixes as a PARTIAL result: positions/cash/trades for an entity
+    aggregate across all its logins, so persisting a partial run would understate them.
+
+    `as_of` is the OLDEST statement period end across the logins that answered — an
+    entity's figures are an aggregate, so they are only as fresh as their stalest part.
+    None when no login produced a parseable date. Callers must persist this rather than
+    date.today(); a throttled fetch quietly serves a days-old on-disk statement, and
+    stamping it with today's date hides that from every consumer downstream.
     """
     prefixes = _account_prefixes(entity_code)
     positions: list[dict] = []
     trades: list[dict] = []
     cash = Decimal("0")
+    asofs: list[date] = []
     # Each failure carries the login prefix and, when known, the numeric Flex code
     # (auth_code set only for persistent auth/config failures) so the caller can tell a
     # dead token apart from a transient throttle and alert accordingly.
@@ -550,10 +585,19 @@ def fetch_all(entity_code: str) -> "tuple[list[dict], Decimal, list[dict], list[
         positions += _positions_from_root(root)
         cash      += _cash_from_root(root)
         trades    += _trades_from_root(root)
+        a = _asof_from_root(root)
+        if a:
+            asofs.append(a)
+            stale = (date.today() - a).days
+            if stale > 1:
+                logger.warning(f"[{p}] IBKR statement is as of {a} ({stale}d old) — "
+                               f"positions/cash will be recorded with THAT date, not today's")
+    as_of = min(asofs) if asofs else None
     logger.info(f"[{entity_code}] IBKR: {len(positions)} positions + cash {cash} + "
                 f"{len(trades)} trades from {len(prefixes) - len(failures)}/{len(prefixes)} "
-                f"login(s)" + (f"; FAILED: {[f['prefix'] for f in failures]}" if failures else ""))
-    return positions, cash, trades, failures
+                f"login(s)" + (f", as of {as_of}" if as_of else "")
+                + (f"; FAILED: {[f['prefix'] for f in failures]}" if failures else ""))
+    return positions, cash, trades, failures, as_of
 
 
 def fetch_positions_and_cash(entity_code: str) -> "tuple[list[dict], Decimal, list[str]]":

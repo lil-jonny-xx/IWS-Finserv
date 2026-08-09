@@ -77,12 +77,18 @@ def ibkr_entities(emap: dict) -> list[tuple[str, int]]:
     return out
 
 
-def upsert_cash(conn, entity_id: int, entity_code: str, bal: Decimal, commit: bool):
+def upsert_cash(conn, entity_id: int, entity_code: str, bal: Decimal, commit: bool,
+                as_of: "date | None" = None):
     """Upsert IBKR cash (already parsed from the single statement) into broker_cash,
-    converting the account base currency to INR."""
+    converting the account base currency to INR.
+
+    `as_of` is the statement's own period end — pass it so a cached (throttled) fetch
+    is not recorded as today's balance. FX is still taken at today's rate: the balance
+    is carried at the current INR value, only its vintage is being stated honestly."""
     bal = bal or Decimal("0")
     ccy = (ibkr.cash_currency(entity_code) or "INR").upper()
     today = date.today()
+    stmt_date = as_of or today
 
     if ccy == "INR":
         inr_bal, native_bal, rate = bal, None, Decimal("1")
@@ -110,13 +116,14 @@ def upsert_cash(conn, entity_id: int, entity_code: str, bal: Decimal, commit: bo
                 updated_at     = NOW()
             """,
             (entity_id, float(inr_bal), ccy, float(rate),
-             float(native_bal) if native_bal is not None else None, today),
+             float(native_bal) if native_bal is not None else None, stmt_date),
         )
         conn.commit(); cur.close()
     return inr_bal
 
 
-def sync_cash_currencies(conn, entity_id: int, entity_code: str, commit: bool):
+def sync_cash_currencies(conn, entity_id: int, entity_code: str, commit: bool,
+                         as_of: "date | None" = None):
     """Persist the per-currency cash breakdown behind the consolidated broker_cash row.
 
     Reads the native per-currency balances from the SAME statement fetch_all just pulled
@@ -126,6 +133,7 @@ def sync_cash_currencies(conn, entity_id: int, entity_code: str, commit: bool):
     portal. Called only on a FULL successful fetch (see main's partial guard)."""
     breakdown = ibkr.cash_by_currency(entity_code)   # {ccy: native Decimal}
     today = date.today()
+    stmt_date = as_of or today      # the statement's vintage, not the run's — see upsert_cash
     kept: list[str] = []
     for ccy, native in sorted(breakdown.items(), key=lambda kv: -abs(kv[1])):
         ccy = ccy.upper()
@@ -154,7 +162,7 @@ def sync_cash_currencies(conn, entity_id: int, entity_code: str, commit: bool):
                     as_of_date     = EXCLUDED.as_of_date,
                     updated_at     = NOW()
                 """,
-                (entity_id, ccy, float(native), float(inr), float(rate), today),
+                (entity_id, ccy, float(native), float(inr), float(rate), stmt_date),
             )
             conn.commit(); cur.close()
 
@@ -248,11 +256,12 @@ def main():
     for code, eid in targets:
         # ONE statement hit per login → positions, cash AND trades parsed from the same XML.
         try:
-            positions, cash, trades, failures = ibkr.fetch_all(code)
+            positions, cash, trades, failures, stmt_asof = ibkr.fetch_all(code)
         except Exception as e:
             logger.error(f"  [{code}/ibkr] fetch failed — {e}")
             continue
-        logger.info(f"  [{code}/ibkr] {len(positions)} positions, cash {cash}, {len(trades)} trades")
+        logger.info(f"  [{code}/ibkr] {len(positions)} positions, cash {cash}, {len(trades)} trades"
+                    + (f", as of {stmt_asof}" if stmt_asof else ""))
 
         # cash/holdings/trades for this entity aggregate across all its logins, so a partial
         # fetch would overwrite the aggregate with an undercount. Skip the write and keep
@@ -281,8 +290,8 @@ def main():
 
         if not args.commit:
             upsert_trades(conn, eid, code, trades, commit=False)
-            upsert_cash(conn, eid, code, cash, commit=False)   # logs the would-be INR value
-            sync_cash_currencies(conn, eid, code, commit=False)  # logs the per-currency split
+            upsert_cash(conn, eid, code, cash, commit=False, as_of=stmt_asof)   # logs the would-be INR value
+            sync_cash_currencies(conn, eid, code, commit=False, as_of=stmt_asof)  # logs the per-currency split
             continue
 
         # Trades FIRST: refresh the ledger so the holdings sync's ledger_metrics() picks up
@@ -294,7 +303,14 @@ def main():
 
         # Holdings upsert reuses the full sync path (FX, ledger metrics, history snapshot)
         # but is fed the positions we ALREADY pulled — no second fetch, no extra Flex hit.
-        snap = date.today()
+        #
+        # The snapshot date is the STATEMENT's period end, not today. A throttled live
+        # fetch falls back to the last on-disk statement, which can be days old; stamping
+        # it with today's date made stale positions read as current in the portal and in
+        # the reports, and blinded the staleness monitor (as_of_date is its only signal).
+        # It also keeps prune_stale_holdings honest: re-serving the SAME cached statement
+        # now yields the same snap, so nothing is pruned on a run that learned nothing.
+        snap = stmt_asof or date.today()
         try:
             n = sync_entity_broker(conn, eid, code, ibkr, "ibkr", snap,
                                    foreign=True, raw=positions)
@@ -305,8 +321,8 @@ def main():
             logger.error(f"  [{code}/ibkr] HOLDINGS upsert failed — {e}")
         # Cash comes straight from the statement we already parsed — no extra call.
         try:
-            upsert_cash(conn, eid, code, cash, commit=True)
-            sync_cash_currencies(conn, eid, code, commit=True)
+            upsert_cash(conn, eid, code, cash, commit=True, as_of=stmt_asof)
+            sync_cash_currencies(conn, eid, code, commit=True, as_of=stmt_asof)
         except Exception as e:
             logger.error(f"  [{code}/ibkr] CASH upsert failed — {e}")
 
