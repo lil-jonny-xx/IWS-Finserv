@@ -41,11 +41,19 @@ import argparse
 import json
 import logging
 import os
+import sys
 from datetime import date, timedelta
+from pathlib import Path
 
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
+
+# Project root on sys.path so the `workers.` imports below resolve when this file is
+# run DIRECTLY — cron_wrapper spawns `python workers/fy_returns_worker.py` as a fresh
+# subprocess with no package context, so without this the scheduled run dies on
+# ModuleNotFoundError before doing anything.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 load_dotenv("/var/www/mis-portal/.env", override=True)
 
@@ -230,6 +238,139 @@ def fy_return_equity(cur, h, ysym, start_anchor: date, end_anchor: date, ledger_
 
 
 # ---------------------------------------------------------------------------
+# Foreign equity
+# ---------------------------------------------------------------------------
+def foreign_txns(cur, h):
+    """Trade history for one foreign holding, oldest first, in NATIVE currency.
+
+    Two feeds, two tables: Vested is scraped into stock_transaction (source='vested',
+    matched on security_name — the scrape carries no ISIN), IBKR's Flex statement lands
+    in equity_trade_ledger. DBS is a holdings-only CSV with no trade history at all, so
+    it has nothing to replay and correctly reports NULL for every year.
+    """
+    if h["broker"] == "vested":
+        cur.execute("""SELECT st.transaction_date d, st.transaction_type side,
+                              st.quantity q, st.price p, COALESCE(st.currency,'USD') currency
+                       FROM stock_transaction st JOIN security_master sm ON sm.id = st.security_id
+                       WHERE st.entity_id = %s AND st.source = 'vested' AND sm.security_name = %s
+                       ORDER BY st.transaction_date, st.id""", (h["entity_id"], h["symbol"]))
+        return cur.fetchall()
+    if h["broker"] == "ibkr":
+        cur.execute("""SELECT trade_date d, side, quantity q, price_native p, currency
+                       FROM equity_trade_ledger
+                       WHERE entity_id = %s AND broker = 'ibkr' AND symbol = %s
+                         AND price_native IS NOT NULL
+                       ORDER BY trade_date, id""", (h["entity_id"], h["symbol"]))
+        return cur.fetchall()
+    return []
+
+
+def foreign_ledger_start(cur, entity_id, broker) -> date | None:
+    """Earliest trade we hold for this (entity, broker) — the honesty gate.
+
+    Deliberately per (entity, broker) and NOT per symbol, mirroring the Indian path:
+    before this date we cannot know what was held, so any FY starting earlier is
+    unknowable for the whole broker. But a stock genuinely first BOUGHT mid-year on a
+    broker whose history does reach back is perfectly computable — it just takes its
+    fill price as the reference. Gating per symbol would blank every such holding.
+    """
+    if broker == "vested":
+        cur.execute("""SELECT MIN(transaction_date) d FROM stock_transaction
+                       WHERE entity_id = %s AND source = 'vested'""", (entity_id,))
+    elif broker == "ibkr":
+        cur.execute("""SELECT MIN(trade_date) d FROM equity_trade_ledger
+                       WHERE entity_id = %s AND broker = 'ibkr'""", (entity_id,))
+    else:
+        return None
+    r = cur.fetchone()
+    return r["d"] if r else None
+
+
+def fx_at(cur, ccy: str, anchor: date):
+    """currency→INR on or just before an anchor. 31-Mar is often a non-business day
+    and frankfurter only publishes business days, so look back a short window."""
+    if not ccy or ccy.upper() == "INR":
+        return 1.0
+    cur.execute("""SELECT rate FROM fx_rate
+                   WHERE from_currency = %s AND to_currency = 'INR'
+                     AND rate_date <= %s AND rate_date >= %s
+                   ORDER BY rate_date DESC LIMIT 1""",
+                (ccy.upper(), anchor, anchor - timedelta(days=10)))
+    r = cur.fetchone()
+    return f(r["rate"]) if r else None
+
+
+def fy_return_foreign(cur, h, ysym, start_anchor: date, end_anchor: date, ledger_start):
+    """One completed FY for one foreign holding, measured in INR. None when unknowable.
+
+    Unlike the Indian path this is computed on the INR value at each end, not the native
+    one: the family reports in rupees, so a year in which the stock went nowhere but the
+    dollar moved 8% DID earn 8%. Pricing both ends natively and converting at a single
+    rate would silently discard that — and would also make the table footer's Σpnl/Σbase
+    incoherent, since pnl would be INR and base native.
+
+    No split gate here (unlike fy_return_equity): the foreign ledgers are broker-reported
+    executions rather than reconstructed history, so there is no synthetic plug for a
+    split to interact with. Yahoo's back-adjusted closes and the raw fills still disagree
+    across a split, which the reconciliation gate below catches as a quantity mismatch."""
+    ccy = (h.get("currency") or "USD").upper()
+
+    # The broker's history has to cover the start of the year, or the opening
+    # position is a guess. Per broker, not per stock — see foreign_ledger_start.
+    if ledger_start is None or ledger_start > start_anchor:
+        return None
+
+    txns = foreign_txns(cur, h)
+    if not txns:
+        return None
+    # Every leg must be in the holding's own currency, or the lots and the anchor
+    # prices are not the same unit — SDR's DFND is dual-listed and has both GBP and
+    # USD fills. Mixing them invents a return.
+    if any((t.get("currency") or ccy).upper() != ccy for t in txns):
+        return None
+
+    p_end = price_at(cur, ysym, end_anchor)
+    if p_end is None:
+        return None
+    fx_end = fx_at(cur, ccy, end_anchor)
+    if fx_end is None:
+        return None
+
+    # Reconciliation gate — same rule as the YTD worker. For IBKR this is load-bearing:
+    # shares moved between an entity's own accounts have a sell leg with no matching buy,
+    # so a lot pool built from them would be wrong.
+    qty = f(h["quantity"]) or 0.0
+    net = sum(((f(t["q"]) or 0.0) if t["side"] == "BUY" else -(f(t["q"]) or 0.0)) for t in txns)
+    tol = max(1.0, 0.02 * qty) if qty >= 50 else 0.02 * qty + 1e-6
+    if abs(net - qty) > tol:
+        return None
+
+    lots = fifo_lots([t for t in txns if t["d"] <= end_anchor])
+    if not lots:
+        return None   # flat at FY end
+
+    p_start  = price_at(cur, ysym, start_anchor)
+    fx_start = fx_at(cur, ccy, start_anchor)
+    pnl_inr = base_inr = 0.0
+    for d, q, p in lots:
+        if d > start_anchor:
+            # Bought during the year: measure from the fill, at the fill date's own rate,
+            # so the currency move since purchase is part of the year's return.
+            ref, ref_fx = p, fx_at(cur, ccy, d)
+        else:
+            ref, ref_fx = p_start, fx_start
+        if ref is None or ref <= 0 or ref_fx is None:
+            return None
+        ref_inr = q * ref * ref_fx
+        pnl_inr  += q * p_end * fx_end - ref_inr
+        base_inr += ref_inr
+    if base_inr <= 0:
+        return None
+    return {"pnl": round(pnl_inr, 2), "pct": round(pnl_inr / base_inr * 100, 4),
+            "base": round(base_inr, 2)}
+
+
+# ---------------------------------------------------------------------------
 # Mutual funds
 # ---------------------------------------------------------------------------
 def nav_at(cur, security_id, anchor: date):
@@ -367,6 +508,36 @@ def main():
         conn.commit()
     logger.info(f"Equity: {eq_filled}/{eq_rows} holdings got at least one FY figure")
 
+    # ---- foreign equity
+    # Resolved straight off symbol_override (never security_symbol_map, which is keyed
+    # on the bare symbol and collides: META is Meta Infotech on the BSE and Meta
+    # Platforms on NASDAQ) — see the matching note in fy_price_backfill.
+    cur.execute("""SELECT id, entity_id, broker, symbol, currency, quantity,
+                          COALESCE(NULLIF(symbol_override,''), symbol) AS ysym
+                   FROM foreign_equity_holding
+                   ORDER BY broker, entity_id, symbol""")
+    fgn = cur.fetchall()
+    fgn_filled = fgn_rows = 0
+    fgn_ledger_cache: dict[tuple, date | None] = {}
+    for h in fgn:
+        fkey = (h["entity_id"], h["broker"])
+        if fkey not in fgn_ledger_cache:
+            fgn_ledger_cache[fkey] = foreign_ledger_start(cur, *fkey)
+        out = {}
+        for s, e in fys:
+            r = fy_return_foreign(cur, h, h["ysym"], s, e, fgn_ledger_cache[fkey])
+            if r:
+                out[fy_label(s.year)] = r
+        fgn_rows += 1
+        if out:
+            fgn_filled += 1
+        if args.commit:
+            cur.execute("UPDATE foreign_equity_holding SET fy_returns=%s WHERE id=%s",
+                        (json.dumps(out) if out else None, h["id"]))
+    if args.commit:
+        conn.commit()
+    logger.info(f"Foreign: {fgn_filled}/{fgn_rows} holdings got at least one FY figure")
+
     # ---- mutual funds
     cur.execute("""SELECT id, entity_id, security_id, folio_number, quantity FROM holding
                    ORDER BY entity_id, security_id, folio_number""")
@@ -394,9 +565,11 @@ def main():
         lbl = fy_label(s.year)
         cur.execute("SELECT COUNT(*) n FROM equity_holding WHERE fy_returns ? %s", (lbl,))
         en = cur.fetchone()["n"]
+        cur.execute("SELECT COUNT(*) n FROM foreign_equity_holding WHERE fy_returns ? %s", (lbl,))
+        fn = cur.fetchone()["n"]
         cur.execute("SELECT COUNT(*) n FROM holding WHERE fy_returns ? %s", (lbl,))
         mn = cur.fetchone()["n"]
-        logger.info(f"   FY{lbl}: equity={en:>3}/{eq_rows}  mf={mn:>3}/{mf_rows}")
+        logger.info(f"   FY{lbl}: equity={en:>3}/{eq_rows}  foreign={fn:>3}/{fgn_rows}  mf={mn:>3}/{mf_rows}")
 
     if not args.commit:
         logger.info("\nDRY RUN — nothing written. Re-run with --commit.")

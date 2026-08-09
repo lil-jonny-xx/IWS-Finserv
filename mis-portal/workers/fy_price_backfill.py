@@ -29,14 +29,20 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 import urllib.parse
 import urllib.request
 from datetime import date, timedelta
+from pathlib import Path
 
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
+
+# Project root on sys.path so this file is runnable DIRECTLY (cron_wrapper spawns it
+# as a bare subprocess with no package context) — same reason as fy_returns_worker.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 load_dotenv("/var/www/mis-portal/.env", override=True)
 
@@ -256,6 +262,71 @@ def main():
 
     logger.info(f"\nresolved {resolved}/{len(holdings)} symbols; "
                 f"{price_rows} boundary closes {'written' if args.commit else 'found (dry-run)'}")
+
+    # ---- foreign holdings -----------------------------------------------------
+    # Deliberately NOT routed through security_symbol_map: that table is keyed on the
+    # bare symbol, and the two books collide — META is Meta Infotech (INE958L01034) on
+    # the BSE and Meta Platforms (US30303M1027) on NASDAQ. Writing the foreign ticker
+    # there would silently repoint the Indian holding's anchors.
+    #
+    # No .NS/.BO probing either: a plain US listing IS its own Yahoo ticker, and where
+    # it isn't (LSE/SIX UCITS lines whose bare ticker collides with a US fund — SMH,
+    # DFND, …) foreign_equity_holding.symbol_override already carries the exact provider
+    # ticker, because the price worker needs it for the very same reason.
+    cur.execute("""SELECT DISTINCT COALESCE(NULLIF(symbol_override,''), symbol) AS ysym,
+                          MIN(symbol) AS shown
+                   FROM   foreign_equity_holding
+                   WHERE  symbol IS NOT NULL AND symbol <> ''
+                   GROUP  BY 1 ORDER BY 1""")
+    fgn = cur.fetchall()
+    f_resolved, f_rows, f_unresolved, f_partial = 0, 0, [], []
+    for h in fgn:
+        ysym = h["ysym"]
+        try:
+            series, sp = fetch_chart(ysym)
+        except Exception as e:
+            logger.warning(f"  {h['shown']} ({ysym}): fetch failed — {e}")
+            f_unresolved.append(h["shown"])
+            continue
+        if len(series) < MIN_POINTS:
+            f_unresolved.append(f"{h['shown']}({ysym})")
+            continue
+        f_resolved += 1
+        if args.commit and sp:
+            for sd, ratio in sp:
+                cur.execute("""INSERT INTO security_split (yahoo_symbol, split_date, ratio)
+                               VALUES (%s,%s,%s)
+                               ON CONFLICT (yahoo_symbol, split_date) DO UPDATE
+                                 SET ratio = EXCLUDED.ratio""",
+                            (ysym, sd, ratio))
+            splits_seen[ysym] = sp
+        hits = 0
+        for b in bounds:
+            hit = anchor_close(series, b)
+            if not hit:
+                continue
+            _, close = hit
+            if args.commit:
+                cur.execute("""INSERT INTO security_price_history (yahoo_symbol, price_date, close, source)
+                               VALUES (%s,%s,%s,'yahoo')
+                               ON CONFLICT (yahoo_symbol, price_date) DO UPDATE
+                                 SET close = EXCLUDED.close, created_at = NOW()""",
+                            (ysym, b, close))
+            f_rows += 1
+            hits += 1
+        if hits < len(bounds):
+            f_partial.append(f"{h['shown']}({hits}/{len(bounds)})")
+        if args.commit:
+            conn.commit()
+        time.sleep(0.12)
+
+    logger.info(f"foreign: resolved {f_resolved}/{len(fgn)} symbols; "
+                f"{f_rows} boundary closes {'written' if args.commit else 'found (dry-run)'}")
+    if f_partial:
+        logger.info(f"  foreign partial anchors ({len(f_partial)}): {', '.join(f_partial)}")
+    if f_unresolved:
+        logger.info(f"  foreign unresolved ({len(f_unresolved)}) — these report NULL FY growth: "
+                    f"{', '.join(f_unresolved)}")
     in_window = {s: [x for x in sp if x[0] >= bounds[0]] for s, sp in splits_seen.items()}
     in_window = {s: v for s, v in in_window.items() if v}
     if in_window:

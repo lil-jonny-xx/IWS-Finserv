@@ -360,27 +360,69 @@ def compute(cur, h, ca_by_isin=None):
     return out
 
 
+FOREIGN_BROKERS = ("vested", "ibkr")
+
+
+def _foreign_txns(cur, h):
+    """Trade history for one foreign holding — oldest first, as (d, side, q, p) in the
+    holding's NATIVE currency.
+
+    The two feeds land in different tables, which is why this dispatch exists:
+      * Vested is scraped into stock_transaction (source='vested'), matched on
+        security_master.security_name because the scrape carries no ISIN.
+      * IBKR's Flex statement is ingested into equity_trade_ledger, keyed on symbol.
+    Both yield the same column names, so the FIFO/YTD maths below is shared.
+
+    DBS is deliberately absent: it is a holdings-only CSV upload with no trade history
+    anywhere, so there is nothing to reconstruct lots from and its metrics stay NULL."""
+    broker = h["broker"]
+    if broker == "vested":
+        cur.execute("""SELECT st.transaction_date d, st.transaction_type side,
+                              st.quantity q, st.price p
+                       FROM stock_transaction st JOIN security_master sm ON sm.id=st.security_id
+                       WHERE st.entity_id=%s AND st.source='vested' AND sm.security_name=%s
+                       ORDER BY st.transaction_date, st.id""", (h["entity_id"], h["symbol"]))
+        return cur.fetchall()
+    if broker == "ibkr":
+        # `currency` comes back so the caller can reject a symbol whose legs are not all
+        # in the holding's own currency — a dual-listed ETF (SDR's DFND: LSE in GBP and
+        # the US line in USD) would otherwise have GBP and USD prices FIFO'd against each
+        # other and one number divided by the other, which invents a return.
+        cur.execute("""SELECT trade_date d, side, quantity q, price_native p, currency
+                       FROM equity_trade_ledger
+                       WHERE entity_id=%s AND broker='ibkr' AND symbol=%s
+                         AND price_native IS NOT NULL
+                       ORDER BY trade_date, id""", (h["entity_id"], h["symbol"]))
+        return cur.fetchall()
+    return []
+
+
 def compute_foreign(cur, h):
-    """Vested (foreign_equity_holding) YTD, computed FROM EACH HOLDING'S PURCHASE DATE.
+    """Foreign (foreign_equity_holding) YTD, computed FROM EACH HOLDING'S PURCHASE DATE.
 
     Foreign holdings have no FY-start price snapshot (foreign_equity_holding_history only
-    starts mid-June), so — as requested — a Vested position's return is measured from the
-    day it was bought, via its native-USD transaction lots (FIFO). pnl_ytd is stored in INR
+    starts mid-June), so — as requested — a foreign position's return is measured from the
+    day it was bought, via its native-currency lots (FIFO). pnl_ytd is stored in INR
     (native P&L x fx_rate); returns_ytd_pct is the native return. xirr/cagr/first_invested
-    are left to the Vested scraper, which already sets them."""
-    sym = h["symbol"]
+    are left to the broker's own sync path, which already sets them.
+
+    Where the reconstructed net quantity disagrees with the held quantity the holding is
+    SKIPPED rather than published — for IBKR this is load-bearing, because shares that
+    arrived by internal transfer between an entity's own accounts have a sell leg but no
+    matching buy leg in the ledger, and a lot pool built from those would be wrong."""
     qty = f(h["quantity"]) or 0.0
     curp = f(h["current_price_native"])
     fx = f(h["fx_rate"]) or 1.0
     out = {"method": "none"}
     if curp is None:
         return out
-    cur.execute("""SELECT st.transaction_date d, st.transaction_type side, st.quantity q, st.price p
-                   FROM stock_transaction st JOIN security_master sm ON sm.id=st.security_id
-                   WHERE st.entity_id=%s AND st.source='vested' AND sm.security_name=%s
-                   ORDER BY st.transaction_date, st.id""", (h["entity_id"], sym))
-    txns = cur.fetchall()
+    txns = _foreign_txns(cur, h)
     if not txns:
+        return out
+    # Every leg must be priced in the currency the holding is valued in, or the FIFO
+    # cost basis and the current price are not the same unit. See _foreign_txns.
+    hold_ccy = (h.get("currency") or "USD").upper()
+    if any((t.get("currency") or hold_ccy).upper() != hold_ccy for t in txns):
         return out
     net_q = sum((f(t["q"]) if t["side"] == "BUY" else -f(t["q"])) for t in txns)
     if abs(net_q - qty) > max(1.0, 0.02 * qty):       # history doesn't reconstruct → skip
@@ -400,29 +442,35 @@ def compute_foreign(cur, h):
 def run_foreign(cur, commit):
     cur.execute("""SELECT feh.*, e.entity_name FROM foreign_equity_holding feh
                    JOIN entity e ON e.id=feh.entity_id
-                   WHERE feh.broker='vested' ORDER BY e.entity_name, symbol""")
+                   WHERE feh.broker = ANY(%s) ORDER BY feh.broker, e.entity_name, symbol""",
+                (list(FOREIGN_BROKERS),))
     rows = cur.fetchall()
-    n = 0
-    print(f"\n--- Vested (foreign_equity_holding): {len(rows)} holding(s) ---")
+    done = {b: [0, 0] for b in FOREIGN_BROKERS}      # broker → [filled, total]
     for h in rows:
+        tally = done.setdefault(h["broker"], [0, 0])
+        tally[1] += 1
         u = compute_foreign(cur, h)
         sets, vals = [], []
         for col in ("pnl_ytd", "returns_ytd_pct"):
             if u.get(col) is not None:
                 sets.append(f"{col}=%s"); vals.append(u[col])
         if sets:
-            n += 1
+            tally[0] += 1
             if commit:
                 cur.execute(f"UPDATE foreign_equity_holding SET {', '.join(sets)}, updated_at=NOW() WHERE id=%s",
                             vals + [h["id"]])
-    print(f"Vested: filled pnl_ytd/returns_ytd on {n}/{len(rows)} (measured from purchase date)")
+    print(f"\n--- Foreign (foreign_equity_holding): {len(rows)} holding(s) ---")
+    for b, (n, total) in done.items():
+        if total:
+            print(f"{b:8s}: filled pnl_ytd/returns_ytd on {n}/{total} (measured from purchase date)")
 
 
 def main():
     ap = argparse.ArgumentParser(description="Backfill equity_holding metrics from transactions.")
     ap.add_argument("--entity", help="entity_name filter")
     ap.add_argument("--broker", choices=INR_BROKERS, help="broker filter")
-    ap.add_argument("--no-foreign", action="store_true", help="skip Vested foreign holdings")
+    ap.add_argument("--no-foreign", action="store_true",
+                    help="skip foreign holdings (Vested + IBKR)")
     ap.add_argument("--commit", action="store_true", help="write (default: dry-run)")
     args = ap.parse_args()
 
