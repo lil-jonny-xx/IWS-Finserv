@@ -33,7 +33,7 @@ import os
 import sys
 import argparse
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -42,6 +42,12 @@ from dotenv import load_dotenv
 load_dotenv("/var/www/mis-portal/.env", override=True)
 
 NRI_ENTITIES = ["SDR", "DHR", "HHR"]
+
+# How far back a BUY can still be unsettled. equity_holding.quantity means shares
+# SETTLED in demat — equity/intraday_positions.py deliberately keeps today's fills out
+# of it — while the ledger records a fill the instant it happens. T+1 plus a weekend or
+# exchange holiday is the longest that divergence can honestly last.
+SETTLE_WINDOW_DAYS = 4
 
 
 def f(v):
@@ -166,6 +172,31 @@ def plan_for_holding(cur, h, tol, actions=None):
     gap = qty - base_net
     if abs(gap) <= tol:
         return None  # already reconciles — nothing to synthesise
+
+    # A NEGATIVE gap (ledger ahead of demat) is only evidence of shares leaving
+    # off-market once settlement has caught up. Before then it is stock still on its way
+    # IN: the fill is in the ledger, the shares are not yet in `quantity`.
+    #
+    # Plugging that mints a permanent phantom SELL. HDR TVSHLTD, 2026-07-21 11:25 — 20
+    # shares bought that morning, demat still showed 35 against a recorded 55, so a
+    # SELL 20 was synthesised. The shares landed on the 23rd; the plug stayed. Every
+    # metrics run since reconstructed 271 against 291 held, failed the FIFO tolerance,
+    # and left pnl_ytd NULL. It never self-heals, because a holding that already has a
+    # 'reconstructed' row is skipped forever after (see above).
+    #
+    # So when recent BUYs can account for the shortfall, do nothing and let settlement
+    # close the gap on its own. A genuine off-market exit is still there to plug on the
+    # next run; a phantom is not undone by one.
+    if gap < 0:
+        cutoff = datetime.now().date() - timedelta(days=SETTLE_WINDOW_DAYS)
+        recent_buys = net([r for r in real + kept_snap
+                           if r["side"] == "BUY" and r["d"] >= cutoff])
+        # intraday_qty is the broker feed's own account of what is unsettled, and it
+        # covers the case where the ledger has not picked today's fills up yet.
+        unsettled = max(recent_buys, f(h.get("intraday_qty")) or 0.0)
+        if unsettled >= abs(gap) - tol:
+            return (f"unsettled-buys ({unsettled:g} sh since {cutoff} cover the "
+                    f"{abs(gap):g} sh shortfall — waiting for settlement)")
 
     avg_cost = (cost / qty) if (cost > 0 and qty) else f(h["current_price"])
     if not avg_cost or avg_cost <= 0:
