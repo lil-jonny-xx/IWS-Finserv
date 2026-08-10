@@ -47,12 +47,23 @@ load_dotenv("/var/www/mis-portal/.env", override=True)
 from workers.equity_txn_metrics_worker import fifo_lots
 from workers.corporate_actions import load_actions_by_isin
 
-# Brokers WITH a live API feed — their equity_holding rows are owned by
-# equity_sync_worker / equity_price_worker, so a manual position is never
-# materialised for them (it would double-count the fed row; a manual trade there
-# only adjusts that row's FIFO). Everything else is treated as a non-API demat.
-# Keep in sync with main.py API_FED_BROKERS.
-API_FED_BROKERS = {"zerodha", "angel_one", "dhan"}
+# The non-API demats this worker owns, named POSITIVELY rather than as "everything that
+# is not zerodha/angel_one/dhan". Those three are API-fed: equity_sync_worker owns their
+# equity_holding rows, so a manual position is never materialised for them (it would
+# double-count the fed row; a manual trade there only adjusts that row's FIFO).
+#
+# The old negative test was safe only while the source filter was 'manual' alone. Now
+# that a demat's own imported tradebook also forms a position, "not API-fed" would sweep
+# in vested/ibkr/dbs rows — foreign holdings that live in foreign_equity_holding and are
+# none of this worker's business.
+# Keep in sync with main.py NON_API_BROKERS.
+NON_API_BROKERS = {"sbi_securities", "hdfc_securities", "icici_direct",
+                   "kotak", "motilal_oswal", "other"}
+
+# Rows that do NOT form a position: the API snapshot tiers. They can only ever carry an
+# API-fed broker, so this is belt-and-braces — but it keeps the source set here aligned
+# with the metrics worker's, which is the whole point of sharing fifo_lots.
+NON_POSITION_SOURCES = ("snapshot", "snapshot_open")
 
 # Below this, a net position is treated as fully closed (guards float drift on
 # fractional-share arithmetic).
@@ -78,35 +89,50 @@ def get_db():
 
 
 def load_manual_positions(cur, entity_id=None):
-    """Group manual trades at non-API brokers into per-position trade lists.
+    """Group a non-API demat's trades into per-position trade lists.
+
+    Two kinds of row form a position here, and BOTH are needed:
+
+      * hand-entered register rows  — source='manual', broker=<the demat>
+      * that demat's own tradebook  — source=<the demat>, broker NULL
+
+    The second is why this is not simply "source='manual'". import_tradebooks_multi
+    writes the broker name into `source` and leaves `st.broker` NULL (see its INSERT),
+    so once an SBI Securities tradebook is imported its rows carry
+    source='sbi_securities', broker=NULL. Reading only 'manual' meant those rows formed
+    no position at all — so deleting the hand-entered opening balances they replace
+    would have made the whole holding vanish from equity_holding, live price, metrics
+    and every total. Hence COALESCE(broker, source) as the effective demat.
 
     Returns {(entity_id, broker, isin): {"symbol", "exchange", "txns": [...]}}, with
     txns ordered date-then-id and shaped for fifo_lots ({d, side, q, p}).
     """
-    where = ["st.source = 'manual'", "st.broker <> ALL(%s)"]
-    params = [list(API_FED_BROKERS)]
+    where = ["COALESCE(st.broker, st.source) = ANY(%s)",
+             "st.source <> ALL(%s)"]
+    params = [list(NON_API_BROKERS), list(NON_POSITION_SOURCES)]
     if entity_id:
         where.append("st.entity_id = %s")
         params.append(entity_id)
     cur.execute(f"""
-        SELECT st.entity_id, st.broker, sm.isin,
+        SELECT st.entity_id, COALESCE(st.broker, st.source) AS broker, sm.isin,
                sm.security_name AS symbol,
                COALESCE(sm.exchange, 'NSE') AS exchange,
                st.transaction_date AS d, st.transaction_type AS side,
-               st.quantity AS q, st.price AS p
+               st.quantity AS q, st.price AS p, st.source
           FROM stock_transaction st
           JOIN security_master sm ON sm.id = st.security_id
          WHERE {' AND '.join(where)}
            AND sm.isin IS NOT NULL
-         ORDER BY st.entity_id, st.broker, sm.isin, st.transaction_date, st.id
+         ORDER BY st.entity_id, 2, sm.isin, st.transaction_date, st.id
     """, params)
 
     groups = {}
     for r in cur.fetchall():
         key = (r["entity_id"], r["broker"], r["isin"])
-        g = groups.setdefault(key, {"symbol": r["symbol"],
-                                    "exchange": r["exchange"], "txns": []})
+        g = groups.setdefault(key, {"symbol": r["symbol"], "exchange": r["exchange"],
+                                    "txns": [], "sources": set()})
         g["txns"].append({"d": r["d"], "side": r["side"], "q": r["q"], "p": r["p"]})
+        g["sources"].add(r["source"])
     return groups
 
 
@@ -156,6 +182,20 @@ def run(commit=False, entity_id=None):
     upserts = 0
 
     for (eid, broker, isin), g in groups.items():
+        # Both a hand-entered row and the demat's own tradebook claiming the same
+        # position is almost always a double-count: the register entry was an opening
+        # balance typed in BECAUSE no tradebook existed, and the import does not
+        # supersede it (import_tradebooks_multi only supersedes the snapshot tiers).
+        # Warn rather than pick a winner — a manual row at a non-API demat can also be
+        # a genuine correction the tradebook cannot contain (bonus, demerger,
+        # transfer_in), and deleting one of those would destroy real history.
+        if "manual" in g["sources"] and (g["sources"] - {"manual", "reconstructed"}):
+            logger.warning(
+                "  %s / %s / %s: BOTH hand-entered and imported rows (%s) — likely "
+                "double-counted. Delete the superseded opening-balance row(s) and "
+                "re-run, or confirm the manual rows are corrections the tradebook "
+                "does not contain.",
+                eid, broker, g["symbol"], ", ".join(sorted(g["sources"])))
         lots = fifo_lots(g["txns"], ca_by_isin.get(isin))
         net_qty = sum(q for _, q, _ in lots)
         if net_qty <= QTY_EPS:
@@ -176,8 +216,8 @@ def run(commit=False, entity_id=None):
     # brokers only, so an API-fed holding can never be caught by this.
     cur.execute(
         "SELECT id, entity_id, broker, isin, symbol FROM equity_holding "
-        "WHERE broker <> ALL(%s)" + (" AND entity_id = %s" if entity_id else ""),
-        ([list(API_FED_BROKERS)] + ([entity_id] if entity_id else [])),
+        "WHERE broker = ANY(%s)" + (" AND entity_id = %s" if entity_id else ""),
+        ([list(NON_API_BROKERS)] + ([entity_id] if entity_id else [])),
     )
     stale = [r for r in cur.fetchall()
              if (r["entity_id"], r["broker"], r["isin"]) not in open_keys]
