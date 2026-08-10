@@ -103,3 +103,16 @@ TRADEBOOKS&LEDGERS
 PLStatements
 # User roster for workers/seed_users.py — real names/emails, never commit
 mis-portal/seed_users.json
+
+# .env backups — same secrets as .env (JWT_SECRET, DB/Redis passwords, API keys).
+# `mis-portal/.env` was already ignored but its dated backups were not.
+mis-portal/.env.bak*
+mis-portal/.env.*.bak
+
+# Investor statement drops (NSDL/CAMS CAS, broker tradebooks). Contain PAN, address,
+# folio numbers and full holdings — this repo is public. Keep them outside the tree,
+# or in a folder matching one of these patterns.
+HDR-as-of-31st-July/
+*-CAS_*.PDF
+*-CAS_*.pdf
+NSDLe-CAS*
