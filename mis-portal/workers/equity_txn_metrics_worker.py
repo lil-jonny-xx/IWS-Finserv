@@ -71,7 +71,24 @@ def fy_start(d: date) -> date:
 
 
 FY_START = fy_start(TODAY)     # current Indian financial year start
-INR_BROKERS = ("zerodha", "angel_one", "dhan")
+
+# Brokers with a live API feed — equity_sync_worker owns their equity_holding rows.
+API_FED_BROKERS = ("zerodha", "angel_one", "dhan")
+
+# Demats with NO API feed. manual_positions_worker materialises these into
+# equity_holding from manual trades (and from an imported tradebook once one exists)
+# and the price worker quotes them via Kite, but it writes only quantity/cost/
+# first_invested_date — the metric columns below are this worker's to fill.
+# Keep in sync with main.py NON_API_BROKERS.
+NON_API_BROKERS = ("sbi_securities", "hdfc_securities", "icici_direct",
+                   "kotak", "motilal_oswal", "other")
+
+# Every INR demat this worker owns metrics for. A holding on a broker outside this list
+# is not selected at all — no error and no skip line, it simply never appears — so its
+# pnl_ytd / xirr / cagr stay NULL forever. HDR's SBI Securities book (₹11.67Cr, ~35% of
+# all equity by value) sat that way unnoticed until 2026-08-10, which is why the
+# non-API demats are in scope here rather than only the API-fed three.
+INR_BROKERS = API_FED_BROKERS + NON_API_BROKERS
 
 
 def connect():
