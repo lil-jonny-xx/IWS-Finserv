@@ -285,11 +285,41 @@ export default function PropertiesPage() {
   const active   = useMemo(() => sortRows(matched.filter(p => !p.sold && !p.is_old_lease), sort), [matched, sort]);
   const leaseList = useMemo(() => sortRows(matched.filter(p => !p.sold && p.is_old_lease), sort), [matched, sort]);
   const soldList = useMemo(() => sortRows(matched.filter(p => p.sold), sort), [matched, sort]);
+  // Ownership-weighted share of a property that belongs to the current view.
+  // A jointly-held property is filtered in when ANY selected holder owns a slice of
+  // it (see `ownedBy`), so counting its FULL value would credit DHR with the whole
+  // building when DHR owns half. Weight by the selected holders' summed pct instead.
+  // No selection ("All") keeps the full value, matching the unfiltered book.
+  // value_effective already carries the old-lease 50%, so this multiplies cleanly.
+  const externalIds = useMemo(
+    () => new Set(externalHolders.map(h => h.id)), [externalHolders]);
+
+  const shareOf = useCallback((p: Property) => {
+    const owners = p.owners ?? [];
+    // "All": the whole book minus any third-party co-owner's slice. An external
+    // holder exists only so a joint split totals 100% and the co-owner is named —
+    // their share is never ours, so it must not sit in the portfolio total. Every
+    // property currently sums to 100% across non-external holders, so this is a
+    // no-op today and stays correct the moment an outside co-owner is recorded.
+    if (selHolders.size === 0) {
+      if (owners.length === 0) return externalIds.has(p.holder_id) ? 0 : 1;
+      const pct = owners.reduce(
+        (s, o) => s + (externalIds.has(o.holder_id) ? 0 : (Number(o.pct) || 0)), 0);
+      return pct / 100;
+    }
+    if (owners.length === 0) return selHolders.has(p.holder_id) ? 1 : 0;
+    const pct = owners.reduce(
+      (s, o) => s + (selHolders.has(o.holder_id) ? (Number(o.pct) || 0) : 0), 0);
+    return pct / 100;
+  }, [selHolders, externalIds]);
+
   const visibleTotal = useMemo(
-    () => [...active, ...leaseList].reduce((s, p) => s + (p.value_effective ?? 0), 0),
-    [active, leaseList]);
+    () => [...active, ...leaseList].reduce(
+      (s, p) => s + (p.value_effective ?? 0) * shareOf(p), 0),
+    [active, leaseList, shareOf]);
   const soldTotal = useMemo(
-    () => soldList.reduce((s, p) => s + (p.sale_price ?? 0), 0), [soldList]);
+    () => soldList.reduce((s, p) => s + (p.sale_price ?? 0) * shareOf(p), 0),
+    [soldList, shareOf]);
 
   const docTypesFor = useCallback((type: PropertyType) =>
     isBuildingLike(type) ? docTypes : docTypes.filter(d => d.scope === 'land'), [docTypes]);
@@ -665,8 +695,16 @@ export default function PropertiesPage() {
             <Glass className="mb-4">
             <div className="bg-card rounded-lg border border-rule px-5 sm:px-6 py-4 flex flex-wrap gap-8 items-end">
               <div>
-                <p className="text-[11px] uppercase tracking-wide text-ghost">Portfolio Value</p>
+                <p className="text-[11px] uppercase tracking-wide text-ghost">
+                  {selHolders.size > 0 ? 'Portfolio Value (owned share)' : 'Portfolio Value'}
+                </p>
                 <p className="text-2xl font-bold text-ink tabular-nums">{fmtINR(visibleTotal)}</p>
+                {/* Joint holdings are pro-rated, so the figure differs from the sum of the
+                    value column below (which shows each property whole). Say so explicitly
+                    rather than leave two numbers that look like they should agree. */}
+                {selHolders.size > 0 && (
+                  <p className="text-[10px] text-ghost mt-0.5">pro-rated by ownership %</p>
+                )}
               </div>
               <div>
                 <p className="text-[11px] uppercase tracking-wide text-ghost">Properties</p>
