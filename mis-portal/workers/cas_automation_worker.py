@@ -134,18 +134,31 @@ def _shuffled_no_consecutive_pan(configs: list[EntityConfig]) -> list[EntityConf
 def _random_pdf_password() -> str:
     """
     Generate a CAMS-compliant PDF password.
-    CAMS requires: ≥2 digits, allowed special chars are only @ # $ * _
+    CAMS requires: ≥2 digits, ≥1 special char, allowed specials are only @ # $ * _
     token_urlsafe produces '-' which CAMS rejects — build manually instead.
+
+    The special char is MANDATORY as of 2026-08-08: CAMS tightened the rule to
+    "Must contain at least one special character (@, #, $, *,_)." and every
+    alphanumeric-only password silently failed form validation from that date —
+    the request was never submitted, so all 8 entities timed out waiting for a
+    PDF that was never sent. Do not "simplify" this back to alnum-only.
     """
     import string as _string
-    letters = _string.ascii_letters
-    digits  = _string.digits
-    # Guarantee 2 digits; fill remaining 10 from alphanumeric only (no special
-    # chars needed — simpler and universally accepted by CAMS).
-    parts = [secrets.choice(digits), secrets.choice(digits)]
-    parts += [secrets.choice(letters + digits) for _ in range(10)]
+    letters  = _string.ascii_letters
+    digits   = _string.digits
+    specials = "@#$*_"
+    # Guarantee 2 digits + 1 special; fill the remaining 8 from the full allowed set,
+    # then shuffle ONLY those 11 and prepend a letter.
+    #
+    # The leading letter is mandatory: CAMS also enforces "Must start with an alphabet
+    # letter." Shuffling all 12 left the first character to chance, so roughly 40% of
+    # runs failed field validation and never submitted — which is precisely how IWS and
+    # HDR silently produced no PDF on 2026-08-10 while the other six succeeded. Do not
+    # fold the first character back into the shuffle.
+    parts  = [secrets.choice(digits), secrets.choice(digits), secrets.choice(specials)]
+    parts += [secrets.choice(letters + digits + specials) for _ in range(8)]
     random.shuffle(parts)
-    return "".join(parts)
+    return secrets.choice(letters) + "".join(parts)
 
 
 def _pdf_matches_password(pdf_path: str, password: str) -> bool:
@@ -288,12 +301,12 @@ def _acquire_lock() -> bool:
         return True
 
 
-def main():
+def main(only: set[str] | None = None):
     if not _acquire_lock():
         sys.exit(1)
 
     try:
-        _main()
+        _main(only)
     finally:
         try:
             LOCK_FILE.unlink(missing_ok=True)
@@ -301,7 +314,7 @@ def main():
             pass
 
 
-def _main():
+def _main(only: set[str] | None = None):
     logger.info(f"╔══ CAS Automation starting — {date.today()} ══╗")
 
     try:
@@ -309,6 +322,18 @@ def _main():
     except KeyError as e:
         logger.error(f"Missing env var: {e}. Check .env file.")
         sys.exit(1)
+
+    # --entity re-runs a subset without re-triggering the whole book. A CAS request
+    # is a real submission against CAMS, which rate-limits and bot-scores, so after a
+    # partial run the only safe retry is the entities that actually failed.
+    if only:
+        wanted  = {c.casefold() for c in only}
+        configs = [c for c in configs if c.code.casefold() in wanted]
+        missing = wanted - {c.code.casefold() for c in configs}
+        if missing:
+            logger.error(f"Unknown entity name(s): {sorted(missing)}")
+            sys.exit(1)
+        logger.info(f"Scoped run — {len(configs)} entity(ies): {[c.code for c in configs]}")
 
     central_token = str(WORKERS_DIR / os.environ.get(
         "GMAIL_TOKEN_CENTRAL", "gmail_token_central.json"
@@ -400,4 +425,9 @@ def _main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    ap = argparse.ArgumentParser(description="IWS CAS automation (trigger + collect + parse)")
+    ap.add_argument("--entity", action="append", metavar="NAME",
+                    help="entity_name to run (repeatable). Default: every configured entity.")
+    _args = ap.parse_args()
+    main(set(_args.entity) if _args.entity else None)

@@ -124,16 +124,6 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str,
                 _click_radio_by_value_or_text(page, "detailed", "Detailed", "Statement type")
                 page.wait_for_timeout(random.randint(300, 700))
 
-                # --- Folio listing: With zero balance folios (all history) ---
-                # The form default is "Without zero balance folios". We want "With zero balance"
-                # to capture complete history including fully-redeemed folios.
-                try:
-                    _click_radio_by_value_or_text(page, "Y", "With zero balance folios", "Folio listing")
-                    page.wait_for_timeout(random.randint(300, 700))
-                    logger.info("Folio listing: With zero balance folios selected")
-                except RuntimeError:
-                    logger.warning("Could not click 'With zero balance folios' radio — using default")
-
                 # --- Period: Specific Period with full history from date ---
                 # Default is "Current Financial Year" which gives only FY-to-date transactions.
                 # We need the full history to compute CAGR / XIRR from first investment date.
@@ -177,6 +167,46 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str,
                         f"Specific Period selection failed for {pan_number[:4]} — "
                         f"aborting to avoid a truncated Current-FY CAS: {e}"
                     ) from e
+
+                # --- Folio listing: With zero balance folios (all history) ---
+                # MUST run AFTER the period block: selecting "Specific Period" and
+                # filling the dates re-renders the form and silently resets this radio
+                # to its "Without zero balance folios" default. Set here (last
+                # re-rendering step is done) and VERIFY — the click helper only proves
+                # a click landed, not that the option stuck.
+                #
+                # This was wrong from the start and cost the whole closed-folio history:
+                # the radio was clicked before the period block, reverted every run, and
+                # the unconditional "selected" log hid it for 8+ weeks. Every CAS fetched
+                # up to 2026-08-10 therefore excluded fully-redeemed folios, so realised
+                # gains on exited funds were missing portfolio-wide (HDR: 41 transactions
+                # ingested vs 6,299 actually in a with-zero-balance statement).
+                #
+                # Unlike the period block this does NOT abort on failure: a
+                # without-zero-balance CAS is incomplete but not corrupting, and
+                # aborting would forfeit the nightly refresh of open holdings too.
+                for attempt in (1, 2, 3):
+                    try:
+                        _click_radio_by_value_or_text(
+                            page, "N", "With zero balance folios", "Folio listing")
+                    except RuntimeError as e:
+                        logger.error(f"Folio listing radio not found (attempt {attempt}): {e}")
+                        break
+                    page.wait_for_timeout(random.randint(300, 700))
+                    if _is_radio_checked(page, "N", "With zero balance folios"):
+                        logger.info(
+                            f"Folio listing: 'With zero balance folios' selected "
+                            f"and VERIFIED (attempt {attempt})")
+                        break
+                    logger.warning(
+                        f"Folio listing radio did not stick (attempt {attempt}) — retrying")
+                else:
+                    _save_screenshot(page, f"cams_folio_fail_{pan_number[:4]}.png")
+                    logger.error(
+                        "Folio listing is still 'Without zero balance folios' after 3 attempts — "
+                        "this CAS will OMIT fully-redeemed folios and their realised gains. "
+                        "Proceeding anyway so open holdings still refresh."
+                    )
 
                 # --- Email ---
                 _save_screenshot(page, f"cams_prefill_{pan_number[:4]}.png")
@@ -223,6 +253,24 @@ def trigger_cas_request(pan_number: str, email: str, pdf_password: str,
                 if _is_success_page(page):
                     logger.info("CAMS form submitted successfully. CAS will arrive by email.")
                     return True
+
+                # Last-moment re-check: filling email/PAN/password (and the T&C dismiss
+                # above) can re-render the form and revert the folio-listing radio the
+                # same way the period block does. This is the state that actually ships.
+                if not _is_radio_checked(page, "N", "With zero balance folios"):
+                    logger.warning("Folio listing reverted during form fill — re-selecting")
+                    try:
+                        _click_radio_by_value_or_text(
+                            page, "N", "With zero balance folios", "Folio listing")
+                        page.wait_for_timeout(random.randint(200, 500))
+                    except RuntimeError:
+                        pass
+                logger.info(
+                    "Pre-submit folio listing = %s",
+                    "With zero balance folios"
+                    if _is_radio_checked(page, "N", "With zero balance folios")
+                    else "WITHOUT zero balance folios (closed folios will be missing)",
+                )
 
                 # --- Submit ---
                 page.locator('button:has-text("Submit")').first.click(
@@ -549,6 +597,15 @@ def _check_submit_result(page) -> bool:
             "confirm password is required",
             "password should contain atleast",
             "password may contain only",
+            # Added 2026-08-08: CAMS began requiring a special char. This fires as a
+            # LIVE field-validation error the moment the password is filled, so the
+            # Submit never goes through. It matched none of the signals above, so
+            # _check_submit_result fell through to "ambiguous → treat as submitted"
+            # and every entity sat waiting 8.5h for a PDF that was never requested.
+            "must contain at least one special character",
+            # Second CAMS password rule, found 2026-08-10 the same way as the first —
+            # from a postsubmit screenshot, after two entities silently produced no PDF.
+            "must start with an alphabet",
         ]
         matched = [s for s in (email_reset_signals + password_reset_signals)
                    if s in content]
@@ -684,25 +741,90 @@ def _fill_date_field(page, selectors: list, value: str, label: str):
 
 
 def _click_radio_by_value_or_text(page, value: str, text: str, label: str):
-    """Click a mat-radio-button by value attribute, falling back to visible text."""
+    """Select a mat-radio-button by value attribute, falling back to visible text.
+
+    Drives the inner <input type="radio"> rather than the mat-radio-button wrapper.
+    A force-click on the wrapper flips Material's visual state (and even the input's
+    .checked property) WITHOUT firing the change event Angular binds the reactive-form
+    value to — so the control looks selected, verifies as selected, and still submits
+    the old value. That is exactly how "With zero balance folios" appeared correct at
+    pre-submit on 2026-08-10 while CAMS still returned a without-zero-balance CAS
+    (6 open schemes instead of 185). Playwright's check() dispatches real events;
+    the explicit change/input dispatch afterwards is belt-and-braces for Angular.
+    """
     # Try by value attribute first
     by_value = page.locator(f'mat-radio-button[value="{value}"]')
     if by_value.count() > 0:
-        by_value.first.click(timeout=ACTION_TIMEOUT, force=True)
-        logger.debug(f"Clicked radio '{label}' by value={value}")
+        _select_radio_input(by_value.first, f"{label} (value={value})")
+        logger.debug(f"Selected radio '{label}' by value={value}")
         return
 
     # Fall back to text content match
     by_text = page.locator(f'mat-radio-button:has-text("{text}")')
     if by_text.count() > 0:
-        by_text.first.click(timeout=ACTION_TIMEOUT, force=True)
-        logger.debug(f"Clicked radio '{label}' by text='{text}'")
+        _select_radio_input(by_text.first, f"{label} (text='{text}')")
+        logger.debug(f"Selected radio '{label}' by text='{text}'")
         return
 
     raise RuntimeError(
         f"Could not find radio '{label}' (value={value}, text='{text}'). "
         "CAMS may have changed their form."
     )
+
+
+def _select_radio_input(radio_node, label: str):
+    """Select the <input type=radio> inside a mat-radio-button, firing real events.
+
+    check() on the inner input is the only interaction that reliably updates Angular's
+    reactive-form model; the explicit change/input dispatch covers Material builds that
+    listen on one or the other. Falls back to a wrapper force-click only if the inner
+    input cannot be driven, since a stale-model selection still beats no selection.
+    """
+    inp = radio_node.locator('input[type="radio"]')
+    if inp.count() > 0:
+        target = inp.first
+        try:
+            target.check(timeout=ACTION_TIMEOUT, force=True)
+        except Exception:
+            target.click(timeout=ACTION_TIMEOUT, force=True)
+        try:
+            target.evaluate(
+                "el => { el.dispatchEvent(new Event('input',  {bubbles: true}));"
+                "       el.dispatchEvent(new Event('change', {bubbles: true})); }"
+            )
+        except Exception as e:
+            logger.debug(f"Event dispatch on '{label}' failed (may be ok): {e}")
+        return
+    logger.warning(f"No inner input for radio '{label}' — falling back to wrapper click")
+    radio_node.click(timeout=ACTION_TIMEOUT, force=True)
+
+
+def _is_radio_checked(page, value: str, text: str) -> bool:
+    """True if the mat-radio-button identified by value (or visible text) is selected.
+
+    _click_radio_by_value_or_text only asserts that a click *event* landed — never that
+    the control ended up selected. Angular re-renders this form whenever another
+    control changes, silently reverting earlier selections, so every caller that cares
+    must verify with this AFTER the last re-rendering interaction.
+    """
+    for sel in (f'mat-radio-button[value="{value}"]',
+                f'mat-radio-button:has-text("{text}")'):
+        loc = page.locator(sel)
+        if loc.count() == 0:
+            continue
+        node = loc.first
+        try:
+            inp = node.locator('input[type="radio"]')
+            if inp.count() > 0:
+                return inp.first.is_checked()
+        except Exception:
+            pass
+        try:
+            cls = node.get_attribute("class") or ""
+            return "mat-mdc-radio-checked" in cls or "mat-radio-checked" in cls
+        except Exception:
+            continue
+    return False
 
 
 _SCREENSHOT_DIR = "/home/SAdmin/.cams-screenshots"
