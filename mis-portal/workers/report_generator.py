@@ -273,11 +273,15 @@ def _fetch_mf_holdings(conn, entity_id: Optional[int] = None):
         {where}
         ORDER BY sm.asset_class, sm.security_name
     """
+    # quantity > 0 — a with-zero-balance CAS carries every fully-exited scheme as a
+    # zero-quantity holding (332 of them across the book) purely so the closed-folio
+    # history reaches mf_transaction for realised gains. They are not positions and
+    # must not be listed as holdings in the report.
     if entity_id:
-        cur.execute(q.format(where="WHERE h.entity_id = %(eid)s"),
+        cur.execute(q.format(where="WHERE h.quantity > 0 AND h.entity_id = %(eid)s"),
                     {"mar31": mar31, "eid": entity_id})
     else:
-        cur.execute(q.format(where=""), {"mar31": mar31})
+        cur.execute(q.format(where="WHERE h.quantity > 0"), {"mar31": mar31})
     rows = cur.fetchall()
     cur.close()
     return rows
@@ -1088,6 +1092,7 @@ def build_individual_report(conn, entity_id: int, entity_name: str, as_of: date)
         ("overseas_fund",   "Overseas Funds"),
         ("overseas_equity", "Overseas Direct Equity"),
         ("forex",           "Forex / Foreign Cash"),
+        ("nre_bank",        "NRE Accounts"),
         ("unlisted",        "Unlisted Equity"),
         ("startup",         "Startups"),
     ]:
@@ -1409,6 +1414,7 @@ def build_combined_report(conn, as_of: date, ws=None):
             ("overseas_fund",   "Overseas Funds"),
             ("overseas_equity", "Overseas Direct Equity"),
             ("forex",           "Forex / Foreign Cash"),
+            ("nre_bank",        "NRE Accounts"),
             ("unlisted",        "Unlisted Equity"),
             ("startup",         "Startups"),
             ("art",             "Art / Collectibles"),
@@ -1729,7 +1735,7 @@ def build_foreign_equity_print(conn, as_of: date, ws=None):
 #  from its real DB holdings, reproducing the template's gold/yellow look, and emit
 #  a section only when the entity actually holds something in it.
 
-# Template palette (gold header / yellow section-total / salmon benchmark).
+# Template palette (gold header / yellow section-total).
 GOLD_FILL    = PatternFill("solid", fgColor="BF9000")
 YELLOW_FILL  = PatternFill("solid", fgColor="FFD965")
 BAND_FILL    = PatternFill("solid", fgColor="FFF2CC")   # light gold band (alt rows)
@@ -1841,20 +1847,22 @@ def _wk_pct(h, key):
     return (float(v) / 100.0) if v is not None else None
 
 
-# Display order of benchmarks in the Market Statistics block.
+# Display order of the benchmark series.
 _BENCHMARK_ORDER = ["SENSEX", "NIFTY", "GS2032_YTM", "GS2032_PRICE", "GS2030_YTM", "GS2030_PRICE"]
-
-
-def _fy_mar31(as_of: date) -> date:
-    """31-Mar that opens the current financial year (FY starts 1-Apr)."""
-    return date(as_of.year if as_of.month >= 4 else as_of.year - 1, 3, 31)
 
 
 def _fetch_benchmarks(conn, as_of: date) -> list[dict]:
     """
     Current / previous-week / 31-Mar values per benchmark (derived from the
     market_benchmark history) + week% and YTD% change.  Returns [] if the table
-    is absent (migration not yet run) so the report still builds.
+    is absent (migration not yet run) so callers still work.
+
+    NOT used by the workbook any more — the Market Statistics block was dropped from
+    the reports. This is now the data source for GET /api/v1/benchmarks (main.py),
+    which feeds the dashboard market rail and the top ticker. Deleting it along with
+    the report block took the overview page's market data down with it (2026-08-10),
+    so it lives on here as an API helper. Move it to a shared module if this file's
+    report-only role ever needs to be strict.
     """
     cur = conn.cursor()
     try:
@@ -1881,7 +1889,7 @@ def _fetch_benchmarks(conn, as_of: date) -> list[dict]:
         prev_close_of[r["code"]] = float(r["prev_close"]) if r["prev_close"] is not None else None
 
     prev_cut = as_of.fromordinal(as_of.toordinal() - 7)
-    mar31    = _fy_mar31(as_of)
+    mar31    = _fy_mar31_for(as_of)
 
     def _at_or_before(pairs, cutoff):
         val = None
@@ -2370,7 +2378,7 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
 
 
 def build_weekly_sheet(wb, sheet_title: str, label: str, bundle: dict, as_of: date,
-                       benchmarks: list = None, realised: list = None):
+                       realised: list = None):
     """Create a data-driven Weekly Report sheet; sections appear only when non-empty.
     The FY-to-date Realised P&L detail (when any) is appended at the bottom of this
     same sheet — there is no separate Realised P&L sheet."""
@@ -2513,6 +2521,9 @@ def build_weekly_sheet(wb, sheet_title: str, label: str, bundle: dict, as_of: da
             ("Unlisted Equity",        man.get("unlisted", [])),
             ("Startups",               man.get("startup", [])),
             ("Forex / Foreign Cash",   man.get("forex", [])),
+            # NRE balances are in rupees but sit on the non-resident side of the
+            # book, so they report under Alternates with forex, not under Liquidity.
+            ("NRE Accounts",           man.get("nre_bank", [])),
         ]),
         ("E. LIQUIDITY", [
             ("Broker Cash",            cash),
@@ -2545,34 +2556,6 @@ def build_weekly_sheet(wb, sheet_title: str, label: str, bundle: dict, as_of: da
     else:
         ws.cell(row=state["row"], column=1,
                 value="No holdings on record for this entity.").font = LABEL_FONT
-
-    # ---- Market Statistics block (benchmarks) ----
-    if benchmarks:
-        state["row"] += 1
-        banner("MARKET STATISTICS")
-        hdrs = ["Benchmark", "Current", "Prev Week", "31-Mar", "Week %", "YTD %"]
-        r = state["row"]
-        for c, name in enumerate(hdrs, 1):
-            cell = ws.cell(row=r, column=c, value=name)
-            cell.font = GOLD_COL_FONT; cell.fill = GOLD_FILL; cell.border = GOLD_BORDER
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        state["row"] += 1
-        for i, b in enumerate(benchmarks):
-            r = state["row"]
-            num_fmt = PCT_FMT if b["unit"] == "pct" else '#,##0.00'
-            vals = [b["label"], b["current"], b["prev_week"], b["mar31"],
-                    b["week_pct"], b["ytd_pct"]]
-            fill = BAND_FILL if i % 2 else WHITE_FILL
-            for c, val in enumerate(vals, 1):
-                cell = ws.cell(row=r, column=c, value=val)
-                cell.fill = fill; cell.border = GOLD_BORDER; cell.font = BODY_FONT
-                if c == 1:
-                    cell.alignment = Alignment(horizontal="left", indent=1)
-                elif c in (2, 3, 4):
-                    cell.number_format = num_fmt; cell.alignment = Alignment(horizontal="right")
-                else:
-                    cell.number_format = PCT_FMT; cell.alignment = Alignment(horizontal="right")
-            state["row"] += 1
 
     # ---- Realised P&L detail — appended at the bottom of this same sheet ----
     if realised:
@@ -2935,13 +2918,11 @@ def build_master_workbook(conn, as_of: date):
     if build_foreign_equity_print(conn, as_of, ws=fe_ws) is None:
         wb.remove(fe_ws)
 
-    benchmarks = _fetch_benchmarks(conn, as_of)
-
     def _emit(label, ids):
         bundle   = _bundle_for(conn, ids, as_of)
         realised = _fetch_realised_gains(conn, ids, as_of)
         # Realised P&L is appended at the bottom of the Weekly sheet — no separate sheet.
-        build_weekly_sheet(wb, f"{label} Weekly Report", label, bundle, as_of, benchmarks, realised)
+        build_weekly_sheet(wb, f"{label} Weekly Report", label, bundle, as_of, realised)
 
     # Per-group sheets (Weekly + realised-at-bottom)
     for g in _pan_groups(conn):
@@ -2954,7 +2935,7 @@ def build_master_workbook(conn, as_of: date):
     return wb
 
 
-def build_entity_workbook(conn, entity: dict, as_of: date, benchmarks: list):
+def build_entity_workbook(conn, entity: dict, as_of: date):
     """One standalone workbook for a single entity: its Weekly Report (holdings
     across every asset class) with the FY-to-date Realised P&L appended at the
     bottom of that same sheet. Saved per entity as ENTITYNAME-DATE.xlsx."""
@@ -2963,7 +2944,7 @@ def build_entity_workbook(conn, entity: dict, as_of: date, benchmarks: list):
     bundle   = _bundle_for(conn, [entity["id"]], as_of)
     realised = _fetch_realised_gains(conn, [entity["id"]], as_of)
     build_weekly_sheet(wb, "Weekly Report", entity["entity_name"],
-                       bundle, as_of, benchmarks, realised)
+                       bundle, as_of, realised)
     return wb
 
 
@@ -3005,12 +2986,11 @@ def generate_reports(conn, generated_by_user_id: Optional[int] = None) -> list[d
     _register("master", None, "MIS Report — All Entities", m_name, m_path)
 
     # 2) One standalone workbook per entity (ENTITYNAME-DATE.xlsx)
-    benchmarks = _fetch_benchmarks(conn, as_of)
     for e in _fetch_entities(conn):
         ename = e["entity_name"]
         fname = f"{_safe_filename(ename)}-{as_of.strftime('%Y-%m-%d')}.xlsx"
         fpath = os.path.join(folder, fname)
-        build_entity_workbook(conn, e, as_of, benchmarks).save(fpath)
+        build_entity_workbook(conn, e, as_of).save(fpath)
         _register("individual", e["id"], ename, fname, fpath)
 
     # 3) Register workbook — properties + art/collectibles, all entities. These are

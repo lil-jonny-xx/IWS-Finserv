@@ -897,10 +897,16 @@ def get_holdings(
         # ?entity_id=N (repeatable) → that entity or subset; no param → all entities.
         eids = _resolve_entities(cursor, payload, entity_id)
 
-        where  = ""
+        # Fully-exited schemes are carried in `holding` at quantity 0 because a
+        # with-zero-balance CAS reports every folio the investor ever held (HDR alone
+        # has 187). They exist only so the closed-folio transaction history lands in
+        # mf_transaction, which is what realised gains are computed from — they are
+        # NOT positions and must never appear in a holdings list. Realised gains are
+        # unaffected: _fetch_realised_gains reads mf_transaction, never `holding`.
+        where  = "WHERE h.quantity > 0"
         params: list = []
         if eids:
-            where = "WHERE h.entity_id = ANY(%s)"
+            where += " AND h.entity_id = ANY(%s)"
             params.append(eids)
 
         cursor.execute(f"""
@@ -1038,8 +1044,13 @@ def get_combined_holdings(
         cursor    = conn.cursor()
         eids      = _resolve_entities(cursor, payload, entity_id)
 
-        hold_where = "WHERE h.entity_id = ANY(%s)" if eids else ""
-        hold_params: list = [eids] if eids else []
+        # quantity > 0: exclude fully-exited schemes carried at zero by the
+        # with-zero-balance CAS (see get_holdings for the full rationale).
+        hold_where = "WHERE h.quantity > 0"
+        hold_params: list = []
+        if eids:
+            hold_where += " AND h.entity_id = ANY(%s)"
+            hold_params.append(eids)
         cursor.execute(f"""
             SELECT
                 h.id, h.entity_id, h.security_id, h.folio_number,
@@ -2843,6 +2854,10 @@ MANUAL_ASSET_CLASS = {
     "overseas_fund":   "ALTERNATES",
     "overseas_equity": "ALTERNATES",
     "forex":           "ALTERNATES",
+    # NRE accounts are rupee-denominated but belong to the non-resident/foreign
+    # side of the book, so they sit with forex rather than in the CASH bucket
+    # alongside ordinary Indian bank balances.
+    "nre_bank":        "ALTERNATES",
     "gold_etf":        "GOLD_SILVER",
     "unlisted":        "ALTERNATES",
     "startup":         "ALTERNATES",
@@ -3189,7 +3204,10 @@ def get_overview(
         # Overview available to individual-entity logins, scoped to just themselves.
         eid = _resolve_entity(cursor, payload, None)
 
-        mf_where  = "WHERE h.entity_id = %s"  if eid is not None else ""
+        # quantity > 0: closed schemes carried at zero by the with-zero-balance CAS
+        # contribute nothing here (weight 0, CAGR NULL) but must not be counted as
+        # positions. See get_holdings for the full rationale.
+        mf_where  = "WHERE h.quantity > 0" + (" AND h.entity_id = %s" if eid is not None else "")
         mf_params = [eid] if eid is not None else []
         cursor.execute(f"""
             SELECT
@@ -3511,7 +3529,7 @@ def get_transactions(
 VALID_CATEGORIES = {
     "liquid_fund", "debt_fund", "arbitrage_fund", "ppf",
     "pms", "direct_equity", "aif",
-    "overseas_fund", "overseas_equity", "forex", "gold_etf",
+    "overseas_fund", "overseas_equity", "forex", "nre_bank", "gold_etf",
     "unlisted", "startup", "art", "collectibles",
     "funds_transit", "broker_balance", "bank",
     "fno",
@@ -5889,7 +5907,7 @@ def get_nav_coverage(
             # this tab has anything to show.
             "/fno":            sorted(set(ids("SELECT DISTINCT entity_id FROM fno_position"))
                                       | set(manual(["fno"]))),
-            "/bank-accounts":  manual(["bank", "forex"]),
+            "/bank-accounts":  manual(["bank", "forex", "nre_bank"]),
             "/pms":            ids("SELECT DISTINCT entity_id FROM pms_holding"),
             "/gold-silver":    ids(f"""SELECT entity_id FROM equity_holding WHERE {commodity}
                                        UNION SELECT entity_id FROM foreign_equity_holding WHERE {commodity}"""),
