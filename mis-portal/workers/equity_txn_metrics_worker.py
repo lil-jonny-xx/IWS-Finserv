@@ -50,7 +50,7 @@ Dry-run by default; pass --commit to write. --entity / --broker to scope.
 import os
 import sys
 import argparse
-from datetime import date
+from datetime import date, timedelta
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -119,7 +119,7 @@ def ann_guard(value_pct, days):
     return round(value_pct, 4)
 
 
-def fy_start_price(cur, entity_id, broker, isin):
+def fy_start_price(cur, entity_id, broker, isin, symbol=None):
     """(market_value, quantity) at FY start from history; (0,0) if not held then.
 
     Nearest snapshot ON OR BEFORE 1-Apr (not exact-date): a single missed snapshot
@@ -130,9 +130,75 @@ def fy_start_price(cur, entity_id, broker, isin):
                    ORDER BY snapshot_date DESC, market_value DESC LIMIT 1""",
                 (entity_id, broker, isin, FY_START))
     row = cur.fetchone()
-    if not row or not row["quantity"]:
+    if row and row["quantity"]:
+        return f(row["market_value"]) or 0.0, f(row["quantity"]) or 0.0
+    return _derived_fy_anchor(cur, entity_id, broker, isin, symbol)
+
+
+def _derived_fy_anchor(cur, entity_id, broker, isin, symbol):
+    """Fallback anchor for a position held at FY start that has NO snapshot.
+
+    Our own snapshots only began 2026-04-01 and never covered every broker — Dhan's
+    first is 2026-06-08, ten weeks into FY26-27 — so a lot bought before 1-Apr on
+    those brokers had no reference price and pnl_ytd was left NULL rather than
+    mislabelling the whole inception gain as YTD. That blanked 38 holdings (~₹1.59Cr).
+
+    Both halves are derived, not invented: quantity by replaying the same trade
+    ledger the lots come from up to FY start, and price from the 31-Mar close
+    already stored in security_price_history by fy_price_backfill. Deliberately
+    NOT written back into equity_holding_history — that table has no provenance
+    column, and snapshot_xirr_worker and staleness_monitor both read it, so a
+    fabricated row would be indistinguishable from a real EOD snapshot and would
+    silently feed those two. Deriving on read keeps the effect to this metric.
+
+    Returns (0.0, 0.0) when the position was not held at FY start (nothing to
+    anchor — every lot is in-year and priced from its own buy) or when no 31-Mar
+    close is on file.
+    """
+    cur.execute("""SELECT st.transaction_date d, st.transaction_type side, st.quantity q
+                   FROM stock_transaction st JOIN security_master sm ON sm.id=st.security_id
+                   WHERE st.entity_id=%s AND sm.isin=%s
+                     AND ( st.source=%s
+                        OR (st.source IN ('manual','reconstructed') AND st.broker=%s)
+                        OR (st.source IN ('snapshot','snapshot_open') AND st.broker=%s) )
+                     AND st.transaction_date < %s""",
+                (entity_id, isin, broker, broker, broker, FY_START))
+    qty = 0.0
+    for r in cur.fetchall():
+        qty += (f(r["q"]) or 0.0) * (1 if r["side"] == "BUY" else -1)
+    if qty <= 0:
         return 0.0, 0.0
-    return f(row["market_value"]) or 0.0, f(row["quantity"]) or 0.0
+
+    close = _close_31mar(cur, symbol)
+    if close is None:
+        return 0.0, 0.0
+    return qty * close, qty
+
+
+def _close_31mar(cur, symbol):
+    """31-Mar close for a broker symbol, via the resolutions fy_price_backfill cached.
+
+    Broker series suffixes are not exchange tickers (Angel One's GOLDBEES-EQ is
+    GOLDBEES on the NSE), so fall back to stripping the suffix and probing .NS/.BO
+    against what is already stored — no network call.
+    """
+    if not symbol:
+        return None
+    cands = []
+    cur.execute("SELECT resolved_symbol FROM security_symbol_map WHERE symbol=%s", (symbol,))
+    row = cur.fetchone()
+    if row and row["resolved_symbol"]:
+        cands.append(row["resolved_symbol"])
+    base = symbol.split("-")[0]
+    cands += [f"{base}.NS", f"{base}.BO"]
+    for s in cands:
+        cur.execute("""SELECT close FROM security_price_history
+                       WHERE yahoo_symbol=%s AND price_date=%s""",
+                    (s, FY_START - timedelta(days=1)))
+        r = cur.fetchone()
+        if r:
+            return f(r["close"])
+    return None
 
 
 def fifo_lots(txns, actions=None):
@@ -348,7 +414,7 @@ def compute(cur, h, ca_by_isin=None):
 
     # FY-to-date P&L — price-based per held lot (bounded, churn-free)
     if cur_price is not None:
-        mv0, qty0 = fy_start_price(cur, eid, broker, isin)
+        mv0, qty0 = fy_start_price(cur, eid, broker, isin, h.get("symbol"))
         p_fy = (mv0 / qty0) if qty0 else None
         if lots:
             pnl = base = 0.0
