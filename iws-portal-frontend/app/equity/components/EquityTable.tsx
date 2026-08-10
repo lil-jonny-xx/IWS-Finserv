@@ -33,6 +33,9 @@ export interface EquityHoldingRow {
   as_of_date?: string;
   exposure_pct?: number;
   weekly_change?: number;
+  // Derived client-side (see withWeeklyPct) — the leading Wkly Chg column shows the
+  // percentage move, while the one under P&L keeps the rupee figure.
+  weekly_change_pct?: number;
   pnl_ytd?: number;
   pnl_inception?: number;
   pnl_weekly_change?: number;
@@ -176,6 +179,14 @@ const BROKER_LABELS: Record<string, string> = {
   vested:    'Vested',
   dbs:       'DBS Wealth',
   combined:  'Combined',
+  // Non-API demats — positions come from manual trades via manual_positions_worker
+  // and are live-priced through Kite. Keep in sync with main.py NON_API_BROKERS.
+  sbi_securities:  'SBI Securities',
+  hdfc_securities: 'HDFC Securities',
+  icici_direct:    'ICICI Direct',
+  kotak:           'Kotak Securities',
+  motilal_oswal:   'Motilal Oswal',
+  other:           'Off-market',
 };
 
 const BROKER_COLORS: Record<string, string> = {
@@ -185,6 +196,12 @@ const BROKER_COLORS: Record<string, string> = {
   ibkr:      '#d2122e',
   vested:    '#7c3aed',
   dbs:       '#b8860b',
+  sbi_securities:  '#5b21b6',
+  hdfc_securities: '#0369a1',
+  icici_direct:    '#c2410c',
+  kotak:           '#be123c',
+  motilal_oswal:   '#15803d',
+  other:           '#6b7280',
 };
 
 // Native-currency symbols for international holdings (display only — all totals
@@ -242,6 +259,19 @@ function weightedAvgBy(
     sumW  += w;
   }
   return sumW > 0 ? sumWV / sumW : null;
+}
+
+// Weekly move as a share of the prior week's value. The rupee figure was being
+// shown twice (once beside Prev Week, once under P&L), so the leading column now
+// carries the percentage and the P&L one keeps the money. Derived here rather
+// than served by the API — both inputs are already on the row.
+function withWeeklyPct(rows: EquityHoldingRow[]): EquityHoldingRow[] {
+  return rows.map(h => ({
+    ...h,
+    weekly_change_pct: h.weekly_change != null && h.prev_week_value
+      ? (h.weekly_change / h.prev_week_value) * 100
+      : undefined,
+  }));
 }
 
 // ── sort ──────────────────────────────────────────────────────────────────────
@@ -482,15 +512,15 @@ function TableHead({
       <tr>
         <th scope="col" rowSpan={2} className={`${base} text-right pl-5 sm:pl-6 w-8`}>#</th>
         <Th col="symbol"              label="Stock"     right={false} rowSpan={2} className="sticky left-0 z-20 bg-card" />
+        <Th col="first_invested_date" label="Bought on" right={false} rowSpan={2} />
         {showEntityCol && <Th col="entity_name" label="Entity"  right={false} rowSpan={2} />}
         <Th col="exchange"            label="Exch"      right={false} rowSpan={2} />
         <Th col="quantity"            label="Qty"                     rowSpan={2} />
         <Th col="avg_cost"            label="Avg Cost"                rowSpan={2} />
         <Th col="cost"                label="Cost"                    rowSpan={2} />
-        <Th col="first_invested_date" label="Since"                   rowSpan={2} />
         <Th col="current_market_value" label="Cur Value"              rowSpan={2} />
         <Th col="prev_week_value"     label="Prev Week"               rowSpan={2} />
-        <Th col="weekly_change"       label="Wkly Chg"                rowSpan={2} />
+        <Th col="weekly_change_pct"   label="Wkly Chg %"              rowSpan={2} />
         <Th col="exposure_pct"        label="Exp %"                   rowSpan={2} />
         <StaticTh label="P&L" colSpan={3} borderL />
         <StaticTh label="Returns" colSpan={3} borderL />
@@ -572,7 +602,9 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
       });
     }
 
-    return rows;
+    // Step 4: derive the weekly % (after merging, so a combined row's % is taken
+    // from its summed change over its summed prior-week value).
+    return withWeeklyPct(rows);
   }, [holdings, search, filterBroker, filterSector]);
 
   // Empty state — placed AFTER all hooks (useState×6 + useMemo) so the hook
@@ -613,6 +645,7 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
   // percentage columns value-weighted, exposure summed (→ ~100% of the view).
   const totalQty     = view.reduce((s, h) => s + h.quantity, 0);
   const totalPrevWk  = view.reduce((s, h) => s + (h.prev_week_value ?? 0), 0);
+  const totalWeeklyPct = totalPrevWk ? (totalWeekly / totalPrevWk) * 100 : null;
   const totalExp     = view.reduce((s, h) => s + (h.exposure_pct ?? 0), 0);
   const hasExp       = view.some(h => h.exposure_pct != null);
   const avgRetYtd    = weightedAvgBy(view, 'returns_ytd_pct');
@@ -639,7 +672,7 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
   // not the filtered view, so the columns don't appear/disappear as you filter.
   const fyLabels = useMemo(() => fyLabelsOf(holdings), [holdings]);
 
-  // col count: # + symbol + [entity] + exch + qty + avg_cost + cost + since + mkt_val + prev_wk + wkly_chg + exp% + pnl×3 + ret×3 + remarks
+  // col count: # + symbol + bought_on + [entity] + exch + qty + avg_cost + cost + mkt_val + prev_wk + wkly_chg% + exp% + pnl×3 + ret×3 + remarks
   //          = 2 + [entity] + 16, plus one per completed FY
   const colCount = 2 + (showEntityCol ? 1 : 0) + 16 + fyLabels.length;
 
@@ -798,6 +831,10 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
                           </div>
                           {h.isin && <p className="text-[10px] text-ghost font-mono mt-0.5">{h.isin}</p>}
                         </td>
+                        <td className="px-3 py-3 tabular-nums text-xs align-top whitespace-nowrap">
+                          <span className="text-ink">{fmtDate(h.first_invested_date)}</span>
+                          {h.first_invested_date && <p className="text-[10px] text-ghost mt-0.5">{fmtDuration(h.first_invested_date)}</p>}
+                        </td>
                         {showEntityCol && (
                           <td className="px-3 py-3 text-xs font-medium text-dim whitespace-nowrap align-top">{h.entity_name ?? '—'}</td>
                         )}
@@ -821,10 +858,6 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
                           )}
                         </td>
                         <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{fmtINR(h.cost)}</td>
-                        <td className="px-3 py-3 text-right tabular-nums text-xs align-top whitespace-nowrap">
-                          <span className="text-ink">{fmtDate(h.first_invested_date)}</span>
-                          {h.first_invested_date && <p className="text-[10px] text-ghost mt-0.5">{fmtDuration(h.first_invested_date)}</p>}
-                        </td>
                         <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">
                           {fmtINR(h.current_market_value)}
                           {h.currency && h.currency !== 'INR' && h.current_market_value_native != null && (
@@ -837,7 +870,7 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
                           )}
                         </td>
                         <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">{fmtINR(h.prev_week_value)}</td>
-                        <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top"><ColorNum n={h.weekly_change} fmt={fmtINR} /></td>
+                        <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top"><ColorNum n={h.weekly_change_pct} fmt={fmtPct} /></td>
                         <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">
                           {h.exposure_pct != null ? h.exposure_pct.toFixed(2) + '%' : '—'}
                         </td>
@@ -871,11 +904,11 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
                 percentage columns value-weighted, exposure summed. */}
             {rows.length > 0 && (
               <tr className="border-t-2 border-rule bg-page">
-                {/* Label spans exactly the non-numeric lead-in: #, Stock, Exch —
-                    three columns, plus Entity when shown. It previously claimed
-                    4 + entity, one too many, which pushed every total one column
-                    right of its heading. */}
-                <td colSpan={3 + (showEntityCol ? 1 : 0)} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim">
+                {/* Label spans exactly the non-numeric lead-in: #, Stock, Bought on,
+                    Exch — four columns, plus Entity when shown. Count these against
+                    the header whenever a column moves; a stale span shifts every
+                    total sideways without any visible error. */}
+                <td colSpan={4 + (showEntityCol ? 1 : 0)} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim">
                   Total ({rows.length} holdings)
                 </td>
                 {/* Qty */}
@@ -888,8 +921,6 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">
                   {fmtINR(rows.reduce((s, h) => s + h.cost, 0))}
                 </td>
-                {/* Since */}
-                <td />
                 {/* Cur Value */}
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">
                   {fmtINR(rows.reduce((s, h) => s + (h.current_market_value ?? 0), 0))}
@@ -898,9 +929,10 @@ export default function EquityTable({ holdings, totals, cashByBroker = [], showE
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-dim whitespace-nowrap">
                   {totalPrevWk ? fmtINR(totalPrevWk) : '—'}
                 </td>
-                {/* Wkly Chg */}
+                {/* Wkly Chg % — the whole view's move over its own prior-week base,
+                    not an average of the per-row percentages. */}
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap">
-                  <ColorNum n={totalWeekly || null} fmt={fmtINR} />
+                  <ColorNum n={totalWeeklyPct} fmt={fmtPct} />
                 </td>
                 {/* Exp % */}
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-dim whitespace-nowrap">

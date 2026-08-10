@@ -311,7 +311,7 @@ export default function MutualFundsPage() {
               <table className="w-full text-xs" style={{ minWidth: '800px' }}>
                 <thead>
                   <tr>
-                    {['Date', 'Fund', ...(showEntityCol ? ['Entity'] : []), 'Folio', 'Type', 'Amount', 'Units', 'NAV', 'Balance'].map(h => (
+                    {['Date', 'Fund', ...(showEntityCol ? ['Entity'] : []), 'Type', 'Amount', 'Units', 'NAV', 'Balance'].map(h => (
                       <th key={h} className="px-3 py-2.5 text-left font-medium text-ghost bg-card border-b border-rule whitespace-nowrap sticky top-0 z-10 first:pl-5 last:pr-5">
                         {h}
                       </th>
@@ -320,18 +320,17 @@ export default function MutualFundsPage() {
                 </thead>
                 <tbody>
                   {txnLoading ? (
-                    <tr><td colSpan={showEntityCol ? 9 : 8} className="px-5 py-6 text-center text-ghost">Loading…</td></tr>
+                    <tr><td colSpan={showEntityCol ? 8 : 7} className="px-5 py-6 text-center text-ghost">Loading…</td></tr>
                   ) : txnData.transactions.length === 0 ? (
-                    <tr><td colSpan={showEntityCol ? 9 : 8} className="px-5 py-6 text-center text-ghost">No transactions found.</td></tr>
+                    <tr><td colSpan={showEntityCol ? 8 : 7} className="px-5 py-6 text-center text-ghost">No transactions found.</td></tr>
                   ) : txnData.transactions.map(t => {
                     const typeKey = t.type ?? '';
                     const color = TXN_TYPE_COLOR[typeKey] ?? 'var(--dim)';
                     return (
                       <tr key={t.id} className="border-t border-rule hover:bg-page transition-colors">
                         <td className="px-3 pl-5 py-3 whitespace-nowrap text-dim">{fmtDate(t.date)}</td>
-                        <td className="px-3 py-3 text-ink max-w-[220px] truncate" title={t.security_name}>{t.security_name}</td>
+                        <td className="px-3 py-3 text-ink max-w-[360px] truncate" title={t.security_name}>{t.security_name}</td>
                         {showEntityCol && <td className="px-3 py-3 text-dim whitespace-nowrap">{t.entity_name ?? '—'}</td>}
-                        <td className="px-3 py-3 font-mono text-dim whitespace-nowrap">{t.folio_number}</td>
                         <td className="px-3 py-3 whitespace-nowrap font-medium" style={{ color }}>{t.type ? fmtTxnType(t.type) : '—'}</td>
                         <td className="px-3 py-3 text-right tabular-nums text-ink whitespace-nowrap">{fmtINR(t.amount)}</td>
                         <td className="px-3 py-3 text-right tabular-nums text-dim whitespace-nowrap">{t.units != null ? t.units.toFixed(3) : '—'}</td>

@@ -134,6 +134,7 @@ PMS_EXPECTED = {
 MANUAL_EXPECTED = {
     "bank":            21,
     "forex":           21,
+    "nre_bank":        21,
     "overseas_equity": 21,
 }
 # Named in the mail so the reply-to-action is obvious, capped so one neglected

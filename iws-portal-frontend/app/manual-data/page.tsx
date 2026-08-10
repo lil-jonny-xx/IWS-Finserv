@@ -55,6 +55,10 @@ const CATEGORIES: { value: string; label: string; group: string }[] = [
   { value: 'overseas_fund',  label: 'Overseas Fund',              group: 'Alternates' },
   { value: 'overseas_equity',label: 'Foreign Equity',             group: 'Alternates' },
   { value: 'forex',          label: 'Forex / Foreign Cash',       group: 'Alternates' },
+  // NRE accounts hold rupees, so they are NOT in FOREIGN_CATS (no native amount /
+  // FX rate to capture) — but they belong to the non-resident side of the book and
+  // report alongside Forex rather than with ordinary Indian bank balances.
+  { value: 'nre_bank',       label: 'Bank Balance — NRE (₹)',     group: 'Alternates' },
   { value: 'gold_etf',       label: 'Gold / Silver ETF',          group: 'Alternates' },
   { value: 'unlisted',       label: 'Unlisted Equity',            group: 'Alternates' },
   { value: 'startup',        label: 'Startup',                    group: 'Alternates' },

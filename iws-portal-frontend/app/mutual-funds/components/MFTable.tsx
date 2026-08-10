@@ -26,6 +26,9 @@ export interface MFHoldingRow {
   as_of_date?: string;
   exposure_pct?: number;
   weekly_change?: number;
+  // Derived client-side (see withWeeklyPct) — the leading Wkly Chg column shows the
+  // percentage move, while the one under P&L keeps the rupee figure.
+  weekly_change_pct?: number;
   pnl_ytd?: number;
   pnl_inception?: number;
   pnl_weekly_change?: number;
@@ -100,6 +103,7 @@ export interface CombinedHolding {
   as_of_date?: string;
   exposure_pct?: number;
   weekly_change?: number;
+  weekly_change_pct?: number;
   prev_week_value?: number;
   pnl_ytd?: number;
   pnl_inception?: number;
@@ -222,6 +226,19 @@ function wavgBy<T>(rows: T[], val: (r: T) => number | null | undefined, wt: (r: 
     swv += v * w; sw += w;
   }
   return sw > 0 ? swv / sw : null;
+}
+
+// Weekly move as a share of the prior week's value. The rupee figure was being
+// shown twice (once beside Prev Week, once under P&L), so the leading column now
+// carries the percentage and the P&L one keeps the money. Works on either row
+// shape — both carry weekly_change + prev_week_value.
+function withWeeklyPct<T extends { weekly_change?: number; prev_week_value?: number }>(rows: T[]): T[] {
+  return rows.map(h => ({
+    ...h,
+    weekly_change_pct: h.weekly_change != null && h.prev_week_value
+      ? (h.weekly_change / h.prev_week_value) * 100
+      : undefined,
+  }));
 }
 
 // ── sort ──────────────────────────────────────────────────────────────────────
@@ -475,15 +492,14 @@ function TableHead({
         {/* Sr. No. */}
         <th scope="col" rowSpan={2} className={`${base} text-right pl-5 sm:pl-6 w-8`}>#</th>
         <Th col="security_name"     label="Fund"          right={false} rowSpan={2} />
-        <Th col="folio_number"      label="Folio"         right={false} rowSpan={2} />
+        <Th col="first_invested_date" label="Bought on"   right={false} rowSpan={2} />
         <Th col="quantity"          label="Units"                       rowSpan={2} />
         <Th col="nav"               label="NAV"                         rowSpan={2} />
         <Th col="invested_amount"   label="Cost"                        rowSpan={2} />
-        <Th col="first_invested_date" label="Since"                     rowSpan={2} />
         <Th col="exposure_pct"      label="Exp %"                       rowSpan={2} />
         <Th col="market_value_as_on" label="Mkt Value"                  rowSpan={2} />
         <Th col="prev_week_value"   label="Prev Week"                   rowSpan={2} />
-        <Th col="weekly_change"     label="Wkly Chg"                    rowSpan={2} />
+        <Th col="weekly_change_pct" label="Wkly Chg %"                  rowSpan={2} />
         {/* P&L group */}
         <StaticTh label="P&L" colSpan={3} borderL />
         {/* Returns group */}
@@ -518,8 +534,8 @@ function TableHead({
 function FundName({ name, type }: { name: string; type: string }) {
   return (
     <div title={name}>
-      <p className="text-[10px] font-medium text-ink leading-snug line-clamp-3 max-w-[320px]">{name}</p>
-      <p className="text-[9px] text-ghost mt-0.5">{SEC_TYPE_LABELS[type] ?? type}</p>
+      <p className="text-[11px] font-medium text-ink leading-snug line-clamp-3 max-w-[460px]">{name}</p>
+      <p className="text-[10px] text-ghost mt-0.5">{SEC_TYPE_LABELS[type] ?? type}</p>
     </div>
   );
 }
@@ -538,22 +554,21 @@ function DataRow({
       <td className="px-3 py-3 align-top">
         <FundName name={h.security_name} type={h.security_type} />
       </td>
-      <td className="px-3 py-3 font-mono text-xs text-dim whitespace-nowrap align-top">{h.folio_number}</td>
-      <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{h.quantity.toFixed(3)}</td>
-      <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">{h.nav != null ? h.nav.toFixed(4) : '—'}</td>
-      <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{fmtINR(h.invested_amount)}</td>
-      <td className="px-3 py-3 text-right tabular-nums text-xs align-top whitespace-nowrap">
+      <td className="px-3 py-3 tabular-nums text-xs align-top whitespace-nowrap">
         <span className="text-ink">{fmtDate(h.first_invested_date)}</span>
         {h.first_invested_date && (
           <p className="text-[10px] text-ghost mt-0.5">{fmtDuration(h.first_invested_date)}</p>
         )}
       </td>
+      <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{h.quantity.toFixed(3)}</td>
+      <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">{h.nav != null ? h.nav.toFixed(4) : '—'}</td>
+      <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{fmtINR(h.invested_amount)}</td>
       <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">
         {h.exposure_pct != null ? h.exposure_pct.toFixed(2) + '%' : '—'}
       </td>
       <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{fmtINR(mktVal)}</td>
       <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">{fmtINR(h.prev_week_value)}</td>
-      <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top"><ColorNum n={h.weekly_change} fmt={fmtINR} /></td>
+      <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top"><ColorNum n={h.weekly_change_pct} fmt={fmtPct} /></td>
       {/* P&L */}
       <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top border-l border-rule"><ColorNum n={h.pnl_ytd} fmt={fmtINR} /></td>
       <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top"><ColorNum n={h.pnl_inception} fmt={fmtINR} /></td>
@@ -593,7 +608,7 @@ function DataRow({
 
 // ── combined table header ─────────────────────────────────────────────────────
 
-const COMBINED_COL_COUNT = 18; // expand + # + fund + entities + units + nav + cost + since + exp% + mktval + prevwk + wklychg + pnl×3 + ret×2(inc%+xirr) + realized
+const COMBINED_COL_COUNT = 18; // expand + # + fund + bought on + entities + units + nav + cost + exp% + mktval + prevwk + wklychg% + pnl×3 + ret×2(inc%+xirr) + realized
 
 function CombinedTableHead({
   sortKey, sortDir, onSort,
@@ -635,15 +650,15 @@ function CombinedTableHead({
         <th scope="col" rowSpan={2} className={`${base} w-6 pl-3`} />
         <th scope="col" rowSpan={2} className={`${base} text-right pl-2 w-8`}>#</th>
         <Th col="security_name"        label="Fund"         right={false} rowSpan={2} first />
+        <Th col="first_invested_date"  label="Bought on"    right={false} rowSpan={2} />
         <Th col="entities"             label="Entities"     right={false} rowSpan={2} />
         <Th col="quantity"             label="Units"                      rowSpan={2} />
         <Th col="nav"                  label="NAV"                        rowSpan={2} />
         <Th col="invested_amount"      label="Cost"                       rowSpan={2} />
-        <Th col="first_invested_date"  label="Since"                      rowSpan={2} />
         <Th col="exposure_pct"         label="Exp %"                      rowSpan={2} />
         <Th col="market_value_as_on"   label="Mkt Value"                  rowSpan={2} />
         <Th col="prev_week_value"      label="Prev Week"                  rowSpan={2} />
-        <Th col="weekly_change"        label="Wkly Chg"                   rowSpan={2} />
+        <Th col="weekly_change_pct"    label="Wkly Chg %"                 rowSpan={2} />
         <StaticTh label="P&L"    colSpan={3} borderL />
         <StaticTh label="Returns" colSpan={2} borderL />
         <th scope="col" rowSpan={2} className={`${base} text-right border-l border-rule pr-5 sm:pr-6`}>Realized</th>
@@ -680,6 +695,10 @@ function CombinedDataRow({
         <td className="px-3 pl-5 sm:pl-6 py-3 align-top">
           <FundName name={h.security_name} type={h.security_type} />
         </td>
+        <td className="px-3 py-3 tabular-nums text-xs align-top whitespace-nowrap">
+          <span className="text-ink">{fmtDate(h.first_invested_date)}</span>
+          {h.first_invested_date && <p className="text-[10px] text-ghost mt-0.5">{fmtDuration(h.first_invested_date)}</p>}
+        </td>
         <td className="px-3 py-3 align-top">
           <div className="flex flex-wrap gap-1">
             {h.entities.map(e => (
@@ -690,16 +709,12 @@ function CombinedDataRow({
         <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{h.quantity.toFixed(3)}</td>
         <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">{h.nav != null ? h.nav.toFixed(4) : '—'}</td>
         <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{fmtINR(h.invested_amount)}</td>
-        <td className="px-3 py-3 text-right tabular-nums text-xs align-top whitespace-nowrap">
-          <span className="text-ink">{fmtDate(h.first_invested_date)}</span>
-          {h.first_invested_date && <p className="text-[10px] text-ghost mt-0.5">{fmtDuration(h.first_invested_date)}</p>}
-        </td>
         <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">
           {h.exposure_pct != null ? h.exposure_pct.toFixed(2) + '%' : '—'}
         </td>
         <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{fmtINR(mktVal)}</td>
         <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">{fmtINR(h.prev_week_value)}</td>
-        <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top"><ColorNum n={h.weekly_change} fmt={fmtINR} /></td>
+        <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top"><ColorNum n={h.weekly_change_pct} fmt={fmtPct} /></td>
         <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top border-l border-rule"><ColorNum n={h.pnl_ytd} fmt={fmtINR} /></td>
         <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top"><ColorNum n={h.pnl_inception} fmt={fmtINR} /></td>
         <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top"><ColorNum n={h.pnl_weekly_change} fmt={fmtINR} /></td>
@@ -732,8 +747,8 @@ function CombinedSubRowEl({ sub }: { sub: CombinedSubRow }) {
       <td className="px-2 py-2" />
       <td className="px-3 pl-8 py-2 align-top" colSpan={1}>
         <p className="text-[11px] font-medium text-dim">{sub.entity_name}</p>
-        <p className="text-[10px] text-ghost font-mono mt-0.5">{sub.folio_number}</p>
       </td>
+      <td className="px-3 py-2 tabular-nums text-xs text-ghost whitespace-nowrap align-top">{fmtDate(sub.first_invested_date)}</td>
       {/* entities col — shows this entity's badge */}
       <td className="px-3 py-2 align-top">
         <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-card border border-rule text-ghost">{sub.entity_name}</span>
@@ -741,7 +756,6 @@ function CombinedSubRowEl({ sub }: { sub: CombinedSubRow }) {
       <td className="px-3 py-2 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">{sub.quantity.toFixed(3)}</td>
       <td className="px-3 py-2 text-right tabular-nums text-xs text-ghost whitespace-nowrap align-top">{sub.nav != null ? sub.nav.toFixed(4) : '—'}</td>
       <td className="px-3 py-2 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">{fmtINR(sub.invested_amount)}</td>
-      <td className="px-3 py-2 text-right tabular-nums text-xs text-ghost whitespace-nowrap align-top">{fmtDate(sub.first_invested_date)}</td>
       <td className="px-3 py-2 text-right tabular-nums text-xs text-ghost whitespace-nowrap align-top">—</td>
       <td className="px-3 py-2 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">{fmtINR(mktVal)}</td>
       <td className="px-3 py-2 text-right tabular-nums text-xs text-ghost whitespace-nowrap align-top">—</td>
@@ -800,8 +814,8 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
   // actual transactions across all entities, which is more accurate than the client-side merge.
   const localCombined = useMemo(() => mergeMFByIsin(holdings), [holdings]);
   const effectiveCombined = useMemo(() => {
-    if (combinedHoldings && combinedHoldings.length > 0) return combinedHoldings;
-    return localCombined;
+    if (combinedHoldings && combinedHoldings.length > 0) return withWeeklyPct(combinedHoldings);
+    return withWeeklyPct(localCombined);
   }, [localCombined, combinedHoldings]);
 
   // Combined view after the active class/type/search filters — shared by the
@@ -828,14 +842,15 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
   // apply all filters
   const filtered = useMemo(() => {
     const q = search.toLowerCase();
-    return holdings.filter(h => {
+    // Folio numbers are no longer shown, so they are no longer searchable either.
+    const rows = holdings.filter(h => {
       if (filterClass  && h.asset_class    !== filterClass)  return false;
       if (filterType   && h.security_type  !== filterType)   return false;
       if (q && !h.security_name.toLowerCase().includes(q) &&
-               !h.folio_number.toLowerCase().includes(q) &&
                !(h.entity_name ?? '').toLowerCase().includes(q)) return false;
       return true;
     });
+    return withWeeklyPct(rows);
   }, [holdings, search, filterClass, filterType]);
 
   // Summary totals follow the active client-side filters (class/type/search) so the
@@ -864,6 +879,7 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
   const totalInvested   = view.reduce((s, h) => s + h.invested_amount, 0);
   const totalMktVal     = view.reduce((s, h) => s + (h.market_value_as_on ?? h.current_value ?? 0), 0);
   const totalPrevWk     = view.reduce((s, h) => s + (h.prev_week_value ?? 0), 0);
+  const totalWeeklyPct  = totalPrevWk ? (totalWeeklyChg / totalPrevWk) * 100 : null;
   const totalExpPct     = view.reduce((s, h) => s + (h.exposure_pct ?? 0), 0);
   const hasExp          = view.some(h => h.exposure_pct != null);
   const totalPnlWeekly  = view.reduce((s, h) => s + (h.pnl_weekly_change ?? 0), 0);
@@ -874,8 +890,8 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
   // disappear as the view is filtered.
   const fyLabels = useMemo(() => fyLabelsOf(holdings), [holdings]);
 
-  const colCount    = 3                          // sr + fund + folio
-    + 8                                          // units nav cost since exp% mktval prevwk wklychg
+  const colCount    = 3                          // sr + fund + bought on
+    + 7                                          // units nav cost exp% mktval prevwk wklychg%
     + 7                                          // pnl×3 returns×4
     + fyLabels.length                            // one per completed FY
     + 2;                                         // realized remarks
@@ -1004,7 +1020,7 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
           type="search"
           value={search}
           onChange={e => setSearch(e.target.value)}
-          placeholder="Search fund, folio or entity…"
+          placeholder="Search fund or entity…"
           aria-label="Search mutual fund holdings"
           className="text-xs bg-page border border-wire rounded px-3 py-1.5 text-ink placeholder:text-ghost focus:outline-none focus:border-prime transition-colors w-52 shrink-0"
         />
@@ -1123,7 +1139,8 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
               {/* Overall totals footer — every column totalled */}
               {combinedFiltered.length > 0 && (
                 <tr className="border-t-2 border-rule bg-page">
-                  <td colSpan={4} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim whitespace-nowrap">
+                  {/* Lead-in: expand, #, Fund, Bought on, Entities. */}
+                  <td colSpan={5} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim whitespace-nowrap">
                     Total ({combinedFiltered.length} funds)
                   </td>
                   {/* Units */}
@@ -1132,8 +1149,6 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
                   <td className="px-3 py-3 text-right tabular-nums text-xs text-ghost whitespace-nowrap">—</td>
                   {/* Cost */}
                   <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">{fmtINR(combinedFiltered.reduce((s, h) => s + h.invested_amount, 0))}</td>
-                  {/* Since */}
-                  <td />
                   {/* Exp % */}
                   <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-dim whitespace-nowrap">
                     {combinedFiltered.some(h => h.exposure_pct != null) ? combinedFiltered.reduce((s, h) => s + (h.exposure_pct ?? 0), 0).toFixed(2) + '%' : '—'}
@@ -1144,8 +1159,14 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
                   <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-dim whitespace-nowrap">
                     {(() => { const v = combinedFiltered.reduce((s, h) => s + (h.prev_week_value ?? 0), 0); return v ? fmtINR(v) : '—'; })()}
                   </td>
-                  {/* Wkly Chg */}
-                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap"><ColorNum n={combinedFiltered.reduce((s, h) => s + (h.weekly_change ?? 0), 0) || null} fmt={fmtINR} /></td>
+                  {/* Wkly Chg % — the whole view's move over its own prior-week base */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap">
+                    {(() => {
+                      const base = combinedFiltered.reduce((s, h) => s + (h.prev_week_value ?? 0), 0);
+                      const chg  = combinedFiltered.reduce((s, h) => s + (h.weekly_change ?? 0), 0);
+                      return <ColorNum n={base ? (chg / base) * 100 : null} fmt={fmtPct} />;
+                    })()}
+                  </td>
                   {/* P&L YTD / Inception / Wkly */}
                   <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap border-l border-rule"><ColorNum n={combinedFiltered.reduce((s, h) => s + (h.pnl_ytd ?? 0), 0) || null} fmt={fmtINR} /></td>
                   <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap"><ColorNum n={combinedFiltered.reduce((s, h) => s + (h.pnl_inception ?? 0), 0) || null} fmt={fmtINR} /></td>
@@ -1233,6 +1254,7 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
               {/* Overall totals footer — every column totalled */}
               {filtered.length > 0 && (
                 <tr className="border-t-2 border-rule bg-page">
+                  {/* Lead-in: #, Fund, Bought on. */}
                   <td colSpan={3} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim whitespace-nowrap">
                     Total ({view.length} holdings)
                   </td>
@@ -1242,16 +1264,14 @@ export default function MFTable({ holdings, totals, showEntityCol, viewMode, onT
                   <td className="px-3 py-3 text-right tabular-nums text-xs text-ghost whitespace-nowrap">—</td>
                   {/* Cost */}
                   <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">{fmtINR(totalInvested)}</td>
-                  {/* Since */}
-                  <td />
                   {/* Exp % */}
                   <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-dim whitespace-nowrap">{hasExp ? totalExpPct.toFixed(2) + '%' : '—'}</td>
                   {/* Mkt Value */}
                   <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">{fmtINR(totalMktVal)}</td>
                   {/* Prev Week */}
                   <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-dim whitespace-nowrap">{totalPrevWk ? fmtINR(totalPrevWk) : '—'}</td>
-                  {/* Wkly Chg */}
-                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap"><ColorNum n={totalWeeklyChg || null} fmt={fmtINR} /></td>
+                  {/* Wkly Chg % — the whole view's move over its own prior-week base */}
+                  <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap"><ColorNum n={totalWeeklyPct} fmt={fmtPct} /></td>
                   {/* P&L YTD / Inception / Wkly */}
                   <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap border-l border-rule"><ColorNum n={totalPnlYtd || null} fmt={fmtINR} /></td>
                   <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap"><ColorNum n={totalPnlInception || null} fmt={fmtINR} /></td>

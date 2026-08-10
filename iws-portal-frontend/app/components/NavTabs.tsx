@@ -120,13 +120,15 @@ export default function NavTabs({
         variant === 'pills' ? 'gap-1.5' : 'items-center gap-0.5'
       } ${className}`}
     >
+      {/* Tab labels render in capitals. Done in CSS rather than baked into TABS so
+          the dynamic Manual-Data tabs (DYNAMIC_CATEGORY_LABELS) capitalise too. */}
       {navFor(tabs, role).map(({ href, label }) => (
         <a
           key={href}
           href={href}
           draggable={false}
           aria-current={href === active ? 'page' : undefined}
-          className={`shrink-0 px-3 py-1.5 rounded text-xs font-medium transition-colors ${
+          className={`shrink-0 px-3 py-1.5 rounded text-xs font-medium uppercase tracking-wide transition-colors ${
             href === active ? item.active : item.inactive
           }`}
         >

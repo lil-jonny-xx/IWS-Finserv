@@ -4,7 +4,7 @@
 // for one of them exists anywhere (any entity), NavTabs shows a tab pointing at
 // the generic /assets/<category> page. Categories that already have their own
 // page (pms, gold_etf, unlisted, startup, properties, art, bank, forex,
-// overseas_equity) are deliberately absent — their entries surface on those
+// nre_bank, overseas_equity) are deliberately absent — their entries surface on those
 // pages and must not spawn a duplicate tab.
 //
 // direct_equity was removed 2026-07-31 for the same reason: equity entered in the

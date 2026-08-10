@@ -31,6 +31,9 @@ export interface CommodityHoldingRow {
   as_of_date?: string | null;
   exposure_pct?: number | null;
   weekly_change?: number | null;
+  // Derived client-side (see withWeeklyPct) — the leading Wkly Chg column shows the
+  // percentage move, while the one under P&L keeps the rupee figure.
+  weekly_change_pct?: number | null;
   pnl_ytd?: number | null;
   pnl_inception?: number | null;
   pnl_weekly_change?: number | null;
@@ -214,6 +217,18 @@ function weightedAvgBy(
     sumW  += w;
   }
   return sumW > 0 ? sumWV / sumW : null;
+}
+
+// Weekly move as a share of the prior week's value. The rupee figure was being
+// shown twice (once beside Prev Week, once under P&L), so the leading column now
+// carries the percentage and the P&L one keeps the money.
+function withWeeklyPct(rows: CommodityHoldingRow[]): CommodityHoldingRow[] {
+  return rows.map(h => ({
+    ...h,
+    weekly_change_pct: h.weekly_change != null && h.prev_week_value
+      ? (h.weekly_change / h.prev_week_value) * 100
+      : undefined,
+  }));
 }
 
 // ── sort ──────────────────────────────────────────────────────────────────────
@@ -448,16 +463,16 @@ function TableHead({
       <tr>
         <th scope="col" rowSpan={2} className={`${base} text-right pl-5 sm:pl-6 w-8`}>#</th>
         <Th col="symbol"               label="Instrument" right={false} rowSpan={2} className="sticky left-0 z-20 bg-card" />
+        <Th col="first_invested_date"  label="Bought on"  right={false} rowSpan={2} />
         {showEntityCol && <Th col="entity_name" label="Entity" right={false} rowSpan={2} />}
         <Th col="exchange"             label="Exch"       right={false} rowSpan={2} />
         <Th col="quantity"             label="Qty"                      rowSpan={2} />
         <Th col="avg_cost"             label="Avg Cost"                 rowSpan={2} />
         <Th col="cost"                 label="Cost"                     rowSpan={2} />
-        <Th col="first_invested_date"  label="Since"                    rowSpan={2} />
         {showNative && <Th col="current_market_value_native" label="Native Value" rowSpan={2} />}
         <Th col="current_market_value" label="Cur Value"                rowSpan={2} />
         <Th col="prev_week_value"      label="Prev Week"                rowSpan={2} />
-        <Th col="weekly_change"        label="Wkly Chg"                 rowSpan={2} />
+        <Th col="weekly_change_pct"    label="Wkly Chg %"               rowSpan={2} />
         <Th col="exposure_pct"         label="Exp %"                    rowSpan={2} />
         <StaticTh label="P&L" colSpan={3} borderL />
         <StaticTh label="Returns" colSpan={4} borderL />
@@ -544,7 +559,9 @@ export default function CommodityTable({ holdings, totals, showEntityCol }: Prop
       });
     }
 
-    return rows;
+    // Step 4: derive the weekly % (after merging, so a combined row's % comes from
+    // its summed change over its summed prior-week value).
+    return withWeeklyPct(rows);
   }, [holdings, search, filterClass, filterSector, filterBroker]);
 
   // FY columns are driven by ALL holdings, not the filtered view, so the columns
@@ -594,6 +611,7 @@ export default function CommodityTable({ holdings, totals, showEntityCol }: Prop
   // percentage columns value-weighted, exposure summed (→ ~100% of the view).
   const totalQty    = view.reduce((s, h) => s + (h.quantity ?? 0), 0);
   const totalPrevWk = view.reduce((s, h) => s + (h.prev_week_value ?? 0), 0);
+  const totalWeeklyPct = totalPrevWk ? (totalWeekly / totalPrevWk) * 100 : null;
   const totalExp    = view.reduce((s, h) => s + (h.exposure_pct ?? 0), 0);
   const hasExp      = view.some(h => h.exposure_pct != null);
   const avgRetYtd   = weightedAvgBy(view, 'returns_ytd_pct');
@@ -601,8 +619,8 @@ export default function CommodityTable({ holdings, totals, showEntityCol }: Prop
   const avgCagrAll  = weightedAvgBy(view, 'cagr_inception_pct');
   const avgXirrAll  = weightedAvgBy(view, 'xirr_inception_pct');
 
-  // col count: # + instrument + [entity] + exch + qty + avg + cost + since
-  //          + [native] + cur + prev + wkly + exp + pnl×3 + returns×4 + remarks
+  // col count: # + instrument + bought_on + [entity] + exch + qty + avg + cost
+  //          + [native] + cur + prev + wkly% + exp + pnl×3 + returns×4 + remarks
   //          = 19 + [entity] + [native], plus one per completed FY
   const colCount = 19 + (showEntityCol ? 1 : 0) + (showNative ? 1 : 0) + fyLabels.length;
 
@@ -739,6 +757,10 @@ export default function CommodityTable({ holdings, totals, showEntityCol }: Prop
                           </div>
                           {h.isin && <p className="text-[10px] text-ghost font-mono mt-0.5">{h.isin}</p>}
                         </td>
+                        <td className="px-3 py-3 tabular-nums text-xs align-top whitespace-nowrap">
+                          <span className="text-ink">{fmtDate(h.first_invested_date)}</span>
+                          {h.first_invested_date && <p className="text-[10px] text-ghost mt-0.5">{fmtDuration(h.first_invested_date)}</p>}
+                        </td>
                         {showEntityCol && (
                           <td className="px-3 py-3 text-xs font-medium text-dim whitespace-nowrap align-top">{h.entity_name ?? '—'}</td>
                         )}
@@ -751,10 +773,6 @@ export default function CommodityTable({ holdings, totals, showEntityCol }: Prop
                           )}
                         </td>
                         <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{fmtINR(h.cost)}</td>
-                        <td className="px-3 py-3 text-right tabular-nums text-xs align-top whitespace-nowrap">
-                          <span className="text-ink">{fmtDate(h.first_invested_date)}</span>
-                          {h.first_invested_date && <p className="text-[10px] text-ghost mt-0.5">{fmtDuration(h.first_invested_date)}</p>}
-                        </td>
                         {showNative && (
                           <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">
                             {(h.currency ?? 'INR') !== 'INR'
@@ -764,7 +782,7 @@ export default function CommodityTable({ holdings, totals, showEntityCol }: Prop
                         )}
                         <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{fmtINR(h.current_market_value)}</td>
                         <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">{fmtINR(h.prev_week_value)}</td>
-                        <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top"><ColorNum n={h.weekly_change} fmt={fmtINR} /></td>
+                        <td className="px-3 py-3 text-right tabular-nums text-xs whitespace-nowrap align-top"><ColorNum n={h.weekly_change_pct} fmt={fmtPct} /></td>
                         <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">
                           {h.exposure_pct != null ? h.exposure_pct.toFixed(2) + '%' : '—'}
                         </td>
@@ -805,10 +823,10 @@ export default function CommodityTable({ holdings, totals, showEntityCol }: Prop
                 percentage columns value-weighted, exposure summed. */}
             {rows.length > 0 && (
               <tr className="border-t-2 border-rule bg-page">
-                {/* Label spans exactly the non-numeric lead-in: #, Instrument, Exch —
-                    three columns, plus Entity when shown. One too many here would push
-                    every total a column right of its heading. */}
-                <td colSpan={3 + (showEntityCol ? 1 : 0)} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim">
+                {/* Label spans exactly the non-numeric lead-in: #, Instrument, Bought on,
+                    Exch — four columns, plus Entity when shown. One too many here would
+                    push every total a column right of its heading. */}
+                <td colSpan={4 + (showEntityCol ? 1 : 0)} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim">
                   Total ({rows.length} holdings)
                 </td>
                 {/* Qty — units of different instruments, summed for completeness */}
@@ -819,8 +837,6 @@ export default function CommodityTable({ holdings, totals, showEntityCol }: Prop
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">
                   {fmtINR(rows.reduce((s, h) => s + (h.cost ?? 0), 0))}
                 </td>
-                {/* Since */}
-                <td />
                 {/* Native Value — spans mixed currencies, so it isn't summed */}
                 {showNative && <td className="px-3 py-3 text-right tabular-nums text-xs text-ghost whitespace-nowrap">—</td>}
                 {/* Cur Value */}
@@ -831,9 +847,10 @@ export default function CommodityTable({ holdings, totals, showEntityCol }: Prop
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-dim whitespace-nowrap">
                   {totalPrevWk ? fmtINR(totalPrevWk) : '—'}
                 </td>
-                {/* Wkly Chg */}
+                {/* Wkly Chg % — the whole view's move over its own prior-week base,
+                    not an average of the per-row percentages. */}
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold whitespace-nowrap">
-                  <ColorNum n={totalWeekly || null} fmt={fmtINR} />
+                  <ColorNum n={totalWeeklyPct} fmt={fmtPct} />
                 </td>
                 {/* Exp % */}
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-dim whitespace-nowrap">

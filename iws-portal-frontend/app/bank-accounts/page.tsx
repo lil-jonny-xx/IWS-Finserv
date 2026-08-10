@@ -180,18 +180,21 @@ export default function BanksPage() {
           if (!r.ok) throw new Error('Failed to load bank balances.');
           return r.json() as Promise<ManualAssetsResponse>;
         });
-    Promise.all([load('bank'), load('forex')])
-      .then(([bank, forex]) => {
-        if (!bank && !forex) return;   // 401 already redirected
+    // NRE balances are rupee-denominated but belong to the non-resident side of the
+    // book, so they are fetched as their own category and then shown in the forex
+    // group rather than beside ordinary Indian bank balances.
+    Promise.all([load('bank'), load('forex'), load('nre_bank')])
+      .then(([bank, forex, nre]) => {
+        if (!bank && !forex && !nre) return;   // 401 already redirected
         const tag = (resp: ManualAssetsResponse | null, source: 'bank' | 'forex'): BankAsset[] =>
           (resp?.assets ?? []).map(a => ({ ...a, source }));
         setData({
           category:    'bank',
-          entity_id:   bank?.entity_id ?? forex?.entity_id ?? 0,
-          total_value: (bank?.total_value ?? 0) + (forex?.total_value ?? 0),
-          count:       (bank?.count ?? 0) + (forex?.count ?? 0),
-          assets:      [...tag(bank, 'bank'), ...tag(forex, 'forex')],
-          fx_rates:    bank?.fx_rates ?? forex?.fx_rates,
+          entity_id:   bank?.entity_id ?? forex?.entity_id ?? nre?.entity_id ?? 0,
+          total_value: (bank?.total_value ?? 0) + (forex?.total_value ?? 0) + (nre?.total_value ?? 0),
+          count:       (bank?.count ?? 0) + (forex?.count ?? 0) + (nre?.count ?? 0),
+          assets:      [...tag(bank, 'bank'), ...tag(forex, 'forex'), ...tag(nre, 'forex')],
+          fx_rates:    bank?.fx_rates ?? forex?.fx_rates ?? nre?.fx_rates,
         });
         setLoading(false);
         didInitialLoad.current = true;
@@ -255,7 +258,7 @@ export default function BanksPage() {
             {data.count === 0 ? (
               <div className="bg-card rounded-lg border border-rule px-5 py-16 text-center text-sm text-ghost">
                 No bank or forex balances yet. Add one from the{' '}
-                <a href="/manual-data" className="text-prime hover:underline">Manual Data</a> page (category “Bank Balance” or “Forex / Foreign Cash”).
+                <a href="/manual-data" className="text-prime hover:underline">Manual Data</a> page (category “Bank Balance”, “Forex / Foreign Cash” or “Bank Balance — NRE”).
               </div>
             ) : (() => {
               const forex = data.assets.filter(a => a.source === 'forex');
@@ -272,7 +275,7 @@ export default function BanksPage() {
               }
               const groups: { key: 'bank' | 'forex'; title: string }[] = [
                 { key: 'bank',  title: 'Bank balances' },
-                { key: 'forex', title: 'Forex / Foreign cash' },
+                { key: 'forex', title: 'Forex / Foreign cash (incl. NRE)' },
               ];
               return (
                 <div className="flex flex-col gap-8">

@@ -437,12 +437,12 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
             <tr>
               <th scope="col" className={`${base} text-right pl-5 sm:pl-6 w-8`}>#</th>
               {th('symbol', 'Stock', false)}
+              {th('first_invested_date', 'Bought on', false)}
               {showEntityCol && th('entity_name', 'Entity', false)}
               {th('exchange', 'Exch', false)}
               {th('quantity', 'Qty')}
               {th('avg_cost', 'Avg Cost')}
               {th('cost', 'Cost')}
-              {th('first_invested_date', 'Since')}
               {th('current_market_value', 'Cur Value')}
               {th('exposure_pct', 'Exp %')}
               {th('pnl_daily', 'Day P&L')}
@@ -468,6 +468,7 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
                     <div className="flex flex-wrap gap-0.5 mt-0.5"><BrokerBadge broker={h.broker} /></div>
                     {h.isin && <p className="text-[10px] text-ghost font-mono mt-0.5">{h.isin}</p>}
                   </td>
+                  <td className="px-3 py-3 tabular-nums text-xs align-top whitespace-nowrap">{fmtDate(h.first_invested_date)}</td>
                   {showEntityCol && (
                     <td className="px-3 py-3 text-xs font-medium text-dim whitespace-nowrap align-top">{h.entity_name ?? '—'}</td>
                   )}
@@ -475,7 +476,6 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
                   <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{h.quantity.toFixed(2)}</td>
                   <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">{fmtMoney(conv(h.avg_cost, h.fx_rate), rowCcy, 2)}</td>
                   <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{fmtMoney(conv(h.cost, h.fx_rate), rowCcy)}</td>
-                  <td className="px-3 py-3 text-right tabular-nums text-xs align-top whitespace-nowrap">{fmtDate(h.first_invested_date)}</td>
                   <td className="px-3 py-3 text-right tabular-nums text-xs text-ink whitespace-nowrap align-top">{fmtMoney(conv(h.current_market_value, h.fx_rate), rowCcy)}</td>
                   <td className="px-3 py-3 text-right tabular-nums text-xs text-dim whitespace-nowrap align-top">
                     {h.exposure_pct != null ? h.exposure_pct.toFixed(2) + '%' : '—'}
@@ -508,8 +508,8 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
 
             {rows.length > 0 && (
               <tr className="border-t-2 border-rule bg-page">
-                {/* label spans #, symbol, [entity], exch */}
-                <td colSpan={3 + (showEntityCol ? 1 : 0)} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim">
+                {/* label spans #, symbol, bought on, [entity], exch */}
+                <td colSpan={4 + (showEntityCol ? 1 : 0)} className="px-5 sm:px-6 py-3 text-xs font-semibold text-dim">
                   Total ({rows.length} holdings) · {totalsCcy}
                 </td>
                 {/* Qty — share counts sum directly (not currency-scaled) */}
@@ -522,8 +522,6 @@ export default function ForeignEquityTable({ holdings, totals, fxRates, showEnti
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">
                   {fmtMoney(convTotal(rows.reduce((s, h) => s + (h.cost ?? 0), 0)), totalsCcy)}
                 </td>
-                {/* Since */}
-                <td />
                 {/* Cur Value */}
                 <td className="px-3 py-3 text-right tabular-nums text-xs font-semibold text-ink whitespace-nowrap">
                   {fmtMoney(convTotal(rows.reduce((s, h) => s + (h.current_market_value ?? 0), 0)), totalsCcy)}
