@@ -5865,6 +5865,612 @@ def get_manual_assets(
         release_db_connection(conn)
 
 
+# ---------------------------------------------------------------------------
+# Ornaments register — Jewellery / Gold / Silver, private to one entity.
+#
+# Not part of manual_input: those rows are versioned and keyed by (entity_id,
+# category, label), which suits a hand-typed valuation but not a per-piece
+# inventory whose items get renamed, re-weighed and photographed. Ornaments are
+# real rows with stable ids, so photos hang off a foreign key (ON DELETE CASCADE)
+# instead of being orphaned by a rename. See workers/db_migrate_ornaments.py.
+#
+# Access is restricted to the owning entity's own login and admins. Every
+# endpoint below re-checks it through _require_ornaments_access — the frontend
+# gate is convenience only.
+# ---------------------------------------------------------------------------
+
+ORNAMENT_CATEGORIES    = {"jewellery", "gold", "silver"}
+ORNAMENT_METALS        = {"gold", "silver", "platinum", "other"}
+ORNAMENT_UPLOAD_SUBDIR = "ornaments"
+
+# The entity whose ornaments register this is. Env-overridable rather than
+# keyed on an email address so a login rename doesn't lock the owner out.
+ORNAMENTS_ENTITY_ID = int(os.getenv("ORNAMENTS_ENTITY_ID", "12"))   # SDR
+
+
+class OrnamentItem(BaseModel):
+    id:               Optional[int]   = None
+    category:         str
+    metal:            Optional[str]   = None
+    serial_no:        Optional[str]   = Field(default=None, max_length=120)
+    code:             Optional[str]   = Field(default=None, max_length=120)
+    given_name:       Optional[str]   = Field(default=None, max_length=300)
+    declared_name:    Optional[str]   = Field(default=None, max_length=300)
+    item_type:        Optional[str]   = Field(default=None, max_length=80)
+    gross_weight_g:   Optional[float] = None
+    metal_weight_g:   Optional[float] = None
+    purity:           Optional[str]   = Field(default=None, max_length=40)
+    stones_carat:     Optional[float] = None
+    stones_note:      Optional[str]   = Field(default=None, max_length=1000)
+    quantity:         Optional[int]   = None
+    mint:             Optional[str]   = Field(default=None, max_length=200)
+    year_minted:      Optional[int]   = None
+    assay_no:         Optional[str]   = Field(default=None, max_length=120)
+    denomination:     Optional[str]   = Field(default=None, max_length=80)
+    sealed:           Optional[bool]  = None
+    valuation:        Optional[float] = None
+    valuation_remark: Optional[str]   = Field(default=None, max_length=2000)
+    valuation_date:   Optional[str]   = None
+    purchased_from:   Optional[str]   = Field(default=None, max_length=300)
+    invoice_no:       Optional[str]   = Field(default=None, max_length=120)
+    purchase_date:    Optional[str]   = None
+    purchase_price:   Optional[float] = None
+    notes:            Optional[str]   = Field(default=None, max_length=4000)
+    sort_order:       Optional[int]   = None
+
+
+def _require_ornaments_access(cur, payload: dict) -> dict:
+    """Authorize a caller for the ornaments register, or raise 403.
+
+    Allowed: an admin, or the login belonging to ORNAMENTS_ENTITY_ID. Returns
+    the user row so callers can stamp created_by / updated_by.
+    """
+    cur.execute(
+        "SELECT id, email, role, entity_id FROM users WHERE email = %s AND is_active = TRUE",
+        (payload["email"],),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=401, detail="User not found")
+    if row["role"] != "admin" and row["entity_id"] != ORNAMENTS_ENTITY_ID:
+        raise HTTPException(status_code=403, detail="This register is private.")
+    return row
+
+
+def _purity_factor(purity: Optional[str]) -> float:
+    """Fraction of the metal weight that is fine metal.
+
+    Accepts the notations that actually appear on Indian invoices and assay
+    cards: '22K' / '22 kt' (karat), '916' / '999.9' / '925' (millesimal
+    fineness), '0.916' (fraction). Anything unparseable falls back to 1.0, i.e.
+    the entered metal weight is treated as already being fine content.
+    """
+    if not purity:
+        return 1.0
+    s = str(purity).strip().lower().replace(" ", "")
+    m = re.match(r"^(\d+(?:\.\d+)?)k(?:t)?$", s)
+    if m:
+        k = float(m.group(1))
+        return min(k / 24.0, 1.0) if k > 0 else 1.0
+    m = re.match(r"^(\d+(?:\.\d+)?)$", s)
+    if m:
+        v = float(m.group(1))
+        if v <= 1.0:
+            return v            # 0.916
+        if v <= 24.0:
+            return v / 24.0     # bare karat, '22'
+        return min(v / 1000.0, 1.0)   # millesimal, '916' / '999.9'
+    return 1.0
+
+
+def _spot_metal_rates(conn) -> dict:
+    """Latest ₹ spot per GRAM for gold and silver, from market_benchmark.
+
+    benchmark_worker stores GOLD_INR as ₹/10g and SILVER_INR as ₹/kg (see
+    SPOT_METALS there), so both are normalised here. The 1900-01-01 definition
+    rows carry a NULL value and are excluded.
+    """
+    out = {"gold_per_g": None, "silver_per_g": None, "as_of": None}
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT DISTINCT ON (code) code, value, as_of_date
+            FROM   market_benchmark
+            WHERE  code IN ('GOLD_INR', 'SILVER_INR') AND value IS NOT NULL
+            ORDER  BY code, as_of_date DESC
+            """
+        )
+        for r in cur.fetchall():
+            v = float(r["value"])
+            if r["code"] == "GOLD_INR":
+                out["gold_per_g"] = round(v / 10.0, 4)
+            elif r["code"] == "SILVER_INR":
+                out["silver_per_g"] = round(v / 1000.0, 4)
+            d = r["as_of_date"].isoformat() if r["as_of_date"] else None
+            if d and (out["as_of"] is None or d > out["as_of"]):
+                out["as_of"] = d
+        cur.close()
+    except Exception as e:
+        # An indicative figure is not worth failing the page over.
+        logger.warning(f"spot metal rates unavailable: {e}")
+    return out
+
+
+def _ornament_metal(r: dict) -> str:
+    """Metal a piece is priced in. Explicit column wins; otherwise the silver
+    tab implies silver and everything else (jewellery, gold) implies gold."""
+    m = (r.get("metal") or "").strip().lower()
+    if m in ORNAMENT_METALS:
+        return m
+    return "silver" if r.get("category") == "silver" else "gold"
+
+
+def _ornament_row(r: dict, photos: list, spot: dict) -> dict:
+    """Shape one ornament for the API, with the derived spot estimate.
+
+    fine grams = metal weight x purity factor x quantity. The typed `valuation`
+    stays authoritative — the estimate is shown beside it, never instead of it,
+    and is None whenever the weight or the feed is missing.
+    """
+    metal  = _ornament_metal(r)
+    rate   = spot.get(f"{metal}_per_g")
+    grams  = float(r["metal_weight_g"]) if r["metal_weight_g"] is not None else None
+    qty    = int(r["quantity"]) if r["quantity"] else 1
+    fine_g = round(grams * _purity_factor(r["purity"]) * qty, 3) if grams else None
+    est    = round(fine_g * rate, 2) if (fine_g and rate) else None
+
+    def num(k):
+        return float(r[k]) if r[k] is not None else None
+
+    return {
+        "id":               r["id"],
+        "entity_id":        r["entity_id"],
+        "category":         r["category"],
+        "metal":            metal,
+        "serial_no":        r["serial_no"],
+        "code":             r["code"],
+        "given_name":       r["given_name"],
+        "declared_name":    r["declared_name"],
+        "item_type":        r["item_type"],
+        "gross_weight_g":   num("gross_weight_g"),
+        "metal_weight_g":   grams,
+        "purity":           r["purity"],
+        "stones_carat":     num("stones_carat"),
+        "stones_note":      r["stones_note"],
+        "quantity":         qty,
+        "mint":             r["mint"],
+        "year_minted":      r["year_minted"],
+        "assay_no":         r["assay_no"],
+        "denomination":     r["denomination"],
+        "sealed":           r["sealed"],
+        "valuation":        num("valuation"),
+        "valuation_remark": r["valuation_remark"],
+        "valuation_date":   str(r["valuation_date"]) if r["valuation_date"] else None,
+        "purchased_from":   r["purchased_from"],
+        "invoice_no":       r["invoice_no"],
+        "purchase_date":    str(r["purchase_date"]) if r["purchase_date"] else None,
+        "purchase_price":   num("purchase_price"),
+        "notes":            r["notes"],
+        "sort_order":       r["sort_order"] or 0,
+        "fine_weight_g":    fine_g,
+        "spot_estimate":    est,
+        "updated_at":       r["updated_at"].isoformat() if r["updated_at"] else None,
+        "photos":           photos,
+    }
+
+
+def _ornament_photo_row(p: dict) -> dict:
+    return {
+        "id":            p["id"],
+        "original_name": p["original_name"],
+        "mime":          p["mime"],
+        "size_bytes":    int(p["size_bytes"]) if p["size_bytes"] is not None else None,
+        "has_thumb":     bool(p["thumb_path"]),
+        "uploaded_at":   p["uploaded_at"].isoformat() if p["uploaded_at"] else None,
+    }
+
+
+def _ornament_date(value: Optional[str], field: str):
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(status_code=422, detail=f"Invalid {field}: {value}")
+
+
+@app.get("/api/v1/ornaments")
+@limiter.limit("120/minute")
+def get_ornaments(request: Request, authorization: Optional[str] = Header(None)):
+    """The whole register in one call — all three categories, their photos, the
+    per-category totals and today's spot rates."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        user = _require_ornaments_access(cur, payload)
+
+        cur.execute(
+            "SELECT * FROM ornament WHERE entity_id = %s ORDER BY category, sort_order, id",
+            (ORNAMENTS_ENTITY_ID,),
+        )
+        rows = cur.fetchall()
+
+        cur.execute(
+            """
+            SELECT p.id, p.ornament_id, p.original_name, p.mime, p.size_bytes,
+                   p.thumb_path, p.uploaded_at
+            FROM   ornament_photo p
+            JOIN   ornament o ON o.id = p.ornament_id
+            WHERE  o.entity_id = %s
+            ORDER  BY p.uploaded_at
+            """,
+            (ORNAMENTS_ENTITY_ID,),
+        )
+        photos_by_item: dict = {}
+        for p in cur.fetchall():
+            photos_by_item.setdefault(p["ornament_id"], []).append(_ornament_photo_row(p))
+
+        cur.execute("SELECT entity_name FROM entity WHERE id = %s", (ORNAMENTS_ENTITY_ID,))
+        ent = cur.fetchone()
+        cur.close()
+
+        spot  = _spot_metal_rates(conn)
+        items = [_ornament_row(r, photos_by_item.get(r["id"], []), spot) for r in rows]
+
+        def totals(subset):
+            return {
+                "count":          len(subset),
+                "valuation":      round(sum(i["valuation"]      or 0 for i in subset), 2),
+                "spot_estimate":  round(sum(i["spot_estimate"]  or 0 for i in subset), 2),
+                "gross_weight_g": round(sum(i["gross_weight_g"] or 0 for i in subset), 3),
+                "metal_weight_g": round(sum(i["metal_weight_g"] or 0 for i in subset), 3),
+                "stones_carat":   round(sum(i["stones_carat"]   or 0 for i in subset), 3),
+            }
+
+        return {
+            "entity_id":   ORNAMENTS_ENTITY_ID,
+            "entity_name": ent["entity_name"] if ent else "",
+            "is_owner":    user["entity_id"] == ORNAMENTS_ENTITY_ID,
+            "spot":        spot,
+            "items":       items,
+            "totals": {
+                **{c: totals([i for i in items if i["category"] == c]) for c in ORNAMENT_CATEGORIES},
+                "all": totals(items),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in GET /api/v1/ornaments: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/ornaments")
+@limiter.limit("60/minute")
+def save_ornament(request: Request, body: OrnamentItem,
+                  authorization: Optional[str] = Header(None)):
+    """Create (no id) or update (id given) one piece."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        user = _require_ornaments_access(cur, payload)
+
+        if body.category not in ORNAMENT_CATEGORIES:
+            raise HTTPException(status_code=422, detail=f"Invalid category: {body.category}")
+        metal = (body.metal or "").strip().lower()
+        if metal and metal not in ORNAMENT_METALS:
+            raise HTTPException(status_code=422, detail=f"Invalid metal: {body.metal}")
+        if not metal:
+            metal = "silver" if body.category == "silver" else "gold"
+        if not (body.given_name or body.declared_name or body.code or body.serial_no):
+            raise HTTPException(status_code=422,
+                                detail="Give the piece at least a name, code or serial number.")
+
+        val_date = _ornament_date(body.valuation_date, "valuation_date")
+        buy_date = _ornament_date(body.purchase_date,  "purchase_date")
+        qty      = body.quantity if (body.quantity and body.quantity > 0) else 1
+
+        cols = (body.serial_no, body.code, body.given_name, body.declared_name,
+                body.item_type, body.gross_weight_g, body.metal_weight_g, body.purity,
+                body.stones_carat, body.stones_note, qty, body.mint, body.year_minted,
+                body.assay_no, body.denomination, body.sealed, body.valuation,
+                body.valuation_remark, val_date, body.purchased_from, body.invoice_no,
+                buy_date, body.purchase_price, body.notes, body.sort_order or 0)
+
+        if body.id:
+            cur.execute("SELECT id FROM ornament WHERE id = %s AND entity_id = %s",
+                        (body.id, ORNAMENTS_ENTITY_ID))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Item not found")
+            cur.execute(
+                """
+                UPDATE ornament SET
+                    category = %s, metal = %s, serial_no = %s, code = %s,
+                    given_name = %s, declared_name = %s, item_type = %s,
+                    gross_weight_g = %s, metal_weight_g = %s, purity = %s,
+                    stones_carat = %s, stones_note = %s, quantity = %s, mint = %s,
+                    year_minted = %s, assay_no = %s, denomination = %s, sealed = %s,
+                    valuation = %s, valuation_remark = %s, valuation_date = %s,
+                    purchased_from = %s, invoice_no = %s, purchase_date = %s,
+                    purchase_price = %s, notes = %s, sort_order = %s,
+                    updated_by = %s, updated_at = NOW()
+                WHERE id = %s AND entity_id = %s
+                RETURNING id
+                """,
+                (body.category, metal, *cols, user["id"], body.id, ORNAMENTS_ENTITY_ID),
+            )
+            action = "ORNAMENT_UPDATE"
+        else:
+            cur.execute(
+                """
+                INSERT INTO ornament
+                    (entity_id, category, metal, serial_no, code, given_name,
+                     declared_name, item_type, gross_weight_g, metal_weight_g, purity,
+                     stones_carat, stones_note, quantity, mint, year_minted, assay_no,
+                     denomination, sealed, valuation, valuation_remark, valuation_date,
+                     purchased_from, invoice_no, purchase_date, purchase_price, notes,
+                     sort_order, created_by, updated_by)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING id
+                """,
+                (ORNAMENTS_ENTITY_ID, body.category, metal, *cols, user["id"], user["id"]),
+            )
+            action = "ORNAMENT_CREATE"
+
+        new_id = cur.fetchone()["id"]
+        write_audit_log(conn, user["id"], action, "ornament", new_id,
+                        f"{body.category}/{body.given_name or body.code or new_id}")
+        conn.commit()
+        cur.close()
+
+        spot = _spot_metal_rates(conn)
+        cur  = conn.cursor()
+        cur.execute("SELECT * FROM ornament WHERE id = %s", (new_id,))
+        row = cur.fetchone()
+        cur.execute(
+            "SELECT id, original_name, mime, size_bytes, thumb_path, uploaded_at "
+            "FROM ornament_photo WHERE ornament_id = %s ORDER BY uploaded_at",
+            (new_id,),
+        )
+        photos = [_ornament_photo_row(p) for p in cur.fetchall()]
+        cur.close()
+        return _ornament_row(row, photos, spot)
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/ornaments: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.delete("/api/v1/ornaments/{oid}")
+@limiter.limit("30/minute")
+def delete_ornament(oid: int, request: Request,
+                    authorization: Optional[str] = Header(None)):
+    """Delete a piece and its photos (rows cascade; files are removed here)."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        user = _require_ornaments_access(cur, payload)
+
+        cur.execute("SELECT id, given_name, category FROM ornament WHERE id = %s AND entity_id = %s",
+                    (oid, ORNAMENTS_ENTITY_ID))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Item not found")
+
+        cur.execute("SELECT stored_path, thumb_path FROM ornament_photo WHERE ornament_id = %s", (oid,))
+        for p in cur.fetchall():
+            for rel in (p["stored_path"], p["thumb_path"]):
+                if not rel:
+                    continue
+                try:
+                    abs_p = _uploads_abspath(rel)
+                    if os.path.exists(abs_p):
+                        os.remove(abs_p)
+                except Exception as e:
+                    logger.warning(f"could not remove ornament photo {rel}: {e}")
+
+        cur.execute("DELETE FROM ornament WHERE id = %s AND entity_id = %s",
+                    (oid, ORNAMENTS_ENTITY_ID))
+        write_audit_log(conn, user["id"], "ORNAMENT_DELETE", "ornament", oid,
+                        f"{row['category']}/{row['given_name'] or oid}")
+        conn.commit()
+        cur.close()
+        return {"deleted": oid}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in DELETE /api/v1/ornaments: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.post("/api/v1/ornaments/{oid}/photos")
+@limiter.limit("60/minute")
+async def upload_ornament_photo(oid: int, request: Request,
+                                file: UploadFile = File(...),
+                                authorization: Optional[str] = Header(None)):
+    """Attach one photo to a piece. Reuses the manual-attachment upload pipeline
+    (spool → mime/magic validation → thumbnail) so the content policy is shared."""
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        user = _require_ornaments_access(cur, payload)
+
+        cur.execute("SELECT id, category FROM ornament WHERE id = %s AND entity_id = %s",
+                    (oid, ORNAMENTS_ENTITY_ID))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Item not found")
+
+        tmp, size, head = await _spool_upload(file)
+        try:
+            mime, ext = _validated_upload_mime(file.filename or "", file.content_type, head)
+        except BaseException:
+            _discard_spool(tmp)
+            raise
+        if not mime.startswith("image/"):
+            _discard_spool(tmp)
+            raise HTTPException(status_code=415, detail="Only image files can be added here.")
+
+        uid     = uuid.uuid4().hex
+        rel_dir = os.path.join(ORNAMENT_UPLOAD_SUBDIR, str(ORNAMENTS_ENTITY_ID), row["category"])
+        os.makedirs(os.path.join(UPLOADS_ROOT, rel_dir), exist_ok=True)
+        rel_path = os.path.join(rel_dir, uid + ext)
+        _commit_spool(tmp, rel_path)
+
+        thumb_rel = None
+        cand = os.path.join(rel_dir, uid + "_thumb.jpg")
+        if _make_thumbnail(_uploads_abspath(rel_path), _uploads_abspath(cand)):
+            thumb_rel = cand
+
+        cur.execute(
+            """
+            INSERT INTO ornament_photo
+                (ornament_id, original_name, stored_path, thumb_path, mime,
+                 size_bytes, uploaded_by)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+            RETURNING id, original_name, mime, size_bytes, thumb_path, uploaded_at
+            """,
+            (oid, file.filename, rel_path, thumb_rel, mime, size, user["id"]),
+        )
+        p = cur.fetchone()
+        write_audit_log(conn, user["id"], "ORNAMENT_PHOTO_UPLOAD", "ornament_photo",
+                        p["id"], f"ornament {oid} ({file.filename})")
+        conn.commit()
+        cur.close()
+        return _ornament_photo_row(p)
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in POST /api/v1/ornaments/{oid}/photos: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+def _serve_ornament_photo(pid: int, request: Request, authorization, want_thumb: bool):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        _require_ornaments_access(cur, payload)
+        cur.execute(
+            """
+            SELECT p.stored_path, p.thumb_path, p.mime
+            FROM   ornament_photo p
+            JOIN   ornament o ON o.id = p.ornament_id
+            WHERE  p.id = %s AND o.entity_id = %s
+            """,
+            (pid, ORNAMENTS_ENTITY_ID),
+        )
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            raise HTTPException(status_code=404, detail="Photo not found")
+        if want_thumb and row["thumb_path"]:
+            return _uploads_file_response(row["thumb_path"], "image/jpeg")
+        return _uploads_file_response(row["stored_path"], row["mime"] or "application/octet-stream")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error serving ornament photo {pid}: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
+@app.get("/api/v1/ornament-photos/{pid}/file")
+@limiter.limit("300/minute")
+def serve_ornament_photo_file(pid: int, request: Request,
+                              authorization: Optional[str] = Header(None)):
+    return _serve_ornament_photo(pid, request, authorization, want_thumb=False)
+
+
+@app.get("/api/v1/ornament-photos/{pid}/thumb")
+@limiter.limit("300/minute")
+def serve_ornament_photo_thumb(pid: int, request: Request,
+                               authorization: Optional[str] = Header(None)):
+    return _serve_ornament_photo(pid, request, authorization, want_thumb=True)
+
+
+@app.delete("/api/v1/ornament-photos/{pid}")
+@limiter.limit("60/minute")
+def delete_ornament_photo(pid: int, request: Request,
+                          authorization: Optional[str] = Header(None)):
+    conn = None
+    try:
+        payload = _require_auth(request, authorization)
+        conn = get_db_connection()
+        cur  = conn.cursor()
+        user = _require_ornaments_access(cur, payload)
+        cur.execute(
+            """
+            SELECT p.stored_path, p.thumb_path
+            FROM   ornament_photo p
+            JOIN   ornament o ON o.id = p.ornament_id
+            WHERE  p.id = %s AND o.entity_id = %s
+            """,
+            (pid, ORNAMENTS_ENTITY_ID),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Photo not found")
+        for rel in (row["stored_path"], row["thumb_path"]):
+            if not rel:
+                continue
+            try:
+                abs_p = _uploads_abspath(rel)
+                if os.path.exists(abs_p):
+                    os.remove(abs_p)
+            except Exception as e:
+                logger.warning(f"could not remove ornament photo {rel}: {e}")
+        cur.execute("DELETE FROM ornament_photo WHERE id = %s", (pid,))
+        write_audit_log(conn, user["id"], "ORNAMENT_PHOTO_DELETE", "ornament_photo", pid, "")
+        conn.commit()
+        cur.close()
+        return {"deleted": pid}
+    except HTTPException:
+        if conn:
+            conn.rollback()
+        raise
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        logger.error(f"Error in DELETE /api/v1/ornament-photos/{pid}: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+    finally:
+        release_db_connection(conn)
+
+
 @app.get("/api/v1/nav-coverage")
 @limiter.limit("240/minute")
 def get_nav_coverage(

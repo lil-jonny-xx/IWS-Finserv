@@ -35,6 +35,9 @@ const TABS = [
   { href: '/properties',     label: 'Properties' },
   { href: '/art',            label: 'Art' },
   { href: '/collectibles',   label: 'Collectibles' },
+  // Owner-only — see OWNER_ONLY_HREFS in lib/nav.ts. Not in DATA_GATED: an
+  // empty register still has to be reachable so its owner can fill it.
+  { href: '/ornaments',      label: 'Ornaments' },
   { href: '/realised-gains', label: 'Realised Gains' },
   { href: '/trades',         label: 'Trades' },
   { href: '/manual-data',    label: 'Manual Data' },
@@ -64,10 +67,11 @@ const DATA_GATED = new Set([
 ]);
 
 export default function NavTabs({
-  active, role, variant = 'pills', className = '',
+  active, role, entityId, variant = 'pills', className = '',
 }: {
   active: string;
   role?: string | null;
+  entityId?: number | null;
   variant?: 'pills' | 'links';
   className?: string;
 }) {
@@ -122,7 +126,7 @@ export default function NavTabs({
     >
       {/* Tab labels render in capitals. Done in CSS rather than baked into TABS so
           the dynamic Manual-Data tabs (DYNAMIC_CATEGORY_LABELS) capitalise too. */}
-      {navFor(tabs, role).map(({ href, label }) => (
+      {navFor(tabs, role, entityId).map(({ href, label }) => (
         <a
           key={href}
           href={href}

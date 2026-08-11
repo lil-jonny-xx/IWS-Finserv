@@ -44,7 +44,7 @@ export default function GlobalNav() {
         {/* Visible at every width — this is now the only section nav, where the
             Overview's copy used to be sm-and-up only and the asset pages carried
             their own mobile-visible strip. The tabs scroll horizontally. */}
-        <NavTabs active={pathname} role={me?.role} variant="links" className="ml-1 sm:ml-4" />
+        <NavTabs active={pathname} role={me?.role} entityId={me?.entity_id} variant="links" className="ml-1 sm:ml-4" />
       </div>
     </header>
   );
