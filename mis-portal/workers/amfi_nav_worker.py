@@ -45,6 +45,11 @@ DB_CONFIG = {
 
 MFAPI_BASE = "https://api.mfapi.in/mf"
 
+# Session-level advisory-lock key guarding the whole NAV refresh. Arbitrary but
+# fixed — 'AMFINAV' as ASCII hex. Any other worker taking a pg advisory lock must
+# not reuse this value.
+_ADVISORY_LOCK_KEY = 0x414D46494E4156
+
 
 def now_utc():
     return datetime.now(timezone.utc)
@@ -228,6 +233,36 @@ def run(catchup=False):
 
     try:
         conn = get_db()
+
+        # Serialise NAV refreshes across processes.
+        #
+        # The daily cron (30 2 * * *) and cas_automation_worker's in-process chain
+        # both fire at 02:30 UTC by design — the CAS run reaches its 08:00 IST
+        # deadline at exactly that minute and then calls run() itself. On 2026-07-19
+        # and 2026-08-14 the two collided and deadlocked while updating the same
+        # `holding` rows; the victim's transaction was aborted, so every remaining
+        # security failed with "current transaction is aborted" and the run exited 1.
+        #
+        # The "already ran today" check below cannot prevent this: both processes
+        # evaluate it before either has written a row. The lock closes that window
+        # by covering the check as well as the work.
+        #
+        # try_ rather than a blocking acquire: the loser would only redo work the
+        # winner is already doing, so it exits cleanly (0) instead of queueing.
+        # Session-level, so it is released when the connection closes in `finally`,
+        # including on every early return below. It also survives a transaction
+        # rollback, which a transaction-scoped lock would not.
+        cursor = conn.cursor()
+        cursor.execute("SELECT pg_try_advisory_lock(%s) AS got", (_ADVISORY_LOCK_KEY,))
+        got_lock = cursor.fetchone()["got"]
+        cursor.close()
+
+        if not got_lock:
+            logger.info(
+                "Another AMFI NAV refresh is already running (advisory lock held) — "
+                "skipping this pass."
+            )
+            return
 
         # Skip if already ran today.
         #
