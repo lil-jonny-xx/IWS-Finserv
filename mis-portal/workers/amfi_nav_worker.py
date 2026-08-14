@@ -334,12 +334,31 @@ def run(catchup=False):
 
                 save_nav(conn, sec_id, entry["date"], entry["nav"])
                 update_holding(conn, sec_id, entry["nav"])
+                # Commit per security rather than once after the loop. The whole
+                # sweep used to be a single transaction, so any mid-loop failure
+                # discarded every NAV saved up to that point. It also held row
+                # locks on `holding` for the full ~10min run, which is what let
+                # the 02:30 UTC double-schedule deadlock in the first place.
+                conn.commit()
                 logger.info(f"✅ {name[:45]} | {entry['nav']} | {entry['date']}")
                 processed += 1
 
             except Exception as e:
-                logger.error(f"Failed {name[:40]}: {e}")
                 failed += 1
+                logger.error(f"Failed {name[:40]}: {e}")
+                # Without this the connection stays in a failed transaction and
+                # EVERY later security dies with "current transaction is aborted"
+                # — one transient error (a deadlock victim, a network blip) took
+                # out all 249 remaining funds and exited 1. See 2026-07-19 and
+                # 2026-08-14. Roll back and carry on with the next fund.
+                try:
+                    conn.rollback()
+                except Exception as rb_err:
+                    # Rollback itself failing means the connection is gone; there
+                    # is nothing left to continue with, so stop rather than log
+                    # one identical failure per remaining security.
+                    logger.error(f"Rollback failed — connection unusable: {rb_err}")
+                    raise
 
         log_run(conn, "success", processed, failed, started)
         conn.commit()
