@@ -27,7 +27,7 @@ import tempfile
 import threading
 import datetime
 import zoneinfo
-from collections import defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -95,46 +95,75 @@ def _entity_configs() -> list[EntityConfig]:
     return [EntityConfig(code=r["code"], email=r["email"], pan=r["pan"]) for r in rows]
 
 
-def _shuffled_no_consecutive_pan(configs: list[EntityConfig]) -> list[EntityConfig]:
+def _pan_spread_score(order: list[EntityConfig]) -> tuple[float, float]:
     """
-    Returns configs in a random order where no two consecutive entries share a PAN.
-    Tries up to 200 random shuffles first; falls back to a greedy interleave if needed.
+    (smallest gap, mean gap) between triggers sharing a PAN. Higher is better;
+    a PAN appearing once imposes no constraint. Used to rank candidate orderings.
     """
-    result = list(configs)
-    for _ in range(200):
-        random.shuffle(result)
-        if all(result[i].pan != result[i + 1].pan for i in range(len(result) - 1)):
-            return result
+    last: dict[str, int] = {}
+    gaps: list[int] = []
+    for i, cfg in enumerate(order):
+        if cfg.pan in last:
+            gaps.append(i - last[cfg.pan])
+        last[cfg.pan] = i
+    if not gaps:
+        return (float("inf"), float("inf"))
+    return (min(gaps), sum(gaps) / len(gaps))
 
-    # Greedy fallback: always pick from the largest PAN group that differs from the last,
-    # breaking ties randomly so the output is still non-deterministic.
-    groups: dict[str, list[EntityConfig]] = defaultdict(list)
-    for cfg in configs:
-        groups[cfg.pan].append(cfg)
-    for grp in groups.values():
-        random.shuffle(grp)
 
-    ordered: list[EntityConfig] = []
-    last_pan: str | None = None
-    while groups:
-        eligible = [(pan, lst) for pan, lst in groups.items() if pan != last_pan]
-        if not eligible:
-            eligible = list(groups.items())  # unavoidable consecutive — pick anything
-        max_len  = max(len(lst) for _, lst in eligible)
-        top      = [(pan, lst) for pan, lst in eligible if len(lst) == max_len]
-        pan, lst = random.choice(top)
-        ordered.append(lst.pop())
-        last_pan = pan
-        if not groups[pan]:
-            del groups[pan]
+def _shuffled_pan_spread(configs: list[EntityConfig]) -> list[EntityConfig]:
+    """
+    Returns configs in a random order that spreads same-PAN entities evenly across
+    the run, rather than merely keeping them non-adjacent.
 
-    return ordered
+    This used to only guarantee no two CONSECUTIVE triggers shared a PAN, which is
+    a much weaker property than it sounds: on 2026-08-13 HHR submitted at 21:09 and
+    a second entity on that same PAN came up again 2.5h later as the last of the
+    8 triggers, and was refused with "unable to process your request" on all three
+    retry attempts. Adjacency was satisfied; the PAN was still hit twice in one
+    evening, with the second hit at the point where the reCAPTCHA v3 score for a
+    long-running session is worst. Maximising the minimum gap pushes the second
+    trigger of a shared PAN toward the opposite end of the run instead.
+
+    Deliberately targets EVEN spacing rather than the maximum possible gap. Simply
+    keeping the best-scoring candidate pins a shared PAN to the first and last slots
+    every single night — which would park one of them permanently in the tail slot
+    where the reCAPTCHA score is worst, i.e. exactly the position that failed. So:
+    sample candidates, keep every one that reaches the even-spacing target, and pick
+    among them at random. Spread and positional variety, neither traded for the other.
+    """
+    if len(configs) < 2:
+        return list(configs)
+
+    counts = Counter(c.pan for c in configs)
+    # Even-spacing gap. Floored at 2 so a small roster never loses the original
+    # non-adjacency guarantee (3 entities with one shared PAN target 3//2 == 1,
+    # which would permit back-to-back same-PAN triggers again). Unreachable targets
+    # are handled by the fallback below. All-unique PANs score inf and always pass.
+    target = max(2, len(configs) // max(counts.values()))
+    candidate = list(configs)
+    good: list[list[EntityConfig]] = []
+    best: list[EntityConfig] = list(candidate)
+    best_score = _pan_spread_score(best)
+
+    for _ in range(500):
+        random.shuffle(candidate)
+        score = _pan_spread_score(candidate)
+        if score[0] >= target:
+            good.append(list(candidate))
+        if score > best_score:
+            best, best_score = list(candidate), score
+
+    # Fall back to the best seen when the target is unreachable (e.g. one PAN
+    # dominating the roster), so this always returns a usable order.
+    return random.choice(good) if good else best
 
 
 def _random_pdf_password() -> str:
     """
     Generate a CAMS-compliant PDF password.
-    CAMS requires: ≥2 digits, ≥1 special char, allowed specials are only @ # $ * _
+    CAMS requires: starts with a letter, ≥1 uppercase, ≥2 digits, ≥1 special char,
+    and allowed specials are only @ # $ * _
     token_urlsafe produces '-' which CAMS rejects — build manually instead.
 
     The special char is MANDATORY as of 2026-08-08: CAMS tightened the rule to
@@ -147,18 +176,27 @@ def _random_pdf_password() -> str:
     letters  = _string.ascii_letters
     digits   = _string.digits
     specials = "@#$*_"
-    # Guarantee 2 digits + 1 special; fill the remaining 8 from the full allowed set,
-    # then shuffle ONLY those 11 and prepend a letter.
+    # Guarantee 2 digits + 1 special + 1 lowercase; fill the remaining 7 from the full
+    # allowed set, then shuffle ONLY those 11 and prepend an UPPERCASE letter.
     #
     # The leading letter is mandatory: CAMS also enforces "Must start with an alphabet
     # letter." Shuffling all 12 left the first character to chance, so roughly 40% of
     # runs failed field validation and never submitted — which is precisely how IWS and
     # HDR silently produced no PDF on 2026-08-10 while the other six succeeded. Do not
     # fold the first character back into the shuffle.
-    parts  = [secrets.choice(digits), secrets.choice(digits), secrets.choice(specials)]
-    parts += [secrets.choice(letters + digits + specials) for _ in range(8)]
+    #
+    # That leading letter is now pinned to UPPERCASE, which also satisfies a third rule
+    # found on 2026-08-13: "Must contain at least one uppercase letter (A-Z)." Case was
+    # previously left entirely to chance — a lowercase lead plus 8 free chars drawn from
+    # a 67-char set missed uppercase ~1.1% of the time, i.e. roughly one entity every
+    # 12 days. SDR drew such a password that night, was rejected at field validation,
+    # and timed out at 08:00 IST waiting for a PDF that was never requested. The
+    # explicit lowercase pick guards the symmetric rule in case CAMS adds it next.
+    parts  = [secrets.choice(digits), secrets.choice(digits), secrets.choice(specials),
+              secrets.choice(_string.ascii_lowercase)]
+    parts += [secrets.choice(letters + digits + specials) for _ in range(7)]
     random.shuffle(parts)
-    return secrets.choice(letters) + "".join(parts)
+    return secrets.choice(_string.ascii_uppercase) + "".join(parts)
 
 
 def _pdf_matches_password(pdf_path: str, password: str) -> bool:
@@ -354,8 +392,8 @@ def _main(only: set[str] | None = None):
     seen_ids       = set()
     stop_collector = threading.Event()
 
-    # Shuffle so no two consecutive triggers share a PAN
-    ordered = _shuffled_no_consecutive_pan(configs)
+    # Shuffle so triggers sharing a PAN land as far apart in the run as possible
+    ordered = _shuffled_pan_spread(configs)
     logger.info(f"Gmail collector active until {deadline_str}")
     logger.info(f"Trigger order: {' → '.join(c.code for c in ordered)}")
 

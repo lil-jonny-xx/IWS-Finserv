@@ -520,6 +520,25 @@ def _is_success_page(page) -> bool:
         return False
 
 
+def _visible_field_errors(page) -> list[str]:
+    """
+    Text of the live, rendered field-validation errors on the form.
+
+    _check_submit_result matches its signals against page.content(), which is the
+    entire DOM — including the password field's static hint text, which itself
+    lists every rule ("must start with an alphabet", ...). On 2026-08-13 that made
+    SDR's failure report a rule the password already satisfied, while the only red
+    error on screen was the uppercase one. Angular Material renders <mat-error>
+    only for a control that is actually invalid, so these are the live errors —
+    log them so a screenshot is not the only way to learn which rule really fired.
+    """
+    try:
+        texts = page.locator("mat-error, .mat-error, .invalid-feedback").all_inner_texts()
+    except Exception:
+        return []
+    return [t.strip() for t in texts if t and t.strip()]
+
+
 def _check_submit_result(page) -> bool:
     """
     Inspect page after Submit to determine success or failure.
@@ -606,14 +625,22 @@ def _check_submit_result(page) -> bool:
             # Second CAMS password rule, found 2026-08-10 the same way as the first —
             # from a postsubmit screenshot, after two entities silently produced no PDF.
             "must start with an alphabet",
+            # Third rule, found 2026-08-13 (SDR). Listed LAST deliberately: these are
+            # substring matches against the whole page, and "must start with an
+            # alphabet" also appears as static hint text under the password field, so
+            # it matched on a page whose only live red error was the uppercase rule.
+            # The reported signal was misleading — see _visible_field_errors().
+            "must contain at least one uppercase",
         ]
         matched = [s for s in (email_reset_signals + password_reset_signals)
                    if s in content]
         if matched:
+            live = _visible_field_errors(page)
             whole_form_reset = any(s in content for s in email_reset_signals)
             if whole_form_reset:
                 logger.error(
                     f"CAMS form was reset after Submit — validation errors {matched}. "
+                    f"Live field errors: {live or 'none rendered'}. "
                     "Whole form cleared: transient reCAPTCHA/session reset. "
                     "Will back off and retry on a fresh browser profile."
                 )
@@ -621,8 +648,11 @@ def _check_submit_result(page) -> bool:
                     "CAMS form reset (transient reCAPTCHA/session reset)"
                 )
             logger.error(
-                f"CAMS form was reset after Submit — validation errors {matched}. "
-                "Likely cause: invalid PDF password. Hard failure — will not wait for PDF."
+                f"CAMS form was reset after Submit — matched signals {matched}. "
+                f"Live field errors: {live or 'none rendered'}. "
+                "Likely cause: invalid PDF password. Hard failure — will not wait for PDF. "
+                "Trust the live field errors over the matched signals: the latter also "
+                "match the password field's static hint text."
             )
             return False
 
