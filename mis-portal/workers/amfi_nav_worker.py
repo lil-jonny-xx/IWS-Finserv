@@ -93,6 +93,12 @@ def check_unresolved_held_mfs(conn) -> list:
     A row in `holding` with no amfi_code on its security can never get a NAV, so it
     silently shows stale/zero value — exactly the gap this guard surfaces. Emails an
     alert listing the offenders. Never raises; returns the offending rows (possibly []).
+
+    Only live (quantity > 0) holdings count. Fully-exited schemes carry a zero-quantity
+    holding row from the full-history CAS import and contribute nothing to value, so a
+    missing amfi_code on one is correct-by-design, not a gap — see resolve_all_missing().
+    Without this the guard emailed the same 7 dead HDR schemes on every daily run,
+    which is exactly how a real alert gets ignored.
     """
     cursor = conn.cursor()
     cursor.execute("""
@@ -101,6 +107,7 @@ def check_unresolved_held_mfs(conn) -> list:
         JOIN   security_master sm ON sm.id = h.security_id
         WHERE  sm.amfi_code IS NULL
           AND  COALESCE(sm.security_type, '') <> 'EQUITY'
+          AND  h.quantity > 0
         ORDER  BY sm.security_name
     """)
     rows = cursor.fetchall()

@@ -71,8 +71,19 @@ def resolve_isin(isin: str, scheme_name: str) -> str:
 
 def resolve_all_missing(conn):
     """
-    Fix all securities in DB that have ISIN but no amfi_code.
+    Fix all currently-held securities that have an ISIN but no amfi_code.
     Called automatically by AMFI NAV worker at startup.
+
+    Restricted to schemes with a live (quantity > 0) holding. The full-history CAS
+    import deliberately backfills closed folios for realised-gains history, and
+    those exited schemes are mostly matured FMPs and discontinued plans that no
+    longer exist to quote — mfapi.in will never resolve them. Without this gate the
+    daily run re-attempted the same 7 dead HDR schemes forever, burning ~10-20s on
+    mfapi timeouts and logging identical "No amfi_code found" warnings every day.
+
+    This hides nothing real: a newly-bought fund has quantity > 0, so a genuine
+    unresolved scheme is still picked up here and still trips
+    check_unresolved_held_mfs(), which carries the same gate for the same reason.
     """
     cursor = conn.cursor()
     cursor.execute("""
@@ -84,6 +95,11 @@ def resolve_all_missing(conn):
             'EQUITY', 'CASH_FOREX', 'PPF', 'UNLISTED_EQUITY',
             'FOREIGN_EQUITY', 'BROKER_CASH', 'BANK_CASH',
             'TRANSIT', 'PMS'
+        )
+        AND EXISTS (
+            SELECT 1 FROM holding h
+            WHERE h.security_id = security_master.id
+              AND h.quantity > 0
         )
     """)
     missing = cursor.fetchall()
