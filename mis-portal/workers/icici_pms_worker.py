@@ -19,8 +19,10 @@ Flow per entity:
   1. Log in: enter PAN → Next → enter Password → Next → Generate OTP.
   2. Poll the central Gmail inbox for the OTP mail, extract the code, submit it.
   3. Dashboard → "List Of Strategies": for each PMS strategy, open View Portfolio
-     and parse the Security Allocation table (Security · Sector · Security % ·
-     Value). Both strategies aggregate into one entity holdings set.
+     → Holdings and parse that grid (Description · Units · Cost · Market Price ·
+     Market Value · G/L · %G/L · %Asset). Both strategies aggregate into one
+     entity holdings set. Holdings is read out of the grid's React state rather
+     than the DOM — see _react_rows.
   4. Upsert into pms_holding with source='icici_pms', SOURCE-SCOPED full-replace
      (delete-then-insert WHERE entity_id AND source) — Rajani Corp also has a
      zerodha_pms source, so an entity-wide delete would wipe it.
@@ -416,59 +418,104 @@ def _login(page, cfg: PmsConfig):
 # ---------------------------------------------------------------------------
 # Navigation + parsing
 # ---------------------------------------------------------------------------
-def _parse_security_allocation(page, cfg: PmsConfig, tag: str) -> list[dict]:
-    """Parse one strategy's 'Security Allocation' table:
-       columns Security · Sector · Security % · Value.
-    Returns row dicts in the pms_holding contract (market_value required)."""
-    rows: list[dict] = []
-    # The allocation grid is an HTML table or a CDK/material grid. Read every
-    # row's cells generically and map by position, skipping the header.
-    candidates = [
-        "table:has-text('Security Allocation') tr",
-        "table tr",
-        "[role='row']",
-    ]
-    grid = []
-    for sel in candidates:
-        try:
-            loc = page.locator(sel)
-            cnt = loc.count()
-            if cnt < 2:
-                continue
-            for i in range(cnt):
-                cells = loc.nth(i).locator("td, th, [role='cell'], [role='gridcell']")
-                vals = [cells.nth(j).inner_text().strip() for j in range(cells.count())]
-                if vals:
-                    grid.append(vals)
-            if grid:
-                break
-        except Exception:
-            continue
+# The portal's grids are MUI DataGrids: the DOM only ever holds the current
+# 5-row page, but React keeps the WHOLE dataset in the fiber tree, with fields
+# the table never renders. So we read component state instead of scraping cells
+# — no pagination, no ₹/comma parsing, full float precision.
+_REACT_ROWS_JS = """
+(key) => {
+  const root = document.querySelector("#root") || document.body;
+  const k = Object.keys(root).find(x => x.startsWith("__reactContainer$") ||
+                                        x.startsWith("__reactFiber$"));
+  if (!k) return null;
+  let best = null, seen = 0;
+  const hit = a => Array.isArray(a) && a.length && a[0] &&
+                   typeof a[0] === "object" && (key in a[0]);
+  const visit = f => {
+    if (!f || seen > 60000) return;
+    seen++;
+    for (const bag of [f.memoizedProps, f.memoizedState]) {
+      if (!bag || typeof bag !== "object") continue;
+      let s = bag, d = 0;
+      while (s && d < 8) {
+        for (const v of Object.values(s)) {
+          if (hit(v) && (!best || v.length > best.length)) best = v;
+        }
+        s = s.next || s.baseState || null; d++;
+      }
+    }
+    visit(f.child); visit(f.sibling);
+  };
+  const c = root[k];
+  visit(c && c.stateNode ? c.stateNode.current : c);
+  return best;
+}
+"""
 
-    for vals in grid:
-        if len(vals) < 4:
+
+def _react_rows(page, key: str) -> list[dict]:
+    """Longest array in the React tree whose rows carry `key`. [] if not found."""
+    try:
+        return page.evaluate(_REACT_ROWS_JS, key) or []
+    except Exception as e:
+        logger.warning(f"React state read for key={key!r} failed: {e}")
+        return []
+
+
+def _dec(v) -> Decimal | None:
+    """Numbers arrive from React as float OR string ('143364.35'); via str() so
+    binary float noise never reaches the DB."""
+    if v is None or v == "":
+        return None
+    try:
+        return Decimal(str(v))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _parse_holdings(page, cfg: PmsConfig, tag: str) -> list[dict]:
+    """Parse one strategy's 'Holdings' tab — Description · Units · Cost ·
+    Market Price · Market Value · G/L · %G/L · %Asset.
+
+    This replaced the old 'Allocation' tab parse (Security/Sector/%/Value),
+    which was the only tab the worker ever opened and which carries no units or
+    cost — that is why every icici_pms row used to land with NULL quantity /
+    avg_cost / cost / current_price while the other two PMS sources were fully
+    populated.
+
+    The row's `stock` field is the ASSET CLASS ("Equity", "Mutual Funds",
+    "Cash and equivalent"), not a ticker. Anything that is not cash is stored as
+    'equity': _pms_aggregate in main.py buckets strictly on 'equity'/'cash', so
+    a third holding_type would silently drop out of both the P&L and the cash
+    totals. The liquid ETF is already carried as 'equity' today.
+    """
+    rows: list[dict] = []
+    for r in _react_rows(page, "marketPrice"):
+        name = (r.get("description") or "").strip()
+        mv = _dec(r.get("marketValue"))
+        if not name or mv is None:
             continue
-        name = vals[0].strip()
-        if not name or name.lower() in ("security", "total"):
-            continue
-        sector = vals[1].strip()
-        weight = _num(vals[2])
-        value  = _num(vals[3])
-        if value is None:
-            continue
-        is_cash = name.strip().lower() == "cash" or sector.upper() in ("(NULL)", "NULL", "")
+        asset_class = (r.get("stock") or "").strip().lower()
+        is_cash = asset_class.startswith("cash")
+        # For cash the portal fills units/cost with the balance itself and
+        # prices it at 0 — meaningless as quantity/price, so leave them NULL.
+        qty   = None if is_cash else _dec(r.get("units"))
+        price = None if is_cash else _dec(r.get("marketPrice"))
+        cost  = _dec(r.get("cost"))
         rows.append({
             "holding_type":  "cash" if is_cash else "equity",
             "security_name": name,
-            "isin":          None,
-            "quantity":      None,
-            "avg_cost":      None,
-            "cost":          None,
-            "current_price": None,
-            "market_value":  value,
-            "weight_pct":    weight,   # per-strategy weight; recomputed globally in upsert
+            "isin":          None,   # the portal exposes no ISIN on any tab
+            "quantity":      qty,
+            "avg_cost":      (cost / qty) if (cost is not None and qty) else None,
+            "cost":          cost,
+            "current_price": price,
+            "market_value":  mv,
+            "weight_pct":    _dec(r.get("asset")),  # per-strategy; recomputed in upsert
         })
-    logger.info(f"[{cfg.code}] {tag}: parsed {len(rows)} allocation rows")
+    priced = sum(1 for r in rows if r["holding_type"] != "cash" and r["quantity"])
+    logger.info(f"[{cfg.code}] {tag}: parsed {len(rows)} holdings rows "
+                f"({priced} with units/cost)")
     return rows
 
 
@@ -510,17 +557,20 @@ def collect_holdings(page, cfg: PmsConfig) -> list[dict]:
                 page.wait_for_timeout(1500)
             page.locator(PORT_SEL).nth(idx).click(timeout=ACTION_TIMEOUT, force=True)
             page.wait_for_timeout(1800)
-            # Land on Strategy Details → View Portfolio → Allocation (Allocation is
-            # the default tab, so these clicks are best-effort).
+            # Land on Strategy Details → View Portfolio, then switch to the
+            # Holdings tab. Allocation is the tab that opens by default and is
+            # the one this worker used to read; Holdings is the only tab that
+            # carries units and cost, so the click is REQUIRED, not optional —
+            # if it silently fails we would parse Allocation and write NULLs.
             _click(page, ['button:has-text("View Portfolio")',
                           'a:has-text("View Portfolio")'], "View Portfolio", optional=True)
             page.wait_for_timeout(1000)
-            _click(page, ['[role="tab"]:has-text("Allocation")',
-                          'a:has-text("Allocation")', 'button:has-text("Allocation")'],
-                   "Allocation tab", optional=True)
-            page.wait_for_timeout(1200)
+            _click(page, ['[role="tab"]:has-text("Holdings")',
+                          'a:has-text("Holdings")', 'button:has-text("Holdings")',
+                          'text="Holdings"'], "Holdings tab")
+            page.wait_for_timeout(2000)
             _shot(page, f"icici_strategy{idx}_{cfg.prefix}.png")
-            srows = _parse_security_allocation(page, cfg, f"strategy[{idx}]")
+            srows = _parse_holdings(page, cfg, f"strategy[{idx}]")
             if not srows:
                 raise PmsPartialScrape(f"strategy[{idx}] yielded 0 rows")
             all_rows.extend(srows)
@@ -546,6 +596,16 @@ def _validate(rows: list[dict]):
     total = sum((r["market_value"] for r in rows), Decimal(0))
     if total <= 0:
         raise PmsPartialScrape(f"non-positive total market value ({total})")
+    # Cost/units completeness is the whole point of reading the Holdings tab.
+    # If the tab click silently landed on Allocation, or ICICI reshapes the
+    # grid's React state, every non-cash row comes back priceless — which is
+    # exactly the failure that went unnoticed for months. Refuse the snapshot
+    # rather than overwrite good rows with NULLs.
+    invested = [r for r in rows if r["holding_type"] != "cash"]
+    if invested and not any(r["quantity"] and r["cost"] for r in invested):
+        raise PmsPartialScrape(
+            f"{len(invested)} non-cash rows but none carry units+cost — "
+            f"wrong tab, or the Holdings grid's state shape changed")
 
 
 def _aggregate_rows(rows: list[dict]) -> list[dict]:
