@@ -2428,14 +2428,18 @@ PMS_SOURCE_LABELS = {
     "icici_pms":   "ICICI Prudential",
 }
 
-# PMS sources whose funding deposits/withdrawals flow through a broker ledger
-# already imported into external_cashflow, keyed to that ledger's broker code.
-# zerodha_pms runs INSIDE the client's own Zerodha account, so its deposits ARE
-# the Zerodha ledger flows — a true money-weighted XIRR is computable. Nuvama
-# and ICICI are separately managed accounts whose deposit history isn't
-# ingested, so they only get absolute return (same rule as equity: annualised
-# metrics only where the dated flows exist).
-PMS_SOURCE_FLOW_BROKER = {"zerodha_pms": "zerodha"}
+# PMS sources whose funding deposits/withdrawals are in external_cashflow, keyed
+# to the broker code they are stored under. zerodha_pms runs INSIDE the client's
+# own Zerodha account, so its deposits ARE the Zerodha ledger flows. icici_pms
+# publishes its own dated subscriptions on the portal's Transactions tab, which
+# icici_pms_worker records under broker='icici_pms'. Nuvama's deposit history is
+# still not ingested, so it gets absolute return only (same rule as equity:
+# annualised metrics only where the dated flows exist).
+#
+# Note _pms_source_xirr still requires a year of flow history, so a newly
+# funded account keeps returning None until it matures — ICICI's first
+# subscription is dated 2026-05-11.
+PMS_SOURCE_FLOW_BROKER = {"zerodha_pms": "zerodha", "icici_pms": "icici_pms"}
 
 # User-supplied total capital deposited into a PMS whose provider doesn't
 # report per-holding cost (ICICI Pru gives market value only). Keyed

@@ -2352,8 +2352,12 @@ def _fetch_realised_gains(conn, entity_ids: list, as_of: date, *,
                         "amount": amt_inr, "name": r["symbol"], "group": "Foreign Equity"})
         _add(_avg_cost_realised(seq, fy), "Foreign Equity", broker=bk)
 
-    # ---- PMS (pms_realised; broker-provided realised P&L, already computed) ----
-    # No avg-cost: the statement gives cost/proceeds/P&L per lot directly. INR only.
+    # ---- PMS (pms_realised; realised P&L already computed per lot) ----
+    # No avg-cost here. Nuvama/Zerodha publish a realised capital-gains statement
+    # and those rows are imported as-is; ICICI publishes no such statement, so
+    # icici_pms_worker FIFO-matches its transaction history instead (only when
+    # that history reconciles against current holdings). Either way the cost,
+    # proceeds and P&L arrive per lot. INR only.
     try:
         cur.execute(f"""
             SELECT security_name, sale_date AS d, purchase_amount, sale_amount, pnl

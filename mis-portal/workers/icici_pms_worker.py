@@ -43,6 +43,7 @@ import logging
 import os
 import re
 import base64
+import hashlib
 import random
 import sys
 import time
@@ -82,6 +83,11 @@ PMS_ENTITIES = [
 ]
 
 SOURCE = "icici_pms"
+
+# external_cashflow.broker value for this account. Kept distinct from any
+# direct-broker code, and mirrored by PMS_SOURCE_FLOW_BROKER in main.py so the
+# PMS endpoint can find these flows for a money-weighted return.
+FLOW_BROKER = "icici_pms"
 
 LOGIN_URL = os.environ.get("ICICI_PMS_LOGIN_URL", "").strip()
 
@@ -519,10 +525,199 @@ def _parse_holdings(page, cfg: PmsConfig, tag: str) -> list[dict]:
     return rows
 
 
-def collect_holdings(page, cfg: PmsConfig) -> list[dict]:
-    """From the Dashboard, open each PMS strategy's portfolio and aggregate the
-    security-allocation rows across strategies into one entity holdings set."""
+# ---------------------------------------------------------------------------
+# Transactions
+# ---------------------------------------------------------------------------
+# How each of the portal's transaction types is treated.
+#
+# Only money the INVESTOR moves in or out is an external cash flow. Everything
+# else happens inside the account and is already reflected in its market value,
+# so counting it as a flow would double-count it in the money-weighted return:
+#   BUY/SELL  — reshuffles the same money between cash and securities.
+#   DIV       — income credited into the account, not withdrawn.
+#   EXP       — management/operational fees deducted from the account.
+#   TDI/TDO   — transfers between the capital and TDS sub-accounts; net zero.
+#   SIT/SOT   — STP between the two strategies. Both strategies aggregate into
+#               ONE icici_pms account here, so these net out entirely.
+FLOW_TYPES = {
+    "II+": "DEPOSIT",      # Initial Investment / Fresh Inflow / New Subscription
+}
+INTERNAL_TYPES = {"BUY", "SELL", "DIV", "EXP", "TDI", "TDO", "SIT", "SOT"}
+
+
+def _parse_transactions(page, cfg: PmsConfig, tag: str) -> list[dict]:
+    """Parse one strategy's 'Transactions' tab out of the grid's React state.
+
+    The grid paginates five rows at a time over ~46 pages, but the whole history
+    is already in component state (paging fires no request), so this reads it in
+    one go — and picks up units/unitPrice/exchange, which the table never shows.
+    """
+    rows: list[dict] = []
+    for r in _react_rows(page, "tranDate"):
+        try:
+            d = datetime.strptime(r["tranDate"], "%d/%m/%Y").date()
+        except (KeyError, TypeError, ValueError):
+            continue
+        rows.append({
+            "client_id":  r.get("clientId"),
+            "date":       d,
+            "type":       (r.get("tranType") or "").strip().upper(),
+            "type_desc":  (r.get("tranTypeDesc") or "").strip(),
+            "security":   (r.get("security") or "").strip(),
+            "amount":     _dec(r.get("amount")),
+            "units":      _dec(r.get("units")),
+            "unit_price": _dec(r.get("unitPrice")),
+        })
+    unknown = {r["type"] for r in rows} - set(FLOW_TYPES) - INTERNAL_TYPES
+    if unknown:
+        # Loud, because an unclassified type is silently absent from both the
+        # realised P&L and the cash flows.
+        logger.warning(f"[{cfg.code}] {tag}: UNKNOWN transaction types {sorted(unknown)} "
+                       f"— classify them in FLOW_TYPES/INTERNAL_TYPES")
+    logger.info(f"[{cfg.code}] {tag}: parsed {len(rows)} transactions")
+    return rows
+
+
+def _txn_ref(t: dict, suffix: str, seq: int) -> str:
+    """Stable dedup key for a transaction-derived row.
+
+    NOT the portal's own row id ("10143236-14/08/2026-7") — its trailing number
+    is the row's position in the returned array, so it shifts as new activity
+    lands and the same trade would be re-inserted under a new ref. This hashes
+    the content instead, with `seq` separating rows that are identical in every
+    field (split fills on the same day at the same price).
+    """
+    key = "|".join(str(x) for x in (
+        t["client_id"], t["date"], t["type"], t["security"],
+        t["units"], t["unit_price"], t["amount"], seq, suffix))
+    return hashlib.sha1(key.encode()).hexdigest()[:32]
+
+
+def _sequenced(txns: list[dict]) -> list[tuple[dict, int]]:
+    """Pair each transaction with an occurrence index among rows identical to
+    it, so _txn_ref stays deterministic across runs regardless of grid order."""
+    ordered = sorted(txns, key=lambda t: (
+        t["date"], t["type"], t["security"],
+        str(t["amount"]), str(t["units"]), str(t["unit_price"])))
+    seen: dict[tuple, int] = {}
+    out = []
+    for t in ordered:
+        k = (t["client_id"], t["date"], t["type"], t["security"],
+             str(t["amount"]), str(t["units"]), str(t["unit_price"]))
+        seen[k] = seen.get(k, -1) + 1
+        out.append((t, seen[k]))
+    return out
+
+
+def _reconciles(txns: list[dict], holdings: list[dict], cfg: PmsConfig) -> bool:
+    """True when every security's BUY − SELL equals the units currently held.
+
+    This is the gate on writing realised P&L. FIFO is only correct over a
+    COMPLETE history: if an opening lot were missing, a sale would be matched
+    against the wrong lot and booked at the wrong cost — and because realised
+    rows are deduped and never revised, that error would be permanent. A clean
+    reconciliation proves the history reaches back to inception. It also fails
+    closed on a corporate action (a split changes units without a BUY), which
+    is exactly when the naive cost basis would be wrong.
+    """
+    net: dict[str, Decimal] = {}
+    for t in txns:
+        if t["type"] == "BUY":
+            net[t["security"]] = net.get(t["security"], Decimal(0)) + (t["units"] or Decimal(0))
+        elif t["type"] == "SELL":
+            net[t["security"]] = net.get(t["security"], Decimal(0)) - (t["units"] or Decimal(0))
+    held = {h["security_name"]: (h["quantity"] or Decimal(0))
+            for h in holdings if h["holding_type"] != "cash"}
+    bad = [(n, net.get(n, Decimal(0)), held.get(n, Decimal(0)))
+           for n in set(net) | set(held)
+           if net.get(n, Decimal(0)) != held.get(n, Decimal(0))]
+    if bad:
+        for n, a, b in bad[:5]:
+            logger.warning(f"[{cfg.code}] reconcile MISMATCH {n}: txn-net {a} vs held {b}")
+        logger.warning(f"[{cfg.code}] {len(bad)} security(ies) do not reconcile — "
+                       f"skipping realised P&L (holdings + flows still written)")
+        return False
+    logger.info(f"[{cfg.code}] transactions reconcile against holdings "
+                f"({len(held)} securities) — realised P&L is safe to compute")
+    return True
+
+
+def _fifo_realised(txns: list[dict]) -> list[dict]:
+    """FIFO-match SELLs against earlier BUYs, one realised row per matched lot.
+
+    ICICI publishes no realised capital-gains statement through this portal, so
+    unlike Nuvama/Zerodha (whose statements arrive pre-computed) the P&L is
+    derived here. Same FIFO convention used for Indian direct equity.
+    """
+    lots: dict[tuple, list[list]] = {}
+    out: list[dict] = []
+    for t, seq in _sequenced(txns):
+        if t["type"] not in ("BUY", "SELL"):
+            continue
+        qty, px = t["units"], t["unit_price"]
+        if not qty or px is None:
+            continue
+        key = (t["client_id"], t["security"])
+        if t["type"] == "BUY":
+            lots.setdefault(key, []).append([qty, px, t["date"]])
+            continue
+        remaining, lot_no = qty, 0
+        queue = lots.setdefault(key, [])
+        while remaining > 0 and queue:
+            lot = queue[0]
+            take = min(remaining, lot[0])
+            out.append({
+                "security_name":   t["security"],
+                "quantity":        take,
+                "buy_date":        lot[2],
+                "sale_date":       t["date"],
+                "purchase_amount": (take * lot[1]).quantize(Decimal("0.01")),
+                "sale_amount":     (take * px).quantize(Decimal("0.01")),
+                "pnl":             (take * (px - lot[1])).quantize(Decimal("0.01")),
+                "source_ref":      _txn_ref(t, f"fifo{lot_no}", seq),
+            })
+            lot[0] -= take
+            remaining -= take
+            lot_no += 1
+            if lot[0] <= 0:
+                queue.pop(0)
+        if remaining > 0:
+            # _reconciles should have caught this; belt and braces.
+            logger.warning(f"SELL of {t['security']} on {t['date']} exceeds held lots "
+                           f"by {remaining} units — that portion is not booked")
+    return out
+
+
+def _capital_flows(txns: list[dict]) -> list[dict]:
+    """External cash flows only — see FLOW_TYPES for why everything else is
+    excluded. Investor-signed to match import_ledgers: a deposit is negative
+    (money left the investor), a withdrawal positive."""
+    out = []
+    for t, seq in _sequenced(txns):
+        ft = FLOW_TYPES.get(t["type"])
+        if ft is None or t["amount"] is None:
+            continue
+        amt = abs(t["amount"])
+        out.append({
+            "flow_date":  t["date"],
+            "flow_type":  ft,
+            "amount":     -amt if ft == "DEPOSIT" else amt,
+            "notes":      t["type_desc"],
+            "source_ref": _txn_ref(t, "flow", seq),
+        })
+    return out
+
+
+def collect_holdings(page, cfg: PmsConfig) -> tuple[list[dict], list[dict]]:
+    """From the Dashboard, open each PMS strategy's portfolio and aggregate both
+    its Holdings and its Transactions across strategies into one entity set.
+
+    Both tabs are read in the same visit: reaching a strategy costs a dashboard
+    reload plus an SPA drill-down, and the login that got us here costs a
+    single-use OTP.
+    """
     all_rows: list[dict] = []
+    all_txns: list[dict] = []
     # We're on the dashboard right after login. Capture its URL so we can return
     # to the strategy list reliably between strategies — drilling into a strategy's
     # tabs makes SPA back-navigation flaky, so we just reload the dashboard.
@@ -574,6 +769,19 @@ def collect_holdings(page, cfg: PmsConfig) -> list[dict]:
             if not srows:
                 raise PmsPartialScrape(f"strategy[{idx}] yielded 0 rows")
             all_rows.extend(srows)
+
+            # Transactions are best-effort: they feed realised P&L and cash
+            # flows, both of which can be rebuilt on a later run, whereas the
+            # holdings snapshot is the daily critical path. A transactions
+            # failure must not cost us the holdings.
+            try:
+                _click(page, ['[role="tab"]:has-text("Transactions")',
+                              'a:has-text("Transactions")',
+                              'button:has-text("Transactions")'], "Transactions tab")
+                page.wait_for_timeout(2500)
+                all_txns.extend(_parse_transactions(page, cfg, f"strategy[{idx}]"))
+            except Exception as e:
+                logger.warning(f"[{cfg.code}] strategy[{idx}] transactions failed: {e}")
         except Exception as e:
             failures += 1
             logger.warning(f"[{cfg.code}] strategy[{idx}] parse failed: {e}")
@@ -584,7 +792,7 @@ def collect_holdings(page, cfg: PmsConfig) -> list[dict]:
     if failures:
         raise PmsPartialScrape(
             f"{failures}/{n} strategies failed to parse — keeping previous snapshot")
-    return all_rows
+    return all_rows, all_txns
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +883,67 @@ def upsert(conn, entity_id: int, rows: list[dict], as_on: date | None = None) ->
     return count
 
 
+def upsert_realised(conn, entity_id: int, rows: list[dict]) -> int:
+    """Insert FIFO-derived realised lots, skipping any already booked.
+
+    Append-only, NOT the delete-then-insert used for holdings: a realised lot is
+    a historical fact, and pms_realised is deduped on (source, source_ref) by a
+    partial unique index. Re-running the worker re-derives identical refs and
+    inserts nothing.
+    """
+    if not rows:
+        return 0
+    cur = conn.cursor()
+    added = 0
+    for r in rows:
+        cur.execute(
+            """
+            INSERT INTO pms_realised
+                (entity_id, source, security_name, isin, quantity, buy_date,
+                 sale_date, purchase_amount, sale_amount, pnl, source_ref)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (source, source_ref) WHERE source_ref IS NOT NULL
+            DO NOTHING
+            """,
+            (entity_id, SOURCE, r["security_name"], None, r["quantity"],
+             r["buy_date"], r["sale_date"], r["purchase_amount"],
+             r["sale_amount"], r["pnl"], r["source_ref"]),
+        )
+        added += cur.rowcount
+    cur.close()
+    return added
+
+
+def upsert_cashflows(conn, entity_id: int, rows: list[dict]) -> int:
+    """Insert external cash flows not already recorded.
+
+    external_cashflow has no unique index on source_ref, so this checks before
+    inserting — the same pattern broker_txn_sync_worker uses.
+    """
+    if not rows:
+        return 0
+    cur = conn.cursor()
+    added = 0
+    for r in rows:
+        cur.execute("SELECT 1 FROM external_cashflow WHERE source_ref = %s",
+                    (r["source_ref"],))
+        if cur.fetchone():
+            continue
+        cur.execute(
+            """
+            INSERT INTO external_cashflow
+                (entity_id, broker, flow_date, flow_type, symbol,
+                 amount_native, currency, source, source_ref, notes)
+            VALUES (%s, %s, %s, %s, NULL, %s, 'INR', %s, %s, %s)
+            """,
+            (entity_id, FLOW_BROKER, r["flow_date"], r["flow_type"],
+             r["amount"], SOURCE, r["source_ref"], r["notes"]),
+        )
+        added += 1
+    cur.close()
+    return added
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -700,7 +969,7 @@ def process_entity(cfg: PmsConfig) -> int:
             Stealth().apply_stealth_sync(page)
             try:
                 _login(page, cfg)
-                rows = collect_holdings(page, cfg)
+                rows, txns = collect_holdings(page, cfg)
                 _validate(rows)
 
                 conn = get_db()
@@ -713,6 +982,25 @@ def process_entity(cfg: PmsConfig) -> int:
                     total = sum((r["market_value"] for r in rows), Decimal(0))
                     logger.info(f"[{cfg.code}] Upserted {n} rows into pms_holding "
                                 f"(source={SOURCE}, total ₹{total})")
+
+                    # Committed separately, and never allowed to fail the run:
+                    # the holdings snapshot above is the daily critical path,
+                    # while realised lots and flows are append-only history that
+                    # the next run re-derives.
+                    if txns:
+                        try:
+                            flows = _capital_flows(txns)
+                            f = upsert_cashflows(conn, entity_id, flows)
+                            r = 0
+                            if _reconciles(txns, _aggregate_rows(rows), cfg):
+                                r = upsert_realised(conn, entity_id, _fifo_realised(txns))
+                            conn.commit()
+                            logger.info(f"[{cfg.code}] {len(txns)} transactions → "
+                                        f"+{r} realised lot(s), +{f} cash flow(s)")
+                        except Exception as e:
+                            conn.rollback()
+                            logger.error(f"[{cfg.code}] transaction persist FAILED "
+                                         f"(holdings are committed): {e}")
                     return n
                 finally:
                     conn.close()
