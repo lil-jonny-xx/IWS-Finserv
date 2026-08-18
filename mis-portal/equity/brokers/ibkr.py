@@ -36,6 +36,7 @@ from pathlib import Path
 
 import requests
 
+from equity.brokers import ibkr_sftp
 from equity.models import EquityHolding
 
 logger = logging.getLogger(__name__)
@@ -242,6 +243,25 @@ def _fetch_statement_xml(
         return cached[1]
 
     daily = from_date is None and to_date is None   # only the daily query is disk-cached
+
+    # SFTP-delivered statement (IB-hosted, we pull). If IBKR has left a fresh file
+    # on their SFTP server we use it and spend ZERO Flex quota — no SendRequest, so
+    # no 1001 to escalate into a 1025 lockout. Only the daily query is eligible:
+    # a delivered file covers IBKR's own fixed period, so it can never satisfy a
+    # date-ranged backfill window. The freshness gate inside latest_statement()
+    # deliberately matches the refetch floor, so the evening provisional run still
+    # falls through to a live pull and picks up the day's fills.
+    # Returns None (never raises) whenever SFTP is unconfigured or has nothing
+    # fresh, which is what keeps this a pure addition to the existing path.
+    if daily:
+        delivered = ibkr_sftp.latest_statement(acct_prefix, query_id)
+        if delivered is not None:
+            stmt, _age = delivered
+            _STMT_CACHE[cache_key] = (time.monotonic(), stmt)
+            # Persist it as the on-disk fallback too, so a later throttled HTTP day
+            # can still fall back to it exactly as it would a live-pulled statement.
+            _save_statement_disk(acct_prefix, query_id, stmt)
+            return stmt
 
     # Proactive refetch floor: if we already have a recent on-disk daily statement,
     # reuse it instead of regenerating. The data hasn't changed (daily snapshot), and

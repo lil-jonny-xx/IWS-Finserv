@@ -82,6 +82,11 @@ mis-portal/equity/feeds/
 
 # IBKR Flex statement disk cache — holds account positions + cash; local fallback only
 mis-portal/.ibkr_statements/
+# IBKR SFTP delivery drop — statements IBKR leaves on their server and we collect.
+# Real account positions/cash/trades; this repo is PUBLIC, so never track these.
+mis-portal/.ibkr_sftp/
+# Drafted provisioning email to IBKR — contains real account numbers. Public repo.
+mis-portal/deploy/ibkr/email-to-ibkr.txt
 
 # ICICI Prudential PMS scraper — browser profile holds live auth cookies (secrets);
 # local runtime artifact, NEVER commit.
