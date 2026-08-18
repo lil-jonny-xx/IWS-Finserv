@@ -121,3 +121,10 @@ HDR-as-of-31st-July/
 *-CAS_*.PDF
 *-CAS_*.pdf
 NSDLe-CAS*
+
+# Portal screenshots dropped at the repo root for reference — they show real
+# holdings (scrip names, units, cost). *.png is already covered above; these
+# arrive as JPEGs, sometimes with no extension at all. Public repo.
+*.jpg
+*.jpeg
+icicixyz
